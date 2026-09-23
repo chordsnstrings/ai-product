@@ -7,7 +7,7 @@ export const fixture = (name: string) => `${root}tests/e2e/fixtures/${name}`;
 
 /** Follow the dev JSONL outbox (EMAIL_DEV_FILE) for the newest magic link sent to `email`. */
 export async function magicLinkFor(email: string, timeoutMs = 20_000): Promise<string> {
-  const file = `${root}.storage/e2e-mail.jsonl`;
+  const file = process.env.EMAIL_DEV_FILE || `${root}.storage/e2e-mail.jsonl`;
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     if (existsSync(file)) {

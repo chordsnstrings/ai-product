@@ -6,7 +6,8 @@ import { defineConfig, devices } from '@playwright/test';
  * PW_EXECUTABLE_PATH points at a preinstalled Chromium when the bundled revision isn't downloaded.
  */
 const root = new URL('.', import.meta.url).pathname;
-const mail = `${root}.storage/e2e-mail.jsonl`;
+// Reused servers may write their dev outbox elsewhere; EMAIL_DEV_FILE (when set) names the file they use.
+const mail = process.env.EMAIL_DEV_FILE || `${root}.storage/e2e-mail.jsonl`;
 const env = { EMAIL_DEV_FILE: mail, NEXT_TELEMETRY_DISABLED: '1' };
 
 export default defineConfig({
