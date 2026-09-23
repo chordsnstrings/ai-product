@@ -129,7 +129,14 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     values (${ctx.workspaceId}, ${input.projectId ?? null}, ${input.purpose}, ${hashToken(token)}, ${input.idempotencyKey},
       ${tx.json(est.rateVersions)}, ${tx.json({ ...est, skuId: input.skuId ?? null } as never)}, ${est.totalMicros},
       ${input.entitlement?.unit ?? null}, ${input.entitlement?.amount ?? 0}, now() + make_interval(mins => ${ttl}))
+    on conflict (workspace_id, idempotency_key) do nothing
     returning id`;
+  if (!auth) {
+    // Lost a race with a concurrent request for the same key (e.g. duplicate job delivery): the unique index
+    // arbitrates, and the loser gets the same answer as a sequential replay.
+    const [winner] = await tx`select id from cost_authorizations where idempotency_key = ${input.idempotencyKey}`;
+    throw new DomainError('CONFLICT', 'Authorization already issued for this request', { authorizationId: winner?.id });
+  }
 
   if (input.entitlement && input.entitlement.amount > 0) {
     await append(tx, ctx, {

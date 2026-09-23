@@ -86,6 +86,21 @@ describe('ledger + cost governor', () => {
     await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, input))).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
+  it('turns a concurrent duplicate authorization into CONFLICT, not a unique-index error', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const input = { purpose: 'storyboard' as const, lines: [{ kind: 'image' as const, provider: 'byteplus', model: 'seedream-5-0-pro', images: 4 }], idempotencyKey: 'sb-race' };
+    // Hold the first transaction open until the second has passed the replay check and is blocked on the insert.
+    let second!: Promise<unknown>;
+    await withTenant(t.workspaceId, async (tx) => {
+      await authorize(tx, ctx, input);
+      second = withTenant(t.workspaceId, (tx2) => authorize(tx2, ctx, input));
+      second.catch(() => {});
+      await new Promise((r) => setTimeout(r, 300));
+    });
+    await expect(second).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
   it('blocks spend without entitlement and above the Creative Test ceiling', async () => {
     const t = await makeTenant();
     const ctx = ctxFor(t.workspaceId, t.userId);
