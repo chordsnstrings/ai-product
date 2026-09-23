@@ -26,6 +26,9 @@ describe('hold decisions (plan 05 §2.3)', () => {
     expect(holdDecision('PURGE_SCHEDULED', Queues.computeResults, {})).toBe('hold');
     expect(holdDecision('PURGE_SCHEDULED', Queues.sendEmail, { template: 'asset_ready' })).toBe('run');
     expect(holdDecision('PURGE_SCHEDULED', Queues.exportWorkspace, {})).toBe('run');
+    // Money owed back (quality-guarantee refund) never waits on a hold; a purge would otherwise drop it.
+    expect(holdDecision('SUSPENDED', Queues.refundPurchase, {})).toBe('run');
+    expect(holdDecision('PURGE_SCHEDULED', Queues.refundPurchase, {})).toBe('run');
     expect(holdDecision('PURGED', Queues.exportWorkspace, {})).toBe('skip');
   });
 });

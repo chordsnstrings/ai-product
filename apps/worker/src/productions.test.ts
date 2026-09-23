@@ -73,6 +73,27 @@ describe('sweep-stuck-productions (prod-07)', () => {
   });
 });
 
+describe('held workspaces (plan 05 §2.3)', () => {
+  it('a suspended or purge-pending workspace’s productions are paused, not stalled: no resume, no fail', async () => {
+    for (const state of ['SUSPENDED', 'PURGE_SCHEDULED']) {
+      const stuck = await project({ state: 'COMPOSING', minutesAgo: 30, authMinutesAgo: 160, paid: true });
+      const paused = await project({
+        state: 'NEEDS_USER_ACTION',
+        outage: { task: 'video.scene', since: new Date(Date.now() - 7 * 3600_000).toISOString(), lastAt: new Date(Date.now() - 30 * 60_000).toISOString(), attempts: 9 },
+        authMinutesAgo: 7 * 60,
+        paid: true,
+      });
+      await ownerPool()`update workspaces set state = ${state} where id in ${ownerPool()([stuck.t.workspaceId, paused.t.workspaceId])}`;
+      await sweeps['sweep-stuck-productions']!.run();
+      await sweeps['resume-paused-productions']!.run();
+      const rows = await ownerPool()`select state from projects where id in ${ownerPool()([stuck.id, paused.id])} order by state`;
+      expect(rows.map((r) => r.state), state).toEqual(['COMPOSING', 'NEEDS_USER_ACTION']);
+      expect(await produceJobs(stuck.id)).toHaveLength(0);
+      expect(await ownerPool()`select 1 from outbox where queue = 'refund-purchase' and workspace_id in ${ownerPool()([stuck.t.workspaceId, paused.t.workspaceId])}`).toHaveLength(0);
+    }
+  });
+});
+
 describe('resume-paused-productions (edge-44-05)', () => {
   const outage = (minutesSince: number, lastMinutesAgo: number, attempts = 1) => ({
     task: 'video.scene',

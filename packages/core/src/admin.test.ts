@@ -194,6 +194,16 @@ describe('purge scheduling (plan 05 §2.2 danger zone)', () => {
     const legacy = await makeTenant({ state: 'PURGE_SCHEDULED' });
     expect(await cancelTenantPurge(a, legacy.workspaceId, 'legacy row')).toBe('CANCELLED');
   });
+
+  it('a subscriber whose subscription lapsed meanwhile comes back CANCELLED; a one-off buyer stays paid', async () => {
+    const ops = await staff(['OPS']);
+    const lapsed = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    await scheduleTenantPurge(ops, lapsed.workspaceId, 'legal hold request');
+    expect(await cancelTenantPurge(ops, lapsed.workspaceId, 'request withdrawn')).toBe('CANCELLED');
+    const oneOff = await makeTenant({ state: 'ACTIVE_PAID' });
+    await scheduleTenantPurge(ops, oneOff.workspaceId, 'legal hold request');
+    expect(await cancelTenantPurge(ops, oneOff.workspaceId, 'request withdrawn')).toBe('ACTIVE_PAID');
+  });
 });
 
 describe('risk flags (plan 05 §2.2 Risk, §17)', () => {

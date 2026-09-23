@@ -154,6 +154,9 @@ describe('privacy.create (plan 05 §21)', () => {
 describe('danger zone and jobs actions', () => {
   it('cancel purge reports the restored state; SUPPORT can retry only no-spend jobs', async () => {
     const t = await makeTenant({ state: 'ACTIVE_PAID', plan: 'LAUNCH' });
+    // Paying = a live subscription (a lapsed one would come back CANCELLED).
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, current_period_start, current_period_end, consent_record_id)
+                      values (${t.workspaceId}, ${'sub_act_' + t.workspaceId.slice(0, 8)}, 'LAUNCH', 'active', now(), now() + interval '1 month', gen_random_uuid())`;
     const o = await staff(['OPS']);
     await act(o, 'tenant.schedule_purge', { workspaceId: t.workspaceId, reason: 'legal request' });
     const r = await act(o, 'tenant.cancel_purge', { workspaceId: t.workspaceId, reason: 'request withdrawn' });

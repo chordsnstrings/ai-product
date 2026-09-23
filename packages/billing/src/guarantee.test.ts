@@ -4,7 +4,7 @@ import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { append, authorize, available, failProduction, retryProduction } from '@arkiv/core';
 import { ctxFor } from '@arkiv/core/testing';
 import { newId } from '@arkiv/shared';
-import { refundProjectPurchase } from './billing';
+import { processStripeEvent, receiveStripeWebhook, refundProjectPurchase } from './billing';
 import { MockStripe, setBillingGateway } from './gateway';
 
 /** Plan 04 L12 / plan 03 P7: "If we can't deliver an ad that passes our quality checks, you're refunded automatically." */
@@ -66,6 +66,23 @@ describe('quality guarantee refund', () => {
     expect(await refundProjectPurchase(ctx, purchaseId)).toBe('skipped');
     expect(gw.refunds).toHaveLength(1);
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(0);
+  });
+
+  it('Stripe’s charge.refunded webhook for the guarantee refund changes nothing (it is already on file)', async () => {
+    const { t, ctx, projectId, purchaseId } = await failedPaidTaste();
+    await withTenant(t.workspaceId, (tx) => failProduction(tx, ctx, projectId, 'Final QA failed'));
+    expect(await refundProjectPurchase(ctx, purchaseId)).toBe('refunded');
+    const customer = `cus_${t.workspaceId.slice(-8)}`;
+    await ownerPool()`insert into stripe_customers (customer_id, workspace_id) values (${customer}, ${t.workspaceId})`;
+    const hook = JSON.stringify({ id: 'evt_guarantee', type: 'charge.refunded', data: { object: { id: 'ch_guarantee', payment_intent: 'pi_guarantee', customer, amount_refunded: 1900, refunded: true, metadata: {} } } });
+    await receiveStripeWebhook(hook, null);
+    expect(await processStripeEvent('evt_guarantee')).toBe('processed');
+    await withTenant(t.workspaceId, async (tx) => {
+      expect(await tx`select 1 from refunds where purchase_id = ${purchaseId}`).toHaveLength(1);
+      const [pu] = await tx`select refunded_micros from purchases where id = ${purchaseId}`;
+      expect(Number(pu!.refunded_micros)).toBe(19_000_000);
+      expect(await available(tx, 'taste')).toBe(0); // the credit is withdrawn once, not twice
+    });
   });
 
   it('does not refund an order the merchant already retried', async () => {
