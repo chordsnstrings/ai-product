@@ -275,3 +275,41 @@ export async function tiktokFetchReport(token: string, advertiserId: string, sta
   if (j.code !== 0) throw new ConnectorError('tiktok', 'invalid', j.message);
   return { list: j.data?.list ?? [], hasMore: (j.data?.page_info.page ?? 1) < (j.data?.page_info.total_page ?? 1) };
 }
+
+// ───────────── OAuth code exchange (Meta, TikTok) ─────────────
+
+export interface AdAccount {
+  id: string;
+  name: string;
+  currency: string | null;
+  timezone: string | null;
+}
+
+/** Meta: code → short-lived → long-lived (~60 day) user token, plus the ad accounts it can read. */
+export async function metaExchangeCode(code: string): Promise<{ accessToken: string; accounts: AdAccount[] }> {
+  const e = env();
+  const q = new URLSearchParams({ client_id: e.META_APP_ID ?? '', client_secret: e.META_APP_SECRET ?? '', redirect_uri: `${e.APP_URL}/api/integrations/meta/callback`, code });
+  const r1 = await fetch(`${META_API}/oauth/access_token?${q}`);
+  const j1 = (await r1.json()) as { access_token?: string; error?: { message: string } };
+  if (!j1.access_token) throw new ConnectorError('meta', 'auth_revoked', j1.error?.message ?? 'token exchange failed');
+  const q2 = new URLSearchParams({ grant_type: 'fb_exchange_token', client_id: e.META_APP_ID ?? '', client_secret: e.META_APP_SECRET ?? '', fb_exchange_token: j1.access_token });
+  const j2 = (await (await fetch(`${META_API}/oauth/access_token?${q2}`)).json()) as { access_token?: string };
+  const token = j2.access_token ?? j1.access_token;
+  const acc = (await (await fetch(`${META_API}/me/adaccounts?${new URLSearchParams({ fields: 'account_id,name,currency,timezone_name', limit: '50', access_token: token })}`)).json()) as {
+    data?: { account_id: string; name: string; currency?: string; timezone_name?: string }[];
+  };
+  return { accessToken: token, accounts: (acc.data ?? []).map((a) => ({ id: `act_${a.account_id}`, name: a.name, currency: a.currency ?? null, timezone: a.timezone_name ?? null })) };
+}
+
+/** TikTok Business: auth_code → long-lived access token + authorised advertiser ids. */
+export async function tiktokExchangeCode(authCode: string): Promise<{ accessToken: string; accounts: AdAccount[] }> {
+  const e = env();
+  const r = await fetch(`${TIKTOK_API}/oauth2/access_token/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: e.TIKTOK_APP_ID, secret: e.TIKTOK_APP_SECRET, auth_code: authCode }),
+  });
+  const j = (await r.json()) as { code: number; message: string; data?: { access_token: string; advertiser_ids: string[] } };
+  if (j.code !== 0 || !j.data) throw new ConnectorError('tiktok', 'auth_revoked', j.message);
+  return { accessToken: j.data.access_token, accounts: j.data.advertiser_ids.map((id) => ({ id, name: `Advertiser ${id}`, currency: null, timezone: null })) };
+}

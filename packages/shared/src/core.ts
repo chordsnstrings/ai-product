@@ -19,6 +19,7 @@ export class DomainError extends Error {
   constructor(
     public readonly code:
       | 'NOT_FOUND'
+      | 'UNAUTHENTICATED'
       | 'FORBIDDEN'
       | 'CONFLICT'
       | 'INVALID'
@@ -43,6 +44,7 @@ export const conflict = (what: string, details?: Record<string, unknown>) =>
 export const httpStatusFor = (e: DomainError): number =>
   ({
     NOT_FOUND: 404,
+    UNAUTHENTICATED: 401,
     FORBIDDEN: 403,
     CONFLICT: 409,
     INVALID: 422,

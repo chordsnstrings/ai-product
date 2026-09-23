@@ -129,13 +129,15 @@ export class MockStripe implements BillingGateway {
   }
 }
 
-let gw: BillingGateway | undefined;
+// Held on globalThis so every bundle layer in one process (Next route handlers + server components) shares the
+// same instance — the mock's in-memory sessions depend on it.
+const slot = globalThis as { __arkivBilling?: BillingGateway };
 export function billingGateway(): BillingGateway {
-  if (!gw) gw = env().STRIPE_SECRET_KEY ? new LiveStripe() : new MockStripe();
-  return gw;
+  if (!slot.__arkivBilling) slot.__arkivBilling = env().STRIPE_SECRET_KEY ? new LiveStripe() : new MockStripe();
+  return slot.__arkivBilling;
 }
 export function setBillingGateway(g: BillingGateway | undefined) {
-  gw = g;
+  slot.__arkivBilling = g;
 }
 
 export function priceIdFor(code: 'TASTE' | 'STANDALONE' | 'LAUNCH' | 'GROWTH' | 'SCALE'): string | null {

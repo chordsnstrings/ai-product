@@ -111,7 +111,7 @@ export async function startSubscriptionCheckout(tx: Tx, ctx: TenantContext, plan
     productName: `${PLANS[plan].name} · ${PLANS[plan].creativeTestsPerMonth} Creative Tests / month`,
     metadata: { workspace_id: ctx.workspaceId, plan, consent_record_id: consentId },
     expiresAt: new Date(Date.now() + 60 * 60_000),
-    returnUrl: `${env().APP_URL}/w/_/this-week?subscribed=1`,
+    returnUrl: `${env().APP_URL}/app?subscribed=1&session={CHECKOUT_SESSION_ID}`,
     idempotencyKey: `sub:${ctx.workspaceId}:${plan}:${consentId}`,
     automaticTax: billingGateway().live,
   });

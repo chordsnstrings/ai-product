@@ -8,7 +8,9 @@ export type Db = Sql | Tx;
 
 type RoleName = 'owner' | 'app' | 'admin' | 'system';
 
-const pools = new Map<RoleName, Sql>();
+// Shared across bundle layers and dev hot-reloads in one process, so connections are never duplicated.
+const g = globalThis as { __arkivPools?: Map<RoleName, Sql> };
+const pools = (g.__arkivPools ??= new Map<RoleName, Sql>());
 
 function urlFor(role: RoleName): string {
   const e = env();
