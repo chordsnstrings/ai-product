@@ -15,7 +15,7 @@ test('staff can sign in and use the console', async ({ page }) => {
   await page.getByRole('link', { name: 'Tenants' }).click();
   await expect(page.getByRole('heading', { name: 'Tenants' })).toBeVisible();
   await page.getByRole('link', { name: 'Flags & config' }).click();
-  // Turning a kill switch on asks for a fresh authenticator code, then a reason.
+  // Turning a kill switch on asks for confirmation and a reason (and a fresh code if 2FA is older than 5 min).
   const dialogs: string[] = [];
   page.on('dialog', async (d) => {
     dialogs.push(d.message());
@@ -28,5 +28,7 @@ test('staff can sign in and use the console', async ({ page }) => {
   await expect(row.getByText('ON', { exact: true })).toBeVisible();
   await row.getByRole('button', { name: /Turn off/ }).click();
   await expect(row.getByText('ON', { exact: true })).toBeHidden();
-  expect(dialogs.some((m) => /authenticator/i.test(m))).toBe(true);
+  // A fresh login counts as a recent second factor (5 min), so only the confirm + reason prompts appear here;
+  // the stale-session 🔐 path is exercised by tests/smoke/admin.ts.
+  expect(dialogs.some((m) => /reason/i.test(m))).toBe(true);
 });
