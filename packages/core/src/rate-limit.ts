@@ -1,11 +1,12 @@
 import { globalTx, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
+import { isAllowlisted } from './allowlist';
 
 /**
  * Fixed-window counter in Postgres (no Redis in V1). Returns remaining budget or throws RATE_LIMITED.
  * Keys look like `login:ip:1.2.3.4`, `magic:email:a@b.com`, `upload:ws:<id>`.
  */
-export async function hit(key: string, limit: number, windowSeconds: number, tx?: Tx): Promise<number> {
+export async function hit(key: string, limit: number, windowSeconds: number, tx?: Tx, opts: { allow?: (string | null | undefined)[] } = {}): Promise<number> {
   const run = async (t: Tx) => {
     const [row] = await t`
       insert into rate_limits (key, window_start, count)
@@ -13,6 +14,8 @@ export async function hit(key: string, limit: number, windowSeconds: number, tx?
       on conflict (key, window_start) do update set count = rate_limits.count + 1
       returning count, window_start`;
     const count = row!.count as number;
+    // Abuse heuristics honour staff allowlists (plan 05 §15); checked only once the limit is exceeded.
+    if (count > limit && opts.allow?.length && (await isAllowlisted(t, opts.allow))) return 0;
     if (count > limit) {
       const retryAfter = Math.max(
         1,

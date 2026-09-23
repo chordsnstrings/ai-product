@@ -16,10 +16,14 @@ export default async function Offers() {
   }));
   const taste = (s: string) => Number(d0.issued.find((i) => i.type === 'TASTE' && i.status === s)?.n ?? 0);
   const tasteTotal = ['active', 'expired', 'redeemed', 'superseded'].reduce((a, s) => a + taste(s), 0);
+  // The engine resolves the latest active version per type whose eligibility matches (first match wins).
+  const latest = new Map<string, string>();
+  for (const o of [...d0.defs].filter((x) => x.active).sort((a, b) => Number(b.version) - Number(a.version))) if (!latest.has(o.type as string)) latest.set(o.type as string, o.code as string);
   return (
-    <Page title="Offers & pricing" sub="Prices on live offers can’t be edited — create a new code. A reference (strike-through) price must be an active price we actually charge.">
-      <Table head={['Code', 'Type', 'Price', 'Reference', 'Window', 'Bonus', 'Active', '']} rows={d0.defs.map((o) => [
-        <Mono key="c">{o.code as string}</Mono>, o.type as string, money(o.price_micros), (o.reference_code as string) ?? '—', o.window_minutes ? `${o.window_minutes} min` : '—', <Mono key="b">{JSON.stringify(o.bonus)}</Mono>, o.active ? 'yes' : 'no',
+    <Page title="Offers & pricing" sub="Prices on live offers can’t be edited — create a new code (a new version). A reference (strike-through) price must be the price we currently charge for its type.">
+      <Table head={['Code', 'Type', 'Version', 'Price', 'Reference', 'Window', 'Eligibility', 'Next offer', 'Stripe Price', 'Bonus', 'Active', '']} rows={d0.defs.map((o) => [
+        <Mono key="c">{o.code as string}</Mono>, o.type as string, `v${o.version}${latest.get(o.type as string) === o.code ? ' · latest' : ''}`, `${money(o.price_micros)} ${o.currency as string}`, (o.reference_code as string) ?? '—', o.window_minutes ? `${o.window_minutes} min` : '—',
+        <Mono key="e">{JSON.stringify(o.eligibility)}</Mono>, (o.next_offer_policy as { next?: string } | null)?.next ?? '—', <Mono key="s">{(o.stripe_price_id as string) ?? '—'}</Mono>, <Mono key="b">{JSON.stringify(o.bonus)}</Mono>, o.active ? 'yes' : 'no',
         <ActButton key="a" small action="offer.active" payload={{ code: o.code, active: !o.active }}>{o.active ? 'Pause' : 'Activate'}</ActButton>,
       ])} />
       <p className="ak-small" style={{ marginTop: 12 }}>Taste offers (30d): issued {tasteTotal} · redeemed {taste('redeemed')} ({pct(tasteTotal ? taste('redeemed') / tasteTotal : NaN)}) · expired {taste('expired')}</p>
@@ -29,11 +33,13 @@ export default async function Offers() {
             <ActForm action="offer.create" submit="Create" fields={[
               { name: 'code', label: 'Code', required: true, placeholder: 'TASTE_24_V2' },
               { name: 'type', label: 'Type', type: 'select', options: ['TASTE', 'STANDALONE', 'PLAN_UPGRADE', 'WIN_BACK'] },
-              { name: 'price', label: 'Price $', type: 'number', required: true },
+              { name: 'price', label: 'Price $ (USD)', type: 'number', required: true },
+              { name: 'stripePriceId', label: 'Stripe Price ID (optional)', placeholder: 'price_…' },
               { name: 'referenceCode', label: 'Reference price code (optional)', placeholder: 'STANDALONE_29' },
               { name: 'windowMinutes', label: 'Window (minutes)', type: 'number' },
               { name: 'bonus', label: 'Bonus (JSON)', type: 'json', defaultValue: '{}' },
-              { name: 'eligibility', label: 'Eligibility (JSON logic)', type: 'json', defaultValue: '{"newWorkspace": true, "neverPurchased": true}' },
+              { name: 'eligibility', label: 'Eligibility (JSON logic over never_purchased, new_workspace, workspace_age_days, state, plan, source_page)', type: 'json', defaultValue: '{"and": [{"var": "never_purchased"}, {"var": "new_workspace"}]}' },
+              { name: 'nextOfferPolicy', label: 'Next-eligible offer once this one ends (JSON)', type: 'json', defaultValue: '{"next": "STANDALONE_29"}' },
             ]} />
           </div>
         </Section>

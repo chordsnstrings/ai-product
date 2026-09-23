@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
-import { activeBreakGlass, assertBreakGlass, assetUrl } from '@arkiv/core';
+import { activeBreakGlass, assertBreakGlass, assetUrl, qaVerdictKey, type CheckResult } from '@arkiv/core';
 import { ActForm } from '@/components/act';
 import { Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -27,10 +27,12 @@ export default async function QaCase({ params, searchParams }: { params: Promise
     return { p, content: { refs, outputs, label: fp?.label_text as string, scenes } };
   });
   if (!d0) notFound();
-  const checks = ((d0.p.qa_report as { checks?: { name: string; pass: boolean; score?: number; detail?: string }[] } | null)?.checks ?? []);
+  // Stored QA reports are summarize(CheckResult[]) from the QA Gateway (packages/core qa.ts).
+  const checks = (d0.p.qa_report as { checks?: CheckResult[] } | null)?.checks ?? [];
+  const palette = (c: CheckResult) => (typeof c.data?.paletteDistance === 'number' ? (c.data.paletteDistance as number).toFixed(1) : '—');
   return (
     <Page title={`QA case ${projectId.slice(0, 8)}`} sub={<><Link href={`/tenants/${ws}?tab=skus`}>Tenant</Link> · {d0.p.state as string}</>}>
-      <Table head={['Check', 'Pass', 'Score', 'Detail']} rows={checks.map((c) => [c.name, c.pass ? '✓' : '✗', c.score ?? '—', <span key="d" className="ak-small">{c.detail ?? ''}</span>])} empty="No QA report stored." />
+      <Table head={['#', 'Check', 'Result', 'Severity', 'Palette distance', 'Detail']} rows={checks.map((c, i) => [i + 1, <Mono key="c">{c.check}</Mono>, c.pass ? '✓ pass' : '✗ fail', c.hard ? 'hard' : 'soft', palette(c), <span key="d" className="ak-small">{c.detail ?? ''}</span>])} empty="No QA report stored." />
       {d0.content ? (
         <>
           <div className="ak-grid-2" style={{ marginTop: 16 }}>
@@ -41,7 +43,7 @@ export default async function QaCase({ params, searchParams }: { params: Promise
           <Section title="Verdict">
             <div className="ak-panel" style={{ maxWidth: 560 }}>
               <ActForm action="qa.review" extra={{ workspaceId: ws, projectId }} submit="Save verdict" fields={[
-                { name: 'verdicts', label: 'Per check (JSON: {"check": "agree"|"disagree"})', type: 'json', defaultValue: JSON.stringify(Object.fromEntries(checks.map((c) => [c.name, 'agree'])), null, 2) },
+                { name: 'verdicts', label: 'Per check (JSON: {"<#>:<check>": "agree"|"disagree"})', type: 'json', defaultValue: JSON.stringify(Object.fromEntries(checks.map((c, i) => [qaVerdictKey(i, c.check), 'agree'])), null, 2) },
                 { name: 'failureLabel', label: 'Failure taxonomy label', type: 'select', options: ['', 'label_drift', 'color_shift', 'shape_warp', 'extra_product', 'hands_artifact', 'claim_unmapped', 'audio', 'platform_spec', 'false_positive'] },
                 { name: 'notes', label: 'Notes', type: 'textarea' },
               ]} />

@@ -63,11 +63,12 @@ export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projec
   const session = await billingGateway().createCheckout({
     mode: 'payment',
     customerId,
-    priceId: quote.kind === 'standalone' ? priceIdFor('STANDALONE') : null,
+    // The offer definition's Stripe Price when it has one (plan 05 §6); env price for the standard $29 otherwise.
+    priceId: quote.stripePriceId ?? (quote.kind === 'standalone' ? priceIdFor('STANDALONE') : null),
     amountCents: microsToCents(quote.priceMicros),
     productName: `Your ${p.name} ad · 15s`,
     description: 'One finished 15-second ad · TikTok, Reels and Feed exports · product and claims checked · one-time, no subscription',
-    metadata: { workspace_id: ctx.workspaceId, project_id: projectId, kind, offer_id: quote.offerId ?? '' },
+    metadata: { workspace_id: ctx.workspaceId, project_id: projectId, kind, offer_id: quote.offerId ?? '', offer_code: quote.definitionCode ?? '' },
     expiresAt: checkoutSessionExpiry(quote),
     returnUrl: `${env().APP_URL}/produce/${projectId}?session={CHECKOUT_SESSION_ID}`,
     idempotencyKey: idem,

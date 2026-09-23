@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { staffCan } from '@arkiv/core';
+import { canRetryQueue, NO_SPEND_QUEUES, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { ago, dt, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -12,6 +12,7 @@ const EXPECTED_MIN: Record<string, number> = { RENDERING: 20, QA_RUNNING: 10, CO
 /** Plan 05 §12. Reads pg-boss tables directly (read-only grant); mutations go through audited ops_commands. */
 export default async function Jobs() {
   const s = await requireStaff('jobs.read');
+  // Redrive and cancel need jobs.manage; SUPPORT may retry only queues whose handlers make no provider spend.
   const canManage = staffCan(s.roles, 'jobs.manage');
   const d0 = await withAdmin(async (tx) => {
     let queues: Record<string, unknown>[] = [];
@@ -46,7 +47,7 @@ export default async function Jobs() {
       </Section>
       <Section title="Failed jobs">
         <Table head={['Finished', 'Queue', 'Job', 'Workspace', 'Retries', 'Error', '']} rows={d0.failed.map((j) => [dt(j.completed_on), <Mono key="q">{j.name as string}</Mono>, <Mono key="j">{String(j.id).slice(0, 8)}</Mono>, j.ws ? <Link key="w" href={`/tenants/${j.ws}`}>{String(j.ws).slice(0, 8)}</Link> : '—', j.retry_count as number, <span key="e" className="ak-small">{JSON.stringify(j.output ?? '').slice(0, 140)}</span>,
-          canManage ? <span key="a" className="ak-row"><ActButton small action="job.retry" payload={{ queue: j.name, jobId: j.id, workspaceId: j.ws ?? undefined }} reason>Retry</ActButton></span> : null])} empty="No failed jobs retained." />
+          canRetryQueue(s.roles, j.name as string) ? <span key="a" className="ak-row"><ActButton small action="job.retry" payload={{ queue: j.name, jobId: j.id, workspaceId: j.ws ?? undefined }} reason>{NO_SPEND_QUEUES.has(j.name as string) ? 'Retry' : 'Retry (may spend)'}</ActButton></span> : null])} empty="No failed jobs retained." />
       </Section>
       <Section title="Staff queue commands">
         <Table head={['When', 'Command', 'Payload', 'By', 'Reason', 'Status', 'Result']} rows={d0.commands.map((c) => [dt(c.created_at), c.kind as string, <Mono key="p">{JSON.stringify(c.payload).slice(0, 100)}</Mono>, c.name as string, c.reason as string, c.status as string, <Mono key="r">{JSON.stringify(c.result ?? '').slice(0, 100)}</Mono>])} />

@@ -3,7 +3,10 @@
 // Explicit runtime: the worker loads this file through tsx, which applies its own tsconfig only to its own
 // sources and would otherwise compile JSX with the classic runtime ("React is not defined").
 import { Body, Button, Container, Head, Hr, Html, Img, Preview, Section, Text } from '@react-email/components';
-import type { ReactNode } from 'react';
+import { createContext, useContext, type ReactNode } from 'react';
+
+/** Support address shown in every footer; a platform setting (plan 05 §20) provided by sendEmail at render. */
+export const SupportEmail = createContext<string | null>(null);
 
 /** Arkiv email design (01-design-system §6/§7): paper background, serif headline, mono metadata, one CTA. */
 const C = { paper: '#F5F2EC', raised: '#FBFAF7', ink: '#1A1917', ink2: '#4A4742', stone: '#8A857D', rule: '#D6D1C7', accent: '#7A4A32' };
@@ -12,6 +15,7 @@ const sans = "'Inter Tight', Inter, Helvetica, Arial, sans-serif";
 const mono = "'IBM Plex Mono', Menlo, Consolas, monospace";
 
 function Layout({ preview, label, children, footer }: { preview: string; label: string; children: ReactNode; footer?: ReactNode }) {
+  const support = useContext(SupportEmail);
   return (
     <Html lang="en">
       <Head />
@@ -24,6 +28,7 @@ function Layout({ preview, label, children, footer }: { preview: string; label: 
           <Hr style={{ borderColor: C.rule, margin: '28px 0 12px' }} />
           <Text style={{ fontSize: 12, color: C.stone, lineHeight: '18px', margin: 0 }}>
             {footer ?? 'Arkiv · Creative testing for skincare brands.'}
+            {support ? <> Questions? Write to {support}.</> : null}
           </Text>
         </Container>
       </Body>

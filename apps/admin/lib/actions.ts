@@ -8,26 +8,35 @@ import {
   assertStaff,
   audit,
   blockClaim,
+  cancelProjectBeforeDispatch,
+  cancelTenantPurge,
   classifyClaim,
+  clearSettingsCache,
   decideApproval,
   endBreakGlass,
   enqueue,
   GOLDEN,
+  normalizeAllowKey,
+  QA_VERDICT_KEY,
   Queues,
   registerExecutor,
   requestOpsCommand,
   requestOrExecute,
+  retryProjectProduction,
   scanCreativeText,
+  scheduleTenantPurge,
+  SETTING_DEFAULTS,
   setTenantFlags,
   setTenantHold,
-  staffCtx,
   startBreakGlass,
-  transitionWorkspace,
+  suppressRiskFlag,
+  validateEligibility,
   type Permission,
+  type SettingKey,
 } from '@arkiv/core';
 import { billingGateway, processStripeEvent, receiveStripeWebhook } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { DomainError, env, newId, StaffRole } from '@arkiv/shared';
+import { DataRequestKind, DomainError, env, newId, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 
 /**
@@ -94,6 +103,14 @@ function lintMarketing(content: unknown): string[] {
   return out;
 }
 
+/** "support, ops" → ['SUPPORT','OPS']; unknown names are rejected rather than silently dropped. */
+function parseRoles(raw: string): StaffRole[] {
+  const roles = [...new Set(raw.split(',').map((r) => r.trim().toUpperCase()).filter(Boolean))];
+  const unknown = roles.filter((r) => !(StaffRole as readonly string[]).includes(r));
+  if (unknown.length) throw new DomainError('INVALID', `Unknown role ${unknown.join(', ')}. Roles: ${StaffRole.join(', ')}.`);
+  return roles as StaffRole[];
+}
+
 async function ownerEmails(workspaceId: string) {
   return withAdmin((tx) => tx`select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${workspaceId} and m.role in ('OWNER','ADMIN')`).then((r) => r.map((x) => x.email as string));
 }
@@ -105,7 +122,7 @@ export const ACTIONS = {
   /* ── Tenants ── */
   'tenant.hold': a({ perm: 'tenant.state', reauth: true, schema: z.object({ workspaceId: uuid, hold: z.enum(['SUSPENDED', 'LOCKED', 'LIFT']), reason }), run: (s, i) => setTenantHold(s, i.workspaceId, i.hold, i.reason) }),
   'tenant.flags': a({ perm: 'tenant.flags', schema: z.object({ workspaceId: uuid, isVip: z.boolean().optional(), isTest: z.boolean().optional(), tags: z.string().optional() }), run: (s, i) => setTenantFlags(s, i.workspaceId, { isVip: i.isVip, isTest: i.isTest, tags: i.tags === undefined ? undefined : i.tags.split(',').map((t) => t.trim()).filter(Boolean) }) }),
-  'tenant.note': a({ perm: 'tenant.note', schema: z.object({ workspaceId: uuid, body: z.string().min(1).max(4000) }), run: (s, i) => addTenantNote(s, i.workspaceId, i.body) }),
+  'tenant.note': a({ perm: 'tenant.note', schema: z.object({ workspaceId: uuid, body: z.string().min(1).max(4000), sentiment: z.enum(['positive', 'neutral', 'negative']).optional() }), run: (s, i) => addTenantNote(s, i.workspaceId, i.body, i.sentiment ?? null) }),
   'tenant.breakglass': a({
     perm: 'breakglass.read',
     schema: z.object({ workspaceId: uuid, reason: z.string().min(8), ticket: z.string().max(40).optional(), write: z.boolean().optional(), writeReason: z.string().optional() }),
@@ -120,26 +137,11 @@ export const ACTIONS = {
   }),
   'tenant.breakglass_end': a({ perm: 'breakglass.read', schema: z.object({ workspaceId: uuid }), run: (s, i) => endBreakGlass(s, i.workspaceId) }),
   'tenant.purge_now': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'workspace.purge_now', { workspaceId: i.workspaceId }, i.reason) }),
-  'tenant.schedule_purge': a({
-    perm: 'tenant.purge',
-    reauth: true,
-    schema: z.object({ workspaceId: uuid, reason }),
-    run: (s, i) =>
-      withAdmin(async (tx) => {
-        await transitionWorkspace(tx, staffCtx(s, i.workspaceId), 'PURGE_SCHEDULED', `staff: ${i.reason}`);
-        await tx`update workspaces set purge_at = now() + interval '7 days' where id = ${i.workspaceId}`;
-        await audit(tx, s, 'tenant.schedule_purge', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason });
-      }),
-  }),
+  'tenant.schedule_purge': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => scheduleTenantPurge(s, i.workspaceId, i.reason) }),
   'tenant.cancel_purge': a({
     perm: 'tenant.purge',
     schema: z.object({ workspaceId: uuid, reason }),
-    run: (s, i) =>
-      withAdmin(async (tx) => {
-        await transitionWorkspace(tx, staffCtx(s, i.workspaceId), 'CANCELLED', `staff: ${i.reason}`);
-        await tx`update workspaces set purge_at = null where id = ${i.workspaceId}`;
-        await audit(tx, s, 'tenant.cancel_purge', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason });
-      }),
+    run: async (s, i) => ({ message: `Purge cancelled; workspace restored to ${(await cancelTenantPurge(s, i.workspaceId, i.reason)).toLowerCase()}.` }),
   }),
   'tenant.export': a({
     perm: 'tenant.state',
@@ -178,7 +180,17 @@ export const ACTIONS = {
   'tenant.invite_revoke': a({ perm: 'tenant.flags', schema: z.object({ workspaceId: uuid, inviteId: uuid }), run: (s, i) => withAdmin(async (tx) => { await tx`update invites set revoked_at = now() where id = ${i.inviteId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'tenant.invite_revoke', { type: 'invite', id: i.inviteId }, { workspaceId: i.workspaceId }); }) }),
   'tenant.integration_sync': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid }), run: (s, i) => withAdmin(async (tx) => { await enqueue(tx, i.workspaceId, Queues.syncIntegration, { integrationId: i.integrationId, full: true }, { singletonKey: `sync:${i.integrationId}` }); await audit(tx, s, 'integration.resync', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId }); }) }),
   'tenant.integration_status': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid, status: z.enum(['active', 'paused', 'degraded']), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update integrations set status = ${i.status} where id = ${i.integrationId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'integration.status', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId, reason: i.reason, after: { status: i.status } }); }) }),
-  'tenant.risk_suppress': a({ perm: 'tenant.flags', schema: z.object({ workspaceId: uuid, flagId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update risk_flags set suppressed_reason = ${i.reason}, resolved_at = now() where id = ${i.flagId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'risk.suppress', { type: 'risk_flag', id: i.flagId }, { workspaceId: i.workspaceId, reason: i.reason }); }) }),
+  'tenant.risk_suppress': a({
+    perm: 'tenant.flags',
+    schema: z.object({ workspaceId: uuid, flagId: uuid, reason, days: z.number().int().min(1).max(180).default(30) }),
+    run: async (s, i) => {
+      const r = await suppressRiskFlag(s, i.workspaceId, i.flagId, i.reason, i.days);
+      return { message: `Suppressed until ${new Date(r.suppressedUntil).toDateString()}.` };
+    },
+  }),
+  /* Experiments & jobs tab (§2.2): retry a failed production within entitlement; cancel before dispatch. */
+  'tenant.project_retry': a({ perm: 'jobs.manage', schema: z.object({ workspaceId: uuid, projectId: uuid, reason }), run: (s, i) => retryProjectProduction(s, i.workspaceId, i.projectId, i.reason) }),
+  'tenant.project_cancel': a({ perm: 'jobs.manage', schema: z.object({ workspaceId: uuid, projectId: uuid, reason }), run: (s, i) => cancelProjectBeforeDispatch(s, i.workspaceId, i.projectId, i.reason) }),
 
   /* ── Users ── */
   'user.lock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update users set locked_at = now(), locked_reason = ${i.reason} where id = ${i.userId}`; await tx`update sessions set revoked_at = now() where user_id = ${i.userId} and revoked_at is null`; await audit(tx, s, 'user.lock', { type: 'user', id: i.userId }, { reason: i.reason }); }) }),
@@ -230,7 +242,8 @@ export const ACTIONS = {
   'eval.run': a({ perm: 'evals.run', schema: z.object({ dataset: z.string(), reason: z.string().default('manual eval run') }), run: async (s, i) => { if (!GOLDEN[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset'); const [r] = await withAdmin((tx) => tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${i.dataset}, 'rules', 'deterministic', ${i.dataset}, 'queued', ${s.staffId}) returning id`); await requestOpsCommand(s, 'eval.run', { dataset: i.dataset, evalRunId: r!.id }, i.reason); return { message: 'Eval queued; results appear in a few seconds.' }; } }),
 
   /* ── Jobs ── */
-  'job.retry': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.retry', i, i.reason).then(() => ({ message: 'Retry queued' })) }),
+  // SUPPORT may retry no-spend queues only; requestOpsCommand enforces the queue check.
+  'job.retry': a({ perm: 'jobs.retry_nospend', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.retry', i, i.reason).then(() => ({ message: 'Retry queued' })) }),
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),
   'dlq.requeue': a({ perm: 'jobs.manage', reauth: true, schema: z.object({ queue: z.string(), limit: z.number().int().min(1).max(1000).default(100), reason }), run: (s, i) => requestOpsCommand(s, 'dlq.requeue', { queue: i.queue, limit: i.limit }, i.reason).then(() => ({ message: 'Redrive queued' })) }),
 
@@ -239,10 +252,22 @@ export const ACTIONS = {
   /* ── QA review (content → break-glass) ── */
   'qa.review': a({
     perm: 'qa.review',
-    schema: z.object({ workspaceId: uuid, projectId: uuid, verdicts: z.record(z.string(), z.enum(['agree', 'disagree'])), failureLabel: z.string().max(60).optional(), notes: z.string().max(1000).optional() }),
+    schema: z.object({
+      workspaceId: uuid,
+      projectId: uuid,
+      // Keyed "<#>:<check>" (position in the stored report), since several scene checks share a name.
+      verdicts: z.record(z.string().regex(QA_VERDICT_KEY, 'Verdict keys look like "1:product_fidelity"'), z.enum(['agree', 'disagree'])),
+      failureLabel: z.string().max(60).optional(),
+      notes: z.string().max(1000).optional(),
+    }),
     run: (s, i) =>
       withAdmin(async (tx) => {
         await assertBreakGlass(tx, s, i.workspaceId, `qa review ${i.projectId}`);
+        const [p] = await tx`select qa_report from projects where id = ${i.projectId} and workspace_id = ${i.workspaceId}`;
+        if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+        const stored = ((p.qa_report as { checks?: { check: string }[] } | null)?.checks ?? []).map((c, n) => `${n + 1}:${c.check}`);
+        const unknown = Object.keys(i.verdicts).filter((k) => !stored.includes(k));
+        if (unknown.length) throw new DomainError('INVALID', `No such check in this QA report: ${unknown.join(', ')}`);
         await tx`insert into qa_reviews (workspace_id, project_id, staff_id, verdicts, failure_label, notes) values (${i.workspaceId}, ${i.projectId}, ${s.staffId}, ${tx.json(i.verdicts)}, ${i.failureLabel ?? null}, ${i.notes ?? null})`;
         await audit(tx, s, 'qa.review', { type: 'project', id: i.projectId }, { workspaceId: i.workspaceId, after: i.verdicts });
       }),
@@ -267,7 +292,19 @@ export const ACTIONS = {
   'claim.check': a({ perm: 'claims.review', schema: z.object({ text: z.string().min(1).max(300) }), run: async (_s, i) => ({ message: JSON.stringify(classifyClaim(i.text)) }) }),
 
   /* ── Abuse & rights ── */
-  'abuse.allowlist': a({ perm: 'abuse.manage', schema: z.object({ key: z.string().min(3), days: z.number().int().min(1).max(30).default(30), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into abuse_allowlist (key, reason, until, created_by) values (${i.key}, ${i.reason}, now() + make_interval(days => ${i.days}), ${s.staffId}) on conflict (key) do update set reason = excluded.reason, until = excluded.until`; await audit(tx, s, 'abuse.allowlist', { type: 'key', id: i.key }, { reason: i.reason }); }) }),
+  // Keys are normalised (ip:/24, domain:, ws:) so the multi-SKU and rate-limit heuristics recognise them.
+  'abuse.allowlist': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), days: z.number().int().min(1).max(30).default(30), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const key = normalizeAllowKey(i.key);
+        await tx`insert into abuse_allowlist (key, reason, until, created_by) values (${key}, ${i.reason}, now() + make_interval(days => ${i.days}), ${s.staffId}) on conflict (key) do update set reason = excluded.reason, until = excluded.until, created_by = excluded.created_by`;
+        await audit(tx, s, 'abuse.allowlist', { type: 'key', id: key }, { reason: i.reason, after: { days: i.days } });
+        return { message: `Allowlisted ${key} for ${i.days} days.` };
+      }),
+  }),
+  'abuse.allowlist_remove': a({ perm: 'abuse.manage', schema: z.object({ key: z.string().min(3), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`delete from abuse_allowlist where key = ${i.key}`; await audit(tx, s, 'abuse.allowlist_remove', { type: 'key', id: i.key }, { reason: i.reason }); }) }),
   'rights.create': a({ perm: 'abuse.manage', schema: z.object({ complainant: z.string().min(2), detail: z.string().min(5), workspaceId: uuid.optional(), assetId: uuid.optional() }), run: (s, i) => withAdmin(async (tx) => { const [c] = await tx`insert into rights_cases (complainant, detail, workspace_id, asset_id, created_by) values (${i.complainant}, ${i.detail}, ${i.workspaceId ?? null}, ${i.assetId ?? null}, ${s.staffId}) returning id`; await audit(tx, s, 'rights.create', { type: 'rights_case', id: c!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
   'rights.update': a({
     perm: 'abuse.manage',
@@ -306,20 +343,44 @@ export const ACTIONS = {
   'lp.rollback': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), version: z.number().int() }), run: (s, i) => withAdmin(async (tx) => { const [p] = await tx`select history, content, version from landing_pages where slug = ${i.slug} for update`; const h = (p?.history as { version: number; content: unknown; variants: unknown }[]) ?? []; const v = h.find((x) => x.version === i.version); if (!v) throw new DomainError('NOT_FOUND', 'Version not found'); await tx`update landing_pages set content = ${tx.json(v.content as never)}, variants = ${tx.json(v.variants as never)}, version = version + 1, history = history || ${tx.json([{ version: p!.version, content: p!.content, at: new Date().toISOString(), by: s.email }] as never)} where slug = ${i.slug}`; await audit(tx, s, 'lp.rollback', { type: 'landing_page', id: i.slug }, { after: { toVersion: i.version } }); }) }),
   'offer.create': a({
     perm: 'offers.manage',
-    schema: z.object({ code: z.string().regex(/^[A-Z0-9_]{3,40}$/), type: z.enum(['TASTE', 'STANDALONE', 'PLAN_UPGRADE', 'WIN_BACK']), price: z.number().positive(), referenceCode: z.string().optional(), windowMinutes: z.number().int().min(5).max(10080).optional(), bonus: z.record(z.string(), z.unknown()).default({}), eligibility: z.record(z.string(), z.unknown()).default({}) }),
+    schema: z.object({
+      code: z.string().regex(/^[A-Z0-9_]{3,40}$/),
+      type: z.enum(['TASTE', 'STANDALONE', 'PLAN_UPGRADE', 'WIN_BACK']),
+      price: z.number().positive(),
+      currency: z.literal('USD').default('USD'), // USD only in V1 (plan 05 §6)
+      referenceCode: z.string().optional(),
+      windowMinutes: z.number().int().min(5).max(10080).optional(),
+      bonus: z.record(z.string(), z.unknown()).default({}),
+      eligibility: z.record(z.string(), z.unknown()).default({}),
+      nextOfferPolicy: z.object({ next: z.string().regex(/^[A-Z0-9_]{3,40}$/).optional() }).strict().default({}),
+      stripePriceId: z.string().regex(/^price_[A-Za-z0-9_]+$/, 'Stripe Price IDs start with price_').optional(),
+    }),
     run: (s, i) =>
       withAdmin(async (tx) => {
         const priceMicros = Math.round(i.price * 1e6);
+        validateEligibility(i.eligibility);
         if (i.referenceCode) {
-          // Honest anchoring: the reference must be a live price we actually charge, above this price.
-          const [ref] = await tx`select price_micros, active from offer_definitions where code = ${i.referenceCode}`;
+          // Honest anchoring: the reference must be the price we actually charge for its type today (its latest
+          // active version), and above this price.
+          const [ref] = await tx`select type, price_micros, active from offer_definitions where code = ${i.referenceCode}`;
           if (!ref || !ref.active) throw new DomainError('GATE_BLOCKED', 'Reference price must be an active, purchasable price.');
+          const [cur] = await tx`select code from offer_definitions where type = ${ref.type} and active order by version desc, created_at desc limit 1`;
+          if (cur?.code !== i.referenceCode) throw new DomainError('GATE_BLOCKED', `Reference must be the price currently charged for ${String(ref.type).toLowerCase()} (${cur?.code as string}).`);
           if (Number(ref.price_micros) <= priceMicros) throw new DomainError('GATE_BLOCKED', 'Reference price must be higher than the offer price.');
+        }
+        if (i.nextOfferPolicy.next) {
+          const [n] = await tx`select type from offer_definitions where code = ${i.nextOfferPolicy.next}`;
+          if (!n) throw new DomainError('INVALID', `Next offer ${i.nextOfferPolicy.next} doesn’t exist.`);
         }
         const [exists] = await tx`select 1 from offer_definitions where code = ${i.code}`;
         if (exists) throw new DomainError('CONFLICT', 'Code exists. Prices on existing offers can’t be edited — create a new code (version).');
-        await tx`insert into offer_definitions (code, type, price_micros, reference_code, window_minutes, bonus, eligibility) values (${i.code}, ${i.type}, ${priceMicros}, ${i.referenceCode ?? null}, ${i.windowMinutes ?? null}, ${tx.json(i.bonus as never)}, ${tx.json(i.eligibility as never)})`;
-        await audit(tx, s, 'offer.create', { type: 'offer', id: i.code }, { after: i });
+        // Versions are per type; the engine uses the latest active version whose eligibility matches.
+        const [v] = await tx`select coalesce(max(version), 0) + 1 as v from offer_definitions where type = ${i.type}`;
+        await tx`insert into offer_definitions (code, type, price_micros, currency, reference_code, window_minutes, bonus, eligibility, next_offer_policy, stripe_price_id, version)
+                 values (${i.code}, ${i.type}, ${priceMicros}, ${i.currency}, ${i.referenceCode ?? null}, ${i.windowMinutes ?? null}, ${tx.json(i.bonus as never)},
+                         ${tx.json(i.eligibility as never)}, ${tx.json(i.nextOfferPolicy as never)}, ${i.stripePriceId ?? null}, ${Number(v!.v)})`;
+        await audit(tx, s, 'offer.create', { type: 'offer', id: i.code }, { after: { ...i, version: Number(v!.v) } });
+        return { message: `Created ${i.code} as ${i.type.toLowerCase()} v${v!.v}. New customers get it once it’s the latest active eligible version.` };
       }),
   }),
   'offer.active': a({ perm: 'offers.manage', schema: z.object({ code: z.string(), active: z.boolean() }), run: (s, i) => withAdmin(async (tx) => { if (!i.active) { const refs = await tx`select code from offer_definitions where reference_code = ${i.code} and active`; if (refs.length) throw new DomainError('CONFLICT', `Active offers anchor to this price: ${refs.map((r) => r.code).join(', ')}. Pause them first.`); } await tx`update offer_definitions set active = ${i.active}, updated_at = now() where code = ${i.code}`; await audit(tx, s, 'offer.active', { type: 'offer', id: i.code }, { after: { active: i.active } }); }) }),
@@ -348,12 +409,27 @@ export const ACTIONS = {
     },
   }),
   'flag.create': a({ perm: 'flags.manage', schema: z.object({ key: z.string().regex(/^[a-z0-9_.]{3,60}$/), description: z.string().min(5), owner: z.string().min(2), kind: z.enum(['boolean', 'percentage', 'workspace_allowlist', 'plan']), expiresAt: z.string().optional() }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into feature_flags (key, description, owner, kind, expires_at) values (${i.key}, ${i.description}, ${i.owner}, ${i.kind}, ${i.expiresAt ?? null})`; await audit(tx, s, 'flag.create', { type: 'flag', id: i.key }, { after: i }); }) }),
-  'setting.set': a({ perm: 'flags.manage', schema: z.object({ key: z.string().min(3), value: z.unknown(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select value from platform_settings where key = ${i.key}`; await tx`insert into platform_settings (key, value, updated_by) values (${i.key}, ${tx.json(i.value as never)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`; await audit(tx, s, 'setting.set', { type: 'setting', id: i.key }, { reason: i.reason, before: b?.value ?? null, after: i.value }); }) }),
+  'setting.set': a({
+    perm: 'flags.manage',
+    schema: z.object({ key: z.string().regex(/^[a-z0-9_.]{3,60}$/, 'Keys look like area.name'), value: z.unknown(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        if (i.value === undefined) throw new DomainError('INVALID', 'A value is required.');
+        const known = SETTING_DEFAULTS[i.key as SettingKey];
+        // Wired settings must keep their shape, or the app silently falls back to the code default.
+        if (known !== undefined && typeof i.value !== typeof known) throw new DomainError('INVALID', `${i.key} must be a ${typeof known}.`);
+        const [b] = await tx`select value from platform_settings where key = ${i.key}`;
+        await tx`insert into platform_settings (key, value, updated_by) values (${i.key}, ${tx.json(i.value as never)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'setting.set', { type: 'setting', id: i.key }, { reason: i.reason, before: b?.value ?? null, after: i.value });
+        clearSettingsCache(i.key);
+        return { message: 'Saved. Other processes pick it up within 30 seconds.' };
+      }),
+  }),
   'banner.set': a({ perm: 'system.banner', schema: z.object({ text: z.string().max(200).default(''), tone: z.enum(['info', 'warn', 'risk']).default('warn') }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into platform_settings (key, value, updated_by) values ('status.banner', ${tx.json(i.text ? { text: i.text, tone: i.tone, at: new Date().toISOString() } : null)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`; await audit(tx, s, 'banner.set', { type: 'setting', id: 'status.banner' }, { after: i }); }) }),
   'ops.restore_drill': a({ perm: 'system.read', schema: z.object({ result: z.enum(['passed', 'failed']), notes: z.string().max(500).optional() }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into platform_settings (key, value, updated_by) values ('ops.restore_drill', ${tx.json({ at: new Date().toISOString(), result: i.result, notes: i.notes ?? null, by: s.email })}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_at = now()`; await audit(tx, s, 'ops.restore_drill', { type: 'setting', id: 'ops.restore_drill' }, { after: i }); }) }),
 
   /* ── Privacy ── */
-  'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(['export', 'delete_workspace', 'delete_user', 'delete_person_in_reviews', 'access']), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
+  'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(DataRequestKind), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
   'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { after: i }); }) }),
   'privacy.erase_reviews': a({
     perm: 'privacy.manage',
@@ -372,8 +448,23 @@ export const ACTIONS = {
   'taxonomy.version': a({ perm: 'taxonomy.manage', reauth: true, schema: z.object({ spec: z.record(z.string(), z.unknown()), reason }), run: (s, i) => withAdmin(async (tx) => { const [v] = await tx`select coalesce(max(version), 0) + 1 as v from taxonomy_versions`; await tx`insert into taxonomy_versions (version, spec) values (${v!.v}, ${tx.json({ ...i.spec, changeReason: i.reason, by: s.email } as never)})`; await audit(tx, s, 'taxonomy.version', { type: 'taxonomy', id: String(v!.v) }, { reason: i.reason, after: i.spec }); return { message: `Taxonomy v${v!.v} recorded. Existing genomes keep their version until remapped.` }; }) }),
 
   /* ── Staff ── */
-  'staff.create': a({ perm: 'staff.manage', reauth: true, schema: z.object({ email: z.string().email(), name: z.string().min(2), password: z.string().min(14), roles: z.string() }), run: async (s, i) => { const roles = i.roles.split(',').map((r) => r.trim().toUpperCase()).filter(Boolean) as (typeof StaffRole)[number][]; const r = await createStaff({ email: i.email, name: i.name, password: i.password, roles }); await withAdmin((tx) => audit(tx, s, 'staff.create', { type: 'staff', id: r.staffId }, { after: { email: i.email, roles } })); return { message: `Created. Give them this authenticator secret once, in person: ${r.totpSecret}` }; } }),
-  'staff.roles': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, roles: z.string(), reason }), run: (s, i) => requestOrExecute(s, 'staff.roles', { staffId: i.staffId, roles: i.roles.split(',').map((r) => r.trim().toUpperCase()).filter((r) => (StaffRole as readonly string[]).includes(r)) }, i.reason) }),
+  // Invite staff: the account starts with no roles; the requested roles go through four-eyes like any role
+  // change (plan 05 §0.5, §23), so one SUPER_ADMIN can't mint another privileged account alone.
+  'staff.create': a({
+    perm: 'staff.manage',
+    reauth: true,
+    schema: z.object({ email: z.string().email(), name: z.string().min(2), password: z.string().min(14), roles: z.string(), reason }),
+    run: async (s, i) => {
+      const roles = parseRoles(i.roles);
+      if (!roles.length) throw new DomainError('INVALID', `Pick at least one role (${StaffRole.join(', ')}).`);
+      const r = await createStaff({ email: i.email, name: i.name, password: i.password, roles: [] });
+      await withAdmin((tx) => audit(tx, s, 'staff.create', { type: 'staff', id: r.staffId }, { reason: i.reason, after: { email: i.email, requestedRoles: roles } }));
+      const grant = await requestOrExecute(s, 'staff.roles', { staffId: r.staffId, roles }, i.reason);
+      const pending = grant.status === 'pending' ? ` Roles (${roles.join(', ')}) are pending approval by another SUPER_ADMIN (approval ${grant.approvalId.slice(0, 8)}).` : '';
+      return { status: grant.status, approvalId: grant.status === 'pending' ? grant.approvalId : null, message: `Created without roles.${pending} Give them this authenticator secret once, in person: ${r.totpSecret}` };
+    },
+  }),
+  'staff.roles': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, roles: z.string(), reason }), run: (s, i) => requestOrExecute(s, 'staff.roles', { staffId: i.staffId, roles: parseRoles(i.roles) }, i.reason) }),
   'staff.deprovision': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'You can’t deprovision yourself.'); await deprovisionStaff(tx, i.staffId); await audit(tx, s, 'staff.deprovision', { type: 'staff', id: i.staffId }, { reason: i.reason }); }) }),
   'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }); }) }),
 } as const;

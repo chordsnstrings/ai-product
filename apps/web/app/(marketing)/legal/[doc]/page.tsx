@@ -1,4 +1,6 @@
-import { notFound } from 'next/navigation';
+import { notFound, redirect } from 'next/navigation';
+import { globalTx } from '@arkiv/db';
+import { setting } from '@arkiv/core';
 import { MarketingShell } from '@/components/marketing';
 import { currentUser } from '@/lib/session';
 
@@ -28,8 +30,13 @@ const DOCS: Record<string, { title: string; body: string[] }> = {
 };
 
 export default async function LegalPage({ params }: { params: Promise<{ doc: string }> }) {
-  const d = DOCS[(await params).doc];
+  const doc = (await params).doc;
+  const d = DOCS[doc];
   if (!d) notFound();
+  // Once counsel-reviewed documents are published elsewhere, staff point the legal URL settings at them
+  // (plan 05 §20); every in-app link to /legal/* then follows.
+  const url = await globalTx((tx) => setting(tx, doc === 'terms' ? 'legal.terms_url' : 'legal.privacy_url'));
+  if (url !== `/legal/${doc}` && /^(https:\/\/|\/(?!\/))/.test(url)) redirect(url);
   const user = await currentUser();
   return (
     <MarketingShell loggedIn={!!user}>

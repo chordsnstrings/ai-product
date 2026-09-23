@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import { withTenant } from '@arkiv/db';
-import { limitsFor, listMembers } from '@arkiv/core';
+import { listMembers, planQuota } from '@arkiv/core';
 import type { PlanCode } from '@arkiv/shared';
 import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
@@ -13,8 +13,9 @@ export default async function Members({ params }: { params: Promise<{ slug: stri
   const d = await withTenant(w.ctx.workspaceId, async (tx) => ({
     members: await listMembers(tx),
     invites: await tx`select id, email, role, expires_at from invites where accepted_at is null and revoked_at is null and expires_at > now() order by created_at desc`,
+    lim: await planQuota(tx, w.ctx.planCode as PlanCode | null),
   }));
-  const lim = limitsFor(w.ctx.planCode as PlanCode | null);
+  const lim = d.lim;
   const isOwner = w.ctx.role === 'OWNER';
   const isAdmin = isOwner || w.ctx.role === 'ADMIN';
   return (

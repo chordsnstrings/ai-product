@@ -1,5 +1,6 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, PROVISIONAL, newId } from '@arkiv/shared';
+import { allowKey, isAllowlisted } from './allowlist';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
 import { proposeClaim } from './claims';
@@ -39,6 +40,8 @@ export interface StartPreviewInput {
   url?: string | null;
   photoAssetIds?: string[];
   visitorId?: string | null;
+  /** Client IP, for the abuse allowlist (never stored here). */
+  ip?: string | null;
 }
 
 /** Create the SKU + preview project and enqueue analysis (transactional). */
@@ -47,7 +50,11 @@ export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPrevi
   if (!input.url && !input.photoAssetIds?.length) throw new DomainError('INVALID', 'Add a product link or at least one photo.');
   if (ctx.workspaceState === 'PROVISIONAL') {
     const [n] = await tx`select count(*)::int as n from skus`;
-    if (n!.n >= PROVISIONAL.MAX_SKUS) throw new DomainError('PAYMENT_REQUIRED', 'Save your work to add more products.', { needsAccount: true });
+    if (n!.n >= PROVISIONAL.MAX_SKUS) {
+      // Staff-allowlisted evaluators (agencies, photographers) get a higher, still bounded, allowance (plan 05 §15).
+      const allowed = n!.n < PROVISIONAL.ALLOWLISTED_MAX_SKUS && (await isAllowlisted(tx, [allowKey.ws(ctx.workspaceId), allowKey.ip(input.ip)]));
+      if (!allowed) throw new DomainError('PAYMENT_REQUIRED', 'Save your work to add more products.', { needsAccount: true });
+    }
   }
   const skuId = newId();
   const projectId = newId();
