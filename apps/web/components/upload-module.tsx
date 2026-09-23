@@ -102,7 +102,8 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey }: { pag
   const validUrl = /^https?:\/\/[^\s.]+\.[^\s]{2,}/i.test(url.trim());
   const addFiles = (list: FileList | null) => {
     if (!list) return;
-    const imgs = [...list].filter((f) => f.type.startsWith('image/')).slice(0, 6);
+    // Some desktop browsers report iPhone HEIC files with an empty type; the server converts them.
+    const imgs = [...list].filter((f) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name)).slice(0, 6);
     if (!imgs.length) return setError('Choose a photo (JPG or PNG).');
     setError(null);
     setFiles((prev) => [...prev, ...imgs].slice(0, 6));
@@ -179,7 +180,7 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey }: { pag
         <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => cameraRef.current?.click()}>Take a photo</button>
         <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => fileRef.current?.click()}>Upload photos</button>
         <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={(e) => addFiles(e.target.files)} />
-        <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic" multiple hidden onChange={(e) => addFiles(e.target.files)} />
+        <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden onChange={(e) => addFiles(e.target.files)} />
       </div>
       {files.length > 0 && (
         <div className="ak-row" style={{ flexWrap: 'wrap' }}>

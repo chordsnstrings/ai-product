@@ -1,3 +1,4 @@
+/// <reference path="./heic-decode.d.ts" />
 import { fileTypeFromBuffer } from 'file-type';
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
@@ -51,6 +52,47 @@ export interface ValidatedMedia {
   mime: 'image/png' | 'image/jpeg' | 'image/webp' | 'video/mp4' | 'application/pdf';
 }
 
+const TOO_SMALL = 'That image is too small to use. Please upload at least 800px.';
+const TOO_LARGE = 'That image is too large to process.';
+/** Final fallback only: the photo is HEIC but neither decoder could read it. */
+const HEIC_UNREADABLE = 'We couldn’t read that iPhone photo. Choose “Most Compatible” in Camera settings, or upload a screenshot.';
+
+/** The prebuilt sharp/libvips decodes AVIF but not HEVC-coded HEIF (iPhone HEIC). */
+function sharpDecodesHeic(): boolean {
+  const heif = (sharp.format as unknown as Record<string, { input?: { fileSuffix?: string[] } } | undefined>).heif;
+  return (heif?.input?.fileSuffix ?? []).includes('.heic');
+}
+
+/**
+ * iPhone HEIC → display-oriented RGB pixels via libheif compiled to WASM (no native dependency), so the photo
+ * is converted server-side like any other upload (plan 03 P2). The pixel limit is checked from the container
+ * header before any pixel is decoded (decompression bombs), and again on the decoded raster. libheif applies
+ * the container's rotation/mirror itself; the pixels carry no metadata, so the re-encode has no EXIF/GPS.
+ */
+async function decodeHeic(raw: Buffer): Promise<ReturnType<typeof sharp>> {
+  const { default: heic } = await import('heic-decode');
+  let frames: Awaited<ReturnType<typeof heic.all>>;
+  try {
+    frames = await heic.all({ buffer: raw });
+  } catch {
+    throw new DomainError('INVALID', HEIC_UNREADABLE);
+  }
+  try {
+    const primary = frames[0];
+    if (!primary) throw new DomainError('INVALID', HEIC_UNREADABLE);
+    if (primary.width * primary.height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
+    const decoded = await primary.decode().catch(() => {
+      throw new DomainError('INVALID', HEIC_UNREADABLE);
+    });
+    const { width, height, data } = decoded;
+    if (width * height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
+    if (data.byteLength !== width * height * 4) throw new DomainError('INVALID', HEIC_UNREADABLE);
+    return sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { raw: { width, height, channels: 4 } }).removeAlpha();
+  } finally {
+    frames.dispose();
+  }
+}
+
 /** Validate untrusted bytes. Throws INVALID with a customer-safe reason. */
 export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
   const ft = await fileTypeFromBuffer(raw);
@@ -59,21 +101,28 @@ export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
   if (raw.length > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.');
   if (family === 'image') {
     let img: ReturnType<typeof sharp>;
-    try {
-      // limitInputPixels rejects decompression bombs before decoding the full raster.
-      img = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
+    let hasAlpha = false;
+    if ((ft.mime === 'image/heic' || ft.mime === 'image/heif') && !sharpDecodesHeic()) {
+      img = await decodeHeic(raw);
       const meta = await img.metadata();
-      if (!meta.width || !meta.height) throw new Error('no dimensions');
-      if (meta.width < 200 || meta.height < 200) throw new DomainError('INVALID', 'That image is too small to use. Please upload at least 800px.');
-    } catch (e) {
-      if (e instanceof DomainError) throw e;
-      if (/heif|heic/i.test(ft.mime))
-        throw new DomainError('INVALID', 'iPhone HEIC photos need converting. Choose “Most Compatible” in Camera settings, or upload a screenshot.');
-      throw new DomainError('INVALID', 'That image looks damaged or too large to process.');
+      if ((meta.width ?? 0) < 200 || (meta.height ?? 0) < 200) throw new DomainError('INVALID', TOO_SMALL);
+    } else {
+      try {
+        // limitInputPixels rejects decompression bombs before decoding the full raster.
+        img = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
+        const meta = await img.metadata();
+        if (!meta.width || !meta.height) throw new Error('no dimensions');
+        if (meta.width < 200 || meta.height < 200) throw new DomainError('INVALID', TOO_SMALL);
+        hasAlpha = !!meta.hasAlpha;
+      } catch (e) {
+        if (e instanceof DomainError) throw e;
+        if (/heif|heic/i.test(ft.mime)) throw new DomainError('INVALID', HEIC_UNREADABLE);
+        throw new DomainError('INVALID', 'That image looks damaged or too large to process.');
+      }
+      img = img.rotate(); // apply EXIF orientation before the metadata is dropped
     }
-    // Re-encode: normalizes orientation and strips EXIF/GPS metadata.
-    const hasAlpha = (await img.metadata()).hasAlpha;
-    const out = img.rotate().resize({ width: UPLOAD_LIMITS.image.maxEdge, height: UPLOAD_LIMITS.image.maxEdge, fit: 'inside', withoutEnlargement: true });
+    // Re-encode: strips EXIF/GPS metadata.
+    const out = img.resize({ width: UPLOAD_LIMITS.image.maxEdge, height: UPLOAD_LIMITS.image.maxEdge, fit: 'inside', withoutEnlargement: true });
     return hasAlpha
       ? { bytes: await out.png().toBuffer(), mime: 'image/png' }
       : { bytes: await out.jpeg({ quality: 90, mozjpeg: true }).toBuffer(), mime: 'image/jpeg' };

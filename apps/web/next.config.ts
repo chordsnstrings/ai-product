@@ -2,7 +2,7 @@ import type { NextConfig } from 'next';
 
 const config: NextConfig = {
   transpilePackages: ['@arkiv/auth', '@arkiv/billing', '@arkiv/core', '@arkiv/db', '@arkiv/email', '@arkiv/integrations', '@arkiv/shared', '@arkiv/ui', '@arkiv/providers', '@arkiv/media'],
-  serverExternalPackages: ['sharp', '@node-rs/argon2', 'postgres', 'file-type'],
+  serverExternalPackages: ['sharp', '@node-rs/argon2', 'postgres', 'file-type', 'heic-decode', 'libheif-js'],
   poweredByHeader: false,
   output: 'standalone',
   outputFileTracingRoot: new URL('../..', import.meta.url).pathname,
