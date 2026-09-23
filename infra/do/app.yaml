@@ -68,6 +68,8 @@ envs:
   - { key: TIKTOK_APP_ID, value: CHANGE_ME, scope: RUN_TIME }
   - { key: TIKTOK_APP_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: TURNSTILE_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  # Public site key for the invisible upload challenge; must be set together with TURNSTILE_SECRET.
+  - { key: TURNSTILE_SITE_KEY, value: CHANGE_ME, scope: RUN_TIME }
 
 jobs:
   - name: migrate

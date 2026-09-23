@@ -53,6 +53,8 @@ const EnvSchema = z.object({
   APPLE_KEY_ID: z.string().optional(),
   APPLE_PRIVATE_KEY: z.string().optional(),
   TURNSTILE_SECRET: z.string().optional(),
+  /** Public Turnstile site key rendered by the upload form; required whenever TURNSTILE_SECRET is set. */
+  TURNSTILE_SITE_KEY: z.string().optional(),
 
   STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
   STORAGE_LOCAL_DIR: z.string().default('.storage/dev'),
@@ -79,6 +81,9 @@ let cached: Env | undefined;
 export function env(): Env {
   if (!cached) {
     const parsed = EnvSchema.parse(process.env);
+    // A secret without a site key would reject every preview (the form could never send a token), and a site
+    // key without a secret would show a challenge nobody verifies.
+    if (!!parsed.TURNSTILE_SECRET !== !!parsed.TURNSTILE_SITE_KEY) throw new Error('TURNSTILE_SITE_KEY and TURNSTILE_SECRET must be set together');
     if (parsed.NODE_ENV === 'production') {
       const required: (keyof Env)[] = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'RESEND_API_KEY'];
       for (const k of required) if (!parsed[k]) throw new Error(`Missing required env ${k} in production`);

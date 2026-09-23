@@ -1,5 +1,6 @@
 import { headers } from 'next/headers';
 import { globalTx, withSystem } from '@arkiv/db';
+import { env } from '@arkiv/shared';
 import { assignVariantOrNull, recordFunnel } from '@arkiv/core';
 import { StickyCta } from '@arkiv/ui/client';
 import { MarketingShell } from '@/components/marketing';
@@ -56,7 +57,7 @@ export async function Landing({ slug, searchParams }: { slug: string; searchPara
                 <li>04 Your ad</li>
               </ol>
             </div>
-            <UploadModule page={page?.slug as string} variant={variant} />
+            <UploadModule page={page?.slug as string} variant={variant} turnstileSiteKey={env().TURNSTILE_SITE_KEY ?? null} />
           </div>
         </section>
 
