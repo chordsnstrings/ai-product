@@ -38,7 +38,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
     const [outbox] = await tx`select extract(epoch from now() - min(created_at))::int as oldest from outbox where dispatched_at is null`;
     let queued: { oldest: number | null } = { oldest: null };
     try {
-      const r = await tx.savepoint((sp) => sp`select extract(epoch from now() - min(created_on))::int as oldest from pgboss.job where state in ('created','retry') and start_after <= now()`);
+      const r = await tx.savepoint((sp) => sp`select extract(epoch from now() - min(created_on))::int as oldest from pgboss.job where state in ('created','retry') and start_after <= now() and name not like '%-dlq'`);
       queued = { oldest: (r[0]?.oldest as number | null) ?? null };
     } catch {
       /* pg-boss schema not visible yet (worker grants on start) */

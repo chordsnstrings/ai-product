@@ -1,3 +1,7 @@
+/** @jsxRuntime automatic */
+/** @jsxImportSource react */
+// Explicit runtime: the worker loads this file through tsx, which applies its own tsconfig only to its own
+// sources and would otherwise compile JSX with the classic runtime ("React is not defined").
 import { Body, Button, Container, Head, Hr, Html, Img, Preview, Section, Text } from '@react-email/components';
 import type { ReactNode } from 'react';
 
