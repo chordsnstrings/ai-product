@@ -1,0 +1,259 @@
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { makeTenant, truncateAll } from '@arkiv/db/testing';
+import { usd, type Role } from '@arkiv/shared';
+import { can } from './authz';
+import type { TenantContext } from './context';
+import { authorize, consumeAuthorization, estimateCost, settle, sweepExpiredAuthorizations } from './cost-governor';
+import { idempotent } from './idempotency';
+import { append, available, balances, expirePeriod, periodUsage } from './ledger';
+import { llmJson } from './model-gateway';
+import { checkoutSessionExpiry, currentQuote, issueTasteOffer } from './offers';
+import { acceptInvite, changeRole, claimProvisional, createProvisionalWorkspace, inviteMember, removeMember, resolveProvisional } from './workspaces';
+
+beforeEach(truncateAll);
+afterAll(closeAll);
+
+const ctxFor = (workspaceId: string, userId: string, role: Role = 'OWNER', state = 'ACTIVE_PAID'): TenantContext => ({
+  workspaceId,
+  workspaceState: state as never,
+  role,
+  actor: { kind: 'user', id: userId },
+  requestId: 'test',
+});
+
+describe('authz matrix', () => {
+  it('matches plan 02 §1.1', () => {
+    const s = 'ACTIVE_PAID' as const;
+    expect(can({ role: 'VIEWER', workspaceState: s }, 'sku.create')).toBe(false);
+    expect(can({ role: 'MEMBER', workspaceState: s }, 'claim.approve')).toBe(false);
+    expect(can({ role: 'ADMIN', workspaceState: s }, 'claim.approve')).toBe(true);
+    expect(can({ role: 'ADMIN', workspaceState: s }, 'billing.manage')).toBe(false);
+    expect(can({ role: 'OWNER', workspaceState: s }, 'billing.manage')).toBe(true);
+  });
+  it('pauses spend when past due / locked but keeps read + export', () => {
+    expect(can({ role: 'OWNER', workspaceState: 'PAST_DUE' }, 'spend.creative_test')).toBe(false);
+    expect(can({ role: 'OWNER', workspaceState: 'LOCKED' }, 'sku.create')).toBe(false);
+    expect(can({ role: 'OWNER', workspaceState: 'LOCKED' }, 'workspace.export')).toBe(true);
+  });
+});
+
+describe('rates', () => {
+  it('prices a standard 15s 720p test like the standard §6 planning model', async () => {
+    const est = await withTenant((await makeTenant()).workspaceId, (tx) =>
+      estimateCost(tx, [{ kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 15, resolution: '720p' }]),
+    );
+    // $3.47 raw + 25% QA retry reserve.
+    expect(est.totalMicros).toBe(Math.ceil(15 * 231333 * 1.25));
+  });
+});
+
+describe('ledger + cost governor', () => {
+  it('derives balances, reserves, settles once, and releases on failure', async () => {
+    const t = await makeTenant({ plan: 'GROWTH', state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 7, periodKey: '2026-09', idempotencyKey: 'grant:2026-09' });
+      // Duplicate grant (e.g. webhook replay) is a no-op.
+      expect(await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 7, periodKey: '2026-09', idempotencyKey: 'grant:2026-09' })).toBe(false);
+      expect(await available(tx, 'creative_test')).toBe(7);
+    });
+    const auth = await withTenant(t.workspaceId, (tx) =>
+      authorize(tx, ctx, {
+        purpose: 'creative_test',
+        lines: [{ kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 15, resolution: '720p' }],
+        entitlement: { unit: 'creative_test', amount: 1, periodKey: '2026-09' },
+        idempotencyKey: 'p1',
+      }),
+    );
+    await withTenant(t.workspaceId, async (tx) => {
+      expect(await available(tx, 'creative_test')).toBe(6);
+      expect((await periodUsage(tx, '2026-09')).remaining).toBe(6);
+      expect(await settle(tx, ctx, auth.authorizationId, 'released')).toBe(true);
+      expect(await settle(tx, ctx, auth.authorizationId, 'consumed')).toBe(false); // duplicate callback
+      expect(await available(tx, 'creative_test')).toBe(7);
+      expect(await expirePeriod(tx, ctx, '2026-09')).toBe(7);
+      expect((await balances(tx)).creativeTests).toBe(0);
+    });
+  });
+
+  it('rejects a second authorization for the same idempotency key (double-click)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const input = { purpose: 'storyboard' as const, lines: [{ kind: 'image' as const, provider: 'byteplus', model: 'seedream-5-0-pro', images: 4 }], idempotencyKey: 'sb-1' };
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, input));
+    await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, input))).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('blocks spend without entitlement and above the Creative Test ceiling', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    await expect(
+      withTenant(t.workspaceId, (tx) =>
+        authorize(tx, ctx, {
+          purpose: 'taste',
+          lines: [{ kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 15, resolution: '720p' }],
+          entitlement: { unit: 'taste', amount: 1 },
+          idempotencyKey: 'x',
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    await expect(
+      withTenant(t.workspaceId, (tx) =>
+        authorize(tx, ctx, {
+          purpose: 'creative_test',
+          lines: [{ kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 30, resolution: '720p' }],
+          idempotencyKey: 'y',
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+  });
+
+  it('enforces the free preview cap per SKU', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
+    const line = { kind: 'llm' as const, provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 10_000, outputTokens: 4_000 };
+    // 10k*$4/M + 4k*$20/M = $0.12 per call → second call exceeds $0.20.
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'free_preview', skuId: 's1', lines: [line], idempotencyKey: 'a' }));
+    await expect(
+      withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'free_preview', skuId: 's1', lines: [line], idempotencyKey: 'b' })),
+    ).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+  });
+
+  it('kill switch stops production', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    await ownerPool()`update feature_flags set enabled = true where key = 'kill.renders'`;
+    await expect(
+      withTenant(t.workspaceId, (tx) =>
+        authorize(tx, ctxFor(t.workspaceId, t.userId), { purpose: 'repair', lines: [{ kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 }], idempotencyKey: 'k' }),
+      ),
+    ).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+  });
+
+  it('sweeper releases stranded reservations', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 1, idempotencyKey: 'g' });
+      await authorize(tx, ctx, { purpose: 'repair', lines: [{ kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 }], entitlement: { unit: 'creative_test', amount: 1 }, idempotencyKey: 'z', ttlMinutes: 0 });
+    });
+    const { withSystem } = await import('@arkiv/db');
+    expect(await withSystem((tx) => sweepExpiredAuthorizations(tx))).toBe(1);
+    expect(await withTenant(t.workspaceId, (tx) => available(tx, 'creative_test'))).toBe(1);
+  });
+});
+
+describe('model gateway', () => {
+  it('refuses provider calls without a valid authorization', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    await expect(
+      llmJson({ ctx, token: 'forged', task: 'extract.product_facts', system: 's', content: [{ type: 'text', text: 'x' }], schema: z.object({ a: z.string() }), mock: () => ({ a: 'b' }) }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  it('records the provider job, actual cost and credits back the unused estimate', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const auth = await withTenant(t.workspaceId, (tx) =>
+      authorize(tx, ctx, { purpose: 'storyboard', lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 20_000, outputTokens: 8_000 }], idempotencyKey: 'g1' }),
+    );
+    const r = await llmJson({ ctx, token: auth.token, task: 'extract.product_facts', system: 'sys', content: [{ type: 'text', text: 'hello' }], schema: z.object({ a: z.string() }), mock: () => ({ a: 'ok' }) });
+    expect(r.data.a).toBe('ok');
+    await withTenant(t.workspaceId, async (tx) => {
+      const [job] = await tx`select * from provider_jobs where id = ${r.jobId}`;
+      expect(job!.status).toBe('succeeded');
+      expect(job!.prompt_version).toBe('extract-product@1.0.0');
+      const [a] = await tx`select spent_micros from cost_authorizations where id = ${auth.authorizationId}`;
+      expect(Number(a!.spent_micros)).toBe(Number(job!.actual_micros));
+      const [c] = await tx`select sum(amount)::bigint as n from ledger_entries where type = 'PROVIDER_COST_RECORDED'`;
+      expect(Number(c!.n)).toBe(Number(job!.actual_micros));
+    });
+  });
+
+  it('a consumed authorization cannot exceed its ceiling', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const auth = await withTenant(t.workspaceId, (tx) =>
+      authorize(tx, ctx, { purpose: 'storyboard', lines: [{ kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 }], idempotencyKey: 'c1' }),
+    );
+    await withTenant(t.workspaceId, (tx) => consumeAuthorization(tx, auth.token, usd(0.045)));
+    await expect(withTenant(t.workspaceId, (tx) => consumeAuthorization(tx, auth.token, usd(0.045)))).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+});
+
+describe('idempotency', () => {
+  it('replays the stored result and rejects a different request with the same key', async () => {
+    const t = await makeTenant();
+    let calls = 0;
+    const run = (body: unknown) => withTenant(t.workspaceId, (tx) => idempotent(tx, t.workspaceId, 'op', 'k1', body, async () => ({ n: ++calls })));
+    expect((await run({ a: 1 })).result).toEqual({ n: 1 });
+    const again = await run({ a: 1 });
+    expect(again.replayed).toBe(true);
+    expect(again.result).toEqual({ n: 1 });
+    await expect(run({ a: 2 })).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+});
+
+describe('offers (standard §5)', () => {
+  it('issues the Taste offer once, never reissues after expiry, and falls back to the real $29', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
+    const q1 = await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctx, t.workspaceId));
+    expect(q1.priceMicros).toBe(usd(19));
+    expect(q1.referencePriceMicros).toBe(usd(29));
+    const q2 = await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctx, t.workspaceId));
+    expect(q2.expiresAt).toBe(q1.expiresAt); // refresh / second device: same clock
+    await ownerPool()`update offers set expires_at = now() - interval '1 minute'`;
+    const q3 = await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctx, t.workspaceId));
+    expect(q3.status).toBe('expired');
+    const now = await withTenant(t.workspaceId, (tx) => currentQuote(tx));
+    expect(now.kind).toBe('standalone');
+    expect(now.priceMicros).toBe(usd(29));
+  });
+
+  it('checkout session honours Stripe 30-minute minimum without extending the offer', () => {
+    const now = new Date('2026-09-23T12:00:00Z');
+    const nearExpiry = { kind: 'taste' as const, offerId: 'o', priceMicros: 1, referencePriceMicros: null, expiresAt: '2026-09-23T12:05:00Z', status: 'active' as const, bonus: {} };
+    expect(checkoutSessionExpiry(nearExpiry, now).getTime()).toBeGreaterThan(now.getTime() + 30 * 60_000);
+  });
+});
+
+describe('workspaces & members (plan 02 §2.1, §5)', () => {
+  it('claims a provisional workspace and keeps the work', async () => {
+    const { workspaceId, token } = await createProvisionalWorkspace();
+    expect(await resolveProvisional(token)).toBe(workspaceId);
+    const [u] = await ownerPool()`insert into users (email) values ('founder@glowlab.com') returning id`;
+    await claimProvisional(workspaceId, u!.id as string);
+    expect(await resolveProvisional(token)).toBeNull();
+    const [w] = await ownerPool()`select state, slug from workspaces where id = ${workspaceId}`;
+    expect(w!.state).toBe('ACTIVE_FREE');
+    expect(w!.slug).toBe('glowlab');
+  });
+
+  it('never leaves a workspace without an owner (M1) and enforces role ranks', async () => {
+    const t = await makeTenant();
+    const owner = ctxFor(t.workspaceId, t.userId);
+    await expect(withTenant(t.workspaceId, (tx) => changeRole(tx, owner, t.userId, 'ADMIN'))).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(withTenant(t.workspaceId, (tx) => removeMember(tx, owner, t.userId))).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('invite acceptance refuses a mismatched account (M4) and single-use tokens', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const owner = ctxFor(t.workspaceId, t.userId);
+    const { token } = await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'anna@brand.com', 'MEMBER'));
+    const [anna] = await ownerPool()`insert into users (email) values ('anna@brand.com') returning id`;
+    const [bob] = await ownerPool()`insert into users (email) values ('bob@brand.com') returning id`;
+    await expect(acceptInvite(token, { id: bob!.id as string, email: 'bob@brand.com' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await acceptInvite(token, { id: anna!.id as string, email: 'anna@brand.com' });
+    await expect(acceptInvite(token, { id: anna!.id as string, email: 'anna@brand.com' })).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('enforces the member limit of the plan', async () => {
+    const t = await makeTenant(); // free: 2 members
+    const owner = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
+    await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'a@x.com', 'MEMBER'));
+    await expect(withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'b@x.com', 'MEMBER'))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
+  });
+});

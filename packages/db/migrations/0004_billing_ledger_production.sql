@@ -77,6 +77,7 @@ create table cost_authorizations (
   project_id uuid,
   purpose text not null,
   token_hash text not null unique,
+  idempotency_key text not null,
   rate_table_versions jsonb not null,
   estimate jsonb not null,
   max_cost_micros bigint not null,
@@ -87,7 +88,8 @@ create table cost_authorizations (
   expires_at timestamptz not null,
   created_at timestamptz not null default now(),
   settled_at timestamptz,
-  unique (workspace_id, id)
+  unique (workspace_id, id),
+  unique (workspace_id, idempotency_key)
 );
 select arkiv_tenant_table('cost_authorizations'); insert into table_registry values ('cost_authorizations','tenant');
 

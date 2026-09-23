@@ -122,7 +122,7 @@ create table learnings (
   do_not_generalize_to text[] not null default '{}',
   history jsonb not null default '[]',
   created_at timestamptz not null default now(),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('learnings'); insert into table_registry values ('learnings','tenant');
 

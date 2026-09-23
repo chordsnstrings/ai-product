@@ -73,7 +73,7 @@ create table assets (
   created_at timestamptz not null default now(),
   deleted_at timestamptz,
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 create index on assets (workspace_id, sku_id, kind);
 select arkiv_tenant_table('assets'); insert into table_registry values ('assets','tenant');
@@ -98,7 +98,7 @@ create table product_facts (
   status text not null default 'ACTIVE' check (status in ('ACTIVE','SUPERSEDED','DISPUTED')),
   created_by text not null,
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 create index on product_facts (workspace_id, sku_id, normalized_key) where status <> 'SUPERSEDED';
 select arkiv_tenant_table('product_facts'); insert into table_registry values ('product_facts','tenant');
@@ -122,7 +122,7 @@ create table visual_fingerprints (
   thresholds jsonb not null default '{}',
   created_at timestamptz not null default now(),
   unique (workspace_id, sku_id, version),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('visual_fingerprints'); insert into table_registry values ('visual_fingerprints','tenant');
 
@@ -148,7 +148,7 @@ create table claims (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 create trigger claims_touch before update on claims for each row execute function arkiv_touch_updated_at();
 select arkiv_tenant_table('claims'); insert into table_registry values ('claims','tenant');
@@ -165,7 +165,7 @@ create table claim_evidence (
   evidence_strength text check (evidence_strength in ('weak','moderate','strong')),
   expiry_date date,
   created_at timestamptz not null default now(),
-  foreign key (workspace_id, claim_id) references claims(workspace_id, id) on delete cascade
+  foreign key (workspace_id, claim_id) references claims(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('claim_evidence'); insert into table_registry values ('claim_evidence','tenant');
 
@@ -182,7 +182,7 @@ create table customer_signals (
   observed_at timestamptz,
   imported_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('customer_signals'); insert into table_registry values ('customer_signals','tenant');
 
@@ -200,7 +200,7 @@ create table customer_themes (
   snippet_ids uuid[] not null default '{}',
   updated_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('customer_themes'); insert into table_registry values ('customer_themes','tenant');
 
@@ -221,7 +221,7 @@ create table creatives (
   source_deleted_at timestamptz,
   created_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('creatives'); insert into table_registry values ('creatives','tenant');
 
@@ -250,7 +250,7 @@ create table experiments (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 create trigger experiments_touch before update on experiments for each row execute function arkiv_touch_updated_at();
 select arkiv_tenant_table('experiments'); insert into table_registry values ('experiments','tenant');
@@ -268,7 +268,7 @@ create table variants (
   genes jsonb not null default '{}',
   created_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, experiment_id) references experiments(workspace_id, id) on delete cascade
+  foreign key (workspace_id, experiment_id) references experiments(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('variants'); insert into table_registry values ('variants','tenant');
 
@@ -295,7 +295,7 @@ create table projects (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 create trigger projects_touch before update on projects for each row execute function arkiv_touch_updated_at();
 select arkiv_tenant_table('projects'); insert into table_registry values ('projects','tenant');
@@ -316,7 +316,7 @@ create table concepts (
   created_at timestamptz not null default now(),
   unique (workspace_id, id),
   unique (workspace_id, project_id, batch, idx),
-  foreign key (workspace_id, project_id) references projects(workspace_id, id) on delete cascade
+  foreign key (workspace_id, project_id) references projects(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('concepts'); insert into table_registry values ('concepts','tenant');
 
@@ -334,7 +334,7 @@ create table storyboards (
   approved_by text,
   created_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, project_id) references projects(workspace_id, id) on delete cascade
+  foreign key (workspace_id, project_id) references projects(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('storyboards'); insert into table_registry values ('storyboards','tenant');
 
@@ -357,7 +357,7 @@ create table scenes (
   free_regenerations_used int not null default 0,
   unique (workspace_id, id),
   unique (workspace_id, storyboard_id, position),
-  foreign key (workspace_id, storyboard_id) references storyboards(workspace_id, id) on delete cascade
+  foreign key (workspace_id, storyboard_id) references storyboards(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('scenes'); insert into table_registry values ('scenes','tenant');
 
@@ -376,7 +376,7 @@ create table scene_versions (
   status text not null default 'pending' check (status in ('pending','succeeded','failed','qa_failed','accepted')),
   created_at timestamptz not null default now(),
   unique (workspace_id, scene_id, kind, version),
-  foreign key (workspace_id, scene_id) references scenes(workspace_id, id) on delete cascade
+  foreign key (workspace_id, scene_id) references scenes(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('scene_versions'); insert into table_registry values ('scene_versions','tenant');
 
@@ -397,7 +397,7 @@ create table recommendations (
   experiment_id uuid,
   created_at timestamptz not null default now(),
   unique (workspace_id, id),
-  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('recommendations'); insert into table_registry values ('recommendations','tenant');
 
@@ -411,7 +411,7 @@ create table creator_packs (
   revoked_at timestamptz,
   views int not null default 0,
   created_at timestamptz not null default now(),
-  foreign key (workspace_id, experiment_id) references experiments(workspace_id, id) on delete cascade
+  foreign key (workspace_id, experiment_id) references experiments(workspace_id, id) on delete cascade on update cascade
 );
 select arkiv_tenant_table('creator_packs'); insert into table_registry values ('creator_packs','tenant');
 

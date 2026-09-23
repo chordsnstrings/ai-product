@@ -51,6 +51,8 @@ export const EventType = [
   'CREDIT_RELEASED',
   'CREDIT_REFUNDED',
   'CREDIT_GRANTED',
+  'CREDIT_EXPIRED',
+  'CREDIT_ADJUSTED',
   'FREE_QA_RETRY',
   'PROVIDER_COST_RECORDED',
   // Platform / tenancy

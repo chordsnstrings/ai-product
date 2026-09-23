@@ -1,0 +1,200 @@
+import type {
+  ImageProvider,
+  ImageRequest,
+  ImageResult,
+  TtsProvider,
+  TtsRequest,
+  TtsResult,
+  VideoPoll,
+  VideoProvider,
+  VideoRequest,
+} from '../types';
+import { ProviderError } from '../types';
+
+/**
+ * BytePlus ModelArk: Seedream (sync images, POST /images/generations) and Seedance (async tasks,
+ * POST/GET /contents/generations/tasks). Video parameters ride in the prompt text as `--flag value`.
+ * Returned URLs expire, so bytes are downloaded immediately and stored in our own bucket (§39).
+ */
+class ArkClient {
+  constructor(
+    private readonly apiKey: string,
+    private readonly baseUrl: string,
+  ) {}
+
+  async call<T>(pathName: string, method: 'GET' | 'POST' | 'DELETE', body?: unknown, timeoutMs = 180_000): Promise<T> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/${pathName}`, {
+        method,
+        headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: ctrl.signal,
+      });
+      const text = await res.text();
+      const json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      if (!res.ok) {
+        const err = (json.error ?? {}) as { code?: string; message?: string };
+        const code = err.code ?? String(res.status);
+        const kind = res.status === 429 ? 'rate_limit' : res.status === 401 || res.status === 403 ? 'auth'
+          : /Sensitive|Moderation|Risk/i.test(code) ? 'moderation' : res.status >= 500 ? 'server' : 'invalid';
+        throw new ProviderError('byteplus', `${code}: ${err.message ?? text.slice(0, 300)}`, res.status === 429 || res.status >= 500, kind);
+      }
+      return json as T;
+    } catch (e) {
+      if (e instanceof ProviderError) throw e;
+      if ((e as Error).name === 'AbortError') throw new ProviderError('byteplus', 'request timed out', true, 'timeout');
+      throw new ProviderError('byteplus', (e as Error).message, true, 'unknown');
+    } finally {
+      clearTimeout(t);
+    }
+  }
+}
+
+async function download(url: string): Promise<Buffer> {
+  const res = await fetch(url);
+  if (!res.ok) throw new ProviderError('byteplus', `download failed ${res.status}`, true, 'server');
+  return Buffer.from(await res.arrayBuffer());
+}
+
+export class SeedreamImage implements ImageProvider {
+  readonly name = 'byteplus';
+  private readonly ark: ArkClient;
+  constructor(apiKey: string, baseUrl: string) {
+    this.ark = new ArkClient(apiKey, baseUrl);
+  }
+  async generate(req: ImageRequest): Promise<ImageResult> {
+    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string }>('images/generations', 'POST', {
+      model: req.model,
+      prompt: req.prompt,
+      size: `${req.width}x${req.height}`,
+      response_format: 'url',
+      watermark: false,
+      ...(req.references.length ? { image: req.references } : {}),
+      ...(req.seed != null ? { seed: req.seed } : {}),
+    });
+    const url = r.data[0]?.url;
+    if (!url) throw new ProviderError('byteplus', 'no image returned', true, 'server');
+    return {
+      bytes: await download(url),
+      mime: 'image/jpeg',
+      model: req.model,
+      modelVersion: r.model ?? req.model,
+      providerRequestId: r.id ?? url.split('?')[0]!.split('/').pop()!,
+    };
+  }
+}
+
+export class SeedanceVideo implements VideoProvider {
+  readonly name = 'byteplus';
+  private readonly ark: ArkClient;
+  constructor(apiKey: string, baseUrl: string) {
+    this.ark = new ArkClient(apiKey, baseUrl);
+  }
+  async submit(req: VideoRequest): Promise<{ providerRequestId: string }> {
+    const flags = [`--duration ${req.seconds}`, `--resolution ${req.resolution}`, `--ratio ${req.ratio}`, '--watermark false'];
+    if (req.seed != null) flags.push(`--seed ${req.seed}`);
+    const content: unknown[] = [{ type: 'text', text: `${req.prompt} ${flags.join(' ')}` }];
+    for (const ref of req.references.slice(0, 4)) content.push({ type: 'image_url', image_url: { url: ref }, role: 'reference_image' });
+    const r = await this.ark.call<{ id: string }>('contents/generations/tasks', 'POST', { model: req.model, content });
+    return { providerRequestId: r.id };
+  }
+  async poll(id: string): Promise<VideoPoll> {
+    const r = await this.ark.call<{
+      status: VideoPoll['status'];
+      model?: string;
+      content?: { video_url?: string };
+      error?: { message?: string };
+    }>(`contents/generations/tasks/${encodeURIComponent(id)}`, 'GET');
+    if (r.status === 'succeeded') {
+      const url = r.content?.video_url;
+      if (!url) return { status: 'failed', error: 'succeeded without video_url' };
+      return { status: 'succeeded', bytes: await download(url), modelVersion: r.model };
+    }
+    return { status: r.status, error: r.error?.message };
+  }
+  async cancel(id: string): Promise<void> {
+    await this.ark.call(`contents/generations/tasks/${encodeURIComponent(id)}`, 'DELETE');
+  }
+}
+
+/** MiniMax T2A v2 (non-streaming). Audio comes back hex-encoded. */
+export class MiniMaxTts implements TtsProvider {
+  readonly name = 'minimax';
+  constructor(
+    private readonly apiKey: string,
+    private readonly baseUrl: string,
+  ) {}
+  async synthesize(req: TtsRequest): Promise<TtsResult> {
+    const res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/v1/t2a_v2`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: req.model,
+        text: req.text,
+        stream: false,
+        voice_setting: { voice_id: req.voice, speed: req.speed ?? 1, vol: 1, pitch: 0 },
+        audio_setting: { sample_rate: 44100, bitrate: 128000, format: 'mp3', channel: 1 },
+        language_boost: 'English',
+      }),
+    });
+    const j = (await res.json()) as {
+      data?: { audio?: string };
+      extra_info?: { audio_length?: number; usage_characters?: number };
+      base_resp?: { status_code: number; status_msg: string };
+      trace_id?: string;
+    };
+    if (!res.ok || (j.base_resp && j.base_resp.status_code !== 0) || !j.data?.audio) {
+      const msg = j.base_resp?.status_msg ?? `HTTP ${res.status}`;
+      throw new ProviderError('minimax', msg, res.status === 429 || res.status >= 500, res.status === 429 ? 'rate_limit' : 'server');
+    }
+    return {
+      bytes: Buffer.from(j.data.audio, 'hex'),
+      mime: 'audio/mpeg',
+      chars: j.extra_info?.usage_characters ?? req.text.length,
+      durationMs: j.extra_info?.audio_length ?? 0,
+      model: req.model,
+      providerRequestId: j.trace_id ?? `minimax-${Date.now()}`,
+    };
+  }
+}
+
+/**
+ * BytePlus Seed Speech (TTS 2.0) HTTP unidirectional endpoint. Fallback voice provider; exact voice list and
+ * English quality are validated by the Phase 3 blind listening test before it serves traffic.
+ */
+export class SeedSpeechTts implements TtsProvider {
+  readonly name = 'byteplus-speech';
+  constructor(
+    private readonly appId: string,
+    private readonly token: string,
+    private readonly endpoint = 'https://voice.ap-southeast-1.bytepluses.com/api/v3/tts/unidirectional',
+  ) {}
+  async synthesize(req: TtsRequest): Promise<TtsResult> {
+    const res = await fetch(this.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Api-App-Id': this.appId,
+        'X-Api-Access-Key': this.token,
+        'X-Api-Resource-Id': 'seed-tts-2.0',
+      },
+      body: JSON.stringify({
+        user: { uid: 'arkiv' },
+        req_params: { text: req.text, speaker: req.voice, audio_params: { format: 'mp3', sample_rate: 24000 } },
+      }),
+    });
+    if (!res.ok) throw new ProviderError('byteplus-speech', `HTTP ${res.status}`, res.status >= 500 || res.status === 429, 'server');
+    // The endpoint streams JSON lines each carrying a base64 audio chunk.
+    const chunks: Buffer[] = [];
+    for (const line of (await res.text()).split('\n')) {
+      if (!line.trim()) continue;
+      const j = JSON.parse(line) as { code?: number; data?: string; message?: string };
+      if (j.code && j.code !== 0 && j.code !== 20000000) throw new ProviderError('byteplus-speech', j.message ?? `code ${j.code}`, false, 'invalid');
+      if (j.data) chunks.push(Buffer.from(j.data, 'base64'));
+    }
+    if (!chunks.length) throw new ProviderError('byteplus-speech', 'no audio returned', true, 'server');
+    return { bytes: Buffer.concat(chunks), mime: 'audio/mpeg', chars: req.text.length, durationMs: 0, model: req.model, providerRequestId: `seed-${Date.now()}` };
+  }
+}

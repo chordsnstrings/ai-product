@@ -1,0 +1,122 @@
+import sharp from 'sharp';
+
+/** Arkiv palette (01-design-system §2.1) for generated overlays and placeholders. */
+export const PAPER = '#F5F2EC';
+export const PAPER_SUNK = '#ECE8E0';
+export const INK = '#1A1917';
+export const STONE = '#8A857D';
+
+export type Aspect = '9x16' | '4x5' | '1x1';
+export const ASPECT_SIZE: Record<Aspect, { w: number; h: number }> = {
+  '9x16': { w: 1080, h: 1920 },
+  '4x5': { w: 1080, h: 1350 },
+  '1x1': { w: 1080, h: 1080 },
+};
+
+/**
+ * Platform safe zones (fraction of height/width kept clear of platform UI). TikTok/Reels place captions,
+ * buttons and the handle at the bottom ~20% and right ~12%; key elements stay inside (§25 platform QA).
+ */
+export const SAFE_ZONE: Record<Aspect, { top: number; bottom: number; left: number; right: number }> = {
+  '9x16': { top: 0.1, bottom: 0.22, left: 0.06, right: 0.14 },
+  '4x5': { top: 0.06, bottom: 0.1, left: 0.06, right: 0.06 },
+  '1x1': { top: 0.06, bottom: 0.08, left: 0.06, right: 0.06 },
+};
+
+const esc = (s: string) =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/** Greedy word wrap by approximate glyph width (0.55em for the sans stack). */
+export function wrap(text: string, fontSize: number, maxWidth: number): string[] {
+  const maxChars = Math.max(8, Math.floor(maxWidth / (fontSize * 0.55)));
+  const lines: string[] = [];
+  let cur = '';
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    if ((cur + ' ' + word).trim().length > maxChars) {
+      if (cur) lines.push(cur);
+      cur = word;
+    } else cur = (cur + ' ' + word).trim();
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+/**
+ * Transparent caption/overlay PNG positioned inside the safe zone. Ink text on a paper plate: legible on any
+ * footage without drop shadows (design system bans shadows).
+ */
+export async function captionOverlay(
+  text: string,
+  aspect: Aspect,
+  opts: { position?: 'upper' | 'lower'; fontSize?: number } = {},
+): Promise<Buffer> {
+  const { w, h } = ASPECT_SIZE[aspect];
+  const sz = SAFE_ZONE[aspect];
+  const fontSize = opts.fontSize ?? Math.round(w * 0.05);
+  const maxWidth = w * (1 - sz.left - sz.right) - 48;
+  const lines = wrap(text, fontSize, maxWidth).slice(0, 4);
+  const lineH = Math.round(fontSize * 1.25);
+  const plateH = lines.length * lineH + 40;
+  const longest = Math.max(...lines.map((l) => l.length));
+  const plateW = Math.min(maxWidth + 48, Math.round(longest * fontSize * 0.55) + 56);
+  const x = Math.round(w * sz.left);
+  const y =
+    opts.position === 'upper' ? Math.round(h * sz.top) : Math.round(h * (1 - sz.bottom)) - plateH;
+  const tspans = lines
+    .map((l, i) => `<text x="${x + 28}" y="${y + 20 + fontSize + i * lineH}" font-family="Inter Tight, Inter, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="500" fill="${INK}">${esc(l)}</text>`)
+    .join('');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+    <rect x="${x}" y="${y}" width="${plateW}" height="${plateH}" fill="${PAPER}" fill-opacity="0.94"/>
+    ${tspans}</svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+/** End card: product name + CTA in arkiv style. */
+export async function endCard(opts: { productName: string; cta: string; index?: string; aspect: Aspect }): Promise<Buffer> {
+  const { w, h } = ASPECT_SIZE[opts.aspect];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+    <rect width="${w}" height="${h}" fill="${PAPER}"/>
+    <text x="${w * 0.08}" y="${h * 0.36}" font-family="IBM Plex Mono, monospace" font-size="${w * 0.028}" fill="${STONE}" letter-spacing="3">${esc(opts.index ?? 'NO. 001')}</text>
+    <line x1="${w * 0.08}" y1="${h * 0.38}" x2="${w * 0.92}" y2="${h * 0.38}" stroke="${INK}" stroke-width="2"/>
+    ${wrap(opts.productName, w * 0.075, w * 0.84)
+      .slice(0, 3)
+      .map((l, i) => `<text x="${w * 0.08}" y="${h * 0.46 + i * w * 0.09}" font-family="Instrument Serif, Georgia, serif" font-size="${w * 0.075}" fill="${INK}">${esc(l)}</text>`)
+      .join('')}
+    <rect x="${w * 0.08}" y="${h * 0.66}" width="${w * 0.84}" height="${w * 0.13}" fill="${INK}"/>
+    <text x="${w * 0.5}" y="${h * 0.66 + w * 0.083}" text-anchor="middle" font-family="Inter Tight, Inter, Arial, sans-serif" font-size="${w * 0.045}" fill="${PAPER}">${esc(opts.cta)}</text>
+  </svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+/** Deterministic placeholder frame (used by mock providers and as a last-resort composite background). */
+export async function placeholderFrame(label: string, aspect: Aspect, seed = 0): Promise<Buffer> {
+  const { w, h } = ASPECT_SIZE[aspect];
+  const tones = ['#ECE8E0', '#E4DED3', '#DCD5C8', '#EFEAE2'];
+  const bg = tones[seed % tones.length];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+    <rect width="${w}" height="${h}" fill="${bg}"/>
+    <rect x="${w * 0.3}" y="${h * 0.3}" width="${w * 0.4}" height="${h * 0.4}" fill="none" stroke="${STONE}" stroke-width="2" stroke-dasharray="8 8"/>
+    ${wrap(label, 40, w * 0.8)
+      .slice(0, 5)
+      .map((l, i) => `<text x="${w / 2}" y="${h * 0.78 + i * 52}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="36" fill="${INK}">${esc(l)}</text>`)
+      .join('')}
+  </svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+/** Place an exact product cut-out onto a background frame (strict composite mode, §23). */
+export async function compositeProduct(
+  background: Buffer,
+  productCutout: Buffer,
+  aspect: Aspect,
+  opts: { scale?: number; anchor?: 'center' | 'lower' } = {},
+): Promise<Buffer> {
+  const { w, h } = ASPECT_SIZE[aspect];
+  const bg = await sharp(background).resize(w, h, { fit: 'cover' }).toBuffer();
+  const targetH = Math.round(h * (opts.scale ?? 0.45));
+  const product = await sharp(productCutout).resize({ height: targetH, fit: 'inside' }).png().toBuffer();
+  const meta = await sharp(product).metadata();
+  const left = Math.round((w - (meta.width ?? 0)) / 2);
+  const top = opts.anchor === 'lower' ? Math.round(h * 0.42) : Math.round((h - (meta.height ?? 0)) / 2);
+  return sharp(bg).composite([{ input: product, left, top }]).png().toBuffer();
+}
