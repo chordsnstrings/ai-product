@@ -1,0 +1,294 @@
+import { withTenant, type Tx } from '@arkiv/db';
+import { DomainError, PROVISIONAL, newId } from '@arkiv/shared';
+import { assetBytes, saveAsset } from './assets';
+import { assertCan } from './authz';
+import { proposeClaim } from './claims';
+import { excludedProductReason, nonSkincareCategory } from './compliance';
+import type { TenantContext } from './context';
+import { authorize, settle } from './cost-governor';
+import { generateConcepts } from './creative-director';
+import { emit } from './events';
+import { recordFunnel } from './funnel';
+import { fetchImage, importProductUrl, type ExtractedProduct } from './ingest';
+import { ProductExtraction } from './intel-schemas';
+import { mockExtraction } from './mock-intel';
+import { llmJson } from './model-gateway';
+import { enqueue, Queues } from './outbox';
+import { planSteps, step } from './progress';
+import { recordFacts, type FactInput } from './product-truth';
+import { transition } from './projects';
+import { EXTRACT_PRODUCT_SYSTEM } from './prompts';
+import { cutout, dominantColors, toJpegBase64 } from './vision';
+import { nextCatalogueNo } from './workspaces';
+
+/**
+ * Phase 1–2 pipeline: product in → Product Brain → three concepts (free preview, ≤ $0.20 COGS).
+ * Steps are recorded as real progress events for the cataloguing screen (design M2).
+ */
+
+export const ANALYSIS_STEPS = [
+  { key: 'read_page', label: 'Reading your product page' },
+  { key: 'photos', label: 'Preparing product photos' },
+  { key: 'identify', label: 'Identifying the product' },
+  { key: 'claims', label: 'Checking claims against cosmetic rules' },
+  { key: 'fingerprint', label: 'Cataloguing packaging details' },
+  { key: 'concepts', label: 'Drafting three test ideas' },
+];
+
+export interface StartPreviewInput {
+  url?: string | null;
+  photoAssetIds?: string[];
+  visitorId?: string | null;
+}
+
+/** Create the SKU + preview project and enqueue analysis (transactional). */
+export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPreviewInput) {
+  assertCan(ctx, 'sku.create');
+  if (!input.url && !input.photoAssetIds?.length) throw new DomainError('INVALID', 'Add a product link or at least one photo.');
+  if (ctx.workspaceState === 'PROVISIONAL') {
+    const [n] = await tx`select count(*)::int as n from skus`;
+    if (n!.n >= PROVISIONAL.MAX_SKUS) throw new DomainError('PAYMENT_REQUIRED', 'Save your work to add more products.', { needsAccount: true });
+  }
+  const skuId = newId();
+  const projectId = newId();
+  const no = await nextCatalogueNo(tx);
+  const [brand] = await tx`select id from brands order by created_at limit 1`;
+  await tx`insert into skus (id, workspace_id, brand_id, catalogue_no, name, status, source_url, source_kind)
+           values (${skuId}, ${ctx.workspaceId}, ${brand?.id ?? null}, ${no}, 'Reading your product…', 'analyzing',
+                   ${input.url ?? null}, ${input.url ? 'url' : 'photos'})`;
+  for (const a of input.photoAssetIds ?? []) await tx`update assets set sku_id = ${skuId}, kind = 'product_photo' where id = ${a} and sku_id is null`;
+  await tx`insert into projects (id, workspace_id, sku_id, kind, state, created_by)
+           values (${projectId}, ${ctx.workspaceId}, ${skuId}, 'preview', 'PRODUCT_UPLOADED', ${ctx.actor.kind + ':' + ctx.actor.id})`;
+  await planSteps(tx, ctx.workspaceId, skuId, input.url ? ANALYSIS_STEPS : ANALYSIS_STEPS.filter((s) => s.key !== 'read_page'));
+  await emit(tx, ctx, 'UPLOAD_COMPLETED', { type: 'sku', id: skuId }, { method: input.url ? 'url' : 'photos' });
+  await enqueue(tx, ctx.workspaceId, Queues.analyzeProduct, { skuId, projectId, actor: ctx.actor }, { priority: ctx.workspaceState === 'PROVISIONAL' || ctx.workspaceState === 'ACTIVE_FREE' ? 0 : 10 });
+  await recordFunnel('UPLOAD_COMPLETED', { visitorId: input.visitorId, workspaceId: ctx.workspaceId, props: { method: input.url ? 'url' : 'photos' } }, tx);
+  return { skuId, projectId, catalogueNo: no };
+}
+
+function factsFromStructured(p: ExtractedProduct, url: string | null): FactInput[] {
+  const src = p.source === 'shopify' ? 'shopify' : p.source === 'json_ld' ? 'json_ld' : 'product_page';
+  const f: FactInput[] = [];
+  const add = (key: string, v: Partial<FactInput>) => f.push({ key, sourceType: src, sourceUrl: url, state: 'OBSERVED', ...v });
+  if (p.name) add('name', { valueText: p.name });
+  if (p.brand) add('brand', { valueText: p.brand });
+  if (p.priceMicros) add('price', { valueNumber: p.priceMicros / 1_000_000, valueJson: { currency: p.currency ?? 'USD' } });
+  if (p.compareAtMicros) add('compare_at_price', { valueNumber: p.compareAtMicros / 1_000_000 });
+  if (p.sizeText) add('size', { valueText: p.sizeText });
+  if (p.ingredients) add('ingredients', { valueText: p.ingredients.slice(0, 2000) });
+  if (p.sku) add('sku_code', { valueText: p.sku });
+  if (p.gtin) add('gtin', { valueText: p.gtin });
+  if (p.inStock !== undefined) add('in_stock', { valueJson: p.inStock });
+  if (p.variants?.length) add('variants', { valueJson: p.variants });
+  if (p.description) add('description', { valueText: p.description.slice(0, 4000) });
+  return f;
+}
+
+export async function analyzeProduct(ctx: TenantContext, skuId: string, projectId: string): Promise<{ status: 'ready' | 'rejected' | 'needs_input'; reason?: string }> {
+  const ws = ctx.workspaceId;
+  const sku = await withTenant(ws, async (tx) => {
+    const [s] = await tx`select * from skus where id = ${skuId}`;
+    if (!s) throw new DomainError('NOT_FOUND', 'Product not found');
+    return s;
+  });
+  if (sku.status !== 'analyzing') return { status: 'ready' }; // idempotent re-run
+
+  // 1. Structured import (preferred source of truth, §16).
+  let extracted: ExtractedProduct | null = null;
+  if (sku.source_url) {
+    await withTenant(ws, (tx) => step(tx, ws, skuId, 'read_page', 'active'));
+    try {
+      extracted = await importProductUrl(sku.source_url as string);
+      await withTenant(ws, async (tx) => {
+        await recordFacts(tx, ctx, skuId, factsFromStructured(extracted!, sku.source_url as string));
+        await step(tx, ws, skuId, 'read_page', 'done', extracted!.name ? `Found “${extracted!.name}”` : 'Page read');
+        await tx`update skus set shopify_product_id = ${extracted!.shopifyProductId ?? null} where id = ${skuId}`;
+      });
+    } catch (e) {
+      // Blocked/JS-only pages fall back to photos without losing the URL (§42, plan 03 P2).
+      await withTenant(ws, async (tx) => {
+        await step(tx, ws, skuId, 'read_page', 'failed', e instanceof DomainError ? e.message : 'We couldn’t read that page');
+        await recordFunnel('URL_PARSE_FAILED', { workspaceId: ws, props: { reason: (e as Error).message } }, tx);
+      });
+    }
+  }
+
+  // 2. Photos: uploaded first, then page images (downloaded into our own storage).
+  await withTenant(ws, (tx) => step(tx, ws, skuId, 'photos', 'active'));
+  let photoIds = (await withTenant(ws, (tx) => tx`select id from assets where sku_id = ${skuId} and kind = 'product_photo' order by created_at`)).map((r) => r.id as string);
+  if (photoIds.length < 3 && extracted?.images.length) {
+    for (const url of extracted.images.slice(0, 3 - photoIds.length)) {
+      const bytes = await fetchImage(url);
+      if (!bytes) continue;
+      try {
+        const { validateMedia } = await import('./uploads');
+        const v = await validateMedia(bytes);
+        const a = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: v.bytes, mime: v.mime, kind: 'product_photo', skuId, source: 'import', origin: { url } }));
+        photoIds.push(a.id);
+      } catch {
+        /* skip unusable image */
+      }
+    }
+  }
+  if (!photoIds.length) {
+    await withTenant(ws, async (tx) => {
+      await step(tx, ws, skuId, 'photos', 'failed', 'Add one clear photo of the front of your product.');
+      await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: 'needs_photo' });
+    });
+    return { status: 'needs_input', reason: 'needs_photo' };
+  }
+  await withTenant(ws, (tx) => step(tx, ws, skuId, 'photos', 'done', `${photoIds.length} photo${photoIds.length > 1 ? 's' : ''}`));
+
+  // 3. Scope checks before any model spend.
+  const scopeText = `${extracted?.name ?? ''} ${extracted?.description ?? ''} ${extracted?.rawText.slice(0, 3000) ?? ''}`;
+  const excluded = excludedProductReason(scopeText);
+  const other = extracted ? nonSkincareCategory(scopeText) : null;
+  if (excluded || other) {
+    const reason = excluded ?? `We’re built for skincare. This looks like ${other}.`;
+    await withTenant(ws, async (tx) => {
+      await tx`update skus set status = 'rejected', reject_reason = ${reason} where id = ${skuId}`;
+      await step(tx, ws, skuId, 'identify', 'failed', reason);
+      await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason });
+      await recordFunnel('SKU_REJECTED', { workspaceId: ws, props: { reason } }, tx);
+    });
+    return { status: 'rejected', reason };
+  }
+
+  // 4. Free preview authorization (extraction + concepts ≤ $0.20, standard §5).
+  const auth = await withTenant(ws, (tx) =>
+    authorize(tx, ctx, {
+      purpose: 'free_preview',
+      skuId,
+      projectId,
+      lines: [
+        { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 14_000, outputTokens: 2_000 },
+        { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 6_000, outputTokens: 3_500 },
+      ],
+      idempotencyKey: `preview:${skuId}`,
+    }),
+  );
+
+  try {
+    // 5. Vision + text extraction.
+    await withTenant(ws, (tx) => step(tx, ws, skuId, 'identify', 'active'));
+    const photos = await withTenant(ws, async (tx) => Promise.all(photoIds.slice(0, 3).map((id) => assetBytes(tx, id))));
+    const images = await Promise.all(photos.map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b) })));
+    const ext = await llmJson({
+      ctx,
+      token: auth.token,
+      task: 'extract.product_facts',
+      subject: { type: 'sku', id: skuId },
+      system: EXTRACT_PRODUCT_SYSTEM,
+      content: [
+        ...images,
+        { type: 'untrusted', sourceId: 'product_page', text: extracted ? JSON.stringify({ name: extracted.name, description: extracted.description, ingredients: extracted.ingredients, size: extracted.sizeText, price: extracted.priceMicros ? extracted.priceMicros / 1e6 : null }).slice(0, 12000) : 'No product page; photos only.' },
+      ],
+      schema: ProductExtraction,
+      mock: () => mockExtraction({ name: extracted?.name, description: extracted?.description, text: extracted?.rawText ?? '', ingredients: extracted?.ingredients, sizeText: extracted?.sizeText }),
+      effort: 'medium',
+      maxTokens: 2000,
+    });
+    const x = ext.data;
+    if (x.category === 'not_skincare') {
+      const reason = 'We’re built for skincare. This product doesn’t look like skincare.';
+      await withTenant(ws, async (tx) => {
+        await tx`update skus set status = 'rejected', reject_reason = ${reason} where id = ${skuId}`;
+        await step(tx, ws, skuId, 'identify', 'failed', reason);
+        await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason });
+        await settle(tx, ctx, auth.authorizationId, 'consumed');
+      });
+      return { status: 'rejected', reason };
+    }
+    await withTenant(ws, async (tx) => {
+      const vf: FactInput[] = [
+        { key: 'name', valueText: x.name, sourceType: 'vision', state: extracted?.name ? 'INFERRED' : 'OBSERVED', confidence: 0.8 },
+        { key: 'category', valueText: x.category, sourceType: 'vision', state: 'INFERRED', confidence: 0.85 },
+        { key: 'format', valueText: x.format, sourceType: 'vision', state: 'INFERRED', confidence: 0.7 },
+        { key: 'texture', valueText: x.texture, sourceType: 'vision', state: 'INFERRED', confidence: 0.6 },
+        { key: 'key_ingredients', valueText: x.keyIngredients.join(', ') || null, sourceType: extracted?.ingredients ? 'product_page' : 'vision', state: extracted?.ingredients ? 'OBSERVED' : 'INFERRED', confidence: 0.8 },
+        { key: 'label_text', valueText: x.labelText, sourceType: 'photo_ocr', state: 'OBSERVED', confidence: x.assetQualityConfidence },
+        { key: 'packaging', valueJson: x.packaging, sourceType: 'vision', state: 'INFERRED', confidence: 0.8 },
+      ];
+      if (!extracted?.sizeText && x.sizeText) vf.push({ key: 'size', valueText: x.sizeText, sourceType: 'photo_ocr', state: 'OBSERVED', confidence: 0.7 });
+      // Name from structured data wins; vision name only if nothing structured exists.
+      await recordFacts(tx, ctx, skuId, extracted?.name ? vf.filter((f) => f.key !== 'name') : vf);
+      const name = extracted?.name ?? x.name;
+      await tx`update skus set name = ${name}, category = ${x.category}, fidelity_confidence = ${x.assetQualityConfidence},
+                 analysis = ${tx.json({ missingEvidence: x.missingEvidence, suggestedViews: x.suggestedViews, multipleProductsVisible: x.multipleProductsVisible } as never)}
+               where id = ${skuId}`;
+      await step(tx, ws, skuId, 'identify', 'done', `${name}${x.sizeText ? ` · ${x.sizeText}` : ''}`);
+      await step(tx, ws, skuId, 'claims', 'active');
+      for (const c of x.claimsFound) await proposeClaim(tx, ctx, skuId, { wording: c.wording, origin: 'extracted', sourceText: c.sourceQuote });
+      const [cc] = await tx`select count(*) filter (where status in ('BLOCKED','RESTRICTED'))::int as risky, count(*)::int as n from claims where sku_id = ${skuId}`;
+      await step(tx, ws, skuId, 'claims', 'done', cc!.n ? `${cc!.n} claim${cc!.n > 1 ? 's' : ''} found${cc!.risky ? ` · ${cc!.risky} we won’t use` : ''}` : 'No claims found on the page');
+    });
+
+    // 6. Visual Fingerprint + cut-out (deterministic).
+    await withTenant(ws, (tx) => step(tx, ws, skuId, 'fingerprint', 'active'));
+    const cut = await cutout(photos[0]!);
+    const colors = await dominantColors(cut.png);
+    await withTenant(ws, async (tx) => {
+      const c = await saveAsset(tx, ws, { bytes: cut.png, mime: 'image/png', kind: 'cutout', skuId, source: 'generated', lineage: { from: photoIds[0], keyed: cut.keyed } });
+      const [v] = await tx`select coalesce(max(version), 0) + 1 as v from visual_fingerprints where sku_id = ${skuId}`;
+      await tx`update visual_fingerprints set active = false where sku_id = ${skuId}`;
+      await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text, brand_text,
+                 package_type, closure, dominant_colors, transparency, thresholds)
+               values (${ws}, ${skuId}, ${v!.v}, ${photoIds}, ${c.id}, ${x.labelText}, ${x.brand}, ${x.packaging.type}, ${x.packaging.closure},
+                 ${tx.json(colors)}, ${x.packaging.transparent ? 'transparent' : 'opaque'},
+                 ${tx.json({ paletteDistanceMax: 70, labelMustMatch: !!x.labelText } as never)})`;
+      await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed });
+      await step(tx, ws, skuId, 'fingerprint', 'done', `${x.packaging.type.replace('_', ' ')}${x.packaging.closure ? ` · ${x.packaging.closure}` : ''}`);
+      await tx`update skus set status = 'active' where id = ${skuId}`;
+      await transition(tx, ctx, projectId, 'PRODUCT_ANALYZED');
+      await transition(tx, ctx, projectId, 'BRIEF_READY');
+      await emit(tx, ctx, 'PRODUCT_IMPORTED', { type: 'sku', id: skuId }, { source: extracted?.source ?? 'photos' });
+      await recordFunnel('SKU_VALIDATED', { workspaceId: ws }, tx);
+      await recordFunnel('PRODUCT_ANALYZED', { workspaceId: ws }, tx);
+    });
+
+    // 7. Concepts (same free-preview authorization).
+    await withTenant(ws, (tx) => step(tx, ws, skuId, 'concepts', 'active'));
+    await generateConcepts({ ctx, token: auth.token, skuId, projectId, batch: 1 });
+    await withTenant(ws, async (tx) => {
+      await transition(tx, ctx, projectId, 'CONCEPTS_READY');
+      await step(tx, ws, skuId, 'concepts', 'done', 'Three test ideas ready');
+      await settle(tx, ctx, auth.authorizationId, 'consumed');
+      await recordFunnel('CONCEPTS_READY', { workspaceId: ws }, tx);
+    });
+    return { status: 'ready' };
+  } catch (e) {
+    await withTenant(ws, async (tx) => {
+      await settle(tx, ctx, auth.authorizationId, 'consumed');
+      await tx`update progress_steps set status = 'failed', detail = 'Something went wrong on our side. Retrying…', completed_at = now()
+               where subject_id = ${skuId} and status = 'active'`;
+    });
+    throw e;
+  }
+}
+
+/** "Try 3 more" (plan 03 P5): limited on provisional workspaces to bound free COGS. */
+export async function regenerateConcepts(ctx: TenantContext, projectId: string) {
+  const ws = ctx.workspaceId;
+  const { skuId, batch } = await withTenant(ws, async (tx) => {
+    const [p] = await tx`select sku_id from projects where id = ${projectId}`;
+    if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+    const [b] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
+    return { skuId: p.sku_id as string, batch: Number(b!.b) + 1 };
+  });
+  if (ctx.workspaceState === 'PROVISIONAL' && batch > 1 + PROVISIONAL.MAX_CONCEPT_REGENERATIONS)
+    throw new DomainError('PAYMENT_REQUIRED', 'Save your work to see more ideas.', { needsAccount: true });
+  const auth = await withTenant(ws, (tx) =>
+    authorize(tx, ctx, {
+      purpose: ctx.workspaceState === 'PROVISIONAL' ? 'free_preview' : 'storyboard',
+      skuId,
+      projectId,
+      lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 6_000, outputTokens: 3_500 }],
+      idempotencyKey: `concepts:${projectId}:${batch}`,
+    }),
+  );
+  try {
+    return await generateConcepts({ ctx, token: auth.token, skuId, projectId, batch });
+  } finally {
+    await withTenant(ws, (tx) => settle(tx, ctx, auth.authorizationId, 'consumed'));
+  }
+}

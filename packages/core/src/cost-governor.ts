@@ -47,6 +47,8 @@ function ceilingFor(purpose: Purpose): Micros | null {
       return COST_LIMITS.CREATIVE_TEST_CEILING;
     case 'free_preview':
       return COST_LIMITS.FREE_PREVIEW_CAP;
+    case 'storyboard':
+      return COST_LIMITS.STORYBOARD_CAP;
     default:
       return null;
   }
@@ -74,7 +76,9 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
   if (ceiling !== null) {
     let prior = 0;
     if (input.purpose === 'free_preview' && input.skuId) {
-      const [r] = await tx`select coalesce(sum(max_cost_micros), 0)::bigint as n from cost_authorizations
+      // Active holds count at their ceiling; settled ones at what was actually spent.
+      const [r] = await tx`select coalesce(sum(case when status = 'active' then max_cost_micros else spent_micros end), 0)::bigint as n
+                           from cost_authorizations
                            where purpose = 'free_preview' and estimate->>'skuId' = ${input.skuId}
                              and status in ('active','settled')`;
       prior = Number(r!.n);

@@ -57,6 +57,8 @@ export const PRICES = {
 export const COST_LIMITS = {
   /** Free preview COGS cap per provisional/free SKU (standard §5). */
   FREE_PREVIEW_CAP: usd(0.2),
+  /** Storyboard preview (account-gated, pre-payment): LLM plan + at most 2 generated frames. */
+  STORYBOARD_CAP: usd(0.25),
   /** Standard Creative Test variable COGS ceiling (standard §5, V1.1). */
   CREATIVE_TEST_CEILING: usd(8.5),
   /** QA retry reserve as fraction of raw video cost (standard §6). */

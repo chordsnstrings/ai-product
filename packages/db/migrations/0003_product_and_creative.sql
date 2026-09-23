@@ -291,6 +291,8 @@ create table projects (
   authorization_id uuid,
   final_creative_id uuid,
   failure_reason text,
+  qa_report jsonb not null default '{}',
+  entitlement_unit text,
   created_by text not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),

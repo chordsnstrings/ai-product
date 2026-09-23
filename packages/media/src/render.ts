@@ -114,7 +114,7 @@ export async function compositeProduct(
   const { w, h } = ASPECT_SIZE[aspect];
   const bg = await sharp(background).resize(w, h, { fit: 'cover' }).toBuffer();
   const targetH = Math.round(h * (opts.scale ?? 0.45));
-  const product = await sharp(productCutout).resize({ height: targetH, fit: 'inside' }).png().toBuffer();
+  const product = await sharp(productCutout).resize({ width: Math.round(w * 0.86), height: targetH, fit: 'inside' }).png().toBuffer();
   const meta = await sharp(product).metadata();
   const left = Math.round((w - (meta.width ?? 0)) / 2);
   const top = opts.anchor === 'lower' ? Math.round(h * 0.42) : Math.round((h - (meta.height ?? 0)) / 2);
