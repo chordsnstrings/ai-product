@@ -53,6 +53,7 @@ export interface TemplateMap {
   magic_link: { url: string; purpose: 'login' | 'claim' | 'resume' | 'step_up'; productName?: string | null };
   invite: { url: string; workspaceName: string; inviterName: string; role: string };
   receipt: { productName: string; amount: string; description: string; url: string };
+  refund_issued: { productName: string; amount: string; url: string };
   asset_ready: { productName: string; url: string; catalogueNo: string };
   offer_ending: { productName: string; url: string; endsAt: string; price: string; regular: string };
   storyboard_saved: { productName: string; url: string; standalonePrice: string };
@@ -119,6 +120,21 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
             <H>Thank you</H>
             <Meta rows={[['Item', m.description], ['Product', m.productName], ['Total', m.amount], ['Billing', 'One-time · no subscription']]} />
             <Cta href={m.url}>Follow production</Cta>
+          </Layout>
+        ),
+      };
+    }
+    case 'refund_issued': {
+      const m = d as TemplateMap['refund_issued'];
+      return {
+        subject: `Refund issued · ${m.productName}`,
+        stream: 'transactional',
+        element: (
+          <Layout preview={`${m.amount} is on its way back to you.`} label="Refund">
+            <H>You’ve been refunded</H>
+            <P>We couldn’t produce your {m.productName} ad to our quality standard, so as promised you don’t pay for it. The full amount is on its way back to your card; it can take 5–10 days to appear.</P>
+            <Meta rows={[['Product', m.productName], ['Refunded', m.amount], ['Why', 'Didn’t pass our quality checks']]} />
+            <Cta href={m.url}>See your storyboard</Cta>
           </Layout>
         ),
       };

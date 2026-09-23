@@ -83,7 +83,7 @@ export async function transition(
   ctx: Pick<TenantContext, 'workspaceId' | 'actor'>,
   projectId: string,
   to: ProjectState,
-  opts: { from?: ProjectState | ProjectState[]; reason?: string; patch?: Record<string, unknown> } = {},
+  opts: { from?: ProjectState | ProjectState[]; reason?: string; detail?: string; patch?: Record<string, unknown> } = {},
 ): Promise<{ changed: boolean; from: ProjectState }> {
   const [p] = await tx`select state from projects where id = ${projectId} for update`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
@@ -99,7 +99,8 @@ export async function transition(
   for (const [k, v] of Object.entries(patch)) {
     await tx`update projects set ${tx({ [k]: v } as never)} where id = ${projectId}`;
   }
-  await emit(tx, ctx, 'PROJECT_STATE_CHANGED', { type: 'project', id: projectId }, { from, to, reason: opts.reason ?? null });
+  // `reason` is customer-facing (shown in the funnel); `detail` is the internal cause, kept on the event only.
+  await emit(tx, ctx, 'PROJECT_STATE_CHANGED', { type: 'project', id: projectId }, { from, to, reason: opts.reason ?? null, detail: opts.detail ?? null });
   return { changed: true, from };
 }
 

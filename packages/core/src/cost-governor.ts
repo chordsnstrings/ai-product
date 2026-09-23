@@ -174,6 +174,24 @@ export async function authorizeOrTakeOver(tx: Tx, ctx: TenantContext, input: Aut
 }
 
 /**
+ * Resume support (§39 "idempotent resume"): hand a new token to the run that took over a live reservation (the
+ * crashed run's token stops working) and extend its expiry. The hold itself — and any reserved entitlement —
+ * is unchanged, so a resumed production never reserves twice.
+ */
+export async function reissueToken(tx: Tx, authorizationId: string, ttlMinutes: number): Promise<string | null> {
+  const token = randomBytes(24).toString('base64url');
+  const [a] = await tx`update cost_authorizations set token_hash = ${hashToken(token)},
+                         expires_at = greatest(expires_at, now() + make_interval(mins => ${ttlMinutes}))
+                       where id = ${authorizationId} and status = 'active' returning id`;
+  return a ? token : null;
+}
+
+/** Keep a reservation alive through a provider outage pause (§44 "preserve reservation"). */
+export async function holdAuthorization(tx: Tx, authorizationId: string, until: Date): Promise<void> {
+  await tx`update cost_authorizations set expires_at = greatest(expires_at, ${until}) where id = ${authorizationId} and status = 'active'`;
+}
+
+/**
  * Called by the Model Gateway before each provider call: validates the token and atomically debits the
  * expected cost of this call against the authorization ceiling.
  */

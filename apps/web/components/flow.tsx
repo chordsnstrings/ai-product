@@ -355,7 +355,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
               <li>Exports for TikTok, Reels (9:16), Feed (4:5) and Square</li>
               <li>Your real packaging, checked scene by scene</li>
               <li>Every claim checked against FDA cosmetic rules</li>
-              <li>If it fails our quality check twice, you’re refunded automatically</li>
+              <li>If we can’t deliver an ad that passes our quality checks, you’re refunded automatically</li>
             </ul>
           </div>
           <div style={{ marginTop: 24 }}>
@@ -440,7 +440,8 @@ export function CheckoutFlow({ projectId, publishableKey }: { projectId: string;
 /* ───────────── P9 · Production ───────────── */
 
 export function ProduceFlow({ projectId }: { projectId: string }) {
-  const active = useCallback((v: View | null) => !v || (v.project.state !== 'COMPLETE' && !['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION', 'CANCELLED'].includes(v.project.state)), []);
+  // A production paused by a provider outage resumes by itself, so keep polling it.
+  const active = useCallback((v: View | null) => !v || v.project.paused || (v.project.state !== 'COMPLETE' && !['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION', 'CANCELLED'].includes(v.project.state)), []);
   const { data: v, error, resume } = useProject(projectId, active);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
@@ -448,15 +449,17 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
   }, [v?.project.state, projectId]);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
   const waitingPayment = v.project.state === 'STORYBOARD_READY';
-  const failed = ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION'].includes(v.project.state);
+  const paused = v.project.paused;
+  const failed = !paused && ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION'].includes(v.project.state);
   return (
-    <Shell step={4} title={failed ? 'We couldn’t finish this ad' : waitingPayment ? 'Confirming your payment' : 'Making your ad'} sub={failed ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
+    <Shell step={4} title={failed ? 'We couldn’t finish this ad' : paused ? 'Your ad is paused' : waitingPayment ? 'Confirming your payment' : 'Making your ad'} sub={failed ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
       {waitingPayment ? <p className="ak-muted">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
+      {paused ? <Banner tone="warn">{v.project.failureReason ?? 'A production service is temporarily unavailable. We’ll resume automatically.'}</Banner> : null}
       {failed ? (
         <div className="ak-stack">
           <Banner tone="risk">{v.project.failureReason ?? 'Something went wrong while producing your ad.'}</Banner>
-          {v.project.state === 'REFUNDED' ? <p>Your payment has been refunded in full. It can take 5–10 days to appear on your statement.</p> : <p>You haven’t lost anything — your credit was returned.</p>}
-          {v.project.state === 'PROVIDER_FAILED' ? (
+          {v.project.state === 'REFUNDED' ? <p>Your payment has been refunded in full. It can take 5–10 days to appear on your statement.</p> : v.purchase?.status === 'paid' && v.project.state === 'PROVIDER_FAILED' ? <p>Your payment is being refunded automatically.</p> : <p>You haven’t lost anything — your credit was returned.</p>}
+          {v.project.state === 'PROVIDER_FAILED' && v.purchase?.status !== 'paid' ? (
             <Button onClick={async () => { setErr(null); try { await api(`/api/projects/${projectId}/retry`, {}); resume(); } catch (e) { setErr((e as Error).message); } }}>Try again</Button>
           ) : null}
           {err ? <p className="ak-error">{err}</p> : null}

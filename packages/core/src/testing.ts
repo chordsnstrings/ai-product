@@ -2,6 +2,9 @@ import sharp from 'sharp';
 import type { Role, WorkspaceState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 
+/** Provider injection for suites outside this package (chaos): e.g. a hanging or failing video provider. */
+export { MockImage, MockLlm, MockTts, MockVideo, setProviders, type VideoProvider } from '@arkiv/providers';
+
 /** Synthetic product photo: a dropper bottle on a plain background, so cut-out/fingerprint run for real. */
 export async function productPhoto(label = 'GLOW SERUM', color = '#C9A27E'): Promise<Buffer> {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1250">

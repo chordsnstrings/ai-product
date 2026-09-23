@@ -53,6 +53,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         state: p.state as string,
         kind: p.kind as string,
         failureReason: (p.failure_reason as string) ?? null,
+        /** Paused by a provider outage: resumes automatically with the reservation held (§44). */
+        paused: p.state === 'NEEDS_USER_ACTION' && !!p.outage,
         qa: p.qa_report ?? null,
         storyboardId: (p.storyboard_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,

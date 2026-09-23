@@ -16,6 +16,7 @@ export const Queues = {
   regenerateFrame: 'regenerate-frame',
   regenerateFrameFree: 'regenerate-frame-free',
   recoveryConcept: 'recovery-concept',
+  refundPurchase: 'refund-purchase',
   produceProject: 'produce-project',
   hookVariants: 'hook-variants',
   processUpload: 'process-upload',

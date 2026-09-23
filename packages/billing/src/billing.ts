@@ -14,6 +14,7 @@ import {
   Queues,
   recordFunnel,
   redeemOffer,
+  transition,
   transitionWorkspace,
   type TenantContext,
 } from '@arkiv/core';
@@ -380,6 +381,39 @@ async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice) {
   }
   if (ctx.workspaceState === 'PAST_DUE' || ctx.workspaceState === 'ACTIVE_FREE' || ctx.workspaceState === 'CANCELLED') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'invoice paid');
   return 'processed';
+}
+
+// ───────────── Quality guarantee (plan 04 L12, plan 03 P7) ─────────────
+
+/**
+ * Worker job `refund-purchase`, queued in the same transaction that failed a paid Taste/Standalone production:
+ * "if we can't deliver an ad that passes our checks, you're refunded automatically". Ordered so it is safe to
+ * retry at any point: (1) the project moves to REFUNDED first, so it can no longer be retried and delivered;
+ * (2) Stripe refunds with an idempotency key; (3) the purchase, ledger and email follow in one transaction.
+ * The failed production already returned the entitlement, so it is taken back out: money or credit, never both.
+ */
+export async function refundProjectPurchase(ctx: TenantContext, purchaseId: string, reason = 'guarantee'): Promise<'refunded' | 'skipped'> {
+  const ws = ctx.workspaceId;
+  const pu = await withTenant(ws, async (tx) => {
+    const [row] = await tx`select pu.*, p.state from purchases pu join projects p on p.id = pu.project_id
+                           where pu.id = ${purchaseId} and pu.workspace_id = ${ws} for update of p`;
+    if (!row || row.status !== 'paid' || !['PROVIDER_FAILED', 'REFUNDED'].includes(row.state as string)) return null;
+    await transition(tx, ctx, row.project_id as string, 'REFUNDED', { from: 'PROVIDER_FAILED', reason: 'Refunded automatically: this ad didn’t pass our quality checks.' });
+    return row;
+  });
+  if (!pu) return 'skipped';
+  const refundId = pu.stripe_payment_intent_id ? await billingGateway().refund(pu.stripe_payment_intent_id as string, undefined, { idempotencyKey: `guarantee:${purchaseId}` }) : null;
+  await withTenant(ws, async (tx) => {
+    const [done] = await tx`update purchases set status = 'refunded', refunded_at = now() where id = ${purchaseId} and status = 'paid' returning id`;
+    if (!done) return;
+    const [consumed] = await tx`select 1 from ledger_entries where project_id = ${pu.project_id} and type = 'CREDIT_CONSUMED' limit 1`;
+    if (!consumed) {
+      await append(tx, ctx, { type: 'CREDIT_ADJUSTED', unit: pu.kind as 'taste' | 'standalone', amount: -1, projectId: pu.project_id as string, idempotencyKey: `refund:purchase:${purchaseId}`, reference: refundId, reason: 'Guarantee refund: payment returned instead of the credit' });
+    }
+    await emit(tx, ctx, 'CREDIT_REFUNDED', { type: 'project', id: pu.project_id as string }, { purchaseId, amountMicros: Number(pu.amount_micros), refundId, reason });
+    await enqueue(tx, ws, Queues.sendEmail, { template: 'refund_issued', purchaseId }, { singletonKey: `refund-email:${purchaseId}` });
+  });
+  return 'refunded';
 }
 
 // ───────────── Mock checkout (dev/test) ─────────────

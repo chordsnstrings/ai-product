@@ -45,6 +45,12 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       if (pu) await send('receipt', { productName: pu.name, amount: formatUsd(Number(pu.amount_micros)), description: pu.kind === 'taste' ? '15-second ad · intro price' : '15-second ad', url: `${app}/produce/${pu.project_id}` });
       return;
     }
+    case 'refund_issued': {
+      const [pu] = await withTenant(ws, (tx) => tx`select pu.amount_micros, pu.project_id, s.name from purchases pu join projects p on p.id = pu.project_id join skus s on s.id = p.sku_id
+                                                    where pu.id = ${data.purchaseId as string} and pu.status = 'refunded'`);
+      if (pu) await send('refund_issued', { productName: pu.name, amount: formatUsd(Number(pu.amount_micros)), url: `${app}/storyboard/${pu.project_id}` }, await recipients(ws, ['OWNER']));
+      return;
+    }
     case 'subscription_started': {
       const plan = PLANS[(data.plan as PlanCode) ?? 'GROWTH'];
       const [s] = await withTenant(ws, (tx) => tx`select current_period_end from subscriptions order by created_at desc limit 1`);

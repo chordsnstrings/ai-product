@@ -19,6 +19,7 @@ import {
   requestOpsCommand,
   requestOrExecute,
   restoreFromScheduledPurge,
+  retryProduction,
   scanCreativeText,
   setTenantFlags,
   setTenantHold,
@@ -231,6 +232,21 @@ export const ACTIONS = {
   'eval.run': a({ perm: 'evals.run', schema: z.object({ dataset: z.string(), reason: z.string().default('manual eval run') }), run: async (s, i) => { if (!GOLDEN[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset'); const [r] = await withAdmin((tx) => tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${i.dataset}, 'rules', 'deterministic', ${i.dataset}, 'queued', ${s.staffId}) returning id`); await requestOpsCommand(s, 'eval.run', { dataset: i.dataset, evalRunId: r!.id }, i.reason); return { message: 'Eval queued; results appear in a few seconds.' }; } }),
 
   /* ── Jobs ── */
+  // Retry a failed, paused or stalled production through the same domain path as the merchant's retry: a stalled
+  // one resumes from durable state (no second reservation), a failed one re-reserves via the Cost Governor.
+  'project.retry': a({
+    perm: 'jobs.manage',
+    schema: z.object({ workspaceId: uuid, projectId: uuid, reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [p] = await tx`select id, state from projects where id = ${i.projectId} and workspace_id = ${i.workspaceId}`;
+        if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+        const ctx = { workspaceId: i.workspaceId, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, actor: { kind: 'staff' as const, id: s.staffId }, requestId: newId() };
+        const r = await retryProduction(tx, ctx, i.projectId);
+        await audit(tx, s, 'project.retry', { type: 'project', id: i.projectId }, { workspaceId: i.workspaceId, reason: i.reason, before: { state: p.state }, after: r });
+        return { message: r.resumed ? 'Resume queued (no new reservation)' : 'Retry queued' };
+      }),
+  }),
   'job.retry': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.retry', i, i.reason).then(() => ({ message: 'Retry queued' })) }),
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),
   'dlq.requeue': a({ perm: 'jobs.manage', reauth: true, schema: z.object({ queue: z.string(), limit: z.number().int().min(1).max(1000).default(100), reason }), run: (s, i) => requestOpsCommand(s, 'dlq.requeue', { queue: i.queue, limit: i.limit }, i.reason).then(() => ({ message: 'Redrive queued' })) }),

@@ -1,5 +1,6 @@
 import { withSystem, withTenant } from '@arkiv/db';
 import { DomainError, PLANS, type PlanCode } from '@arkiv/shared';
+import { refundProjectPurchase } from '@arkiv/billing';
 import {
   analyzeProduct,
   buildExport,
@@ -67,6 +68,8 @@ export const handlers: Record<string, Handler> = {
   },
   [Queues.hookVariants]: (ctx, d) => produceHookVariants(ctx, d.projectId as string),
   [Queues.recoveryConcept]: (ctx, d) => draftRecoveryConcept(ctx, d.projectId as string),
+  // Core can't import billing, so the guarantee refund (queued by failProduction) runs here.
+  [Queues.refundPurchase]: (ctx, d) => refundProjectPurchase(ctx, d.purchaseId as string, String(d.reason ?? 'guarantee')),
   [Queues.processUpload]: (ctx, d) => withTenant(ctx.workspaceId, (tx) => processUpload(tx, ctx, d.uploadId as string, (d.skuId as string) ?? null)),
   [Queues.sendEmail]: (ctx, d, jobId) => sendQueuedEmail(ctx, d, jobId),
   [Queues.syncIntegration]: (ctx, d) => syncIntegration(ctx, d.integrationId as string, { full: !!d.full }),

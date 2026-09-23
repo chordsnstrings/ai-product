@@ -178,6 +178,8 @@ export interface VideoCall extends CallMeta {
   mockLabel?: string;
   timeoutMs?: number;
   pollMs?: number;
+  /** Called while waiting on the provider (at most once a minute) so the caller can keep its run lease alive. */
+  heartbeat?: () => Promise<void>;
 }
 
 /**
@@ -197,7 +199,12 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
     await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId} where id = ${started.jobId}`);
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
     let res: VideoPoll;
+    let beat = Date.now();
     for (;;) {
+      if (call.heartbeat && Date.now() - beat > 60_000) {
+        beat = Date.now();
+        await call.heartbeat();
+      }
       res = await withTransientRetry(() => p.video.poll(requestId!));
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
       if (Date.now() > deadline) {

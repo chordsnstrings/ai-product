@@ -17,6 +17,8 @@ export const QUEUE_CONFIG: Record<string, { concurrency: number; expireInSeconds
   [Queues.hookVariants]: { concurrency: 2, expireInSeconds: 900, retryLimit: 2 },
   // Marketing recovery (plan 04 L20): lowest urgency, one at a time.
   [Queues.recoveryConcept]: { concurrency: 1, expireInSeconds: 300, retryLimit: 1 },
+  // Money back for undeliverable paid orders: retried generously (every step is idempotent).
+  [Queues.refundPurchase]: { concurrency: 2, expireInSeconds: 120, retryLimit: 8 },
   [Queues.processUpload]: { concurrency: 4, expireInSeconds: 120, retryLimit: 2 },
   [Queues.sendEmail]: { concurrency: 4, expireInSeconds: 60, retryLimit: 5 },
   [Queues.syncIntegration]: { concurrency: 2, expireInSeconds: 1800, retryLimit: 3 },

@@ -1,6 +1,11 @@
 import { withSystem, withTenant } from '@arkiv/db';
 import {
+  OUTAGE_MAX_HOURS,
   RECOVERY_EMAIL_CAP,
+  STUCK_DEADLINE_MINUTES,
+  failProduction,
+  systemContext,
+  type TenantContext,
   duePurges,
   expireOffers,
   refreshRiskFlags,
@@ -16,11 +21,13 @@ import {
  * Scheduled maintenance (§39: reservations must never be stranded; plan 02 lifecycle; plan 04 L20 recovery).
  * Each sweep runs as the system role and fans out tenant work through the outbox.
  */
-async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], workspaceId: string, queue: string, payload: Record<string, unknown>, singletonKey: string) {
+async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], workspaceId: string, queue: string, payload: Record<string, unknown>, singletonKey: string, priority = 0) {
   const [dup] = await tx`select 1 from outbox where queue = ${queue} and singleton_key = ${singletonKey} limit 1`;
   if (dup) return;
-  await tx`insert into outbox (workspace_id, queue, payload, singleton_key) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey})`;
+  await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority})`;
 }
+
+const sysCtx = (workspaceId: string, id: string): TenantContext => ({ ...systemContext(workspaceId, id), actor: { kind: 'system', id } });
 
 /** pg-boss queue for a schedule — never the same name as a job queue (see main.ts). */
 export const sweepQueue = (key: string) => `cron-${key}`;
@@ -56,6 +63,55 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
         for (const p of cold) await enqueueFor(tx, p.workspace_id as string, 'recovery-concept', { projectId: p.id }, `recovery-concept:${p.id}`);
         return due.length + stale.length + cold.length;
       }),
+  },
+  // §39/§44: productions paused by a provider outage resume (with backoff) once the provider's circuit is closed
+  // and renders aren't kill-switched; an outage past OUTAGE_MAX_HOURS ends the attempt (entitlement returned,
+  // paid one-off orders refunded).
+  'resume-paused-productions': {
+    cron: '* * * * *',
+    run: async () => {
+      const rows = await withSystem((tx) => tx`
+        select p.id, p.workspace_id, p.outage,
+          (p.outage->>'since')::timestamptz < now() - make_interval(hours => ${OUTAGE_MAX_HOURS}) as exhausted,
+          coalesce((select r.circuit_open from model_routes r where r.task = p.outage->>'task'), false)
+            or exists (select 1 from feature_flags f where f.key = 'kill.renders' and f.enabled) as blocked,
+          (p.outage->>'lastAt')::timestamptz < now() - make_interval(mins => least(30, power(2, greatest(0, coalesce((p.outage->>'attempts')::int, 1) - 1))::int)) as due
+        from projects p where p.state = 'NEEDS_USER_ACTION' and p.outage is not null limit 200`);
+      let n = 0;
+      for (const r of rows) {
+        if (r.exhausted) {
+          await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'outage-sweep'), r.id as string, 'provider outage did not recover in time'));
+          n++;
+        } else if (!r.blocked && r.due) {
+          const attempts = Number((r.outage as { attempts?: number }).attempts ?? 1);
+          await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:resume:${attempts}`, 20));
+          n++;
+        }
+      }
+      return n;
+    },
+  },
+  // prod-07: a production in RENDER_RESERVED..FINAL_QA with no live run (worker crashed) is resumed; if it has been
+  // stuck past STUCK_DEADLINE_MINUTES — before its reservation's 180-minute TTL — it is failed and refunded instead.
+  'sweep-stuck-productions': {
+    cron: '* * * * *',
+    run: async () => {
+      const rows = await withSystem((tx) => tx`
+        select p.id, p.workspace_id, a.created_at < now() - make_interval(mins => ${STUCK_DEADLINE_MINUTES}) as overdue
+        from projects p left join cost_authorizations a on a.id = p.authorization_id and a.workspace_id = p.workspace_id
+        where p.state in ('RENDER_RESERVED','RENDERING','QA_RUNNING','COMPOSING','PLATFORM_VARIANTS','FINAL_QA')
+          and p.updated_at < now() - interval '2 minutes'
+          and not exists (select 1 from workspace_leases l where l.workspace_id = p.workspace_id
+                          and l.resource = 'produce:' || p.id::text and l.expires_at > now())
+          and not exists (select 1 from outbox o where o.workspace_id = p.workspace_id and o.queue = 'produce-project'
+                          and o.dispatched_at is null and o.payload->>'projectId' = p.id::text)
+        limit 200`);
+      for (const r of rows) {
+        if (r.overdue) await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'stuck-sweep'), r.id as string, 'production stalled (no live worker) past the deadline'));
+        else await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:stuck:${Math.floor(Date.now() / 300_000)}`, 20));
+      }
+      return rows.length;
+    },
   },
   'sweep-provisional': { cron: '*/15 * * * *', run: () => withSystem((tx) => sweepProvisional(tx)) },
   'sweep-retention': { cron: '0 * * * *', run: () => withSystem((tx) => sweepRetention(tx)) },

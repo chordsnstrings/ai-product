@@ -67,3 +67,9 @@ begin
   return new;
 end $$;
 create trigger brands_initial_version after insert on brands for each row execute function arkiv_brand_initial_version();
+
+-- ───────────── Production resume and outage pause (standard §25, §35, §39, §44) ─────────────
+-- A provider outage pauses a production (NEEDS_USER_ACTION) with its reservation held; this records which task
+-- is waiting, since when and how many resume attempts were made, so a sweep can resume it with backoff.
+alter table projects add column outage jsonb;
+create index projects_paused_outage on projects (workspace_id) where outage is not null;
