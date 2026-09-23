@@ -65,6 +65,16 @@ async function main() {
   }
   console.log(`  ${pages.length} pages 200`);
 
+  step('QA case lists the stored checks by name');
+  const [qaProject] = await withSystem((tx) => tx`select id, workspace_id from projects where jsonb_array_length(coalesce(qa_report->'checks', '[]'::jsonb)) > 0
+                                                  and qa_report->'checks' @> '[{"check": "product_fidelity"}]' order by updated_at desc limit 1`);
+  if (qaProject) {
+    const html = await (await A.req(`/qa/${qaProject.id}?ws=${qaProject.workspace_id}`)).text();
+    if (!/product_fidelity/.test(html)) throw new Error('QA case page does not list product_fidelity');
+    if (/&quot;undefined&quot;|"undefined":/.test(html)) throw new Error('QA verdict template has undefined keys');
+    console.log('  ✓');
+  } else console.log('  (no produced project with a QA report yet — skipped)');
+
   step('Role gating: FINANCE cannot see staff or claims modules');
   for (const p of ['/staff', '/claims', '/audit']) {
     const r = await F.req(p);

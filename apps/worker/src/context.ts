@@ -16,8 +16,3 @@ export async function jobContext(payload: { workspaceId?: string; actor?: Actor 
     planCode: w.plan_code as string | null,
   };
 }
-
-/** Jobs for suspended/purged workspaces pause instead of running (plan 02 §2 table). */
-export function paused(ctx: TenantContext) {
-  return ctx.workspaceState === 'SUSPENDED' || ctx.workspaceState === 'PURGED' || ctx.workspaceState === 'PURGE_SCHEDULED';
-}

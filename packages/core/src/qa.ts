@@ -140,6 +140,14 @@ export function qaExperimentIntegrity(
   };
 }
 
+const CHECK_NAMES: readonly CheckResult['check'][] = ['product_fidelity', 'visual', 'claims', 'audio', 'platform', 'experiment_integrity', 'asset_integrity'];
+/**
+ * Key for a reviewer's verdict on one stored check (plan 05 §13). Several scene checks share a name, so the
+ * key carries the check's 1-based position in the stored report.
+ */
+export const qaVerdictKey = (index: number, check: CheckResult['check']) => `${index + 1}:${check}`;
+export const QA_VERDICT_KEY = new RegExp(`^[1-9]\\d{0,2}:(${CHECK_NAMES.join('|')})$`);
+
 export const summarize = (checks: CheckResult[]) => ({
   pass: checks.every((c) => c.pass || !c.hard) && checks.filter((c) => !c.pass).length === 0,
   hardFail: checks.some((c) => !c.pass && c.hard),

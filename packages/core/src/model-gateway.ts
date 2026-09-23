@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, sleep, type Micros } from '@arkiv/shared';
 import {
@@ -12,6 +13,7 @@ import {
 import type { z } from 'zod';
 import type { TenantContext } from './context';
 import { consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
+import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
 import { actualCost, loadRates, priceLine, type CostLine } from './rates';
 
@@ -27,12 +29,36 @@ export interface Route {
   model: string;
   promptVersion: string;
   circuitOpen: boolean;
+  /** Which rollout arm served this call (plan 05 §11 canary rollout). */
+  arm: 'stable' | 'canary';
 }
 
-export async function route(tx: Tx, task: string): Promise<Route> {
-  const [r] = await tx`select task, provider, model, prompt_version, circuit_open from model_routes where task = ${task}`;
+/** A route's canary arm, written by the console's route.update (plan 05 §11: 5% → 25% → 100%). */
+export interface Canary {
+  model?: string;
+  promptVersion?: string;
+  pct: number;
+  startedAt?: string;
+}
+
+/** Deterministic 0–99 bucket per (task, workspace): a workspace stays on one arm for the whole rollout step. */
+export function canaryBucket(task: string, workspaceId: string): number {
+  return parseInt(createHash('sha256').update(`canary:${task}:${workspaceId}`).digest('hex').slice(0, 8), 16) % 100;
+}
+
+export async function route(tx: Tx, task: string, workspaceId?: string | null): Promise<Route> {
+  const [r] = await tx`select task, provider, model, prompt_version, circuit_open, canary from model_routes where task = ${task}`;
   if (!r) throw new DomainError('UNAVAILABLE', `No model route for ${task}`);
-  return { task, provider: r.provider, model: r.model, promptVersion: r.prompt_version, circuitOpen: r.circuit_open };
+  const canary = r.canary as Canary | null;
+  const inCanary = !!canary && !!workspaceId && Number(canary.pct) > 0 && canaryBucket(task, workspaceId) < Number(canary.pct);
+  return {
+    task,
+    provider: r.provider,
+    model: inCanary ? (canary!.model ?? r.model) : r.model,
+    promptVersion: inCanary ? (canary!.promptVersion ?? r.prompt_version) : r.prompt_version,
+    circuitOpen: r.circuit_open,
+    arm: inCanary ? 'canary' : 'stable',
+  };
 }
 
 interface CallMeta {
@@ -43,21 +69,30 @@ interface CallMeta {
   inputRefs?: Record<string, unknown>;
 }
 
-async function begin(meta: CallMeta, line: CostLine, requestFingerprint: unknown) {
+/**
+ * Open a provider call: resolve the route (and its canary arm), refuse open circuits and killed providers
+ * (plan 05 §20 kill.provider.*), price the call with the routed model and debit the authorization.
+ */
+async function begin(meta: CallMeta, line: CostLine | ((r: Route) => CostLine), requestFingerprint: unknown, opts: { provider?: string } = {}) {
   return withTenant(meta.ctx.workspaceId, async (tx) => {
-    const r = await route(tx, meta.task);
+    const r = await route(tx, meta.task, meta.ctx.workspaceId);
     if (r.circuitOpen) throw new DomainError('UNAVAILABLE', `Provider circuit open for ${meta.task}`);
+    const provider = opts.provider ?? r.provider;
+    if (await isFlagOn(tx, `kill.provider.${provider}`, meta.ctx.workspaceId)) {
+      throw new DomainError('UNAVAILABLE', `${provider} is switched off for maintenance. Your work is saved.`, { killSwitch: provider });
+    }
+    const costLine = typeof line === 'function' ? line(r) : line;
     const rates = await loadRates(tx);
-    const expected = priceLine(rates, line).micros;
+    const expected = priceLine(rates, costLine).micros;
     const auth = await consumeAuthorization(tx, meta.token, expected);
     const [job] = await tx`
       insert into provider_jobs (workspace_id, project_id, subject_type, subject_id, provider, task, model, prompt_version,
-        request_hash, input_refs, status, authorization_id, estimate_micros)
+        request_hash, input_refs, status, authorization_id, estimate_micros, arm)
       values (${meta.ctx.workspaceId}, ${auth.projectId}, ${meta.subject?.type ?? null}, ${meta.subject?.id ?? null},
-        ${r.provider}, ${meta.task}, ${r.model}, ${r.promptVersion}, ${hashRequest(requestFingerprint)},
-        ${tx.json((meta.inputRefs ?? {}) as never)}, 'dispatched', ${auth.authorizationId}, ${expected})
+        ${provider}, ${meta.task}, ${r.model}, ${r.promptVersion}, ${hashRequest(requestFingerprint)},
+        ${tx.json((meta.inputRefs ?? {}) as never)}, 'dispatched', ${auth.authorizationId}, ${expected}, ${r.arm})
       returning id`;
-    return { route: r, jobId: job!.id as string, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
+    return { route: r, line: costLine, jobId: job!.id as string, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
   });
 }
 
@@ -112,7 +147,7 @@ export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & {
   const approxIn = Math.ceil((call.system.length + call.content.reduce((n, c) => n + (c.type === 'image' ? 6000 : c.text.length), 0)) / 4);
   const maxTokens = call.maxTokens ?? 8000;
   const p = await providers();
-  const started = await begin(call, { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: approxIn, outputTokens: maxTokens }, {
+  const started = await begin(call, (r) => ({ kind: 'llm', provider: r.provider, model: r.model, inputTokens: approxIn, outputTokens: maxTokens }), {
     task: call.task,
     content: call.content.map((c) => (c.type === 'image' ? { type: 'image', len: c.base64.length } : c)),
   });
@@ -132,7 +167,7 @@ export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & {
     );
     await finish(call, started, {
       ok: true,
-      actualLine: { kind: 'llm', provider: 'anthropic', model: started.route.model, inputTokens: res.usage.inputTokens, outputTokens: res.usage.outputTokens, cachedTokens: res.usage.cachedTokens },
+      actualLine: { kind: 'llm', provider: started.route.provider, model: started.route.model, inputTokens: res.usage.inputTokens, outputTokens: res.usage.outputTokens, cachedTokens: res.usage.cachedTokens },
       modelVersion: res.modelVersion,
       output: res.data,
       latencyMs: Date.now() - t0,
@@ -154,14 +189,13 @@ export interface ImageCall extends CallMeta {
 
 export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string }> {
   const p = await providers();
-  const line: CostLine = { kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 };
-  const started = await begin(call, line, { prompt: call.prompt, refs: call.references.length });
+  const started = await begin(call, (rt) => ({ kind: 'image', provider: rt.provider, model: rt.model, images: 1 }), { prompt: call.prompt, refs: call.references.length });
   const t0 = Date.now();
   try {
     const r = await withTransientRetry(() =>
       p.image.generate({ model: p.wireModel(started.route.model), prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }),
     );
-    await finish(call, started, { ok: true, actualLine: line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
+    await finish(call, started, { ok: true, actualLine: started.line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
     return { ...r, jobId: started.jobId, promptVersion: started.route.promptVersion };
   } catch (e) {
     await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
@@ -186,8 +220,8 @@ export interface VideoCall extends CallMeta {
  */
 export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string }> {
   const p = await providers();
-  const line: CostLine = { kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: call.seconds, resolution: call.resolution, retryReserve: false };
-  const started = await begin(call, line, { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
+  const started = await begin(call, (rt) => ({ kind: 'video', provider: rt.provider, model: rt.model, seconds: call.seconds, resolution: call.resolution, retryReserve: false }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
+  const line = started.line;
   const t0 = Date.now();
   let requestId: string | null = null;
   try {
@@ -224,6 +258,9 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
   }
 }
 
+/** Approved voice-over fallback (BytePlus Seed Speech). */
+const TTS_FALLBACK = { provider: 'byteplus', model: 'seed-speech-2-0' } as const;
+
 export interface TtsCall extends CallMeta {
   text: string;
   voice: string;
@@ -232,18 +269,32 @@ export interface TtsCall extends CallMeta {
 /** Voice-over with provider fallback (MiniMax primary, BytePlus Seed Speech fallback). */
 export async function synthesizeVoice(call: TtsCall): Promise<TtsResult & { jobId: string }> {
   const p = await providers();
-  const line: CostLine = { kind: 'tts', provider: 'minimax', model: 'speech-2.8-hd', chars: call.text.length };
-  const started = await begin(call, line, { text: call.text, voice: call.voice });
+  // Priced and called with the routed model (canary included), never a hard-coded one.
+  const lineFor = (rt: Route): CostLine => ({ kind: 'tts', provider: rt.provider, model: rt.model, chars: call.text.length });
+  const fingerprint = { text: call.text, voice: call.voice };
+  // A killed primary provider goes straight to the approved fallback (plan 05 §10/§20).
+  let fallbackOnly = false;
+  let started: Awaited<ReturnType<typeof begin>>;
+  try {
+    started = await begin(call, lineFor, fingerprint);
+  } catch (e) {
+    if (!(e instanceof DomainError && (e.details as { killSwitch?: string } | undefined)?.killSwitch)) throw e;
+    started = await begin(call, lineFor, fingerprint, { provider: TTS_FALLBACK.provider });
+    fallbackOnly = true;
+  }
   const t0 = Date.now();
   try {
     let r: TtsResult;
-    try {
-      r = await withTransientRetry(() => p.tts.synthesize({ model: p.wireModel('speech-2.8-hd'), text: call.text, voice: call.voice }));
-    } catch (primaryErr) {
-      if (!(primaryErr instanceof ProviderError)) throw primaryErr;
-      r = await p.ttsFallback.synthesize({ model: 'seed-speech-2-0', text: call.text, voice: call.voice });
+    if (fallbackOnly) r = await p.ttsFallback.synthesize({ model: TTS_FALLBACK.model, text: call.text, voice: call.voice });
+    else {
+      try {
+        r = await withTransientRetry(() => p.tts.synthesize({ model: p.wireModel(started.route.model), text: call.text, voice: call.voice }));
+      } catch (primaryErr) {
+        if (!(primaryErr instanceof ProviderError)) throw primaryErr;
+        r = await p.ttsFallback.synthesize({ model: TTS_FALLBACK.model, text: call.text, voice: call.voice });
+      }
     }
-    await finish(call, started, { ok: true, actualLine: { ...line, chars: r.chars }, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
+    await finish(call, started, { ok: true, actualLine: { ...(started.line as Extract<CostLine, { kind: 'tts' }>), chars: r.chars }, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
     return { ...r, jobId: started.jobId };
   } catch (e) {
     await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });

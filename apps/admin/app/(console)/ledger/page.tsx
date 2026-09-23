@@ -51,7 +51,12 @@ export default async function Ledger({ searchParams }: { searchParams: Promise<{
       ) : null}
       {tab === 'explorer' ? (
         <>
-          <form className="ak-row" style={{ marginBottom: 12 }}><input type="hidden" name="tab" value="explorer" /><input className="ak-input" name="ws" placeholder="Workspace id" defaultValue={sp.ws} /><input className="ak-input" name="type" placeholder="Type e.g. CREDIT_RESERVED" defaultValue={sp.type} /><button className="ak-btn ak-btn--sm">Filter</button></form>
+          <form className="ak-row" style={{ marginBottom: 12, alignItems: 'end', flexWrap: 'wrap' }}>
+            <input type="hidden" name="tab" value="explorer" />
+            <label className="ak-field"><span className="ak-label">Workspace id</span><input className="ak-input" name="ws" defaultValue={sp.ws} /></label>
+            <label className="ak-field"><span className="ak-label">Entry type</span><input className="ak-input" name="type" placeholder="e.g. CREDIT_RESERVED" defaultValue={sp.type} /></label>
+            <button className="ak-btn ak-btn--sm">Filter</button>
+          </form>
           <Table head={['#', 'When', 'Workspace', 'Type', 'Unit', 'Amount', 'Period', 'Authorization', 'Reason', 'Actor']} rows={d0.entries.map((e) => [e.id as number, dt(e.created_at), e.name as string, <Mono key="t">{e.type as string}</Mono>, e.unit as string, e.unit === 'usd_micros' ? money(e.amount, 4) : String(e.amount), (e.period_key as string) ?? '—', <Mono key="a">{String(e.authorization_id ?? '').slice(0, 8)}</Mono>, (e.reason as string) ?? '', <Mono key="ac">{e.actor as string}</Mono>])} />
         </>
       ) : null}

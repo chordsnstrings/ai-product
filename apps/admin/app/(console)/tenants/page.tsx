@@ -39,8 +39,11 @@ export default async function Tenants({ searchParams }: { searchParams: Promise<
   };
   return (
     <Page title="Tenants" sub={`${rows.length} shown · test accounts ${sp.test === '1' ? 'included' : 'hidden'}`}>
-      <form className="ak-row" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
-        <input className="ak-input" name="q" defaultValue={q} placeholder="Name, slug, ID, member email, cus_…, shop.myshopify.com, ad account" style={{ minWidth: 380 }} />
+      <form className="ak-row" style={{ marginBottom: 12, flexWrap: 'wrap', alignItems: 'end' }}>
+        <label className="ak-field">
+          <span className="ak-label">Search tenants</span>
+          <input className="ak-input" name="q" defaultValue={q} placeholder="Name, slug, ID, member email, cus_…, shop.myshopify.com, ad account" style={{ minWidth: 380 }} />
+        </label>
         <button className="ak-btn ak-btn--sm">Search</button>
       </form>
       <div className="ak-row" style={{ marginBottom: 12, flexWrap: 'wrap' }}>

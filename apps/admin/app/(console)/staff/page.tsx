@@ -11,6 +11,9 @@ export default async function Staff() {
   const me = await requireStaff('staff.manage');
   const rows = await withAdmin((tx) => tx`select u.*, (select max(last_seen_at) from staff_sessions s where s.staff_id = u.id) as last_seen,
       (select count(*) from admin_audit_log a where a.staff_id = u.id and a.at > now() - interval '30 days')::int as actions from staff_users u order by u.active desc, u.created_at`);
+  const pending = await withAdmin((tx) => tx`select a.created_at, a.payload, a.reason, r.name as requester, t.email as target from approvals a
+      join staff_users r on r.id = a.requested_by left join staff_users t on t.id = (a.payload->>'staffId')::uuid
+      where a.action = 'staff.roles' and a.status = 'pending' order by a.created_at desc`);
   const reviewDue = (x: Record<string, unknown>) => Date.now() - new Date(x.roles_confirmed_at as string).getTime() > 90 * 86400_000;
   return (
     <Page title="Staff" sub={`Roles: ${StaffRole.join(', ')}`}>
@@ -27,8 +30,18 @@ export default async function Staff() {
       ])} />
       <Section title="Invite staff">
         <div className="ak-panel" style={{ maxWidth: 520 }}>
-          <ActForm action="staff.create" submit="🔐 Create" fields={[{ name: 'email', label: 'Email', required: true }, { name: 'name', label: 'Name', required: true }, { name: 'password', label: 'Temporary password (≥ 14 chars)', required: true }, { name: 'roles', label: 'Roles (comma separated)', required: true, placeholder: 'SUPPORT' }]} />
+          <p className="ak-small ak-muted">The account is created without roles; the roles you request take effect once another SUPER_ADMIN approves them (four-eyes).</p>
+          <ActForm action="staff.create" submit="🔐 Create" fields={[
+            { name: 'email', label: 'Email', required: true },
+            { name: 'name', label: 'Name', required: true },
+            { name: 'password', label: 'Temporary password (≥ 14 chars)', required: true },
+            { name: 'roles', label: 'Roles (comma separated)', required: true, placeholder: 'SUPPORT' },
+            { name: 'reason', label: 'Reason (why they need these roles)', type: 'textarea', required: true },
+          ]} />
         </div>
+      </Section>
+      <Section title="Pending role approvals">
+        <Table head={['Requested', 'Staff', 'Roles', 'By', 'Reason']} rows={pending.map((p) => [d(p.created_at), (p.target as string) ?? String((p.payload as { staffId: string }).staffId).slice(0, 8), ((p.payload as { roles: string[] }).roles ?? []).join(', '), p.requester as string, p.reason as string])} empty="None — decide requests in Approvals." />
       </Section>
     </Page>
   );

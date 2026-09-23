@@ -17,7 +17,7 @@ export default async function AccessLog({ params }: { params: Promise<{ slug: st
   return (
     <div className="ak-stack" style={{ ['--stack' as string]: '32px' }}>
       <section>
-        <p className="ak-label">Arkiv staff access</p>
+        <h2 className="ak-label">Arkiv staff access</h2>
         {d.staff.length === 0 ? (
           <p className="ak-small ak-muted">No Arkiv staff member has accessed this workspace. Support access requires a reason, is time-limited, and always appears here.</p>
         ) : (
@@ -37,7 +37,7 @@ export default async function AccessLog({ params }: { params: Promise<{ slug: st
         )}
       </section>
       <section>
-        <p className="ak-label">Security events</p>
+        <h2 className="ak-label">Security events</h2>
         <table className="ak-table ak-dense">
           <thead><tr><th>When</th><th>Event</th><th>By</th></tr></thead>
           <tbody>

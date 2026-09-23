@@ -19,6 +19,7 @@ import {
 } from '@arkiv/core';
 import type Stripe from 'stripe';
 import { billingGateway, priceIdFor, type MockStripe } from './gateway';
+import { applySucceededRefund, recordChargeRefund } from './refunds';
 
 /**
  * Billing (plan 02 §6 B1–B12, plan 04 §3 legal line):
@@ -63,11 +64,12 @@ export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projec
   const session = await billingGateway().createCheckout({
     mode: 'payment',
     customerId,
-    priceId: quote.kind === 'standalone' ? priceIdFor('STANDALONE') : null,
+    // The offer definition's Stripe Price when it has one (plan 05 §6); env price for the standard $29 otherwise.
+    priceId: quote.stripePriceId ?? (quote.kind === 'standalone' ? priceIdFor('STANDALONE') : null),
     amountCents: microsToCents(quote.priceMicros),
     productName: `Your ${p.name} ad · 15s`,
     description: 'One finished 15-second ad · TikTok, Reels and Feed exports · product and claims checked · one-time, no subscription',
-    metadata: { workspace_id: ctx.workspaceId, project_id: projectId, kind, offer_id: quote.offerId ?? '' },
+    metadata: { workspace_id: ctx.workspaceId, project_id: projectId, kind, offer_id: quote.offerId ?? '', offer_code: quote.definitionCode ?? '' },
     expiresAt: checkoutSessionExpiry(quote),
     returnUrl: `${env().APP_URL}/produce/${projectId}?session={CHECKOUT_SESSION_ID}`,
     idempotencyKey: idem,
@@ -251,14 +253,10 @@ export async function processStripeEvent(eventId: string): Promise<'processed' |
           return 'processed';
         }
         case 'charge.refunded': {
+          // Refunds made from the console are already on file; anything else (Stripe dashboard) is recorded
+          // here with the same bookkeeping: mirror row, partial amounts, CREDIT_REFUNDED (B9 credit withdrawal).
           const ch = obj as unknown as Stripe.Charge;
-          const pi = (ch.payment_intent as string) ?? '';
-          const [pu] = await tx`update purchases set status = 'refunded', refunded_at = now() where stripe_payment_intent_id = ${pi} and status = 'paid' returning id, kind, project_id`;
-          if (pu) {
-            // B9: entitlement returned only if it was never consumed; delivered files stay accessible.
-            const [consumed] = await tx`select 1 from ledger_entries where project_id = ${pu.project_id} and type = 'CREDIT_CONSUMED'`;
-            if (!consumed) await append(tx, ctx, { type: 'CREDIT_ADJUSTED', unit: pu.kind as 'taste', amount: -1, projectId: pu.project_id as string, idempotencyKey: `refund:${ch.id}`, reason: 'Refunded before use' });
-          }
+          await recordChargeRefund(tx, ctx, { id: ch.id, payment_intent: (ch.payment_intent as string) ?? null, amount_refunded: ch.amount_refunded ?? null, refunded: ch.refunded ?? null });
           return 'processed';
         }
         case 'charge.dispute.created':
@@ -302,9 +300,14 @@ async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkou
   const [otherPaid] = await tx`select id from purchases where project_id = ${pu.project_id} and status = 'paid' and id <> ${pu.id}`;
   await tx`update purchases set status = 'paid', paid_at = now(), stripe_payment_intent_id = ${(cs.payment_intent as string) ?? null} where id = ${pu.id}`;
   if (otherPaid) {
-    // B4: two tabs both paid — refund the second automatically.
-    if (cs.payment_intent) await billingGateway().refund(cs.payment_intent as string);
-    await emit(tx, ctx, 'CREDIT_REFUNDED', { type: 'project', id: pu.project_id as string }, { reason: 'duplicate payment auto-refunded' });
+    // B4: two tabs both paid — refund the second automatically (idempotent on the session) and record it.
+    if (cs.payment_intent) {
+      const refundId = await billingGateway().refund(cs.payment_intent as string, undefined, `dup:${cs.id}`);
+      const [row] = await tx`insert into refunds (workspace_id, purchase_id, payment_intent_id, amount_micros, reason_code, customer_note, idempotency_key)
+                             values (${ctx.workspaceId}, ${pu.id}, ${cs.payment_intent as string}, ${pu.amount_micros}, 'duplicate', 'Second payment for the same ad', ${`dup:${cs.id}`})
+                             on conflict (workspace_id, idempotency_key) do nothing returning id`;
+      if (row) await applySucceededRefund(tx, ctx, row.id as string, refundId);
+    }
     return 'processed';
   }
   const unit = pu.kind as 'taste' | 'standalone';
@@ -400,7 +403,7 @@ export async function completeMockCheckout(sessionId: string): Promise<string[]>
           const now = Math.floor(Date.now() / 1000);
           return [
             evt('checkout.session.completed', { id: s.id, mode: 'subscription', customer: s.customerId, metadata: s.metadata, subscription: subId }),
-            evt('invoice.paid', { id: `in_mock_${s.id.slice(-8)}`, customer: s.customerId, subscription: subId, billing_reason: 'subscription_create', lines: { data: [{ period: { start: now, end: now + 30 * 86400 } }] } }),
+            evt('invoice.paid', { id: `in_mock_${s.id.slice(-8)}`, customer: s.customerId, subscription: subId, billing_reason: 'subscription_create', amount_paid: s.amountCents ?? 0, payment_intent: `pi_mock_in_${s.id.slice(-8)}`, lines: { data: [{ period: { start: now, end: now + 30 * 86400 } }] } }),
           ];
         })();
   for (const e of events) {

@@ -45,8 +45,12 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
                         values (${opts.workspaceId ?? null}, ${email}, ${template}, ${built.stream}, ${opts.idempotencyKey}, 'queued')
                         on conflict (idempotency_key) do nothing returning id`;
     if (!ins.length) return { status: 'duplicate' };
-    const html = await render(built.element as never);
-    const text = await render(built.element as never, { plainText: true });
+    // Footer support address is a platform setting (plan 05 §20); omitted when unset.
+    const [supportRow] = await t`select value from platform_settings where key = 'support.email'`;
+    const supportEmail = typeof supportRow?.value === 'string' && supportRow.value.includes('@') ? supportRow.value : null;
+    const element = build(template, data, { supportEmail }).element;
+    const html = await render(element as never);
+    const text = await render(element as never, { plainText: true });
     if (!env().RESEND_API_KEY) {
       devOutbox.push({ to: email, template, subject: built.subject, html, data });
       if (devOutbox.length > 200) devOutbox.shift();

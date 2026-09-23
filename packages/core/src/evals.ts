@@ -38,6 +38,17 @@ export const GOLDEN: Record<string, GoldenCase[]> = {
   ],
 };
 
+/**
+ * The golden dataset that gates changes to a route's task (plan 05 §10: "changing a route requires an eval
+ * run that passed on the golden set"). Tasks whose output is creative copy are gated by the compliance scan;
+ * a task no dataset covers can't be changed until one is added.
+ */
+export function evalDatasetFor(task: string): string | null {
+  if (GOLDEN[task]) return task;
+  if (task.startsWith('compliance') || task.startsWith('creative_director') || task === 'qa.implied_claims') return 'compliance.scan';
+  return null;
+}
+
 export interface EvalResult {
   dataset: string;
   cases: number;

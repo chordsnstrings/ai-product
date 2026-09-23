@@ -34,13 +34,16 @@ export default async function Integrations({ params, searchParams }: { params: P
           <section key={p} className="ak-panel">
             <div className="ak-between" style={{ flexWrap: 'wrap', gap: 12 }}>
               <div>
-                <p className="ak-h2" style={{ margin: 0 }}>{info.name}</p>
+                <h2 className="ak-h2" style={{ margin: 0 }}>{info.name}</h2>
                 <p className="ak-small ak-muted" style={{ maxWidth: 520 }}>{info.what}</p>
               </div>
               {canManage ? (
                 p === 'shopify' ? (
-                  <form action={`/api/w/${slug}/connect/shopify`} method="get" className="ak-row">
-                    <input className="ak-input" name="shop" placeholder="your-store.myshopify.com" required aria-label="Shopify store domain" />
+                  <form action={`/api/w/${slug}/connect/shopify`} method="get" className="ak-row" style={{ alignItems: 'end' }}>
+                    <label className="ak-field">
+                      <span className="ak-label">Shopify store domain</span>
+                      <input className="ak-input" name="shop" placeholder="your-store.myshopify.com" required />
+                    </label>
                     <button className="ak-btn" type="submit" disabled={!info.configured()}>Connect</button>
                   </form>
                 ) : info.configured() ? (

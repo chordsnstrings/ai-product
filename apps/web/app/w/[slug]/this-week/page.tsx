@@ -110,7 +110,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
 
       {data.jobs.length ? (
         <section className="ak-section">
-          <p className="ak-label">In progress</p>
+          <h2 className="ak-label">In progress</h2>
           {data.jobs.map((j) => (
             <Link key={j.id as string} className="ak-index-row" href={j.experiment_id ? `/w/${slug}/studio/${j.experiment_id}` : j.state === 'STORYBOARD_READY' ? `/storyboard/${j.id}` : `/produce/${j.id}`}>
               <span>{j.name as string}</span>
@@ -121,7 +121,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
       ) : null}
 
       <section className="ak-section">
-        <p className="ak-label">What changed</p>
+        <h2 className="ak-label">What changed</h2>
         {data.changes.length === 0 ? (
           <p className="ak-muted ak-small">Nothing significant in the last two weeks. We only list changes that should affect what you test.</p>
         ) : (

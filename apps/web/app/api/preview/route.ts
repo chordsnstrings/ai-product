@@ -1,5 +1,5 @@
 import { withTenant, globalTx } from '@arkiv/db';
-import { createProvisionalWorkspace, hit, ingestBytes, recordFunnel, resolveProvisional, startPreview, type TenantContext } from '@arkiv/core';
+import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, resolveProvisional, startPreview, type TenantContext } from '@arkiv/core';
 import { DomainError, env } from '@arkiv/shared';
 import { clientIp, json, route } from '@/lib/http';
 import { currentUser, provisionalToken, setProvisionalCookie, visitorId } from '@/lib/session';
@@ -34,7 +34,7 @@ export const POST = route(async (req) => {
   } else {
     let wsId = await resolveProvisional(await provisionalToken());
     if (!wsId) {
-      if (ip) await hit(`provisional:ip:${ip.split('.').slice(0, 3).join('.')}`, 15, 3600);
+      if (ip) await hit(`provisional:ip:${ip.split('.').slice(0, 3).join('.')}`, 15, 3600, undefined, { allow: [allowKey.ip(ip)] });
       const p = await createProvisionalWorkspace();
       await setProvisionalCookie(p.token);
       wsId = p.workspaceId;
@@ -47,6 +47,6 @@ export const POST = route(async (req) => {
     const a = await withTenant(ctx.workspaceId, async (tx) => ingestBytes(tx, ctx, Buffer.from(await f.arrayBuffer()), 'product_photo', null, { filename: f.name }));
     assetIds.push(a.id);
   }
-  const r = await withTenant(ctx.workspaceId, (tx) => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid }));
+  const r = await withTenant(ctx.workspaceId, (tx) => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip }));
   return json({ projectId: r.projectId, skuId: r.skuId, catalogueNo: r.catalogueNo });
 });

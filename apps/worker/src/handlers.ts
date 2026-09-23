@@ -1,5 +1,5 @@
 import { withSystem, withTenant } from '@arkiv/db';
-import { DomainError, PLANS, type PlanCode } from '@arkiv/shared';
+import { DomainError, type PlanCode } from '@arkiv/shared';
 import {
   analyzeProduct,
   buildExport,
@@ -17,17 +17,20 @@ import {
   syncIntegration,
   weekOf,
   enqueue,
+  holdDecision,
+  holdJob,
+  planQuota,
   type TenantContext,
 } from '@arkiv/core';
-import { jobContext, paused } from './context';
+import { jobContext } from './context';
 import { sendQueuedEmail } from './emails';
 
 export type Handler = (ctx: TenantContext, data: Record<string, unknown>, jobId: string) => Promise<unknown>;
 
 /** Per-workspace render concurrency (plan 02 §3 layer 5): lease or re-queue with a truthful delay. */
 async function withRenderLease<T>(ctx: TenantContext, jobId: string, fn: () => Promise<T>): Promise<T | 'requeued'> {
-  const limit = ctx.planCode ? PLANS[ctx.planCode as PlanCode].renderConcurrency : 1;
   const acquired = await withTenant(ctx.workspaceId, async (tx) => {
+    const limit = (await planQuota(tx, (ctx.planCode as PlanCode | null) ?? null)).renderConcurrency;
     await tx`delete from workspace_leases where resource = 'render' and expires_at < now()`;
     await tx`select pg_advisory_xact_lock(hashtext(${'lease:' + ctx.workspaceId}))`;
     const [n] = await tx`select count(*)::int as n from workspace_leases where resource = 'render'`;
@@ -73,8 +76,15 @@ export const handlers: Record<string, Handler> = {
     if (n) await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week }, { singletonKey: `brief:${week}` }));
     return n;
   },
-  [Queues.exportWorkspace]: async (ctx) => {
+  [Queues.exportWorkspace]: async (ctx, _d, jobId) => {
+    // Runs even while the workspace is held (staff export on legal request), but a suspended tenant's link is
+    // parked with the other deliveries; a fresh signed URL is minted from the asset when it is released.
     const r = await buildExport(ctx);
+    const email = { template: 'export_ready', assetId: r.assetId, actor: ctx.actor };
+    if (holdDecision(ctx.workspaceState, Queues.sendEmail, email) === 'hold') {
+      await withTenant(ctx.workspaceId, (tx) => holdJob(tx, ctx.workspaceId, Queues.sendEmail, email, `export-email:${jobId}`, `workspace ${ctx.workspaceState}`));
+      return { assetId: r.assetId, delivery: 'held' };
+    }
     await sendQueuedEmail(ctx, { template: 'export_ready', url: r.url }, `export:${r.assetId}`);
     return r.assetId;
   },
@@ -95,7 +105,14 @@ export async function runJob(queue: string, data: Record<string, unknown>, jobId
     if (e instanceof DomainError) return { skipped: e.message };
     throw e;
   }
-  if (paused(ctx) && queue !== Queues.sendEmail) return { skipped: `workspace ${ctx.workspaceState}` };
+  // Held workspaces pause jobs instead of dropping them (plan 05 §2.3): the job is parked and re-enqueued when
+  // the hold ends. Deliveries of finished work wait the same way; purged workspaces drop everything.
+  const decision = holdDecision(ctx.workspaceState, queue, data);
+  if (decision === 'skip') return { skipped: `workspace ${ctx.workspaceState}` };
+  if (decision === 'hold') {
+    const parked = await withTenant(ctx.workspaceId, (tx) => holdJob(tx, ctx.workspaceId, queue, data, jobId, `workspace ${ctx.workspaceState}`));
+    return { held: `workspace ${ctx.workspaceState}`, parked };
+  }
   try {
     return await h(ctx, data, jobId);
   } catch (e) {

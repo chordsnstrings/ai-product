@@ -1,8 +1,16 @@
 import Link from 'next/link';
 import type { ReactNode } from 'react';
+import { globalTx } from '@arkiv/db';
+import { setting } from '@arkiv/core';
+
+/** Support address and legal links are platform settings (plan 05 §20), editable in the staff console. */
+async function footerSettings() {
+  return globalTx(async (tx) => ({ support: await setting(tx, 'support.email'), terms: await setting(tx, 'legal.terms_url'), privacy: await setting(tx, 'legal.privacy_url') }));
+}
 
 /** Marketing chrome: no nav menu (single path, plan 04 L1); light theme only (design §7). */
-export function MarketingShell({ children, loggedIn }: { children: ReactNode; loggedIn: boolean }) {
+export async function MarketingShell({ children, loggedIn }: { children: ReactNode; loggedIn: boolean }) {
+  const f = await footerSettings();
   return (
     <div data-theme="light" style={{ background: 'var(--paper)', minHeight: '100vh' }}>
       <header className="ak-wrap ak-between" style={{ paddingTop: 20, paddingBottom: 20 }}>
@@ -16,9 +24,9 @@ export function MarketingShell({ children, loggedIn }: { children: ReactNode; lo
           <span>Arkiv · Creative testing for skincare brands</span>
           <span className="ak-row">
             <Link href="/pricing">Pricing</Link>
-            <Link href="/legal/terms">Terms</Link>
-            <Link href="/legal/privacy">Privacy</Link>
-            <a href="mailto:support@arkiv.app">Contact</a>
+            <Link href={f.terms}>Terms</Link>
+            <Link href={f.privacy}>Privacy</Link>
+            <a href={`mailto:${f.support}`}>Contact</a>
           </span>
         </div>
       </footer>

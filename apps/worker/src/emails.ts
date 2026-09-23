@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
 import { env, formatUsd, PLANS, type PlanCode } from '@arkiv/shared';
 import { sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import type { TenantContext } from '@arkiv/core';
+import { assetUrl, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -65,9 +65,12 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
     case 'integration_disconnected':
       await send('integration_disconnected', { provider: String(data.provider), url: `${base}/settings/integrations`, workspaceName: w!.name });
       return;
-    case 'export_ready':
-      await send('export_ready', { url: String(data.url), workspaceName: w!.name }, await recipients(ws, ['OWNER']));
+    case 'export_ready': {
+      // A delivery released after a hold carries the asset, not a (long expired) signed link.
+      const url = data.assetId ? await withTenant(ws, (tx) => assetUrl(tx, data.assetId as string, 24 * 3600, 'arkiv-export.zip')) : String(data.url);
+      await send('export_ready', { url, workspaceName: w!.name }, await recipients(ws, ['OWNER']));
       return;
+    }
     case 'invite':
       await sendEmail('invite', String(data.email), { url: `${app}/invite/${data.token}`, workspaceName: w!.name, inviterName: String(data.inviterName ?? 'A teammate'), role: String(data.role) }, { idempotencyKey: `${jobId}:invite`, workspaceId: ws });
       return;

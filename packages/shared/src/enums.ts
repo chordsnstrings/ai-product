@@ -194,3 +194,26 @@ export type Angle = (typeof Taxonomy.angle)[number];
 export type HookMechanism = (typeof Taxonomy.hook)[number];
 export type ProofMechanism = (typeof Taxonomy.proof)[number];
 export type Treatment = (typeof Taxonomy.treatment)[number];
+
+/** Churn-risk indicators (plan 05 §17, standard §10). Persisted in risk_flags.indicator; each maps to a playbook. */
+export const RiskIndicator = [
+  'idle_7d',
+  'paid_no_export',
+  'repeated_qa_rejects',
+  'ignored_recommendations',
+  'ad_account_disconnected',
+  'stockout',
+  'low_utilisation',
+  'high_utilisation_friction',
+  'no_performance_linked_test',
+  'negative_support_sentiment',
+] as const;
+export type RiskIndicator = (typeof RiskIndicator)[number];
+
+/** Privacy queue kinds (plan 05 §21). */
+export const DataRequestKind = ['access', 'export', 'delete_workspace', 'delete_user', 'delete_person_in_reviews'] as const;
+export type DataRequestKind = (typeof DataRequestKind)[number];
+
+/** Refund reason codes (plan 05 §7 refund tool). */
+export const RefundReason = ['requested_by_customer', 'duplicate', 'service_failure', 'goodwill', 'fraudulent', 'other'] as const;
+export type RefundReason = (typeof RefundReason)[number];

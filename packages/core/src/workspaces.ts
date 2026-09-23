@@ -17,6 +17,8 @@ import {
 import { assertCan, roleRank } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
+import { JOB_HOLD_STATES, releaseHeldJobs } from './holds';
+import { planQuota } from './settings';
 import { storage } from './storage';
 
 export const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -41,19 +43,24 @@ export async function transitionWorkspace(
   to: WorkspaceState,
   reason: string,
 ): Promise<WorkspaceState> {
-  const [w] = await tx`select state, state_before_hold from workspaces where id = ${ctx.workspaceId} for update`;
+  const [w] = await tx`select state, state_before_hold, state_before_purge from workspaces where id = ${ctx.workspaceId} for update`;
   if (!w) throw notFound('Workspace not found');
   const from = w.state as WorkspaceState;
   if (from === to) return from;
   const liftingHold = (from === 'SUSPENDED' || from === 'LOCKED') && to === (w.state_before_hold as WorkspaceState);
-  if (!liftingHold && !TRANSITIONS[from].includes(to)) throw conflict(`Cannot move workspace from ${from} to ${to}`);
+  // Cancelling a scheduled purge returns the workspace to where it was (e.g. a paying tenant stays paying).
+  const cancellingPurge = from === 'PURGE_SCHEDULED' && !!w.state_before_purge && to === (w.state_before_purge as WorkspaceState);
+  if (!liftingHold && !cancellingPurge && !TRANSITIONS[from].includes(to)) throw conflict(`Cannot move workspace from ${from} to ${to}`);
   const holding = to === 'SUSPENDED' || to === 'LOCKED';
   await tx`
     update workspaces set state = ${to}, state_reason = ${reason},
       state_before_hold = ${holding ? from : null},
+      state_before_purge = ${to === 'PURGE_SCHEDULED' ? from : null},
       cancelled_at = case when ${to} = 'CANCELLED' then now() else cancelled_at end
     where id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'WORKSPACE_STATE_CHANGED', { type: 'workspace', id: ctx.workspaceId }, { from, to, reason });
+  // Jobs parked while the workspace was held run again once the hold ends (plan 05 §2.3).
+  if (JOB_HOLD_STATES.has(from) && !JOB_HOLD_STATES.has(to) && to !== 'PURGED') await releaseHeldJobs(tx, ctx.workspaceId);
   return to;
 }
 
@@ -178,6 +185,7 @@ export async function moveProvisionalSkus(fromWorkspaceId: string, toWorkspaceId
 
 // ───────────── Limits ─────────────
 
+/** Code defaults only; runtime checks use planQuota (settings-aware, plan 05 §20). */
 export function limitsFor(plan: PlanCode | null | undefined) {
   if (!plan) return { ...FREE_LIMITS, creativeTestsPerMonth: 0 };
   const p = PLANS[plan];
@@ -195,7 +203,7 @@ export async function inviteMember(tx: Tx, ctx: TenantContext, email: string, ro
   const normalized = email.trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized)) throw invalid('Enter a valid email address');
   const [w] = await tx`select plan_code from workspaces where id = ${ctx.workspaceId}`;
-  const lim = limitsFor(w?.plan_code as PlanCode | null);
+  const lim = await planQuota(tx, w?.plan_code as PlanCode | null);
   const [c] = await tx`select (select count(*) from memberships) + (select count(*) from invites where accepted_at is null
                          and revoked_at is null and expires_at > now()) as n`;
   if (Number(c!.n) >= lim.members) throw new DomainError('PAYMENT_REQUIRED', `Your plan includes ${lim.members} members. Upgrade to invite more.`);

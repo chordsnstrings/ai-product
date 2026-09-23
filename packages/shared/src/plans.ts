@@ -75,6 +75,8 @@ export const OFFER_RULES = {
 export const PROVISIONAL = {
   TTL_DAYS: 7,
   MAX_SKUS: 3,
+  /** Upper bound for staff-allowlisted evaluators (plan 05 §15): still bounded, COGS caps still apply per SKU. */
+  ALLOWLISTED_MAX_SKUS: 25,
   MAX_CONCEPT_REGENERATIONS: 1,
 } as const;
 

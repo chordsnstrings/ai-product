@@ -11,7 +11,16 @@ const serif = "'Instrument Serif', Georgia, 'Times New Roman', serif";
 const sans = "'Inter Tight', Inter, Helvetica, Arial, sans-serif";
 const mono = "'IBM Plex Mono', Menlo, Consolas, monospace";
 
-function Layout({ preview, label, children, footer }: { preview: string; label: string; children: ReactNode; footer?: ReactNode }) {
+interface LayoutProps {
+  preview: string;
+  label: string;
+  children: ReactNode;
+  footer?: ReactNode;
+  /** Support address (platform setting, plan 05 §20); omitted when unset. */
+  support?: string | null;
+}
+
+function Layout({ preview, label, children, footer, support }: LayoutProps) {
   return (
     <Html lang="en">
       <Head />
@@ -24,6 +33,7 @@ function Layout({ preview, label, children, footer }: { preview: string; label: 
           <Hr style={{ borderColor: C.rule, margin: '28px 0 12px' }} />
           <Text style={{ fontSize: 12, color: C.stone, lineHeight: '18px', margin: 0 }}>
             {footer ?? 'Arkiv · Creative testing for skincare brands.'}
+            {support ? <> Questions? Write to {support}.</> : null}
           </Text>
         </Container>
       </Body>
@@ -58,6 +68,8 @@ export interface TemplateMap {
   storyboard_saved: { productName: string; url: string; standalonePrice: string };
   new_concept: { productName: string; url: string; hook: string };
   export_ready: { url: string; workspaceName: string };
+  refund_issued: { amount: string; description: string; note: string | null; url: string };
+  flag_expired: { flagKey: string; owner: string; expiredOn: string; url: string };
   integration_disconnected: { provider: string; url: string; workspaceName: string };
   claim_review_result: { claim: string; outcome: string; url: string };
   cancellation_confirmed: { planName: string; endsOn: string; exportUrl: string };
@@ -75,7 +87,13 @@ export type TemplateName = keyof TemplateMap;
 
 type Built = { subject: string; element: ReactNode; stream: 'transactional' | 'marketing' };
 
-export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built {
+export interface BuildOptions {
+  /** Footer support address (platform setting `support.email`). */
+  supportEmail?: string | null;
+}
+
+export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: BuildOptions = {}): Built {
+  const L = (p: Omit<LayoutProps, 'support'>) => <Layout {...p} support={opts.supportEmail ?? null} />;
   const x = d as never as Record<string, unknown> & TemplateMap[TemplateName];
   switch (name) {
     case 'magic_link': {
@@ -85,13 +103,13 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: title,
         stream: 'transactional',
         element: (
-          <Layout preview={`${title}. This link works for 15 minutes.`} label="Sign in">
+          <L preview={`${title}. This link works for 15 minutes.`} label="Sign in">
             <H>{title}</H>
             <P>{m.purpose === 'claim' ? 'Your storyboard is being prepared. Tap below to save your work and continue.' : 'Tap the button to continue. This link works once, for 15 minutes.'}</P>
             <Cta href={m.url}>{m.purpose === 'claim' ? 'Save and continue' : 'Continue'}</Cta>
             <P>{' '}</P>
             <P>If you didn’t ask for this, you can ignore this email.</P>
-          </Layout>
+          </L>
         ),
       };
     }
@@ -101,11 +119,11 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `${m.inviterName} invited you to ${m.workspaceName}`,
         stream: 'transactional',
         element: (
-          <Layout preview={`Join ${m.workspaceName} on Arkiv`} label="Invitation">
+          <L preview={`Join ${m.workspaceName} on Arkiv`} label="Invitation">
             <H>Join {m.workspaceName}</H>
             <Meta rows={[['Invited by', m.inviterName], ['Role', m.role.toLowerCase()], ['Expires', 'in 7 days']]} />
             <Cta href={m.url}>Accept invitation</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
@@ -115,11 +133,11 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `Receipt · ${m.description}`,
         stream: 'transactional',
         element: (
-          <Layout preview={`${m.amount} · ${m.description}`} label="Receipt">
+          <L preview={`${m.amount} · ${m.description}`} label="Receipt">
             <H>Thank you</H>
             <Meta rows={[['Item', m.description], ['Product', m.productName], ['Total', m.amount], ['Billing', 'One-time · no subscription']]} />
             <Cta href={m.url}>Follow production</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
@@ -129,11 +147,11 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `Your ${m.productName} ad is ready`,
         stream: 'transactional',
         element: (
-          <Layout preview="Product accuracy and claims checked. Exports for TikTok, Reels and Feed." label={`Archived · ${m.catalogueNo}`}>
+          <L preview="Product accuracy and claims checked. Exports for TikTok, Reels and Feed." label={`Archived · ${m.catalogueNo}`}>
             <H>Your ad is ready</H>
             <P>We checked product accuracy and every claim before it reached you. Exports are sized for TikTok, Reels and Feed.</P>
             <Cta href={m.url} accent>Watch your ad</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
@@ -143,11 +161,11 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `Your intro price for ${m.productName} ends at ${m.endsAt}`,
         stream: 'transactional',
         element: (
-          <Layout preview={`${m.price} until ${m.endsAt}, then ${m.regular}.`} label="Storyboard saved">
+          <L preview={`${m.price} until ${m.endsAt}, then ${m.regular}.`} label="Storyboard saved">
             <H>Your storyboard is saved</H>
             <Meta rows={[['Product', m.productName], ['Intro price', `${m.price} until ${m.endsAt}`], ['After that', `${m.regular} (standard price)`]]} />
             <Cta href={m.url} accent>Produce my ad</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
@@ -157,11 +175,11 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `${m.productName} · your storyboard is saved`,
         stream: 'marketing',
         element: (
-          <Layout preview="Pick up where you left off." label="Your archive">
+          <L preview="Pick up where you left off." label="Your archive">
             <H>Pick up where you left off</H>
             <P>Your storyboard for {m.productName} is saved. You can produce it any time for {m.standalonePrice}.</P>
             <Cta href={m.url}>Open storyboard</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
@@ -171,45 +189,75 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `A new test idea for ${m.productName}`,
         stream: 'marketing',
         element: (
-          <Layout preview={m.hook} label="New idea">
+          <L preview={m.hook} label="New idea">
             <H>“{m.hook}”</H>
             <P>We drafted another direction for {m.productName}, based on what your customers say.</P>
             <Cta href={m.url}>See the idea</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
     case 'export_ready': {
       const m = d as TemplateMap['export_ready'];
-      return { subject: `Your ${m.workspaceName} export is ready`, stream: 'transactional', element: (<Layout preview="Download link valid for 24 hours." label="Export"><H>Your export is ready</H><P>This link works for 24 hours.</P><Cta href={m.url}>Download export</Cta></Layout>) };
+      return { subject: `Your ${m.workspaceName} export is ready`, stream: 'transactional', element: (<L preview="Download link valid for 24 hours." label="Export"><H>Your export is ready</H><P>This link works for 24 hours.</P><Cta href={m.url}>Download export</Cta></L>) };
+    }
+    case 'refund_issued': {
+      const m = d as TemplateMap['refund_issued'];
+      return {
+        subject: `Refund issued · ${m.amount}`,
+        stream: 'transactional',
+        element: (
+          <L preview={`${m.amount} is on its way back to your card.`} label="Refund">
+            <H>Your refund is on its way</H>
+            <Meta rows={[['Amount', m.amount], ['For', m.description], ['Arrives', 'in 5–10 business days, depending on your bank']]} />
+            {m.note ? <P>{m.note}</P> : null}
+            <Cta href={m.url}>View billing</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'flag_expired': {
+      const m = d as TemplateMap['flag_expired'];
+      return {
+        subject: `Feature flag past expiry: ${m.flagKey}`,
+        stream: 'transactional',
+        element: (
+          <L preview={`${m.flagKey} expired on ${m.expiredOn}. It now evaluates as off.`} label="Staff · Feature flags">
+            <H>A flag you own has expired</H>
+            <Meta rows={[['Flag', m.flagKey], ['Owner', m.owner], ['Expired', m.expiredOn]]} />
+            <P>Expired flags evaluate as off. Remove the flag from code, or extend its expiry if it is still needed.</P>
+            <Cta href={m.url}>Open flags</Cta>
+          </L>
+        ),
+      };
     }
     case 'integration_disconnected': {
       const m = d as TemplateMap['integration_disconnected'];
-      return { subject: `${m.provider} disconnected from ${m.workspaceName}`, stream: 'transactional', element: (<Layout preview="Recommendations are now context-limited until you reconnect." label="Integration"><H>{m.provider} disconnected</H><P>Until you reconnect, recommendations use your product and customer language only — not performance.</P><Cta href={m.url}>Reconnect</Cta></Layout>) };
+      return { subject: `${m.provider} disconnected from ${m.workspaceName}`, stream: 'transactional', element: (<L preview="Recommendations are now context-limited until you reconnect." label="Integration"><H>{m.provider} disconnected</H><P>Until you reconnect, recommendations use your product and customer language only — not performance.</P><Cta href={m.url}>Reconnect</Cta></L>) };
     }
     case 'claim_review_result': {
       const m = d as TemplateMap['claim_review_result'];
-      return { subject: `Claim review: ${m.outcome}`, stream: 'transactional', element: (<Layout preview={m.claim} label="Claims Vault"><H>{m.outcome}</H><Meta rows={[['Claim', m.claim], ['Outcome', m.outcome]]} /><Cta href={m.url}>Open Claims Vault</Cta></Layout>) };
+      return { subject: `Claim review: ${m.outcome}`, stream: 'transactional', element: (<L preview={m.claim} label="Claims Vault"><H>{m.outcome}</H><Meta rows={[['Claim', m.claim], ['Outcome', m.outcome]]} /><Cta href={m.url}>Open Claims Vault</Cta></L>) };
     }
     case 'cancellation_confirmed': {
       const m = d as TemplateMap['cancellation_confirmed'];
-      return { subject: 'Your plan is cancelled', stream: 'transactional', element: (<Layout preview={`Access until ${m.endsOn}.`} label="Billing"><H>Cancelled</H><Meta rows={[['Plan', m.planName], ['Access until', m.endsOn], ['Your archive', 'Kept for 90 days, then deleted']]} /><Cta href={m.exportUrl}>Export your data</Cta></Layout>) };
+      return { subject: 'Your plan is cancelled', stream: 'transactional', element: (<L preview={`Access until ${m.endsOn}.`} label="Billing"><H>Cancelled</H><Meta rows={[['Plan', m.planName], ['Access until', m.endsOn], ['Your archive', 'Kept for 90 days, then deleted']]} /><Cta href={m.exportUrl}>Export your data</Cta></L>) };
     }
     case 'subscription_started': {
       const m = d as TemplateMap['subscription_started'];
-      return { subject: `Welcome to ${m.planName}`, stream: 'transactional', element: (<Layout preview={`${m.tests} Creative Tests a month.`} label="Billing"><H>{m.planName} is active</H><Meta rows={[['Creative Tests', `${m.tests} per month`], ['Price', `${m.price} per month`], ['Renews', m.renewsOn], ['Cancel', 'Online anytime in Settings → Billing']]} /><Cta href={m.url}>See this week’s tests</Cta></Layout>) };
+      return { subject: `Welcome to ${m.planName}`, stream: 'transactional', element: (<L preview={`${m.tests} Creative Tests a month.`} label="Billing"><H>{m.planName} is active</H><Meta rows={[['Creative Tests', `${m.tests} per month`], ['Price', `${m.price} per month`], ['Renews', m.renewsOn], ['Cancel', 'Online anytime in Settings → Billing']]} /><Cta href={m.url}>See this week’s tests</Cta></L>) };
     }
     case 'price_change_notice': {
       const m = d as TemplateMap['price_change_notice'];
-      return { subject: `Upcoming price change for ${m.planName}`, stream: 'transactional', element: (<Layout preview={`${m.oldPrice} → ${m.newPrice} from ${m.effectiveOn}`} label="Billing"><H>A change to your plan price</H><Meta rows={[['Plan', m.planName], ['Current', m.oldPrice], ['New', m.newPrice], ['From', m.effectiveOn]]} /><P>You can cancel online anytime before then.</P><Cta href={m.url}>Manage plan</Cta></Layout>) };
+      return { subject: `Upcoming price change for ${m.planName}`, stream: 'transactional', element: (<L preview={`${m.oldPrice} → ${m.newPrice} from ${m.effectiveOn}`} label="Billing"><H>A change to your plan price</H><Meta rows={[['Plan', m.planName], ['Current', m.oldPrice], ['New', m.newPrice], ['From', m.effectiveOn]]} /><P>You can cancel online anytime before then.</P><Cta href={m.url}>Manage plan</Cta></L>) };
     }
     case 'payment_failed': {
       const m = d as TemplateMap['payment_failed'];
-      return { subject: 'Payment didn’t go through', stream: 'transactional', element: (<Layout preview="Update your card to keep producing tests." label="Billing"><H>Payment didn’t go through</H><P>Your archive and exports are safe. New production is paused until the card is updated.</P><Cta href={m.url}>Update payment method</Cta></Layout>) };
+      return { subject: 'Payment didn’t go through', stream: 'transactional', element: (<L preview="Update your card to keep producing tests." label="Billing"><H>Payment didn’t go through</H><P>Your archive and exports are safe. New production is paused until the card is updated.</P><Cta href={m.url}>Update payment method</Cta></L>) };
     }
     case 'security_alert': {
       const m = d as TemplateMap['security_alert'];
-      return { subject: `Security: ${m.event}`, stream: 'transactional', element: (<Layout preview={m.event} label="Security"><H>{m.event}</H><Meta rows={[['When', m.when]]} /><P>If this wasn’t you, sign out other sessions now.</P><Cta href={m.url}>Review sessions</Cta></Layout>) };
+      return { subject: `Security: ${m.event}`, stream: 'transactional', element: (<L preview={m.event} label="Security"><H>{m.event}</H><Meta rows={[['When', m.when]]} /><P>If this wasn’t you, sign out other sessions now.</P><Cta href={m.url}>Review sessions</Cta></L>) };
     }
     case 'weekly_brief': {
       const m = d as TemplateMap['weekly_brief'];
@@ -217,7 +265,7 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
         subject: `${m.workspaceName} · What to test this week`,
         stream: 'transactional',
         element: (
-          <Layout preview={m.recommendations[0]?.hypothesis ?? 'Your weekly tests'} label={`Week of ${m.week}`}>
+          <L preview={m.recommendations[0]?.hypothesis ?? 'Your weekly tests'} label={`Week of ${m.week}`}>
             <H>What to test this week</H>
             {m.recommendations.map((r, i) => (
               <Text key={i} style={{ fontSize: 15, lineHeight: '22px', borderBottom: `1px solid ${C.rule}`, padding: '8px 0', margin: 0 }}>
@@ -228,21 +276,21 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
             ))}
             <P>{' '}</P>
             <Cta href={m.url}>Review and approve</Cta>
-          </Layout>
+          </L>
         ),
       };
     }
     case 'friday_summary': {
       const m = d as TemplateMap['friday_summary'];
-      return { subject: `${m.workspaceName} · This week’s learning`, stream: 'transactional', element: (<Layout preview={m.lines[0] ?? 'Weekly summary'} label="Friday summary"><H>What we learned</H>{m.lines.map((l, i) => <P key={i}>{l}</P>)}<Cta href={m.url}>Open results</Cta></Layout>) };
+      return { subject: `${m.workspaceName} · This week’s learning`, stream: 'transactional', element: (<L preview={m.lines[0] ?? 'Weekly summary'} label="Friday summary"><H>What we learned</H>{m.lines.map((l, i) => <P key={i}>{l}</P>)}<Cta href={m.url}>Open results</Cta></L>) };
     }
     case 'day30_review': {
       const m = d as TemplateMap['day30_review'];
-      return { subject: `${m.productName} · 30-day creative review`, stream: 'transactional', element: (<Layout preview={`${m.tested} tests, ${m.actionable} actionable learnings`} label="SKU review"><H>Your first 30 days</H><Meta rows={[['Tests run', String(m.tested)], ['Actionable learnings', String(m.actionable)]]} /><Cta href={m.url}>Read the review</Cta></Layout>) };
+      return { subject: `${m.productName} · 30-day creative review`, stream: 'transactional', element: (<L preview={`${m.tested} tests, ${m.actionable} actionable learnings`} label="SKU review"><H>Your first 30 days</H><Meta rows={[['Tests run', String(m.tested)], ['Actionable learnings', String(m.actionable)]]} /><Cta href={m.url}>Read the review</Cta></L>) };
     }
     case 'staff_break_glass': {
       const m = d as TemplateMap['staff_break_glass'];
-      return { subject: 'Our support team accessed your workspace', stream: 'transactional', element: (<Layout preview={m.reason} label="Access log"><H>Support access</H><Meta rows={[['Who', m.staffName], ['Why', m.reason], ['When', m.when]]} /><Cta href={m.url}>View access log</Cta></Layout>) };
+      return { subject: 'Our support team accessed your workspace', stream: 'transactional', element: (<L preview={m.reason} label="Access log"><H>Support access</H><Meta rows={[['Who', m.staffName], ['Why', m.reason], ['When', m.when]]} /><Cta href={m.url}>View access log</Cta></L>) };
     }
   }
   void x;

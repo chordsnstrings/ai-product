@@ -5,6 +5,7 @@ import type { TenantContext } from './context';
 import { append, available, providerSpendSince, type LedgerUnit } from './ledger';
 import { estimate as priceEstimate, loadRates, type CostLine, type Estimate } from './rates';
 import { isFlagOn } from './flags';
+import { setting } from './settings';
 
 /**
  * Cost Governor (§37). No creative or agent may call a billable provider directly: the Production Planner
@@ -39,14 +40,15 @@ export async function estimateCost(tx: Tx, lines: CostLine[]): Promise<Estimate>
   return priceEstimate(await loadRates(tx), lines);
 }
 
-function ceilingFor(purpose: Purpose): Micros | null {
+async function ceilingFor(tx: Tx, purpose: Purpose): Promise<Micros | null> {
   switch (purpose) {
     case 'creative_test':
     case 'taste':
     case 'standalone':
       return COST_LIMITS.CREATIVE_TEST_CEILING;
     case 'free_preview':
-      return COST_LIMITS.FREE_PREVIEW_CAP;
+      // Staff-tunable (plan 05 §20 "free-preview COGS cap"); the standard's cap is the fallback.
+      return setting(tx, 'free_preview.cogs_cap_micros');
     case 'storyboard':
       return COST_LIMITS.STORYBOARD_CAP;
     default:
@@ -55,7 +57,10 @@ function ceilingFor(purpose: Purpose): Micros | null {
 }
 
 export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInput): Promise<Authorization> {
-  // Idempotent: a retried request returns the same reservation (no second hold).
+  // Idempotent: a retried request returns the same reservation (no second hold). Concurrent requests for the
+  // same key (duplicate job delivery) serialize here, so the second sees the first's authorization instead of
+  // racing it to the entitlement check and failing with a spurious PAYMENT_REQUIRED.
+  await tx`select pg_advisory_xact_lock(hashtext(${`authorize:${ctx.workspaceId}:${input.idempotencyKey}`}))`;
   const [existing] = await tx`select id from cost_authorizations where idempotency_key = ${input.idempotencyKey}`;
   if (existing) {
     // The token is only ever returned once; a replay must not dispatch again (the project state machine guards this).
@@ -72,7 +77,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
   const est = await estimateCost(tx, input.lines);
 
   // 1. Ceiling per purpose (standard §5 V1.1 Creative Test ceiling; free preview cap per SKU).
-  const ceiling = ceilingFor(input.purpose);
+  const ceiling = await ceilingFor(tx, input.purpose);
   if (ceiling !== null) {
     let prior = 0;
     if (input.purpose === 'free_preview' && input.skuId) {
@@ -237,9 +242,16 @@ export async function recordProviderCost(
   });
 }
 
-/** Sweeper (§39): crashed workers must not strand entitlement. Runs as system across tenants. */
+/**
+ * Sweeper (§39): crashed workers must not strand entitlement. Runs as system across tenants. Suspended
+ * workspaces are skipped: their jobs are paused, and a reservation is not released until its job resolves
+ * (plan 05 §2.3).
+ */
 export async function sweepExpiredAuthorizations(tx: Tx): Promise<number> {
-  const rows = await tx`select id, workspace_id from cost_authorizations where status = 'active' and expires_at < now() limit 500`;
+  const rows = await tx`select a.id, a.workspace_id from cost_authorizations a
+                        where a.status = 'active' and a.expires_at < now()
+                          and not exists (select 1 from workspaces w where w.id = a.workspace_id and w.state = 'SUSPENDED')
+                        limit 500`;
   let n = 0;
   for (const r of rows) {
     const ctx: TenantContext = {

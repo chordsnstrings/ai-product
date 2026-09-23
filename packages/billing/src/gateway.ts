@@ -29,7 +29,8 @@ export interface BillingGateway {
   setCancelAtPeriodEnd(subscriptionId: string, cancel: boolean): Promise<void>;
   changeSubscriptionPrice(subscriptionId: string, priceId: string, prorate: boolean): Promise<void>;
   portalUrl(customerId: string, returnUrl: string): Promise<string>;
-  refund(paymentIntentId: string, amountCents?: number): Promise<string>;
+  /** Refund a payment. The idempotency key makes a retried request return the same refund (never a second one). */
+  refund(paymentIntentId: string, amountCents?: number, idempotencyKey?: string): Promise<string>;
   constructEvent(raw: string | Buffer, signature: string | null): Stripe.Event;
 }
 
@@ -77,8 +78,8 @@ class LiveStripe implements BillingGateway {
   async portalUrl(customerId: string, returnUrl: string) {
     return (await this.s.billingPortal.sessions.create({ customer: customerId, return_url: returnUrl })).url;
   }
-  async refund(paymentIntentId: string, amountCents?: number) {
-    return (await this.s.refunds.create({ payment_intent: paymentIntentId, amount: amountCents })).id;
+  async refund(paymentIntentId: string, amountCents?: number, idempotencyKey?: string) {
+    return (await this.s.refunds.create({ payment_intent: paymentIntentId, amount: amountCents }, idempotencyKey ? { idempotencyKey } : undefined)).id;
   }
   constructEvent(raw: string | Buffer, signature: string | null) {
     return this.s.webhooks.constructEvent(raw, signature ?? '', env().STRIPE_WEBHOOK_SECRET!);
@@ -96,7 +97,7 @@ export class MockStripe implements BillingGateway {
   sessions = new Map<string, MockSession>();
   cancelFlags = new Map<string, boolean>();
   priceChanges: { id: string; priceId: string; prorate: boolean }[] = [];
-  refunds: { pi: string; amount?: number }[] = [];
+  refunds: { pi: string; amount?: number; id: string; idempotencyKey?: string }[] = [];
   async createCustomer(_email: string, workspaceId: string) {
     return `cus_mock_${workspaceId.replace(/-/g, '').slice(0, 14)}`;
   }
@@ -120,9 +121,13 @@ export class MockStripe implements BillingGateway {
   async portalUrl(_c: string, returnUrl: string) {
     return `${returnUrl}?portal=mock`;
   }
-  async refund(pi: string, amount?: number) {
-    this.refunds.push({ pi, amount });
-    return `re_mock_${randomBytes(4).toString('hex')}`;
+  async refund(pi: string, amount?: number, idempotencyKey?: string) {
+    // Same semantics as Stripe's Idempotency-Key: a replay returns the original refund.
+    const prior = idempotencyKey ? this.refunds.find((r) => r.idempotencyKey === idempotencyKey) : undefined;
+    if (prior) return prior.id;
+    const id = `re_mock_${randomBytes(4).toString('hex')}`;
+    this.refunds.push({ pi, amount, id, idempotencyKey });
+    return id;
   }
   constructEvent(raw: string | Buffer): Stripe.Event {
     return JSON.parse(raw.toString()) as Stripe.Event;

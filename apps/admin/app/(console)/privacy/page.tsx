@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
+import { DataRequestKind } from '@arkiv/shared';
 import { ActForm } from '@/components/act';
 import { dt, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -22,7 +23,7 @@ export default async function Privacy() {
       })} empty="No requests." />
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
         <Section title="Log a request">
-          <div className="ak-panel"><ActForm action="privacy.create" submit="Create (due in 45 days)" fields={[{ name: 'kind', label: 'Kind', type: 'select', options: ['access', 'export', 'delete_workspace', 'delete_user', 'delete_person_in_reviews'] }, { name: 'requesterEmail', label: 'Requester email', required: true }, { name: 'workspaceId', label: 'Workspace id' }, { name: 'notes', label: 'Notes', type: 'textarea' }]} /></div>
+          <div className="ak-panel"><ActForm action="privacy.create" submit="Create (due in 45 days)" fields={[{ name: 'kind', label: 'Kind', type: 'select', options: [...DataRequestKind] }, { name: 'requesterEmail', label: 'Requester email', required: true }, { name: 'workspaceId', label: 'Workspace id' }, { name: 'notes', label: 'Notes', type: 'textarea' }]} /></div>
         </Section>
         <Section title="Erase a person’s review text (break-glass write + tenant notice)">
           <div className="ak-panel"><ActForm action="privacy.erase_reviews" submit="🔐 Erase" fields={[{ name: 'workspaceId', label: 'Workspace id', required: true }, { name: 'phrase', label: 'Distinctive phrase / name in the review', required: true }, { name: 'reason', label: 'Request reference', required: true }]} /></div>

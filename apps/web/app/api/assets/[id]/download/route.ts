@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withTenant } from '@arkiv/db';
-import { assetUrl, emit, recordFunnel } from '@arkiv/core';
+import { assetUrl, DELIVERY_HOLD_STATES, emit, recordFunnel } from '@arkiv/core';
+import { DomainError } from '@arkiv/shared';
 import { errorResponse } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
 
@@ -10,6 +11,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const { id } = await params;
     const q = new URL(req.url).searchParams;
     const a = await projectAccess(q.get('project') ?? '');
+    // Finished work isn't delivered while the workspace is suspended (plan 05 §2.3).
+    if (DELIVERY_HOLD_STATES.has(a.ctx.workspaceState)) throw new DomainError('FORBIDDEN', 'This workspace is on hold. Downloads are available again once it is restored.');
     const url = await withTenant(a.ctx.workspaceId, async (tx) => {
       const [asset] = await tx`select id, lineage from assets where id = ${id}`;
       if (!asset) throw new Error('not found');

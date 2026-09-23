@@ -1,5 +1,6 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { assetUrl, currentFacts, currentQuote, listClaims, listSteps, storyboardView, type Proposal } from '@arkiv/core';
+import { assetUrl, currentFacts, currentQuote, DELIVERY_HOLD_STATES, listClaims, listSteps, storyboardView, type Proposal } from '@arkiv/core';
+import type { WorkspaceState } from '@arkiv/shared';
 
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
 export async function projectView(workspaceId: string, projectId: string) {
@@ -19,7 +20,10 @@ export async function projectView(workspaceId: string, projectId: string) {
     const quote = await currentQuote(tx);
     const [purchase] = await tx`select status, kind, amount_micros from purchases where project_id = ${projectId} order by created_at desc limit 1`;
     let exports: { aspect: string; assetId: string; url: string; download: string }[] = [];
-    if (p.final_creative_id) {
+    // Finished work is stored but not delivered while the workspace is suspended (plan 05 §2.3).
+    const [ws] = await tx`select state from workspaces where id = ${workspaceId}`;
+    const deliveryHeld = DELIVERY_HOLD_STATES.has(ws?.state as WorkspaceState);
+    if (p.final_creative_id && !deliveryHeld) {
       const [cr] = await tx`select final_asset_ids from creatives where id = ${p.final_creative_id}`;
       const assets = await tx`select id, lineage from assets where id in ${tx((cr?.final_asset_ids as string[]) ?? ['00000000-0000-0000-0000-000000000000'])}`;
       exports = await Promise.all(
@@ -51,6 +55,7 @@ export async function projectView(workspaceId: string, projectId: string) {
         qa: p.qa_report ?? null,
         storyboardId: (p.storyboard_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
+        deliveryHeld,
       },
       sku: {
         id: p.sku_id as string,

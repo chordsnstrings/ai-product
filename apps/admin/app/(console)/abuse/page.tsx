@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
+import { PROVISIONAL } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
 import { ago, dt, money, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -25,7 +26,13 @@ export default async function Abuse() {
         <Section title="Sign-in bursts by /24 (24h)"><Table head={['Network', 'Links']} rows={d0.farms.map((f) => [<Mono key="n">{`${f.net}.0/24`}</Mono>, f.n as number])} empty="No bursts." /></Section>
         <Section title="Free-preview COGS outliers (7d)"><Table head={['Workspace', 'State', 'Spend']} rows={d0.cogsOutliers.map((c) => [<Link key="w" href={`/tenants/${c.workspace_id}`}>{c.name as string}</Link>, c.state as string, money(c.spend)])} empty="Within caps." /></Section>
       </div>
-      <Section title="Allowlist"><Table head={['Key', 'Reason', 'Until', 'By']} rows={d0.allow.map((a) => [<Mono key="k">{a.key as string}</Mono>, a.reason as string, dt(a.until), a.name as string])} empty="Empty." /></Section>
+      <Section title="Allowlist">
+        <p className="ak-small ak-muted">Allowlisted keys lift the free-preview multi-SKU limit (to a bounded {PROVISIONAL.ALLOWLISTED_MAX_SKUS} SKUs) and the per-network preview rate limit. Keys: <Mono>ip:1.2.3</Mono> (a /24), <Mono>domain:agency.com</Mono>, <Mono>ws:&lt;workspace id&gt;</Mono> — an IP, email or workspace id is normalised.</p>
+        <Table head={['Key', 'Reason', 'Until', 'By', '']} rows={d0.allow.map((a) => [<Mono key="k">{a.key as string}</Mono>, a.reason as string, dt(a.until), a.name as string, <ActButton key="r" small action="abuse.allowlist_remove" payload={{ key: a.key }} reason>Remove</ActButton>])} empty="Empty." />
+        <div className="ak-panel" style={{ maxWidth: 560, marginTop: 12 }}>
+          <ActForm action="abuse.allowlist" submit="Allowlist" fields={[{ name: 'key', label: 'Key (IP, email domain or workspace id)', required: true }, { name: 'days', label: 'Days (max 30)', type: 'number', defaultValue: 30, required: true }, { name: 'reason', label: 'Why is this legitimate?', type: 'textarea', required: true }]} />
+        </div>
+      </Section>
       <Section title="Rights & takedown cases">
         <Table head={['Opened', 'Complainant', 'Detail', 'Workspace', 'Status', '']} rows={d0.cases.map((c) => [dt(c.created_at), c.complainant as string, <span key="d" className="ak-small">{c.detail as string}</span>, c.workspace_id ? <Link key="w" href={`/tenants/${c.workspace_id}`}>{String(c.workspace_id).slice(0, 8)}</Link> : '—', c.status as string,
           ['open', 'frozen'].includes(c.status as string) ? <ActForm key="u" inline action="rights.update" extra={{ id: c.id }} submit="Update" fields={[{ name: 'status', label: 'Status', type: 'select', options: ['frozen', 'resolved_kept', 'resolved_removed'] }, { name: 'resolution', label: 'Resolution' }]} /> : ((c.resolution as string) ?? '')])} empty="No cases." />

@@ -1,10 +1,11 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
-import { activeBreakGlass, assertBreakGlass, audit, staffCan } from '@arkiv/core';
-import { PLANS, type PlanCode } from '@arkiv/shared';
-import { ActButton, ActForm } from '@/components/act';
+import { activeBreakGlass, assertBreakGlass, audit, CANCELLABLE_BEFORE_DISPATCH, RISK_PLAYBOOKS, staffCan } from '@arkiv/core';
+import { newId, PLANS, RefundReason, type PlanCode, type RiskIndicator } from '@arkiv/shared';
+import { ActButton, ActForm, type F } from '@/components/act';
 import { ago, d, dt, money, Mono, Page, Section, Table, Tabs } from '@/components/ui';
+import { estimateProjectRetry } from '@/lib/estimates';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Tenant' };
@@ -24,11 +25,13 @@ const TABS: [string, string][] = [
 ];
 
 /** Plan 05 §2.2. Metadata tabs are role-gated; content (the SKU tree) requires an active break-glass session. */
-export default async function Tenant({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string }> }) {
+export default async function Tenant({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string; project?: string }> }) {
   const s = await requireStaff('tenant.read');
   const { id } = await params;
   if (!/^[0-9a-f-]{36}$/i.test(id)) notFound();
-  const tab = (await searchParams).tab ?? 'overview';
+  const sp = await searchParams;
+  const tab = sp.tab ?? 'overview';
+  const focusProject = sp.project && /^[0-9a-f-]{36}$/i.test(sp.project) ? sp.project : null;
   const base = `/tenants/${id}`;
   const data = await withAdmin(async (tx) => {
     const [w] = await tx`select * from workspaces where id = ${id}`;
@@ -54,12 +57,12 @@ export default async function Tenant({ params, searchParams }: { params: Promise
       {tab === 'overview' ? <Overview id={id} w={w} canFlag={staffCan(s.roles, 'tenant.flags')} /> : null}
       {tab === 'members' ? <Members id={id} canManage={staffCan(s.roles, 'tenant.state')} /> : null}
       {tab === 'skus' ? <Skus id={id} staff={s} hasBg={!!bg} canBg={staffCan(s.roles, 'breakglass.read')} canWrite={staffCan(s.roles, 'breakglass.write')} /> : null}
-      {tab === 'projects' ? <Projects id={id} canRetry={staffCan(s.roles, 'jobs.manage')} /> : null}
+      {tab === 'projects' ? <Projects id={id} canManage={staffCan(s.roles, 'jobs.manage')} focus={focusProject} /> : null}
       {tab === 'ledger' ? <Ledger id={id} canAdjust={staffCan(s.roles, 'ledger.adjust')} /> : null}
       {tab === 'billing' ? <Billing id={id} canRefund={staffCan(s.roles, 'billing.refund')} /> : null}
       {tab === 'integrations' ? <Integrations id={id} canManage={staffCan(s.roles, 'integrations.manage')} /> : null}
       {tab === 'emails' ? <Emails id={id} /> : null}
-      {tab === 'risk' ? <Risk id={id} /> : null}
+      {tab === 'risk' ? <Risk id={id} canSuppress={staffCan(s.roles, 'tenant.flags')} /> : null}
       {tab === 'access' ? <Access id={id} /> : null}
       {tab === 'danger' ? <Danger id={id} w={w} canState={staffCan(s.roles, 'tenant.state')} canPurge={staffCan(s.roles, 'tenant.purge')} /> : null}
     </Page>
@@ -73,7 +76,7 @@ async function Overview({ id, w, canFlag }: { id: string; w: Record<string, unkn
     counts: (await tx`select (select count(*) from skus where workspace_id = ${id})::int as skus, (select count(*) from experiments where workspace_id = ${id})::int as experiments,
                              (select count(*) from projects where workspace_id = ${id})::int as projects, (select count(*) from memberships where workspace_id = ${id})::int as members,
                              (select coalesce(sum(bytes), 0) from assets where workspace_id = ${id} and deleted_at is null)::bigint as bytes`)[0]!,
-    notes: await tx`select n.body, n.created_at, s.name from tenant_notes n left join staff_users s on s.id = n.staff_id where n.workspace_id = ${id} order by n.created_at desc`,
+    notes: await tx`select n.body, n.sentiment, n.created_at, s.name from tenant_notes n left join staff_users s on s.id = n.staff_id where n.workspace_id = ${id} order by n.created_at desc`,
   }));
   const bal = Object.fromEntries(d0.ledger.map((l) => [l.unit as string, Number(l.bal)]));
   const plan = w.plan_code ? PLANS[w.plan_code as PlanCode] : null;
@@ -105,8 +108,11 @@ async function Overview({ id, w, canFlag }: { id: string; w: Record<string, unkn
         ) : null}
         <div className="ak-panel">
           <p className="ak-label">Notes</p>
-          <ActForm action="tenant.note" extra={{ workspaceId: id }} submit="Add note" fields={[{ name: 'body', label: 'Note (staff only)', type: 'textarea', required: true }]} />
-          {d0.notes.map((n, i) => <div key={i} className="ak-index-row"><span>{n.body as string}</span><span className="ak-index">{(n.name as string) ?? 'staff'} · {ago(n.created_at)}</span></div>)}
+          <ActForm action="tenant.note" extra={{ workspaceId: id }} submit="Add note" fields={[
+            { name: 'body', label: 'Note (staff only)', type: 'textarea', required: true },
+            { name: 'sentiment', label: 'Customer sentiment (support conversations)', type: 'select', options: [{ value: '', label: '—' }, { value: 'positive', label: 'positive' }, { value: 'neutral', label: 'neutral' }, { value: 'negative', label: 'negative (raises a churn-risk flag)' }] },
+          ]} />
+          {d0.notes.map((n, i) => <div key={i} className="ak-index-row"><span>{n.body as string}</span><span className="ak-index">{n.sentiment ? `${n.sentiment as string} · ` : ''}{(n.name as string) ?? 'staff'} · {ago(n.created_at)}</span></div>)}
         </div>
       </div>
     </div>
@@ -178,24 +184,94 @@ async function Skus({ id, staff, hasBg, canBg, canWrite }: { id: string; staff: 
   );
 }
 
-async function Projects({ id, canRetry }: { id: string; canRetry: boolean }) {
+/** Production states in which a project is waiting on us, with the minutes after which it counts as stuck. */
+const STUCK_AFTER_MIN: Record<string, number> = { RENDERING: 20, QA_RUNNING: 10, COMPOSING: 10, PLATFORM_VARIANTS: 10, FINAL_QA: 10, RENDER_RESERVED: 10, STORYBOARD_APPROVED: 10 };
+const RETRYABLE = ['PROVIDER_FAILED', 'NEEDS_USER_ACTION'];
+
+async function Projects({ id, canManage, focus }: { id: string; canManage: boolean; focus: string | null }) {
   const d0 = await withAdmin(async (tx) => ({
-    projects: await tx`select p.id, p.kind, p.state, p.failure_reason, p.updated_at, p.created_at, (select count(*) from provider_jobs j where j.project_id = p.id)::int as jobs,
-                              (select coalesce(sum(actual_micros), 0) from provider_jobs j where j.project_id = p.id)::bigint as cost
-                       from projects p where p.workspace_id = ${id} order by p.created_at desc limit 50`,
-    jobs: await tx`select id, provider, task, model, status, error, latency_ms, actual_micros, created_at, project_id from provider_jobs where workspace_id = ${id} order by created_at desc limit 50`,
+    projects: await tx`select p.id, p.kind, p.state, p.failure_reason, p.updated_at, p.created_at, p.experiment_id, s.catalogue_no,
+                              (select count(*) from provider_jobs j where j.workspace_id = p.workspace_id and j.project_id = p.id)::int as jobs,
+                              (select coalesce(sum(actual_micros), 0) from provider_jobs j where j.workspace_id = p.workspace_id and j.project_id = p.id)::bigint as cost,
+                              (select status from cost_authorizations a where a.workspace_id = p.workspace_id and a.project_id = p.id order by a.created_at desc limit 1) as reservation
+                       from projects p join skus s on s.id = p.sku_id where p.workspace_id = ${id} order by p.created_at desc limit 50`,
+    experiments: await tx`select e.id, e.state, e.mode, e.portfolio_slot, e.primary_variable, e.created_at, e.updated_at, s.catalogue_no,
+                                 (select count(*) from variants v where v.workspace_id = e.workspace_id and v.experiment_id = e.id)::int as variants,
+                                 (select count(*) from projects p where p.workspace_id = e.workspace_id and p.experiment_id = e.id)::int as projects
+                          from experiments e join skus s on s.id = e.sku_id where e.workspace_id = ${id} order by e.created_at desc limit 50`,
+    jobs: await tx`select id, provider, task, model, arm, status, error, latency_ms, actual_micros, created_at, project_id from provider_jobs where workspace_id = ${id} order by created_at desc limit 50`,
+    held: await tx`select queue, reason, held_at, released_at, payload->>'template' as template from held_jobs where workspace_id = ${id} order by held_at desc limit 50`,
   }));
-  const stuckAfter: Record<string, number> = { RENDERING: 20, QA_RUNNING: 10, COMPOSING: 10, RENDER_RESERVED: 10, STORYBOARD_APPROVED: 10 };
+  const retryEstimates = new Map<string, number | null>();
+  if (canManage) for (const p of d0.projects.filter((x) => RETRYABLE.includes(x.state as string))) retryEstimates.set(p.id as string, await estimateProjectRetry(id, p.id as string));
+  const shown = focus && d0.projects.some((p) => p.id === focus) ? focus : null;
   return (
     <>
-      <Table head={['Project', 'Kind', 'State', 'Updated', 'Provider jobs', 'Cost', '']} rows={d0.projects.map((p) => {
-        const stuck = stuckAfter[p.state as string] && Date.now() - new Date(p.updated_at as string).getTime() > stuckAfter[p.state as string]! * 60_000;
-        return [<Mono key="i">{String(p.id).slice(0, 8)}</Mono>, p.kind as string, <span key="s" style={{ color: stuck ? 'var(--risk)' : undefined }}>{String(p.state).toLowerCase()}{stuck ? ' (stuck)' : ''}{p.failure_reason ? ` — ${p.failure_reason}` : ''}</span>, ago(p.updated_at), p.jobs as number, money(p.cost), canRetry && ['PROVIDER_FAILED'].includes(p.state as string) ? <ActButton key="r" small action="job.retry" payload={{ queue: 'produce-project', jobId: p.id, workspaceId: id }} reason="Retry reason (no new spend unless re-authorised)">Retry</ActButton> : null];
+      <Table head={['Project', 'SKU', 'Kind', 'State', 'Updated', 'Reservation', 'Provider jobs', 'Cost', '']} rows={d0.projects.map((p) => {
+        const limit = STUCK_AFTER_MIN[p.state as string];
+        const stuck = limit !== undefined && Date.now() - new Date(p.updated_at as string).getTime() > limit * 60_000;
+        const est = retryEstimates.get(p.id as string);
+        return [
+          <Link key="i" href={`/tenants/${id}?tab=projects&project=${p.id}`}><Mono>{String(p.id).slice(0, 8)}</Mono></Link>,
+          String(p.catalogue_no).padStart(3, '0'),
+          p.kind as string,
+          <span key="s" style={{ color: stuck ? 'var(--risk)' : undefined }}>{String(p.state).toLowerCase()}{stuck ? ' (stuck)' : ''}{p.failure_reason ? ` — ${p.failure_reason}` : ''}</span>,
+          ago(p.updated_at),
+          (p.reservation as string) ?? '—',
+          p.jobs as number,
+          money(p.cost),
+          canManage ? (
+            <span key="a" className="ak-row">
+              {RETRYABLE.includes(p.state as string) ? (
+                <ActButton small action="tenant.project_retry" payload={{ workspaceId: id, projectId: p.id }} confirm={`Retry this production? A fresh Cost Governor authorisation re-reserves the customer’s entitlement${est != null ? ` (estimate ${money(est)} at current rates)` : ''}; the customer is not charged again.`} reason="Retry reason (ticket / incident)">
+                  Retry{est != null ? ` (est. ${money(est)})` : ''}
+                </ActButton>
+              ) : null}
+              {(CANCELLABLE_BEFORE_DISPATCH as readonly string[]).includes(p.state as string) ? (
+                <ActButton small danger action="tenant.project_cancel" payload={{ workspaceId: id, projectId: p.id }} confirm="Cancel before dispatch? The project ends cancelled and any reservation returns to the customer’s balance." reason="Cancel reason">
+                  Cancel
+                </ActButton>
+              ) : null}
+            </span>
+          ) : null,
+        ];
       })} />
+      {shown ? <Timeline id={id} projectId={shown} /> : <p className="ak-small ak-muted" style={{ marginTop: 8 }}>Open a project to see its job timeline.</p>}
+      <Section title="Experiments">
+        <Table head={['Experiment', 'SKU', 'State', 'Mode', 'Slot', 'Variable', 'Variants', 'Projects', 'Updated']} rows={d0.experiments.map((e) => [<Mono key="i">{String(e.id).slice(0, 8)}</Mono>, String(e.catalogue_no).padStart(3, '0'), String(e.state).toLowerCase(), String(e.mode).toLowerCase(), (e.portfolio_slot as string)?.toLowerCase() ?? '—', <Mono key="v">{e.primary_variable as string}</Mono>, e.variants as number, e.projects as number, ago(e.updated_at)])} empty="No experiments." />
+      </Section>
       <Section title="Provider jobs">
-        <Table head={['When', 'Provider', 'Task', 'Model', 'Status', 'Latency', 'Cost', 'Error']} rows={d0.jobs.map((j) => [dt(j.created_at), j.provider as string, j.task as string, <Mono key="m">{j.model as string}</Mono>, j.status as string, j.latency_ms ? `${j.latency_ms}ms` : '—', money(j.actual_micros ?? 0, 4), <span key="e" className="ak-small">{(j.error as string)?.slice(0, 120) ?? ''}</span>])} />
+        <Table head={['When', 'Provider', 'Task', 'Model', 'Arm', 'Status', 'Latency', 'Cost', 'Error']} rows={d0.jobs.map((j) => [dt(j.created_at), j.provider as string, j.task as string, <Mono key="m">{j.model as string}</Mono>, (j.arm as string) ?? '—', j.status as string, j.latency_ms ? `${j.latency_ms}ms` : '—', money(j.actual_micros ?? 0, 4), <span key="e" className="ak-small">{(j.error as string)?.slice(0, 120) ?? ''}</span>])} />
+      </Section>
+      <Section title="Jobs held while the workspace was on hold">
+        <Table head={['Held', 'Queue', 'Reason', 'Released']} rows={d0.held.map((h) => [dt(h.held_at), <Mono key="q">{`${h.queue as string}${h.template ? ` · ${h.template}` : ''}`}</Mono>, h.reason as string, h.released_at ? dt(h.released_at) : 'waiting'])} empty="Nothing held." />
       </Section>
     </>
+  );
+}
+
+/** Job timeline for one project: state changes and QA events, provider calls, and ledger rows, in order. */
+async function Timeline({ id, projectId }: { id: string; projectId: string }) {
+  const rows = await withAdmin((tx) => tx`
+    select * from (
+      select e.at, 'event' as source, e.type as what, e.actor as who,
+             coalesce(e.payload->>'to', e.payload->>'attempt', '') as detail
+      from events e
+      where e.workspace_id = ${id} and (e.subject_id = ${projectId} or e.subject_id in (
+        select sc.id from scenes sc join projects p on p.storyboard_id = sc.storyboard_id and p.workspace_id = sc.workspace_id
+        where p.id = ${projectId} and p.workspace_id = ${id}))
+      union all
+      select j.created_at, 'provider', j.task || ' · ' || j.provider || '/' || j.model || coalesce(' · ' || j.arm, ''), j.status,
+             concat_ws(' · ', case when j.latency_ms is not null then j.latency_ms || 'ms' end, case when j.actual_micros is not null then '$' || round(j.actual_micros / 1e6, 4) end, left(j.error, 120))
+      from provider_jobs j where j.workspace_id = ${id} and j.project_id = ${projectId}
+      union all
+      select l.created_at, 'ledger', l.type || ' ' || l.amount || ' ' || l.unit, l.actor, coalesce(left(l.reason, 120), '')
+      from ledger_entries l where l.workspace_id = ${id} and l.project_id = ${projectId}
+    ) t order by at limit 400`);
+  return (
+    <Section title={`Job timeline · ${projectId.slice(0, 8)}`} right={<Link className="ak-small" href={`/tenants/${id}?tab=projects`}>Close</Link>}>
+      <Table head={['When', 'Source', 'What', 'Actor / status', 'Detail']} rows={rows.map((r) => [dt(r.at), r.source as string, <Mono key="w">{r.what as string}</Mono>, <Mono key="a">{String(r.who).split(':')[0]}</Mono>, <span key="d" className="ak-small">{(r.detail as string) ?? ''}</span>])} empty="No activity recorded." />
+    </Section>
   );
 }
 
@@ -229,17 +305,43 @@ async function Billing({ id, canRefund }: { id: string; canRefund: boolean }) {
     purchases: await tx`select * from purchases where workspace_id = ${id} order by created_at desc limit 50`,
     events: await tx`select id, type, status, received_at, error from stripe_events where workspace_id = ${id} or payload->'data'->'object'->>'customer' = (select customer_id from stripe_customers where workspace_id = ${id}) order by received_at desc limit 50`,
     consents: await tx`select kind, text_version, text_snapshot, created_at, ip from consent_records where workspace_id = ${id} order by created_at desc limit 10`,
+    invoices: await tx`select e.id, e.received_at, (e.payload->'data'->'object'->>'amount_paid')::bigint as cents,
+                              coalesce(e.payload->'data'->'object'->>'payment_intent', e.payload->'data'->'object'->'payments'->'data'->0->'payment'->>'payment_intent') as pi
+                       from stripe_events e where e.workspace_id = ${id} and e.type = 'invoice.paid' order by e.received_at desc limit 24`,
+    refunds: await tx`select r.*, a.name as approver from refunds r left join staff_users a on a.id = r.approved_by where r.workspace_id = ${id} order by r.created_at desc limit 50`,
   }));
+  const refundedByPi = new Map<string, number>();
+  for (const r of d0.refunds) if (r.status === 'succeeded') refundedByPi.set(r.payment_intent_id as string, (refundedByPi.get(r.payment_intent_id as string) ?? 0) + Number(r.amount_micros));
+  const refundFields = (maxMicros: number): F[] => [
+    { name: 'amount', label: 'Amount $', type: 'number', defaultValue: maxMicros / 1e6, required: true },
+    { name: 'reasonCode', label: 'Reason code', type: 'select', options: [...RefundReason] },
+    { name: 'customerNote', label: 'Note to the customer (emailed)', type: 'textarea' },
+    { name: 'reason', label: 'Internal reason (audit)', required: true },
+  ];
   return (
     <>
       <p className="ak-small">Stripe customer: <Mono>{(d0.cust?.customer_id as string) ?? '—'}</Mono> {d0.cust ? <ActButton small action="billing.portal" payload={{ workspaceId: id }}>Open in Stripe</ActButton> : null}</p>
+      <p className="ak-small ak-muted">Refunds over $200 need a second FINANCE approver. Each refund writes CREDIT_REFUNDED; a full refund of an unused credit withdraws it.</p>
       <Section title="Subscriptions">
         <Table head={['Plan', 'Status', 'Period', 'Cancel at end', 'Pending', 'Stripe id']} rows={d0.subs.map((s) => [s.plan_code as string, s.status as string, `${d(s.current_period_start)} → ${d(s.current_period_end)}`, s.cancel_at_period_end ? 'yes' : 'no', (s.pending_plan_code as string) ?? '—', <Mono key="i">{s.stripe_subscription_id as string}</Mono>])} />
       </Section>
+      <Section title="Subscription payments">
+        <Table head={['Paid', 'Invoice event', 'Amount', 'Refunded', '']} rows={d0.invoices.map((v) => {
+          const paid = Number(v.cents ?? 0) * 10_000;
+          const left = paid - (refundedByPi.get(v.pi as string) ?? 0);
+          return [dt(v.received_at), <Mono key="e">{v.id as string}</Mono>, money(paid), money(paid - left), canRefund && v.pi && left > 0 ? <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, invoiceEventId: v.id, requestId: newId() }} submit="🔐 Refund" fields={refundFields(left)} /> : null];
+        })} empty="No subscription payments on record." />
+      </Section>
       <Section title="One-time purchases">
-        <Table head={['When', 'Kind', 'Amount', 'Status', 'Payment', '']} rows={d0.purchases.map((p) => [dt(p.created_at), p.kind as string, money(p.amount_micros), p.status as string, <Mono key="pi">{(p.stripe_payment_intent_id as string) ?? '—'}</Mono>, canRefund && p.status === 'paid' ? (
-          <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, purchaseId: p.id }} submit="🔐 Refund" fields={[{ name: 'amount', label: 'Amount $', type: 'number', defaultValue: Number(p.amount_micros) / 1e6, required: true }, { name: 'reason', label: 'Reason code + note', required: true }]} />
-        ) : null])} />
+        <Table head={['When', 'Kind', 'Amount', 'Refunded', 'Status', 'Payment', '']} rows={d0.purchases.map((p) => {
+          const left = Number(p.amount_micros) - Number(p.refunded_micros ?? 0);
+          return [dt(p.created_at), p.kind as string, money(p.amount_micros), money(p.refunded_micros ?? 0), p.status as string, <Mono key="pi">{(p.stripe_payment_intent_id as string) ?? '—'}</Mono>, canRefund && ['paid', 'refunded'].includes(p.status as string) && left > 0 && p.stripe_payment_intent_id ? (
+            <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, purchaseId: p.id, requestId: newId() }} submit="🔐 Refund" fields={refundFields(left)} />
+          ) : null];
+        })} />
+      </Section>
+      <Section title="Refunds">
+        <Table head={['When', 'Amount', 'Reason code', 'Customer note', 'Status', 'Stripe refund', 'Approved by']} rows={d0.refunds.map((r) => [dt(r.created_at), money(r.amount_micros), r.reason_code as string, <span key="n" className="ak-small">{(r.customer_note as string) ?? ''}</span>, `${r.status as string}${r.error ? ` — ${String(r.error).slice(0, 80)}` : ''}`, <Mono key="s">{(r.stripe_refund_id as string) ?? '—'}</Mono>, (r.approver as string) ?? 'Stripe'])} empty="No refunds." />
       </Section>
       <Section title="Auto-renew consent records">
         <Table head={['When', 'Version', 'Text shown', 'IP']} rows={d0.consents.map((c) => [dt(c.created_at), <Mono key="v">{c.text_version as string}</Mono>, <span key="t" className="ak-small">{c.text_snapshot as string}</span>, <Mono key="ip">{String(c.ip ?? '')}</Mono>])} />
@@ -268,15 +370,29 @@ async function Emails({ id }: { id: string }) {
   return <Table head={['When', 'To', 'Template', 'Stream', 'Status', '']} rows={rows.map((r) => [dt(r.created_at), r.to_email as string, r.template as string, r.stream as string, r.status as string, r.suppressed ? <ActButton key="u" small action="email.unsuppress" payload={{ email: r.to_email }} reason>Unsuppress ({r.suppressed as string})</ActButton> : null])} />;
 }
 
-async function Risk({ id }: { id: string }) {
+async function Risk({ id, canSuppress }: { id: string; canSuppress: boolean }) {
   const d0 = await withAdmin(async (tx) => ({
     flags: await tx`select * from risk_flags where workspace_id = ${id} order by raised_at desc`,
     abuse: await tx`select kind, key, detail, at from abuse_signals where workspace_id = ${id} order by at desc limit 50`,
     disputes: await tx`select type, received_at from stripe_events where workspace_id = ${id} and type like 'charge.dispute%' order by received_at desc`,
   }));
+  const status = (f: Record<string, unknown>) => {
+    if (f.suppressed_reason) {
+      const until = f.suppressed_until ? new Date(f.suppressed_until as string) : null;
+      return until && until > new Date() ? `suppressed until ${d(until)}: ${f.suppressed_reason}` : `suppression ended${until ? ` ${d(until)}` : ''}: ${f.suppressed_reason}`;
+    }
+    return f.resolved_at ? `resolved ${d(f.resolved_at)}` : 'open';
+  };
   return (
     <>
-      <Table head={['Indicator', 'Evidence', 'Raised', 'Status', '']} rows={d0.flags.map((f) => [f.indicator as string, <Mono key="e">{JSON.stringify(f.evidence).slice(0, 140)}</Mono>, dt(f.raised_at), f.resolved_at ? (f.suppressed_reason ? `suppressed: ${f.suppressed_reason}` : 'resolved') : 'open', !f.resolved_at ? <ActButton key="s" small action="tenant.risk_suppress" payload={{ workspaceId: id, flagId: f.id }} reason>Suppress</ActButton> : null])} empty="No churn-risk indicators." />
+      <Table head={['Indicator', 'Evidence', 'Raised', 'Status', 'Playbook', '']} rows={d0.flags.map((f) => [
+        RISK_PLAYBOOKS[f.indicator as RiskIndicator]?.label ?? (f.indicator as string),
+        <Mono key="e">{JSON.stringify(f.evidence).slice(0, 140)}</Mono>,
+        dt(f.raised_at),
+        status(f),
+        <span key="p" className="ak-small">{RISK_PLAYBOOKS[f.indicator as RiskIndicator]?.intervention ?? '—'}</span>,
+        canSuppress && !f.resolved_at ? <ActForm key="s" inline action="tenant.risk_suppress" extra={{ workspaceId: id, flagId: f.id }} submit="Suppress" fields={[{ name: 'days', label: 'Days', type: 'number', defaultValue: 30, required: true }, { name: 'reason', label: 'Reason', required: true }]} /> : null,
+      ])} empty="No churn-risk indicators." />
       <Section title="Abuse signals"><Table head={['When', 'Kind', 'Key', 'Detail']} rows={d0.abuse.map((a) => [dt(a.at), a.kind as string, <Mono key="k">{a.key as string}</Mono>, <Mono key="d">{JSON.stringify(a.detail).slice(0, 120)}</Mono>])} /></Section>
       <Section title="Disputes"><Table head={['When', 'Event']} rows={d0.disputes.map((x) => [dt(x.received_at), x.type as string])} /></Section>
     </>
@@ -298,7 +414,7 @@ function Danger({ id, w, canState, canPurge }: { id: string; w: Record<string, u
             <ActButton action="tenant.hold" payload={{ workspaceId: id, hold: 'LIFT' }} reason confirm={`Restore to ${String(w.state_before_hold).toLowerCase()}?`}>🔐 Lift {String(w.state).toLowerCase()}</ActButton>
           ) : (
             <>
-              <ActButton danger action="tenant.hold" payload={{ workspaceId: id, hold: 'SUSPENDED' }} reason confirm="Suspend? In-flight jobs finish but aren't delivered until lifted.">🔐 Suspend</ActButton>
+              <ActButton danger action="tenant.hold" payload={{ workspaceId: id, hold: 'SUSPENDED' }} reason confirm="Suspend? Queued jobs pause; in-flight jobs finish and are stored but not delivered until lifted.">🔐 Suspend</ActButton>
               <ActButton danger action="tenant.hold" payload={{ workspaceId: id, hold: 'LOCKED' }} reason confirm="Lock? Members lose access immediately.">🔐 Lock</ActButton>
             </>
           )}
@@ -310,7 +426,7 @@ function Danger({ id, w, canState, canPurge }: { id: string; w: Record<string, u
           {w.state === 'PURGE_SCHEDULED' ? (
             <>
               <span className="ak-small">Purge scheduled {dt(w.purge_at)}</span>
-              <ActButton action="tenant.cancel_purge" payload={{ workspaceId: id }} reason>Cancel purge</ActButton>
+              <ActButton action="tenant.cancel_purge" payload={{ workspaceId: id }} reason confirm={`Cancel the purge and restore the workspace to ${String(w.state_before_purge ?? 'CANCELLED').toLowerCase()}?`}>Cancel purge</ActButton>
             </>
           ) : (
             <ActButton danger action="tenant.schedule_purge" payload={{ workspaceId: id }} reason confirm="Schedule purge in 7 days?">🔐 Schedule purge (7 days)</ActButton>

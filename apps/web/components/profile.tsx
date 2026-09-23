@@ -36,8 +36,11 @@ export function NameForm({ initial }: { initial: string }) {
   const [name, setName] = useState(initial);
   const [saved, setSaved] = useState(false);
   return (
-    <form className="ak-row" onSubmit={async (e) => { e.preventDefault(); await api('/api/me/name', { name }); setSaved(true); router.refresh(); }}>
-      <input className="ak-input" value={name} onChange={(e) => { setName(e.target.value); setSaved(false); }} placeholder="Your name" aria-label="Your name" maxLength={80} />
+    <form className="ak-row" style={{ alignItems: 'end' }} onSubmit={async (e) => { e.preventDefault(); await api('/api/me/name', { name }); setSaved(true); router.refresh(); }}>
+      <label className="ak-field">
+        <span className="ak-label">Your name</span>
+        <input className="ak-input" value={name} onChange={(e) => { setName(e.target.value); setSaved(false); }} maxLength={80} autoComplete="name" />
+      </label>
       <Button type="submit" variant="secondary" size="sm">{saved ? 'Saved' : 'Save'}</Button>
     </form>
   );

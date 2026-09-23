@@ -6,6 +6,8 @@ import { z } from 'zod';
  */
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  /** Deployment environment for per-environment feature flag values (e.g. staging vs production); defaults from NODE_ENV. */
+  APP_ENV: z.string().regex(/^[a-z][a-z0-9-]{1,30}$/).optional(),
   APP_URL: z.string().default('http://localhost:3000'),
   ADMIN_URL: z.string().default('http://localhost:3001'),
   APP_SECRET: z.string().min(32).default('dev-secret-dev-secret-dev-secret-0000'),

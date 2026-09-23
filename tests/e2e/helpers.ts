@@ -44,4 +44,19 @@ export async function a11yFloor(page: Page) {
   expect(unlabeledImages, 'images without alt').toBe(0);
   const noHorizontalScroll = await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
   expect(noHorizontalScroll, 'no horizontal page scroll').toBe(true);
+  await headingOutline(page);
+}
+
+/** WCAG 1.3.1 / 2.4.6: exactly one h1 and no skipped heading levels (an h2 section, then h3 inside it). */
+export async function headingOutline(page: Page) {
+  const levels = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
+      .filter((h) => (h as HTMLElement).offsetParent !== null || getComputedStyle(h).position === 'fixed')
+      .map((h) => Number(h.tagName.slice(1))),
+  );
+  expect(levels.filter((l) => l === 1), `one h1 on ${page.url()}`).toHaveLength(1);
+  levels.reduce((prev, l) => {
+    expect(l - prev, `heading h${l} after h${prev} skips a level on ${page.url()}`).toBeLessThanOrEqual(1);
+    return l;
+  }, 1);
 }
