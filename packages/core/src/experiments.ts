@@ -7,6 +7,7 @@ import { emit } from './events';
 import type { Proposal } from './intel-schemas';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps } from './progress';
+import { transition } from './projects';
 import { STORYBOARD_STEPS } from './storyboard';
 import { compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, toRate, type RateMetric, type VariantEvidence } from './statistics';
 
@@ -71,7 +72,7 @@ export async function createExperiment(
                              values (${ctx.workspaceId}, ${input.skuId}, ${projectId}, 1, 'A', ${tx.json(p as never)}, true, 'recommendation', 'n/a') returning id`;
   // Storyboard straight away (the approval boundary before expensive production, §13).
   const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${concept!.id}, 'generating') returning id`;
-  await tx`update projects set state = 'CONCEPT_SELECTED', selected_concept_id = ${concept!.id}, storyboard_id = ${sb!.id} where id = ${projectId}`;
+  await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: concept!.id, storyboard_id: sb!.id } });
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
   await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true }, { priority: priorityFor(ctx) });
   await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: expId }, { mode, slot: input.slot, primaryVariable: p.primaryVariable });
