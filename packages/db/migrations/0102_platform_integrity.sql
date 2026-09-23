@@ -163,3 +163,9 @@ begin
 end $$;
 revoke all on function stripe_event_receive from public;
 grant execute on function stripe_event_receive to app_rw, system_rw;
+
+-- ───────────── Learning revision (standard §21, §45, §48) ─────────────
+-- Learnings are matched on the variant that led (not just the angle), and a result from an operationally
+-- confounded period marks the learning instead of creating or strengthening it.
+alter table learnings add column leader_variant_id uuid;
+alter table learnings add column confounded boolean not null default false;

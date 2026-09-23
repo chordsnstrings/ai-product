@@ -9,7 +9,7 @@ import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps } from './progress';
 import { transition } from './projects';
 import { STORYBOARD_STEPS } from './storyboard';
-import { compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, toRate, type RateMetric, type VariantEvidence } from './statistics';
+import { compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, toRate, type ComparisonResult, type RateMetric, type VariantEvidence } from './statistics';
 
 /**
  * Experiment Engine (§20) + learning (§21). CONTROLLED experiments change a limited set of variables and keep
@@ -176,6 +176,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   const contexts = [...new Set(agg.map((a) => a.measurement_context))];
   const metrics: RateMetric[] = e.primary_metric === 'hold_rate' ? ['hold_rate', 'ctr', 'cvr'] : ['ctr', 'hold_rate', 'cvr'];
   const summary: { context: MeasurementContext; metric: RateMetric; state: string; leader: string | null; explanation: string }[] = [];
+  const comparisons: { context: MeasurementContext; metric: RateMetric; cmp: ComparisonResult }[] = [];
   const [confounded] = await tx`select count(*)::int as n from confounders where (sku_id is null or sku_id = ${e.sku_id})
                                 and starts_at > now() - interval '30 days'`;
 
@@ -197,7 +198,10 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
             successes = excluded.successes, trials = excluded.trials, raw_rate = excluded.raw_rate, posterior_mean = excluded.posterior_mean,
             ci_low = excluded.ci_low, ci_high = excluded.ci_high, prob_best = excluded.prob_best, state = excluded.state, computed_at = now()`;
       }
-      if (cmp) summary.push({ context, metric, state: cmp.state, leader: cmp.leader, explanation: cmp.explanation });
+      if (cmp) {
+        summary.push({ context, metric, state: cmp.state, leader: cmp.leader, explanation: cmp.explanation });
+        comparisons.push({ context, metric, cmp });
+      }
     }
   }
 
@@ -210,34 +214,102 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   if (agg.length) await setExperimentState(tx, ctx, experimentId, expState, 'results');
   if (prev !== expState && agg.length) await emit(tx, ctx, 'CONFIDENCE_CHANGED', { type: 'experiment', id: experimentId }, { from: prev, to: expState });
 
-  // Learnings (scoped to platform/measurement context; never generalized across platforms, §21).
-  for (const s of primary.filter((x) => (x.state === 'ACTIONABLE' || x.state === 'DIRECTIONAL') && x.leader)) {
-    const leader = variants.find((v) => v.id === s.leader);
-    const genes = (e.genes ?? {}) as Record<string, string>;
-    const platform = s.context.startsWith('META') ? 'meta' : s.context.startsWith('TIKTOK') ? 'tiktok' : 'blended';
-    const statement =
-      e.mode === 'CONTROLLED'
-        ? `For this SKU on ${platform === 'meta' ? 'Meta' : platform === 'tiktok' ? 'TikTok' : 'blended data'}, “${leader?.label}” ${s.state === 'ACTIONABLE' ? 'is' : 'looks'} stronger on ${s.metric.replace('_', ' ')} (${String(genes.angle ?? '').toLowerCase().replace(/_/g, ' ')} angle).`
-        : `For this SKU on ${platform}, the ${String(genes.angle ?? '').toLowerCase().replace(/_/g, ' ')} direction ${s.state === 'ACTIONABLE' ? 'won' : 'is leading'} — exploratory, so the cause is not isolated.`;
-    const [existing] = await tx`select id, state, history from learnings where sku_id = ${e.sku_id} and measurement_context = ${s.context}
-                                and relevant_genes->>'angle' = ${genes.angle ?? ''} and state <> 'INVALIDATED' limit 1`;
-    if (!existing) {
-      const [l] = await tx`
-        insert into learnings (workspace_id, sku_id, statement, scope_platform, measurement_context, relevant_genes, supporting_experiments,
-          confidence, state, do_not_generalize_to)
-        values (${ctx.workspaceId}, ${e.sku_id}, ${statement}, ${platform}, ${s.context}, ${tx.json(genes as never)}, ${[experimentId]},
-          ${s.state === 'ACTIONABLE' ? 0.95 : 0.7}, ${s.state}, ${platform === 'meta' ? ['tiktok', 'other_skus'] : ['meta', 'other_skus']})
-        returning id`;
-      await emit(tx, ctx, 'LEARNING_CREATED', { type: 'learning', id: l!.id as string }, { state: s.state });
-    } else {
-      const next = nextLearningState(existing.state as SignalState, s.state === 'ACTIONABLE' ? 0.97 : 0.75, s.state === 'ACTIONABLE');
-      await tx`update learnings set state = ${next}, last_revalidated_at = now(),
-                 supporting_experiments = array(select distinct unnest(supporting_experiments || ${[experimentId]}::uuid[])),
-                 history = history || ${tx.json([{ at: new Date().toISOString(), from: existing.state, to: next, experimentId }] as never)}
-               where id = ${existing.id}`;
+  // Learnings (scoped to platform/measurement context; never generalized across platforms, §21). Learnings are
+  // revised whenever results are recomputed — late conversions, backfills and corrections (§45, §48) — so they can
+  // strengthen, weaken or be invalidated. History is appended, never rewritten.
+  const genes = (e.genes ?? {}) as Record<string, string>;
+  const isConfounded = expState === 'OPERATIONALLY_CONFOUNDED';
+  const revised = new Set<string>();
+  const now = new Date().toISOString();
+  const primaryCmp = new Map(comparisons.filter((c) => c.metric === e.primary_metric).map((c) => [c.context, c.cmp]));
+
+  // 1. Create or strengthen from a current lead — unless the period is operationally confounded (§45: a
+  //    confounded result must not create or strengthen a learning).
+  if (!isConfounded) {
+    for (const s of primary.filter((x) => (x.state === 'ACTIONABLE' || x.state === 'DIRECTIONAL') && x.leader)) {
+      const leader = variants.find((v) => v.id === s.leader);
+      const cmp = primaryCmp.get(s.context)!;
+      const supports = cmp.variants.find((v) => v.variantId === s.leader)?.probBest ?? 0;
+      const platform = s.context.startsWith('META') ? 'meta' : s.context.startsWith('TIKTOK') ? 'tiktok' : 'blended';
+      const statement =
+        e.mode === 'CONTROLLED'
+          ? `For this SKU on ${platform === 'meta' ? 'Meta' : platform === 'tiktok' ? 'TikTok' : 'blended data'}, “${leader?.label}” ${s.state === 'ACTIONABLE' ? 'is' : 'looks'} stronger on ${s.metric.replace('_', ' ')} (${String(genes.angle ?? '').toLowerCase().replace(/_/g, ' ')} angle).`
+          : `For this SKU on ${platform}, the ${String(genes.angle ?? '').toLowerCase().replace(/_/g, ' ')} direction ${s.state === 'ACTIONABLE' ? 'won' : 'is leading'} — exploratory, so the cause is not isolated.`;
+      // Same learning = same SKU, context, angle and leading variant (a different leader is a different claim).
+      const [existing] = await tx`select id, state from learnings where sku_id = ${e.sku_id} and measurement_context = ${s.context}
+                                  and relevant_genes->>'angle' = ${genes.angle ?? ''} and state <> 'INVALIDATED'
+                                  and (leader_variant_id = ${s.leader} or (leader_variant_id is null and ${experimentId}::uuid = any(supporting_experiments)))
+                                  order by created_at limit 1`;
+      if (!existing) {
+        const [l] = await tx`
+          insert into learnings (workspace_id, sku_id, statement, scope_platform, measurement_context, relevant_genes, supporting_experiments,
+            confidence, state, do_not_generalize_to, leader_variant_id, history)
+          values (${ctx.workspaceId}, ${e.sku_id}, ${statement}, ${platform}, ${s.context}, ${tx.json({ ...genes, hook: leader?.label ?? null } as never)}, ${[experimentId]},
+            ${supports}, ${s.state}, ${platform === 'meta' ? ['tiktok', 'other_skus'] : ['meta', 'other_skus']}, ${s.leader},
+            ${tx.json([{ at: now, to: s.state, experimentId, supports, reason: 'created' }] as never)})
+          returning id`;
+        revised.add(l!.id as string);
+        await emit(tx, ctx, 'LEARNING_CREATED', { type: 'learning', id: l!.id as string }, { state: s.state, experimentId, supports });
+      } else {
+        await reviseLearning(tx, ctx, existing.id as string, supports, s.state === 'ACTIONABLE', { experimentId, reason: 'new evidence', leaderId: s.leader! });
+        revised.add(existing.id as string);
+      }
     }
   }
+
+  // 2. Every other learning this experiment supports is re-checked against the newest comparable evidence,
+  //    including GATHERING / INCONCLUSIVE results: a flipped leader invalidates it, an erased lead weakens it.
+  const supported = await tx`select id, measurement_context, leader_variant_id, confounded from learnings
+                             where sku_id = ${e.sku_id} and ${experimentId}::uuid = any(supporting_experiments) and state <> 'INVALIDATED'`;
+  for (const l of supported) {
+    if (isConfounded) {
+      if (!l.confounded) {
+        await tx`update learnings set confounded = true, last_revalidated_at = now(),
+                   history = history || ${tx.json([{ at: now, experimentId, reason: 'operationally confounded' }] as never)} where id = ${l.id}`;
+        await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { confounded: true, experimentId });
+      }
+      continue;
+    }
+    if (l.confounded) {
+      await tx`update learnings set confounded = false, history = history || ${tx.json([{ at: now, experimentId, reason: 'confounder cleared' }] as never)} where id = ${l.id}`;
+    }
+    if (revised.has(l.id as string)) continue;
+    const cmp = primaryCmp.get(l.measurement_context as MeasurementContext);
+    // No comparable evidence left in this context (e.g. corrected away) → the learning has lost its support.
+    let supports = 0.3;
+    let actionable = false;
+    if (cmp) {
+      supports = cmp.variants.find((v) => v.variantId === l.leader_variant_id)?.probBest ?? 0;
+      actionable = cmp.state === 'ACTIONABLE';
+      // "Equivalent" evidence contradicts a claimed difference.
+      if (cmp.state === 'INCONCLUSIVE') supports = Math.min(supports, 0.3);
+    }
+    await reviseLearning(tx, ctx, l.id as string, supports, actionable, { experimentId, reason: cmp ? `recomputed: ${cmp.state.toLowerCase()}` : 'evidence withdrawn' });
+  }
   return { state: expState, summary };
+}
+
+/** Apply new evidence to a learning (§21): state per nextLearningState, confidence, appended history, events. */
+async function reviseLearning(
+  tx: Tx,
+  ctx: Pick<TenantContext, 'workspaceId' | 'actor'>,
+  learningId: string,
+  supports: number,
+  actionable: boolean,
+  meta: { experimentId: string; reason: string; leaderId?: string },
+) {
+  const [l] = await tx`select state from learnings where id = ${learningId} for update`;
+  const from = l!.state as SignalState;
+  const next = nextLearningState(from, supports, actionable);
+  await tx`update learnings set state = ${next}, confidence = ${supports}, last_revalidated_at = now(),
+             leader_variant_id = coalesce(leader_variant_id, ${meta.leaderId ?? null}::uuid),
+             supporting_experiments = array(select distinct unnest(supporting_experiments || ${[meta.experimentId]}::uuid[])),
+             history = history || ${tx.json([{ at: new Date().toISOString(), from, to: next, experimentId: meta.experimentId, supports, reason: meta.reason }] as never)}
+           where id = ${learningId}`;
+  if (next !== from && (next === 'WEAKENING' || next === 'INVALIDATED')) {
+    await emit(tx, ctx, next === 'INVALIDATED' ? 'LEARNING_INVALIDATED' : 'LEARNING_WEAKENED', { type: 'learning', id: learningId }, { from, to: next, supports, experimentId: meta.experimentId, reason: meta.reason });
+  }
+  return next;
 }
 
 /** Merchant-marked confounder (plan 03 A6): stockout, outage, price change, influencer spike… */

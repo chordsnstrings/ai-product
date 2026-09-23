@@ -30,7 +30,7 @@ export async function buildContext(tx: Tx, skuId: string) {
   const coverage = await tx`select genes->>'angle' as angle, state, count(*)::int as n from experiments where sku_id = ${skuId}
                             group by 1, 2`;
   const learnings = await tx`select statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
-                             and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') order by confidence desc limit 6`;
+                             and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') and not confounded order by confidence desc limit 6`;
   const ingredients = (factText(facts, 'key_ingredients') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   const brand = await brandBrainFor(tx, skuId);
   const productContext: ProductContext = {

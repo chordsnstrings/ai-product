@@ -145,7 +145,8 @@ async function scoringContext(tx: Tx, skuId: string): Promise<ScoringContext & {
   const themes = await tx`select label, prevalence from customer_themes where sku_id = ${skuId}`;
   const tests = await tx`select genes->>'angle' as angle, count(*)::int as n from experiments where sku_id = ${skuId} group by 1`;
   const recent = await tx`select genes->>'angle' as angle, genes->>'hookMechanism' as hook from experiments where sku_id = ${skuId} and created_at > now() - interval '21 days'`;
-  const learnings = await tx`select relevant_genes->>'angle' as angle, state from learnings where sku_id = ${skuId}`;
+  // Confounded learnings (§45) never count as evidence for or against an angle.
+  const learnings = await tx`select relevant_genes->>'angle' as angle, state from learnings where sku_id = ${skuId} and not confounded`;
   const fatigue = await tx`select distinct e.genes->>'angle' as angle from experiments e join experiment_results r on r.experiment_id = e.id
                            where e.sku_id = ${skuId} and e.state = 'ACTIONABLE' and r.computed_at < now() - interval '21 days'`;
   const [assets] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind in ('creator_footage','historical_creative') and deleted_at is null`;
@@ -234,7 +235,7 @@ export async function dismissRecommendation(tx: Tx, ctx: TenantContext, id: stri
 /** Maturity from evidence: COLD (no actionable/directional learnings) → DEVELOPING → MATURE (≥3 actionable). */
 export async function refreshMaturity(tx: Tx, skuId: string) {
   const [l] = await tx`select count(*) filter (where state = 'ACTIONABLE')::int as a, count(*) filter (where state in ('DIRECTIONAL','ACTIONABLE'))::int as d
-                       from learnings where sku_id = ${skuId}`;
+                       from learnings where sku_id = ${skuId} and not confounded`;
   const m: SkuMaturity = l!.a >= 3 ? 'MATURE' : l!.d >= 1 ? 'DEVELOPING' : 'COLD';
   await tx`update skus set maturity = ${m} where id = ${skuId}`;
   return m;
