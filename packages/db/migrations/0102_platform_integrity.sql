@@ -73,3 +73,93 @@ create trigger brands_initial_version after insert on brands for each row execut
 -- is waiting, since when and how many resume attempts were made, so a sweep can resume it with backoff.
 alter table projects add column outage jsonb;
 create index projects_paused_outage on projects (workspace_id) where outage is not null;
+
+-- ───────────── RLS for global tables that carry tenant rows (plan 02 §3 layer 2, §8.1) ─────────────
+-- stripe_customers, shopify_shops, email_log and workspace_slug_history were registered 'global' although each
+-- row belongs to a workspace, and app_rw could read (and for email_log update) every tenant's rows. They become
+-- tenant tables with the standard policies; the few legitimate cross-tenant reads go through narrow
+-- SECURITY DEFINER functions. stripe_events (raw payloads with customer PII) is no longer readable by app_rw.
+
+-- A tenant context that may be absent (never throws): for functions that also serve pre-tenant flows.
+create or replace function arkiv_current_workspace_or_null() returns uuid
+language sql stable as $$ select nullif(current_setting('app.workspace_id', true), '')::uuid $$;
+
+select arkiv_tenant_table('stripe_customers');
+revoke update, delete on stripe_customers from app_rw;
+update table_registry set kind = 'tenant' where table_name = 'stripe_customers';
+
+select arkiv_tenant_table('shopify_shops');
+revoke update on shopify_shops from app_rw;
+update table_registry set kind = 'tenant' where table_name = 'shopify_shops';
+
+-- Webhook routing (no tenant context yet) and the "store connected elsewhere" check.
+create or replace function workspace_for_shop(p_shop text) returns uuid
+language sql stable security definer set search_path = public as $$
+  select workspace_id from shopify_shops where shop_domain = p_shop
+$$;
+create or replace function shop_connected_elsewhere(p_shop text) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from shopify_shops where shop_domain = p_shop and workspace_id <> arkiv_current_workspace())
+$$;
+revoke all on function workspace_for_shop, shop_connected_elsewhere from public;
+grant execute on function workspace_for_shop, shop_connected_elsewhere to app_rw;
+
+select arkiv_tenant_table('workspace_slug_history');
+revoke update on workspace_slug_history from app_rw;
+update table_registry set kind = 'tenant' where table_name = 'workspace_slug_history';
+
+-- email_log: app_rw may read its own workspace's rows only; writes go through the functions below, which also
+-- cover sends that have no workspace (magic links) and the per-address marketing frequency cap.
+select arkiv_tenant_table('email_log');
+revoke insert, update, delete on email_log from app_rw;
+update table_registry set kind = 'tenant' where table_name = 'email_log';
+
+create or replace function email_log_open(p_workspace uuid, p_email citext, p_template text, p_stream text, p_key text)
+returns table (id uuid, outcome text)
+language plpgsql volatile security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_day int;
+  v_week int;
+begin
+  -- A send may only be logged against the tenant the caller is acting for (or none).
+  if p_workspace is not null and p_workspace is distinct from arkiv_current_workspace_or_null() then
+    raise exception 'email_log_open: workspace does not match tenant context' using errcode = 'insufficient_privilege';
+  end if;
+  if p_stream = 'marketing' then
+    select count(*) filter (where l.created_at > now() - interval '1 day'), count(*) filter (where l.created_at > now() - interval '7 days')
+      into v_day, v_week from email_log l where l.to_email = p_email and l.stream = 'marketing';
+    if v_day >= 1 or v_week >= 3 then return query select null::uuid, 'capped'::text; return; end if;
+  end if;
+  insert into email_log (workspace_id, to_email, template, stream, idempotency_key, status)
+    values (p_workspace, p_email, p_template, p_stream, p_key, 'queued')
+    on conflict (idempotency_key) do nothing returning email_log.id into v_id;
+  return query select v_id, case when v_id is null then 'duplicate' else 'opened' end;
+end $$;
+
+create or replace function email_log_mark(p_id uuid, p_status text, p_provider_id text, p_event jsonb)
+returns void language sql volatile security definer set search_path = public as $$
+  update email_log set status = p_status, provider_id = coalesce(p_provider_id, provider_id),
+    events = case when p_event is null then events else events || jsonb_build_array(p_event) end
+  where id = p_id
+$$;
+
+-- Resend webhook (no tenant context): status/event by provider message id.
+create or replace function email_log_event(p_provider_id text, p_status text, p_event jsonb)
+returns void language sql volatile security definer set search_path = public as $$
+  update email_log set status = p_status, events = events || jsonb_build_array(p_event) where provider_id = p_provider_id
+$$;
+revoke all on function email_log_open, email_log_mark, email_log_event from public;
+grant execute on function email_log_open, email_log_mark, email_log_event to app_rw, system_rw;
+
+-- Stripe: the webhook stores events through a dedupe function; app_rw can no longer read raw payloads.
+revoke select, insert, update, delete on stripe_events from app_rw;
+create or replace function stripe_event_receive(p_id text, p_type text, p_payload jsonb) returns boolean
+language plpgsql volatile security definer set search_path = public as $$
+declare v text;
+begin
+  insert into stripe_events (id, type, payload) values (p_id, p_type, p_payload) on conflict (id) do nothing returning id into v;
+  return v is not null;
+end $$;
+revoke all on function stripe_event_receive from public;
+grant execute on function stripe_event_receive to app_rw, system_rw;

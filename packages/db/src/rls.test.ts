@@ -28,6 +28,43 @@ describe('RLS coverage (plan 02 §8.1)', () => {
     }
   });
 
+  it('every table with a workspace_id column is tenant-scoped, or is justified here and unreadable by app_rw', async () => {
+    // Global tables that carry a workspace_id but hold no rows the app role may read (plan 02 §3 layer 2).
+    const JUSTIFIED: Record<string, string> = {
+      stripe_events: 'raw Stripe payloads; written via stripe_event_receive(), read by system/staff only',
+      funnel_events: 'insert-only funnel log (pre-tenant visitors); read by staff analytics only',
+      abuse_signals: 'insert-only abuse log; read by staff only',
+      data_requests: 'privacy requests; app inserts, staff and system process',
+      purge_certificates: 'written by the purge job after the workspace is gone; staff/system only',
+      rights_cases: 'staff rights/takedown cases; staff only',
+      admin_audit_log: 'append-only staff audit log; admin_rw only',
+    };
+    const rows = await ownerPool()<{ table_name: string; kind: string | null; rls: boolean; forced: boolean; policies: string[]; app_select: boolean; app_update: boolean; app_delete: boolean }[]>`
+      select t.table_name, r.kind, c.relrowsecurity as rls, c.relforcerowsecurity as forced,
+             coalesce((select array_agg(p.polname) from pg_policy p where p.polrelid = c.oid), '{}') as policies,
+             has_table_privilege('app_rw', c.oid, 'SELECT') as app_select,
+             has_table_privilege('app_rw', c.oid, 'UPDATE') as app_update,
+             has_table_privilege('app_rw', c.oid, 'DELETE') as app_delete
+      from information_schema.columns t
+      join pg_class c on c.relname = t.table_name and c.relkind = 'r'
+      join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'public'
+      left join table_registry r on r.table_name = t.table_name
+      where t.table_schema = 'public' and t.column_name = 'workspace_id'`;
+    expect(rows.length).toBeGreaterThan(40);
+    const problems: string[] = [];
+    for (const r of rows) {
+      if (JUSTIFIED[r.table_name]) {
+        if (r.app_select || r.app_update || r.app_delete) problems.push(`${r.table_name}: justified global table is readable/writable by app_rw`);
+        continue;
+      }
+      const staffOnly = r.table_name === 'tenant_notes' || r.table_name === 'qa_reviews';
+      if (r.kind !== 'tenant') problems.push(`${r.table_name}: has workspace_id but is registered ${r.kind ?? 'nowhere'}`);
+      if (!r.rls || !r.forced) problems.push(`${r.table_name}: RLS not enabled + forced`);
+      if (!staffOnly && !r.policies.includes('tenant_isolation')) problems.push(`${r.table_name}: no tenant_isolation policy`);
+    }
+    expect(problems).toEqual([]);
+  });
+
   it('every tenant table has a workspace_id column', async () => {
     const missing = await ownerPool()`
       select r.table_name from table_registry r where r.kind = 'tenant' and not exists (
@@ -112,6 +149,45 @@ describe('tenant isolation', () => {
     const a = await makeTenant();
     await withAdmin((tx) => tx`insert into tenant_notes (workspace_id, staff_id, body) values (${a.workspaceId}, ${newId()}, 'vip')`);
     await expect(withTenant(a.workspaceId, (tx) => tx`select * from tenant_notes`)).rejects.toThrow(/permission denied/);
+  });
+
+  it('billing customers, Shopify shops, slug history and email logs are tenant-scoped', async () => {
+    const a = await makeTenant();
+    const b = await makeTenant();
+    await ownerPool()`insert into stripe_customers (customer_id, workspace_id) values ('cus_a', ${a.workspaceId}), ('cus_b', ${b.workspaceId})`;
+    await ownerPool()`insert into shopify_shops (shop_domain, workspace_id, integration_id) values ('a.myshopify.com', ${a.workspaceId}, ${newId()}), ('b.myshopify.com', ${b.workspaceId}, ${newId()})`;
+    await ownerPool()`insert into email_log (workspace_id, to_email, template, stream, idempotency_key) values
+                      (${a.workspaceId}, 'a@x.com', 'receipt', 'transactional', 'k-a'), (${b.workspaceId}, 'b@x.com', 'receipt', 'transactional', 'k-b'),
+                      (null, 'c@x.com', 'magic_link', 'transactional', 'k-c')`;
+    await withTenant(a.workspaceId, async (tx) => {
+      // The billing page / portal read: only this workspace's customer, even without a filter.
+      expect((await tx`select customer_id from stripe_customers`).map((r) => r.customer_id)).toEqual(['cus_a']);
+      expect((await tx`select shop_domain from shopify_shops`).map((r) => r.shop_domain)).toEqual(['a.myshopify.com']);
+      expect((await tx`select to_email from email_log`).map((r) => r.to_email)).toEqual(['a@x.com']);
+      const [r] = await tx`select shop_connected_elsewhere('b.myshopify.com') as elsewhere, shop_connected_elsewhere('a.myshopify.com') as mine`;
+      expect(r).toMatchObject({ elsewhere: true, mine: false });
+    });
+    // Log rows are written only through the email_log_* functions.
+    await expect(withTenant(a.workspaceId, (tx) => tx`update email_log set status = 'x'`)).rejects.toThrow(/permission denied/);
+    // Pre-tenant lookups only through the narrow functions.
+    const [ws] = await globalTx((tx) => tx`select workspace_for_shop('b.myshopify.com') as w`);
+    expect(ws!.w).toBe(b.workspaceId);
+    await expect(globalTx((tx) => tx`select * from stripe_customers`)).rejects.toThrow();
+    // Raw Stripe payloads are not readable by the app role at all.
+    await expect(globalTx((tx) => tx`select * from stripe_events`)).rejects.toThrow(/permission denied/);
+    const [ins] = await globalTx((tx) => tx`select stripe_event_receive('evt_rls', 't', '{}'::jsonb) as inserted`);
+    const [dup] = await globalTx((tx) => tx`select stripe_event_receive('evt_rls', 't', '{}'::jsonb) as inserted`);
+    expect([ins!.inserted, dup!.inserted]).toEqual([true, false]);
+  });
+
+  it('email log rows can only be opened for the tenant being acted for', async () => {
+    const a = await makeTenant();
+    const b = await makeTenant();
+    const [ok] = await withTenant(a.workspaceId, (tx) => tx`select * from email_log_open(${a.workspaceId}, 'x@y.com', 'receipt', 'transactional', 'k1')`);
+    expect(ok!.outcome).toBe('opened');
+    await expect(withTenant(a.workspaceId, (tx) => tx`select * from email_log_open(${b.workspaceId}, 'x@y.com', 'receipt', 'transactional', 'k2')`)).rejects.toThrow(/tenant context/);
+    const [none] = await globalTx((tx) => tx`select * from email_log_open(null, 'x@y.com', 'magic_link', 'transactional', 'k3')`);
+    expect(none!.outcome).toBe('opened');
   });
 
   it('membership resolution crosses the boundary only for the member', async () => {

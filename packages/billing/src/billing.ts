@@ -177,9 +177,9 @@ export async function receiveStripeWebhook(raw: string, signature: string | null
   } catch {
     throw new DomainError('FORBIDDEN', 'Invalid signature');
   }
-  const ins = await globalTx((tx) => tx`insert into stripe_events (id, type, payload) values (${event.id}, ${event.type}, ${tx.json(event as never)})
-                                        on conflict (id) do nothing returning id`);
-  return { id: event.id, duplicate: ins.length === 0 };
+  // Stored through a dedupe function: the app role can insert events but never read other tenants' payloads.
+  const [r] = await globalTx((tx) => tx`select stripe_event_receive(${event.id}, ${event.type}, ${tx.json(event as never)}) as inserted`);
+  return { id: event.id, duplicate: !r?.inserted };
 }
 
 async function resolveWorkspace(tx: Tx, customerId: string | null, metaWorkspace: string | null): Promise<string | null> {

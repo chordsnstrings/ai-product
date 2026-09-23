@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { render } from '@react-email/render';
-import { globalTx, type Tx } from '@arkiv/db';
+import { globalTx, withTenant, type Tx } from '@arkiv/db';
 import { env } from '@arkiv/shared';
 import { build, type TemplateMap, type TemplateName } from './templates';
 
@@ -35,16 +35,12 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
     const [sup] = await t`select stream from email_suppressions where email = ${email}`;
     if (sup && (sup.stream === 'all' || sup.stream === built.stream) && built.stream === 'marketing') return { status: 'suppressed' };
     if (sup && sup.stream === 'all' && built.stream === 'transactional' && template !== 'magic_link' && template !== 'security_alert') return { status: 'suppressed' };
-    if (built.stream === 'marketing') {
-      const [cap] = await t`select count(*) filter (where created_at > now() - interval '1 day')::int as d,
-                                   count(*) filter (where created_at > now() - interval '7 days')::int as w
-                            from email_log where to_email = ${email} and stream = 'marketing'`;
-      if (cap!.d >= 1 || cap!.w >= 3) return { status: 'capped' };
-    }
-    const ins = await t`insert into email_log (workspace_id, to_email, template, stream, idempotency_key, status)
-                        values (${opts.workspaceId ?? null}, ${email}, ${template}, ${built.stream}, ${opts.idempotencyKey}, 'queued')
-                        on conflict (idempotency_key) do nothing returning id`;
-    if (!ins.length) return { status: 'duplicate' };
+    // email_log is tenant-scoped (RLS); the log row, the marketing frequency cap (per address, across
+    // workspaces) and the dedupe go through a narrow SECURITY DEFINER function.
+    const [open] = await t`select id, outcome from email_log_open(${opts.workspaceId ?? null}, ${email}, ${template}, ${built.stream}, ${opts.idempotencyKey})`;
+    if (open!.outcome === 'capped') return { status: 'capped' };
+    if (open!.outcome === 'duplicate') return { status: 'duplicate' };
+    const ins = [{ id: open!.id as string }];
     const html = await render(built.element as never);
     const text = await render(built.element as never, { plainText: true });
     if (!env().RESEND_API_KEY) {
@@ -56,7 +52,7 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
         const { appendFile } = await import('node:fs/promises');
         await appendFile(process.env.EMAIL_DEV_FILE, `${JSON.stringify({ at: new Date().toISOString(), to: email, template, subject: built.subject, data })}\n`).catch(() => {});
       }
-      await t`update email_log set status = 'logged' where id = ${ins[0]!.id}`;
+      await t`select email_log_mark(${ins[0]!.id}, 'logged', null, null)`;
       return { status: 'logged' };
     }
     const from = built.stream === 'marketing' ? env().EMAIL_FROM.replace('@mail.', '@news.') : env().EMAIL_FROM;
@@ -72,13 +68,14 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
       { idempotencyKey: opts.idempotencyKey },
     );
     if (r.error) {
-      await t`update email_log set status = 'failed', events = events || ${t.json([{ at: new Date().toISOString(), error: r.error.message }])} where id = ${ins[0]!.id}`;
+      await t`select email_log_mark(${ins[0]!.id}, 'failed', null, ${t.json({ at: new Date().toISOString(), error: r.error.message })})`;
       throw new Error(`resend: ${r.error.message}`);
     }
-    await t`update email_log set status = 'sent', provider_id = ${r.data?.id ?? null} where id = ${ins[0]!.id}`;
+    await t`select email_log_mark(${ins[0]!.id}, 'sent', ${r.data?.id ?? null}, null)`;
     return { status: 'sent', providerId: r.data?.id ?? null };
   };
-  return tx ? run(tx) : globalTx(run);
+  // A send for a workspace runs in that tenant's context (the log row must match it); others need none.
+  return tx ? run(tx) : opts.workspaceId ? withTenant(opts.workspaceId, run) : globalTx(run);
 }
 
 export function signUnsub(email: string) {
@@ -118,8 +115,7 @@ export function verifyResendWebhook(body: string, headers: { id: string | null; 
 export async function handleResendEvent(evt: { type: string; data: { email_id?: string; to?: string[] } }) {
   await globalTx(async (t) => {
     if (evt.data.email_id) {
-      await t`update email_log set status = ${evt.type.replace('email.', '')}, events = events || ${t.json([{ type: evt.type, at: new Date().toISOString() }])}
-              where provider_id = ${evt.data.email_id}`;
+      await t`select email_log_event(${evt.data.email_id}, ${evt.type.replace('email.', '')}, ${t.json({ type: evt.type, at: new Date().toISOString() })})`;
     }
     if (evt.type === 'email.bounced' || evt.type === 'email.complained') {
       for (const to of evt.data.to ?? []) {
