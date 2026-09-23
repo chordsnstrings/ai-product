@@ -1,6 +1,6 @@
 SKINCARE CREATIVE OS
 Product, Software & Operating Standard
-V1.1  |  23 September 2026  |  US DTC Cosmetic Skincare
+V1.2  |  23 September 2026  |  US DTC Cosmetic Skincare
 <TABLE>
 | SOURCE OF TRUTH / This document defines what the product is, who it is for, what it must and must not do, how the intelligence layer is structured, how customer value compounds over time, and the software/operating rules engineering must follow. Where this standard conflicts with an ad-hoc feature request, the standard wins until the decision is deliberately revised and versioned. |
 </TABLE>
@@ -20,7 +20,7 @@ An AI performance-creative operating system built exclusively for small, already
 | Development environment | Claude Code / Opus 5.5 is suitable for implementation; runtime architecture remains model-agnostic |
 | Financial scope | Platform economics only; human payroll and other human OPEX/CAPEX excluded from current model |
 | External facts verified | 23 September 2026 |
-| Revision | V1.1 - reconciled billing event names, fixed CONFOUNDED typo, corrected R25 citation, added Creative Test cost ceiling, recorded stack decisions (Stripe, in-house auth, Postgres-backed queue, DigitalOcean). |
+| Revision | V1.1 - reconciled billing event names, fixed CONFOUNDED typo, corrected R25 citation, added Creative Test cost ceiling, recorded stack decisions (Stripe, in-house auth, Postgres-backed queue, DigitalOcean). V1.2 - email (Resend), voice (MiniMax / BytePlus), passwordless-first auth. |
 </TABLE>
 ## How to use this document
 Requirements marked MUST, MUST NOT, SHOULD and MAY use their normal engineering meaning. MUST and MUST NOT are launch gates. SHOULD indicates a default that may be overridden only with a documented reason. MAY indicates optional functionality. Research-derived facts carry source markers such as [R4]; commercial assumptions and internal targets are labelled as assumptions or targets rather than presented as external facts.
@@ -583,9 +583,11 @@ Figure 3. Recommended V1 architecture. The LLM is one component inside a control
 | Media | FFmpeg workers | Deterministic composition/transcode separate from generative models. |
 | AI | Provider-agnostic Model Gateway | Opus 5.5 initially for Creative Director; BytePlus image/video adapters; easy replacement. |
 | Observability | Structured logs + traces + metrics | Every job joins workspace/SKU/experiment/generation IDs. |
-| Auth/secrets | In-house auth (email + password with Argon2id, email verification, server-side sessions in Postgres) + DigitalOcean encrypted secrets | Login rate-limited; session cookies HttpOnly/Secure/SameSite; OAuth tokens encrypted; least privilege; no credentials in source code. |
+| Auth/secrets | In-house auth: email magic link, Google and Apple sign-in, passkeys, optional password (Argon2id); server-side sessions in Postgres + DigitalOcean encrypted secrets | Login rate-limited; session cookies HttpOnly/Secure/SameSite; OAuth tokens encrypted; least privilege; no credentials in source code. |
 | Payments | Stripe (Checkout for Taste, Billing for subscriptions) | Card data stays with Stripe; webhooks signature-verified and deduplicated; entitlements granted only from confirmed webhook events. |
 | Hosting | DigitalOcean: App Platform (web, API, workers), Managed Postgres, Spaces object storage + CDN | Containerized services; staging and production environments; automated database backups tested before paid launch. |
+| Email | Resend + React Email templates | Separate transactional and marketing sending subdomains; SPF/DKIM/DMARC; idempotency key on every send; bounce/complaint webhooks feed suppression. |
+| Voice | MiniMax speech (primary candidate) + BytePlus Seed Speech (fallback) via Model Gateway | Final primary chosen by blind listening test; no voice cloning in V1 without a consent-record flow. |
 </TABLE>
 # 35. Canonical State Machines
 ## Creative project state
