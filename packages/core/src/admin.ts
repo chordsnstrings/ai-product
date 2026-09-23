@@ -7,6 +7,7 @@ import { Queues } from './outbox';
 import { retryProduction } from './production';
 import { transition } from './projects';
 import { retireSupersededRates } from './rates';
+import { setting } from './settings';
 import { transitionWorkspace } from './workspaces';
 
 /**
@@ -353,14 +354,14 @@ export async function addTenantNote(s: Staff, workspaceId: string, body: string,
 }
 
 /** Danger zone: schedule a purge after the grace period. The prior state is kept so a cancel can restore it. */
-export async function scheduleTenantPurge(s: Staff, workspaceId: string, reason: string, graceDays = 7) {
+export async function scheduleTenantPurge(s: Staff, workspaceId: string, reason: string) {
   assertStaff(s, 'tenant.purge');
   if (reason.trim().length < 4) throw new DomainError('INVALID', 'A reason is required.');
   return withAdmin(async (tx) => {
     const [w] = await tx`select state from workspaces where id = ${workspaceId} for update`;
     if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
     await transitionWorkspace(tx, staffCtx(s, workspaceId), 'PURGE_SCHEDULED', `staff: ${reason}`);
-    await tx`update workspaces set purge_at = now() + make_interval(days => ${graceDays}) where id = ${workspaceId}`;
+    await tx`update workspaces set purge_at = now() + make_interval(days => ${await setting(tx, 'retention.purge_grace_days')}) where id = ${workspaceId}`;
     await audit(tx, s, 'tenant.schedule_purge', { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { state: w.state }, after: { state: 'PURGE_SCHEDULED' } });
   });
 }

@@ -207,11 +207,13 @@ export const ACTIONS = {
         amount: z.number().positive(),
         reasonCode: z.enum(RefundReason),
         customerNote: z.string().max(500).optional(),
+        // Minted when the refund form renders: a double submit or retried request reuses it and replays.
+        requestId: uuid.optional(),
         reason,
       })
       .refine((x) => !!x.purchaseId !== !!x.invoiceEventId, 'Choose exactly one payment to refund'),
-    // The nonce is minted once per request, so a replay after approval (or a retried click) never refunds twice.
-    run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId ?? null, invoiceEventId: i.invoiceEventId ?? null, amountMicros: Math.round(i.amount * 1e6), reasonCode: i.reasonCode, customerNote: i.customerNote ?? null, nonce: newId() }, i.reason),
+    // The nonce keys the Stripe refund and its mirror row, so a replay (retried click, re-run approval) never refunds twice.
+    run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId ?? null, invoiceEventId: i.invoiceEventId ?? null, amountMicros: Math.round(i.amount * 1e6), reasonCode: i.reasonCode, customerNote: i.customerNote ?? null, nonce: i.requestId ?? newId() }, i.reason),
   }),
   'billing.stripe_assign': a({ perm: 'billing.unmatched', reauth: true, schema: z.object({ eventId: z.string(), workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'stripe.assign', { eventId: i.eventId, workspaceId: i.workspaceId }, i.reason) }),
   'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched'`; await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason }); }) }),
@@ -267,6 +269,9 @@ export const ACTIONS = {
       const [ev] = await withAdmin((tx) => tx`select id from eval_runs where task = ${i.task} and model = ${model} and prompt_version = ${promptVersion} and dataset = ${dataset}
                                                  and status = 'passed' and created_at > now() - interval '7 days' limit 1`);
       if (!ev) throw new DomainError('CONFLICT', `Run a passing ${dataset} eval for ${i.task} · ${model} · ${promptVersion} (within 7 days) before changing this route.`);
+      // Every routed call is priced before dispatch (Cost Governor), so the candidate model needs a published rate.
+      const [rate] = await withAdmin((tx) => tx`select 1 from provider_rate_tables where provider = ${cur.provider as string} and model = ${model} and status = 'published' and effective_from <= now() limit 1`);
+      if (!rate) throw new DomainError('CONFLICT', `No published rate for ${cur.provider as string}/${model}. Publish one first; calls can't be priced without it.`);
       if (i.rolloutPct >= 100) return requestOrExecute(s, 'route.promote', { task: i.task, rolloutPct: i.rolloutPct, model, promptVersion }, i.reason);
       return withAdmin(async (tx) => {
         const prev = cur.canary as { model?: string; promptVersion?: string; startedAt?: string } | null;

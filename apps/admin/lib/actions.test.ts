@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { assertStaff, decideApproval, startBreakGlass } from '@arkiv/core';
+import { MockStripe, setBillingGateway } from '@arkiv/billing';
 import { DataRequestKind, newId, type StaffRole } from '@arkiv/shared';
 import { ACTIONS, type ActionName } from './actions';
 import type { StaffUser } from './staff';
@@ -110,9 +111,33 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
       await act(eng, 'route.update', { task, rolloutPct: '0', reason: 'end canary' });
       const [c3] = await ownerPool()`select canary from model_routes where task = ${task}`;
       expect(c3!.canary).toBeNull();
+      // A candidate model the Cost Governor can't price is refused even with a passing eval.
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.0.0', 'unpriced-model', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await expect(act(eng, 'route.update', { task, rolloutPct: '5', model: 'unpriced-model', reason: 'try it' })).rejects.toThrow(/No published rate for anthropic\/unpriced-model/);
     } finally {
       await ownerPool()`update model_routes set canary = null`;
     }
+  });
+});
+
+describe('billing.refund (plan 05 §7)', () => {
+  it('a repeated submit of the same refund form replays instead of refunding twice', async () => {
+    const gw = new MockStripe();
+    setBillingGateway(gw);
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const purchaseId = newId();
+    await ownerPool()`insert into purchases (id, workspace_id, kind, amount_micros, stripe_checkout_session_id, stripe_payment_intent_id, status, created_by)
+                      values (${purchaseId}, ${t.workspaceId}, 'standalone', 29000000, ${'cs_' + purchaseId}, ${'pi_' + purchaseId}, 'paid', 'user:x')`;
+    const fin = await staff(['FINANCE']);
+    const form = { workspaceId: t.workspaceId, purchaseId, amount: 10, reasonCode: 'goodwill', customerNote: 'Sorry for the delay.', requestId: newId(), reason: 'late delivery' };
+    const first = await act(fin, 'billing.refund', form);
+    const again = await act(fin, 'billing.refund', form);
+    expect(first.status).toBe('executed');
+    expect((again.result as { replayed?: boolean }).replayed).toBe(true);
+    expect(gw.refunds).toHaveLength(1);
+    await expect(act(fin, 'billing.refund', { ...form, purchaseId: undefined })).rejects.toThrow(/exactly one payment/);
+    const [pu] = await ownerPool()`select refunded_micros from purchases where id = ${purchaseId}`;
+    expect(Number(pu!.refunded_micros)).toBe(10_000_000);
   });
 });
 

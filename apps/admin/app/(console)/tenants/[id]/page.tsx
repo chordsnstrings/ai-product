@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
 import { activeBreakGlass, assertBreakGlass, audit, CANCELLABLE_BEFORE_DISPATCH, RISK_PLAYBOOKS, staffCan } from '@arkiv/core';
-import { PLANS, RefundReason, type PlanCode, type RiskIndicator } from '@arkiv/shared';
+import { newId, PLANS, RefundReason, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { ActButton, ActForm, type F } from '@/components/act';
 import { ago, d, dt, money, Mono, Page, Section, Table, Tabs } from '@/components/ui';
 import { estimateProjectRetry } from '@/lib/estimates';
@@ -329,14 +329,14 @@ async function Billing({ id, canRefund }: { id: string; canRefund: boolean }) {
         <Table head={['Paid', 'Invoice event', 'Amount', 'Refunded', '']} rows={d0.invoices.map((v) => {
           const paid = Number(v.cents ?? 0) * 10_000;
           const left = paid - (refundedByPi.get(v.pi as string) ?? 0);
-          return [dt(v.received_at), <Mono key="e">{v.id as string}</Mono>, money(paid), money(paid - left), canRefund && v.pi && left > 0 ? <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, invoiceEventId: v.id }} submit="🔐 Refund" fields={refundFields(left)} /> : null];
+          return [dt(v.received_at), <Mono key="e">{v.id as string}</Mono>, money(paid), money(paid - left), canRefund && v.pi && left > 0 ? <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, invoiceEventId: v.id, requestId: newId() }} submit="🔐 Refund" fields={refundFields(left)} /> : null];
         })} empty="No subscription payments on record." />
       </Section>
       <Section title="One-time purchases">
         <Table head={['When', 'Kind', 'Amount', 'Refunded', 'Status', 'Payment', '']} rows={d0.purchases.map((p) => {
           const left = Number(p.amount_micros) - Number(p.refunded_micros ?? 0);
           return [dt(p.created_at), p.kind as string, money(p.amount_micros), money(p.refunded_micros ?? 0), p.status as string, <Mono key="pi">{(p.stripe_payment_intent_id as string) ?? '—'}</Mono>, canRefund && ['paid', 'refunded'].includes(p.status as string) && left > 0 && p.stripe_payment_intent_id ? (
-            <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, purchaseId: p.id }} submit="🔐 Refund" fields={refundFields(left)} />
+            <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, purchaseId: p.id, requestId: newId() }} submit="🔐 Refund" fields={refundFields(left)} />
           ) : null];
         })} />
       </Section>

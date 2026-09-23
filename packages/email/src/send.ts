@@ -2,8 +2,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { render } from '@react-email/render';
 import { globalTx, type Tx } from '@arkiv/db';
 import { env } from '@arkiv/shared';
-import { createElement } from 'react';
-import { build, SupportEmail, type TemplateMap, type TemplateName } from './templates';
+import { build, type TemplateMap, type TemplateName } from './templates';
 
 /**
  * Email via Resend (decided). Transactional and marketing streams use separate sending subdomains; marketing
@@ -49,7 +48,7 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
     // Footer support address is a platform setting (plan 05 §20); omitted when unset.
     const [supportRow] = await t`select value from platform_settings where key = 'support.email'`;
     const supportEmail = typeof supportRow?.value === 'string' && supportRow.value.includes('@') ? supportRow.value : null;
-    const element = createElement(SupportEmail.Provider, { value: supportEmail }, built.element);
+    const element = build(template, data, { supportEmail }).element;
     const html = await render(element as never);
     const text = await render(element as never, { plainText: true });
     if (!env().RESEND_API_KEY) {
