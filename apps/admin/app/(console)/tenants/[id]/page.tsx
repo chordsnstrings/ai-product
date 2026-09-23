@@ -2,8 +2,8 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
 import { activeBreakGlass, assertBreakGlass, audit, CANCELLABLE_BEFORE_DISPATCH, RISK_PLAYBOOKS, staffCan } from '@arkiv/core';
-import { PLANS, type PlanCode, type RiskIndicator } from '@arkiv/shared';
-import { ActButton, ActForm } from '@/components/act';
+import { PLANS, RefundReason, type PlanCode, type RiskIndicator } from '@arkiv/shared';
+import { ActButton, ActForm, type F } from '@/components/act';
 import { ago, d, dt, money, Mono, Page, Section, Table, Tabs } from '@/components/ui';
 import { estimateProjectRetry } from '@/lib/estimates';
 import { requireStaff } from '@/lib/staff';
@@ -305,17 +305,43 @@ async function Billing({ id, canRefund }: { id: string; canRefund: boolean }) {
     purchases: await tx`select * from purchases where workspace_id = ${id} order by created_at desc limit 50`,
     events: await tx`select id, type, status, received_at, error from stripe_events where workspace_id = ${id} or payload->'data'->'object'->>'customer' = (select customer_id from stripe_customers where workspace_id = ${id}) order by received_at desc limit 50`,
     consents: await tx`select kind, text_version, text_snapshot, created_at, ip from consent_records where workspace_id = ${id} order by created_at desc limit 10`,
+    invoices: await tx`select e.id, e.received_at, (e.payload->'data'->'object'->>'amount_paid')::bigint as cents,
+                              coalesce(e.payload->'data'->'object'->>'payment_intent', e.payload->'data'->'object'->'payments'->'data'->0->'payment'->>'payment_intent') as pi
+                       from stripe_events e where e.workspace_id = ${id} and e.type = 'invoice.paid' order by e.received_at desc limit 24`,
+    refunds: await tx`select r.*, a.name as approver from refunds r left join staff_users a on a.id = r.approved_by where r.workspace_id = ${id} order by r.created_at desc limit 50`,
   }));
+  const refundedByPi = new Map<string, number>();
+  for (const r of d0.refunds) if (r.status === 'succeeded') refundedByPi.set(r.payment_intent_id as string, (refundedByPi.get(r.payment_intent_id as string) ?? 0) + Number(r.amount_micros));
+  const refundFields = (maxMicros: number): F[] => [
+    { name: 'amount', label: 'Amount $', type: 'number', defaultValue: maxMicros / 1e6, required: true },
+    { name: 'reasonCode', label: 'Reason code', type: 'select', options: [...RefundReason] },
+    { name: 'customerNote', label: 'Note to the customer (emailed)', type: 'textarea' },
+    { name: 'reason', label: 'Internal reason (audit)', required: true },
+  ];
   return (
     <>
       <p className="ak-small">Stripe customer: <Mono>{(d0.cust?.customer_id as string) ?? '—'}</Mono> {d0.cust ? <ActButton small action="billing.portal" payload={{ workspaceId: id }}>Open in Stripe</ActButton> : null}</p>
+      <p className="ak-small ak-muted">Refunds over $200 need a second FINANCE approver. Each refund writes CREDIT_REFUNDED; a full refund of an unused credit withdraws it.</p>
       <Section title="Subscriptions">
         <Table head={['Plan', 'Status', 'Period', 'Cancel at end', 'Pending', 'Stripe id']} rows={d0.subs.map((s) => [s.plan_code as string, s.status as string, `${d(s.current_period_start)} → ${d(s.current_period_end)}`, s.cancel_at_period_end ? 'yes' : 'no', (s.pending_plan_code as string) ?? '—', <Mono key="i">{s.stripe_subscription_id as string}</Mono>])} />
       </Section>
+      <Section title="Subscription payments">
+        <Table head={['Paid', 'Invoice event', 'Amount', 'Refunded', '']} rows={d0.invoices.map((v) => {
+          const paid = Number(v.cents ?? 0) * 10_000;
+          const left = paid - (refundedByPi.get(v.pi as string) ?? 0);
+          return [dt(v.received_at), <Mono key="e">{v.id as string}</Mono>, money(paid), money(paid - left), canRefund && v.pi && left > 0 ? <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, invoiceEventId: v.id }} submit="🔐 Refund" fields={refundFields(left)} /> : null];
+        })} empty="No subscription payments on record." />
+      </Section>
       <Section title="One-time purchases">
-        <Table head={['When', 'Kind', 'Amount', 'Status', 'Payment', '']} rows={d0.purchases.map((p) => [dt(p.created_at), p.kind as string, money(p.amount_micros), p.status as string, <Mono key="pi">{(p.stripe_payment_intent_id as string) ?? '—'}</Mono>, canRefund && p.status === 'paid' ? (
-          <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, purchaseId: p.id }} submit="🔐 Refund" fields={[{ name: 'amount', label: 'Amount $', type: 'number', defaultValue: Number(p.amount_micros) / 1e6, required: true }, { name: 'reason', label: 'Reason code + note', required: true }]} />
-        ) : null])} />
+        <Table head={['When', 'Kind', 'Amount', 'Refunded', 'Status', 'Payment', '']} rows={d0.purchases.map((p) => {
+          const left = Number(p.amount_micros) - Number(p.refunded_micros ?? 0);
+          return [dt(p.created_at), p.kind as string, money(p.amount_micros), money(p.refunded_micros ?? 0), p.status as string, <Mono key="pi">{(p.stripe_payment_intent_id as string) ?? '—'}</Mono>, canRefund && ['paid', 'refunded'].includes(p.status as string) && left > 0 && p.stripe_payment_intent_id ? (
+            <ActForm key="r" inline action="billing.refund" extra={{ workspaceId: id, purchaseId: p.id }} submit="🔐 Refund" fields={refundFields(left)} />
+          ) : null];
+        })} />
+      </Section>
+      <Section title="Refunds">
+        <Table head={['When', 'Amount', 'Reason code', 'Customer note', 'Status', 'Stripe refund', 'Approved by']} rows={d0.refunds.map((r) => [dt(r.created_at), money(r.amount_micros), r.reason_code as string, <span key="n" className="ak-small">{(r.customer_note as string) ?? ''}</span>, `${r.status as string}${r.error ? ` — ${String(r.error).slice(0, 80)}` : ''}`, <Mono key="s">{(r.stripe_refund_id as string) ?? '—'}</Mono>, (r.approver as string) ?? 'Stripe'])} empty="No refunds." />
       </Section>
       <Section title="Auto-renew consent records">
         <Table head={['When', 'Version', 'Text shown', 'IP']} rows={d0.consents.map((c) => [dt(c.created_at), <Mono key="v">{c.text_version as string}</Mono>, <span key="t" className="ak-small">{c.text_snapshot as string}</span>, <Mono key="ip">{String(c.ip ?? '')}</Mono>])} />

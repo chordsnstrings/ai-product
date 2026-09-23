@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { withAdmin, withSystem } from '@arkiv/db';
+import { withAdmin } from '@arkiv/db';
 import { assertFreshReauth, createStaff, deprovisionStaff, revokeAllSessions } from '@arkiv/auth';
 import {
   addTenantNote,
@@ -34,9 +34,9 @@ import {
   type Permission,
   type SettingKey,
 } from '@arkiv/core';
-import { billingGateway, processStripeEvent, receiveStripeWebhook } from '@arkiv/billing';
+import { billingGateway, processStripeEvent, refundPayment } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { DataRequestKind, DomainError, env, newId, StaffRole } from '@arkiv/shared';
+import { DataRequestKind, DomainError, env, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 
 /**
@@ -55,25 +55,22 @@ const uuid = z.string().uuid();
 const reason = z.string().trim().min(4, 'A reason is required');
 
 // ── Executors that need packages core can't import (billing) ──
-registerExecutor('billing.refund', async (p, { approver }) => {
-  const [pu] = await withAdmin((tx) => tx`select * from purchases where id = ${p.purchaseId as string} and workspace_id = ${p.workspaceId as string}`);
-  if (!pu || pu.status !== 'paid' || !pu.stripe_payment_intent_id) throw new DomainError('CONFLICT', 'Only paid purchases with a payment can be refunded');
-  const amount = Math.min(Number(p.amountMicros), Number(pu.amount_micros));
-  const refundId = await billingGateway().refund(pu.stripe_payment_intent_id as string, Math.round(amount / 10_000));
-  if (!billingGateway().live) {
-    // Mock mode: emit the webhook Stripe would send so the same pipeline updates purchases + entitlements.
-    const evt = { id: `evt_mock_${newId().slice(-12)}`, type: 'charge.refunded', created: Math.floor(Date.now() / 1000), data: { object: { id: `ch_mock_${refundId}`, payment_intent: pu.stripe_payment_intent_id, customer: null, metadata: { workspace_id: p.workspaceId } } } };
-    const r = await receiveStripeWebhook(JSON.stringify(evt), null);
-    await withSystem((tx) => tx`update stripe_events set workspace_id = ${p.workspaceId as string} where id = ${r.id}`);
-    await withSystem(async (tx) => {
-      const [c] = await tx`select customer_id from stripe_customers where workspace_id = ${p.workspaceId as string}`;
-      if (c) await tx`update stripe_events set payload = jsonb_set(payload, '{data,object,customer}', to_jsonb(${c.customer_id as string}::text)) where id = ${r.id}`;
-    });
-    await processStripeEvent(r.id);
-  }
-  await withAdmin((tx) => audit(tx, approver, 'billing.refunded', { type: 'purchase', id: pu.id as string }, { workspaceId: p.workspaceId as string, reason: p.reason as string, after: { amountMicros: amount, refundId } }));
-  return { refundId, amountMicros: amount };
-});
+// Refund tool (§7): one idempotent operation — Stripe refund + refunds mirror + CREDIT_REFUNDED (see billing/refunds).
+registerExecutor('billing.refund', (p, who) =>
+  refundPayment(
+    {
+      workspaceId: p.workspaceId as string,
+      purchaseId: (p.purchaseId as string) ?? null,
+      invoiceEventId: (p.invoiceEventId as string) ?? null,
+      amountMicros: Number(p.amountMicros),
+      reasonCode: p.reasonCode as RefundReason,
+      customerNote: (p.customerNote as string) ?? null,
+      nonce: p.nonce as string,
+      reason: p.reason as string,
+    },
+    who,
+  ),
+);
 
 registerExecutor('stripe.assign', async (p, { approver }) => {
   const [e] = await withAdmin((tx) => tx`select * from stripe_events where id = ${p.eventId as string}`);
@@ -198,7 +195,23 @@ export const ACTIONS = {
   'user.force_logout': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: async (s, i) => { await revokeAllSessions(i.userId); await withAdmin((tx) => audit(tx, s, 'user.force_logout', { type: 'user', id: i.userId }, { reason: i.reason })); } }),
 
   /* ── Billing ── */
-  'billing.refund': a({ perm: 'billing.refund', reauth: true, schema: z.object({ workspaceId: uuid, purchaseId: uuid, amount: z.number().positive(), reason }), run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId, amountMicros: Math.round(i.amount * 1e6) }, i.reason) }),
+  'billing.refund': a({
+    perm: 'billing.refund',
+    reauth: true,
+    schema: z
+      .object({
+        workspaceId: uuid,
+        purchaseId: uuid.optional(),
+        invoiceEventId: z.string().min(3).optional(),
+        amount: z.number().positive(),
+        reasonCode: z.enum(RefundReason),
+        customerNote: z.string().max(500).optional(),
+        reason,
+      })
+      .refine((x) => !!x.purchaseId !== !!x.invoiceEventId, 'Choose exactly one payment to refund'),
+    // The nonce is minted once per request, so a replay after approval (or a retried click) never refunds twice.
+    run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId ?? null, invoiceEventId: i.invoiceEventId ?? null, amountMicros: Math.round(i.amount * 1e6), reasonCode: i.reasonCode, customerNote: i.customerNote ?? null, nonce: newId() }, i.reason),
+  }),
   'billing.stripe_assign': a({ perm: 'billing.unmatched', reauth: true, schema: z.object({ eventId: z.string(), workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'stripe.assign', { eventId: i.eventId, workspaceId: i.workspaceId }, i.reason) }),
   'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched'`; await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason }); }) }),
   'billing.portal': a({ perm: 'billing.read', schema: z.object({ workspaceId: uuid }), run: async (s, i) => { const [c] = await withAdmin((tx) => tx`select customer_id from stripe_customers where workspace_id = ${i.workspaceId}`); if (!c) throw new DomainError('NOT_FOUND', 'No Stripe customer'); await withAdmin((tx) => audit(tx, s, 'billing.open_stripe', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId })); return { url: billingGateway().live ? `https://dashboard.stripe.com/customers/${c.customer_id}` : `${env().ADMIN_URL}/billing?customer=${c.customer_id}` }; } }),

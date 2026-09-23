@@ -63,6 +63,7 @@ export interface TemplateMap {
   storyboard_saved: { productName: string; url: string; standalonePrice: string };
   new_concept: { productName: string; url: string; hook: string };
   export_ready: { url: string; workspaceName: string };
+  refund_issued: { amount: string; description: string; note: string | null; url: string };
   integration_disconnected: { provider: string; url: string; workspaceName: string };
   claim_review_result: { claim: string; outcome: string; url: string };
   cancellation_confirmed: { planName: string; endsOn: string; exportUrl: string };
@@ -187,6 +188,21 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
     case 'export_ready': {
       const m = d as TemplateMap['export_ready'];
       return { subject: `Your ${m.workspaceName} export is ready`, stream: 'transactional', element: (<Layout preview="Download link valid for 24 hours." label="Export"><H>Your export is ready</H><P>This link works for 24 hours.</P><Cta href={m.url}>Download export</Cta></Layout>) };
+    }
+    case 'refund_issued': {
+      const m = d as TemplateMap['refund_issued'];
+      return {
+        subject: `Refund issued · ${m.amount}`,
+        stream: 'transactional',
+        element: (
+          <Layout preview={`${m.amount} is on its way back to your card.`} label="Refund">
+            <H>Your refund is on its way</H>
+            <Meta rows={[['Amount', m.amount], ['For', m.description], ['Arrives', 'in 5–10 business days, depending on your bank']]} />
+            {m.note ? <P>{m.note}</P> : null}
+            <Cta href={m.url}>View billing</Cta>
+          </Layout>
+        ),
+      };
     }
     case 'integration_disconnected': {
       const m = d as TemplateMap['integration_disconnected'];
