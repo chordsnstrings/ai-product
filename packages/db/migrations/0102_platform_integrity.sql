@@ -25,3 +25,45 @@ update claims c set allowed_platforms = coalesce((
                 where p <> upper(btrim(p)) or upper(btrim(p)) in ('META','INSTAGRAM','REELS','FACEBOOK','FEED','YOUTUBE_SHORTS'));
 update claims c set allowed_markets = array(select distinct upper(btrim(m)) from unnest(c.allowed_markets) m)
   where exists (select 1 from unnest(c.allowed_markets) m where m <> upper(btrim(m)));
+
+-- ───────────── Brand Brain versions (standard §15, §16 "Brand Brain") ─────────────
+-- Brand Brain edits used to overwrite brands.brain in place. Each edit is now an immutable version with its
+-- actor and reason; brands.brain stays the current copy and current_version_id points at its version.
+create table brand_brain_versions (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null,
+  brand_id uuid not null,
+  version int not null,
+  name text not null,
+  brain jsonb not null,
+  diff jsonb not null default '{}',
+  reason text,
+  created_by text not null,
+  created_at timestamptz not null default now(),
+  unique (workspace_id, id),
+  unique (brand_id, version),
+  foreign key (workspace_id, brand_id) references brands(workspace_id, id) on delete cascade on update cascade
+);
+-- Versions are history: never edited (deleted only with the brand, or by a workspace purge).
+create trigger brand_brain_versions_immutable before update on brand_brain_versions for each row execute function arkiv_forbid_mutation();
+select arkiv_tenant_table('brand_brain_versions'); insert into table_registry values ('brand_brain_versions','tenant');
+
+alter table brands add column current_version_id uuid;
+-- Generated work records which Brand Brain it was made with (provenance, §15).
+alter table concepts add column brand_brain_version_id uuid;
+alter table storyboards add column brand_brain_version_id uuid;
+
+insert into brand_brain_versions (workspace_id, brand_id, version, name, brain, reason, created_by)
+  select workspace_id, id, 1, name, brain, 'initial version (backfill)', 'system:migration' from brands;
+update brands b set current_version_id = v.id from brand_brain_versions v where v.brand_id = b.id and v.version = 1;
+
+-- Every new brand starts with version 1, whichever path created it.
+create or replace function arkiv_brand_initial_version() returns trigger language plpgsql as $$
+declare v uuid;
+begin
+  insert into brand_brain_versions (workspace_id, brand_id, version, name, brain, reason, created_by)
+    values (new.workspace_id, new.id, 1, new.name, new.brain, 'created', 'system:brand') returning id into v;
+  update brands set current_version_id = v where id = new.id;
+  return new;
+end $$;
+create trigger brands_initial_version after insert on brands for each row execute function arkiv_brand_initial_version();

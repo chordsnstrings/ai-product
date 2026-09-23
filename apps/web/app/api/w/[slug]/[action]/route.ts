@@ -11,7 +11,6 @@ import {
   decideFact,
   disconnectIntegration,
   dismissRecommendation,
-  emit,
   enqueue,
   importHistoricalCreative,
   importSignals,
@@ -31,6 +30,7 @@ import {
   scheduleDeletion,
   setExperimentState,
   transferOwnership,
+  updateBrandBrain,
   weekOf,
 } from '@arkiv/core';
 import { billingGateway, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
@@ -260,16 +260,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     /* ── Brand, workspace ── */
     case 'brand': {
-      const i = await body(req, z.object({ name: z.string().trim().min(1).max(80), tone: z.string().max(300).optional(), colors: z.array(z.string().regex(/^#[0-9a-f]{6}$/i)).max(6).optional(), prohibited: z.string().max(500).optional(), disclosures: z.string().max(500).optional(), cta: z.string().max(40).optional() }));
-      assertCan(ctx, 'sku.edit');
-      await t(async (tx) => {
-        const brain = { tone: i.tone ?? null, colors: i.colors ?? [], prohibited: i.prohibited ?? null, disclosures: i.disclosures ?? null, cta: i.cta ?? null };
-        const [b] = await tx`select id from brands order by created_at limit 1`;
-        if (b) await tx`update brands set name = ${i.name}, brain = ${tx.json(brain)} where id = ${b.id}`;
-        else await tx`insert into brands (workspace_id, name, brain) values (${ctx.workspaceId}, ${i.name}, ${tx.json(brain)})`;
-        await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'workspace', id: ctx.workspaceId }, { brand: true });
-      });
-      return json({ ok: true });
+      const i = await body(req, z.object({ name: z.string().trim().min(1).max(80), tone: z.string().max(300).optional(), colors: z.array(z.string().regex(/^#[0-9a-f]{6}$/i)).max(6).optional(), prohibited: z.string().max(500).optional(), disclosures: z.string().max(500).optional(), cta: z.string().max(40).optional(), market: z.string().trim().min(2).max(3).optional(), reason: z.string().max(200).optional() }));
+      // A new immutable Brand Brain version (with diff + BRAND_BRAIN_VERSIONED), never an in-place overwrite.
+      const r = await t((tx) => updateBrandBrain(tx, ctx, i, i.reason?.trim() || null));
+      return json({ ok: true, version: r.version, changed: r.changed });
     }
     case 'rename': {
       const { name } = await body(req, z.object({ name: z.string().trim().min(1).max(80) }));

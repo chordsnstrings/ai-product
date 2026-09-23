@@ -1,6 +1,7 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, type Angle } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
+import { brandBrainFor } from './brand';
 import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
 import { classifyClaim, scanCreativeText } from './compliance';
 import type { TenantContext } from './context';
@@ -31,6 +32,7 @@ export async function buildContext(tx: Tx, skuId: string) {
   const learnings = await tx`select statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
                              and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') order by confidence desc limit 6`;
   const ingredients = (factText(facts, 'key_ingredients') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const brand = await brandBrainFor(tx, skuId);
   const productContext: ProductContext = {
     name: sku.name as string,
     category: (factText(facts, 'category') ?? sku.category ?? 'skincare') as string,
@@ -59,10 +61,14 @@ export async function buildContext(tx: Tx, skuId: string) {
     customerThemes: themes.map((t) => ({ label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
     coverage: coverage.map((c) => ({ angle: c.angle, state: c.state, count: c.n })),
     learnings: learnings.map((l) => ({ statement: l.statement, state: l.state, platform: l.scope_platform })),
+    // The merchant's own Brand Brain (versioned): shapes voice and visuals, never overrides claim rules.
+    brand: brand
+      ? { name: brand.name, tone: brand.brain.tone, neverShowOrSay: brand.brain.prohibited, requiredDisclosures: brand.brain.disclosures, preferredCta: brand.brain.cta, colors: brand.brain.colors, market: brand.brain.market }
+      : null,
     platform: 'TikTok + Instagram Reels (9:16)',
     objective: 'Find the next creative test worth running for this SKU',
   };
-  return { sku, facts, productContext, packet, snippets: snippets.map((s) => s.text as string) };
+  return { sku, facts, productContext, packet, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
 }
 
 /** Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). */
@@ -105,7 +111,7 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, brandBrainVersionId } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -140,9 +146,9 @@ export async function generateConcepts(run: ConceptRun) {
     const pick = Math.min(res!.data.pickIndex, valid.length - 1);
     for (const [i, g] of valid.entries()) {
       const [c] = await tx`
-        insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, pick_reason, gate_results, prompt_version, model)
+        insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, pick_reason, gate_results, prompt_version, model, brand_brain_version_id)
         values (${run.ctx.workspaceId}, ${run.skuId}, ${run.projectId}, ${run.batch}, ${letters[i]!}, ${tx.json(g.cleaned as never)},
-          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons } as never)}, ${res!.promptVersion}, ${res!.model})
+          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons } as never)}, ${res!.promptVersion}, ${res!.model}, ${brandBrainVersionId})
         on conflict (workspace_id, project_id, batch, idx) do update set proposal = excluded.proposal
         returning id`;
       ids.push(c!.id as string);
@@ -180,8 +186,8 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[]): Storybo
   return { ...plan, scenes };
 }
 
-export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string }> {
-  const { productContext, packet, concept } = await withTenant(run.ctx.workspaceId, async (tx) => {
+export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string; brandBrainVersionId: string | null }> {
+  const { productContext, packet, concept, brandBrainVersionId } = await withTenant(run.ctx.workspaceId, async (tx) => {
     const c = await buildContext(tx, run.skuId);
     const [row] = await tx`select proposal from concepts where id = ${run.conceptId}`;
     if (!row) throw new DomainError('NOT_FOUND', 'Concept not found');
@@ -206,7 +212,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       maxTokens: 5000,
     });
     try {
-      return { plan: normalizePlan(res.data, productContext.approvedClaims), promptVersion: res.promptVersion, model: res.model };
+      return { plan: normalizePlan(res.data, productContext.approvedClaims), promptVersion: res.promptVersion, model: res.model, brandBrainVersionId };
     } catch (e) {
       lastErr = e;
     }

@@ -16,6 +16,7 @@ export * from './uploads';
 export * from './workspaces';
 export * from './offers';
 export * from './compliance';
+export * from './brand';
 export * from './claims';
 export * from './product-truth';
 export * from './ingest';

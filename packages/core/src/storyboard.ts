@@ -92,11 +92,11 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
   );
   try {
     await withTenant(ws, (tx) => step(tx, ws, storyboardId, 'plan', 'active'));
-    const { plan, promptVersion, model } = await planStoryboard({ ctx, token: auth.token, skuId, projectId, conceptId });
+    const { plan, promptVersion, model, brandBrainVersionId } = await planStoryboard({ ctx, token: auth.token, skuId, projectId, conceptId });
     await withTenant(ws, async (tx) => {
       await step(tx, ws, storyboardId, 'plan', 'done', `${plan.scenes.length} scenes · 15 seconds`);
       await step(tx, ws, storyboardId, 'claims', 'done', 'Every line uses approved or neutral wording');
-      await tx`update storyboards set hook_text = ${plan.hook}, cta_text = ${plan.cta}, total_ms = 15000 where id = ${storyboardId}`;
+      await tx`update storyboards set hook_text = ${plan.hook}, cta_text = ${plan.cta}, total_ms = 15000, brand_brain_version_id = ${brandBrainVersionId} where id = ${storyboardId}`;
       await tx`delete from scenes where storyboard_id = ${storyboardId}`;
       for (const [i, s] of plan.scenes.entries()) {
         await tx`insert into scenes (workspace_id, storyboard_id, position, purpose, duration_ms, visual_plan, product_behavior,
