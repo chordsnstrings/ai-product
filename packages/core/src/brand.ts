@@ -1,5 +1,5 @@
 import type { Tx } from '@arkiv/db';
-import { DomainError, normalizeMarkets } from '@arkiv/shared';
+import { DEFAULT_VOICE, DomainError, isLogicalVoice, normalizeMarkets, type LogicalVoice } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
@@ -18,6 +18,8 @@ export interface BrandBrain {
   cta: string | null;
   /** Primary market (claims are approved per market, §43). */
   market: string;
+  /** Logical voice-over voice (resolved per TTS provider by the Model Gateway). */
+  voice: LogicalVoice;
 }
 
 export function toBrain(raw: unknown): BrandBrain {
@@ -28,13 +30,13 @@ export function toBrain(raw: unknown): BrandBrain {
   } catch {
     /* keep US */
   }
-  return { tone: b.tone ?? null, colors: Array.isArray(b.colors) ? b.colors : [], prohibited: b.prohibited ?? null, disclosures: b.disclosures ?? null, cta: b.cta ?? null, market };
+  return { tone: b.tone ?? null, colors: Array.isArray(b.colors) ? b.colors : [], prohibited: b.prohibited ?? null, disclosures: b.disclosures ?? null, cta: b.cta ?? null, market, voice: isLogicalVoice(b.voice) ? b.voice : DEFAULT_VOICE };
 }
 
 /** Field-by-field change set between two versions (what the event and the version row record). */
 export function brainDiff(before: BrandBrain & { name?: string }, after: BrandBrain & { name?: string }): Record<string, { from: unknown; to: unknown }> {
   const out: Record<string, { from: unknown; to: unknown }> = {};
-  for (const k of ['name', 'tone', 'colors', 'prohibited', 'disclosures', 'cta', 'market'] as const) {
+  for (const k of ['name', 'tone', 'colors', 'prohibited', 'disclosures', 'cta', 'market', 'voice'] as const) {
     if (JSON.stringify(before[k] ?? null) !== JSON.stringify(after[k] ?? null)) out[k] = { from: before[k] ?? null, to: after[k] ?? null };
   }
   return out;
@@ -48,6 +50,7 @@ export interface BrandBrainInput {
   disclosures?: string | null;
   cta?: string | null;
   market?: string | null;
+  voice?: string | null;
 }
 
 /**
@@ -71,7 +74,9 @@ export async function updateBrandBrain(tx: Tx, ctx: TenantContext, input: BrandB
     disclosures: input.disclosures?.trim() || null,
     cta: input.cta?.trim() || null,
     market: input.market ? normalizeMarkets([input.market])[0] : before.market,
+    voice: input.voice ?? before.voice,
   });
+  if (input.voice && !isLogicalVoice(input.voice)) throw new DomainError('INVALID', 'Unknown voice');
   const diff = brainDiff(before, { ...brain, name });
   if (!Object.keys(diff).length) {
     const [v] = await tx`select version from brand_brain_versions where id = ${b!.current_version_id}`;

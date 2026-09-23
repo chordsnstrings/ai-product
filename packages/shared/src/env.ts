@@ -30,6 +30,8 @@ const EnvSchema = z.object({
   MINIMAX_TTS_MODEL: z.string().default('speech-2.8-hd'),
   BYTEPLUS_SPEECH_APP_ID: z.string().optional(),
   BYTEPLUS_SPEECH_TOKEN: z.string().optional(),
+  /** Provider voice ids per logical voice, JSON: {"warm_female":{"byteplus-speech":"<speaker id>"}} (see voices.ts). */
+  TTS_VOICE_MAP: z.string().optional(),
 
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),

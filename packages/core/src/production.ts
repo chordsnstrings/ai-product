@@ -1,11 +1,12 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, platformsFor, type Platform } from '@arkiv/shared';
+import { DEFAULT_VOICE, DomainError, platformsFor, type Platform } from '@arkiv/shared';
 import { composeAd, placeholderFrame, withTempDir, type Aspect, type SceneInput } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
+import { brandBrainFor } from './brand';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { allowedClaimTexts } from './creative-director';
@@ -248,7 +249,9 @@ export async function produceProject(ctx: TenantContext, projectId: string): Pro
       });
       let voPath: string | null = null;
       if (voText) {
-        const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'project', id: projectId }, text: voText, voice: 'English_Graceful_Lady' });
+        // Logical voice from the Brand Brain; the gateway resolves each TTS provider's own voice id.
+        const voice = (await withTenant(ws, (tx) => brandBrainFor(tx, sku.id as string)))?.brain.voice ?? DEFAULT_VOICE;
+        const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'project', id: projectId }, text: voText, voice });
         voPath = path.join(dir, 'vo.mp3');
         await writeFile(voPath, vo.bytes);
         await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId: sku.id as string, source: 'generated', lineage: { providerJobId: vo.jobId } }));
