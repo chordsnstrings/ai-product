@@ -445,7 +445,9 @@ export async function cancelProjectBeforeDispatch(s: Staff, workspaceId: string,
       throw new DomainError('CONFLICT', `Only productions that haven’t reached a provider can be cancelled (this one is ${String(p.state).toLowerCase()}).`);
     // Lock the reservations first: a worker's provider dispatch debits the same row, so it either committed
     // before us (and its provider job is visible below) or it will find the reservation released.
-    const auths = await tx`select id from cost_authorizations where workspace_id = ${workspaceId} and project_id = ${projectId} and status = 'active' for update`;
+    // Only the production reservation (keyed produce:<project>) — storyboard authorizations have their own lifecycle.
+    const auths = await tx`select id from cost_authorizations where workspace_id = ${workspaceId} and project_id = ${projectId}
+                           and idempotency_key = ${'produce:' + projectId} and status = 'active' for update`;
     if (auths.length) {
       const [dispatched] = await tx`select 1 from provider_jobs where workspace_id = ${workspaceId} and authorization_id in ${tx(auths.map((a) => a.id as string))} limit 1`;
       if (dispatched) throw new DomainError('CONFLICT', 'A provider call was already dispatched; the job has to finish and settle.');
