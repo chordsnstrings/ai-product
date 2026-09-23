@@ -142,6 +142,8 @@ returns void language sql volatile security definer set search_path = public as 
   update email_log set status = p_status, provider_id = coalesce(p_provider_id, provider_id),
     events = case when p_event is null then events else events || jsonb_build_array(p_event) end
   where id = p_id
+    -- Same rule as email_log_open: a tenant's row is only updated from that tenant's context.
+    and (workspace_id is null or workspace_id = arkiv_current_workspace_or_null())
 $$;
 
 -- Resend webhook (no tenant context): status/event by provider message id.

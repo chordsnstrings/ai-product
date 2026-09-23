@@ -188,6 +188,15 @@ describe('tenant isolation', () => {
     await expect(withTenant(a.workspaceId, (tx) => tx`select * from email_log_open(${b.workspaceId}, 'x@y.com', 'receipt', 'transactional', 'k2')`)).rejects.toThrow(/tenant context/);
     const [none] = await globalTx((tx) => tx`select * from email_log_open(null, 'x@y.com', 'magic_link', 'transactional', 'k3')`);
     expect(none!.outcome).toBe('opened');
+    // Marking a row: only from its own tenant's context (another tenant, or no context, changes nothing).
+    await withTenant(b.workspaceId, (tx) => tx`select email_log_mark(${ok!.id}, 'hijacked', null, null)`);
+    await globalTx((tx) => tx`select email_log_mark(${ok!.id}, 'hijacked', null, null)`);
+    const [untouched] = await ownerPool()`select status, provider_id from email_log where id = ${ok!.id}`;
+    expect(untouched).toMatchObject({ status: 'queued', provider_id: null });
+    await withTenant(a.workspaceId, (tx) => tx`select email_log_mark(${ok!.id}, 'sent', 'msg_1', null)`);
+    await globalTx((tx) => tx`select email_log_mark(${none!.id}, 'sent', 'msg_2', null)`);
+    const rows = await ownerPool()`select idempotency_key, status from email_log where idempotency_key in ('k1', 'k3') order by idempotency_key`;
+    expect(rows.map((r) => [r.idempotency_key, r.status])).toEqual([['k1', 'sent'], ['k3', 'sent']]);
   });
 
   it('membership resolution crosses the boundary only for the member', async () => {
