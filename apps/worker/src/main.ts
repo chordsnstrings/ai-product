@@ -4,7 +4,7 @@ import { env } from '@arkiv/shared';
 import { Queues } from '@arkiv/core';
 import { processStripeEvent } from '@arkiv/billing';
 import { processPendingStripeEvents, runJob } from './handlers';
-import { sweeps } from './sweeps';
+import { sweepQueue, sweeps } from './sweeps';
 import { grantQueueVisibility, processOpsCommands } from './ops';
 
 /**
@@ -69,7 +69,11 @@ async function main() {
       });
     }
   }
-  for (const [name, s] of Object.entries(sweeps)) {
+  for (const [key, s] of Object.entries(sweeps)) {
+    // Schedules get their own queue namespace: a sweep sharing a job queue's name (e.g. weekly-recommendations)
+    // would compete for that queue's per-workspace jobs and run the fan-out instead of the job.
+    const name = sweepQueue(key);
+    await boss.unschedule(key).catch(() => {}); // remove schedules registered under the old, colliding name
     await boss.createQueue(name).catch(() => {});
     await boss.schedule(name, s.cron, {});
     await boss.work(name, async () => {

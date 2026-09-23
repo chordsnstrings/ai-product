@@ -21,6 +21,9 @@ async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], w
   await tx`insert into outbox (workspace_id, queue, payload, singleton_key) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey})`;
 }
 
+/** pg-boss queue for a schedule — never the same name as a job queue (see main.ts). */
+export const sweepQueue = (key: string) => `cron-${key}`;
+
 export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> }> = {
   'sweep-authorizations': { cron: '* * * * *', run: () => withSystem((tx) => sweepExpiredAuthorizations(tx)) },
   'sweep-offers': { cron: '* * * * *', run: () => withSystem((tx) => expireOffers(tx)) },
