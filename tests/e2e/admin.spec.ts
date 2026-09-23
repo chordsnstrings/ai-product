@@ -25,8 +25,8 @@ test('staff can sign in and use the console', async ({ page }) => {
   });
   const row = page.locator('tr', { hasText: 'kill.read_only' });
   await row.getByRole('button', { name: /Turn on/ }).click();
-  await expect(row.getByText('ON')).toBeVisible();
+  await expect(row.getByText('ON', { exact: true })).toBeVisible();
   await row.getByRole('button', { name: /Turn off/ }).click();
-  await expect(row.getByText('ON')).toBeHidden();
+  await expect(row.getByText('ON', { exact: true })).toBeHidden();
   expect(dialogs.some((m) => /authenticator/i.test(m))).toBe(true);
 });
