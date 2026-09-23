@@ -296,7 +296,7 @@ export async function produceProject(ctx: TenantContext, projectId: string): Pro
         await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets });
         await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, {});
         await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
-        if (p.experiment_id) await enqueue(tx, ws, Queues.computeResults, { experimentId: p.experiment_id, reason: 'variant_ready' });
+        if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
       });
     });
     const [final] = await withTenant(ws, (tx) => tx`select state from projects where id = ${projectId}`);

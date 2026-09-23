@@ -6,6 +6,7 @@ export const Queues = {
   generateConcepts: 'generate-concepts',
   generateStoryboard: 'generate-storyboard',
   produceProject: 'produce-project',
+  hookVariants: 'hook-variants',
   processUpload: 'process-upload',
   stripeEvent: 'stripe-event',
   sendEmail: 'send-email',

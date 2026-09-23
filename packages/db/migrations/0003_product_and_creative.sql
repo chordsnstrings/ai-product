@@ -260,6 +260,7 @@ create table variants (
   workspace_id uuid not null,
   experiment_id uuid not null,
   label text not null,
+  code text not null,                  -- e.g. AK-014-B; put in ad names so platform ads auto-link to variants
   role text not null check (role in ('control','variant')),
   creative_id uuid,
   project_id uuid,

@@ -148,7 +148,9 @@ create table tenant_notes (
 );
 alter table tenant_notes enable row level security; alter table tenant_notes force row level security;
 create policy staff_access on tenant_notes to admin_rw using (true) with check (true);
+create policy system_access on tenant_notes to system_rw using (true) with check (true);
 grant select, insert, delete on tenant_notes to admin_rw;
+grant select, delete on tenant_notes to system_rw;
 insert into table_registry values ('tenant_notes','tenant');
 
 -- Break-glass sessions are visible to the tenant in its access log (plan 05 §0.3).
