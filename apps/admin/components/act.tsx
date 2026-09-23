@@ -75,7 +75,7 @@ export function ActButton({ action, payload = {}, children, confirm, reason, dan
 export interface F {
   name: string;
   label: string;
-  type?: 'text' | 'number' | 'textarea' | 'select' | 'checkbox' | 'date' | 'json';
+  type?: 'text' | 'number' | 'textarea' | 'select' | 'checkbox' | 'date' | 'datetime-local' | 'json';
   options?: string[] | { value: string; label: string }[];
   defaultValue?: string | number | boolean;
   required?: boolean;
@@ -101,6 +101,8 @@ export function ActForm({ action, fields, submit, extra = {}, inline }: { action
             if (f.type === 'checkbox') payload[f.name] = v === 'on';
             else if (f.type === 'number') payload[f.name] = v === '' || v === null ? undefined : Number(v);
             else if (f.type === 'json') payload[f.name] = v ? JSON.parse(String(v)) : undefined;
+            // The browser's local time → an explicit UTC instant (the server never guesses the staff timezone).
+            else if (f.type === 'datetime-local') payload[f.name] = v ? new Date(String(v)).toISOString() : undefined;
             else if (v !== null && v !== '') payload[f.name] = String(v);
           }
         } catch {

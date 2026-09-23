@@ -3,6 +3,7 @@ import {
   duePurges,
   expireOffers,
   refreshRiskFlags,
+  retireSupersededRates,
   sweepExpiredAuthorizations,
   sweepExpiringEvidence,
   sweepProvisional,
@@ -54,6 +55,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       }),
   },
   'sweep-rate-limits': { cron: '17 * * * *', run: () => withSystem((tx) => sweepRateLimits(tx)) },
+  // A scheduled rate-table version replaces its predecessor at its effective time (plan 05 §9); pricing already
+  // uses the newest version in effect, this keeps the table's statuses truthful.
+  'retire-superseded-rates': { cron: '*/5 * * * *', run: () => withSystem((tx) => retireSupersededRates(tx)) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
   'sync-integrations': {
     cron: '0 */6 * * *',
@@ -88,11 +92,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
     cron: '30 7 * * *',
     run: () =>
       withSystem(async (tx) => {
+        // refreshRiskFlags filters every query by workspace_id: the system role's policies see all tenants.
         const ws = await tx`select id from workspaces where state in ('ACTIVE_PAID','PAST_DUE','ACTIVE_FREE')`;
-        for (const w of ws) {
-          await tx`select set_config('app.workspace_id', ${w.id as string}, true)`;
-          await refreshRiskFlags(tx, w.id as string);
-        }
+        for (const w of ws) await refreshRiskFlags(tx, w.id as string);
         return ws.length;
       }),
   },

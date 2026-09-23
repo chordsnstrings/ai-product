@@ -219,14 +219,24 @@ export const ACTIONS = {
   /* ── Rates ── */
   'rates.propose': a({
     perm: 'rates.propose',
-    schema: z.object({ provider: z.string().min(2), model: z.string().min(2), unit: z.string().min(2), rates: z.record(z.string(), z.number().nonnegative()), sourceUrl: z.string().url().optional(), notes: z.string().max(500).optional(), effectiveFrom: z.string().optional() }),
+    schema: z.object({
+      provider: z.string().min(2),
+      model: z.string().min(2),
+      unit: z.string().min(2),
+      rates: z.record(z.string(), z.number().nonnegative()),
+      sourceUrl: z.string().url().optional(),
+      notes: z.string().max(500).optional(),
+      // When the new price takes effect (plan 05 §9 "effective at a time"); publishing earlier keeps today's rate until then.
+      effectiveFrom: z.string().datetime({ offset: true }).optional(),
+    }),
     run: (s, i) =>
       withAdmin(async (tx) => {
         const [v] = await tx`select coalesce(max(version), 0) + 1 as v from provider_rate_tables where provider = ${i.provider} and model = ${i.model}`;
+        const effective = i.effectiveFrom ? new Date(i.effectiveFrom) : new Date();
         const [r] = await tx`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, source_url, notes, status, created_by)
-                             values (${i.provider}, ${i.model}, ${v!.v}, ${i.unit}, ${tx.json(i.rates)}, ${i.effectiveFrom ?? new Date().toISOString()}, ${i.sourceUrl ?? null}, ${i.notes ?? null}, 'draft', ${s.staffId}) returning id`;
+                             values (${i.provider}, ${i.model}, ${v!.v}, ${i.unit}, ${tx.json(i.rates)}, ${effective}, ${i.sourceUrl ?? null}, ${i.notes ?? null}, 'draft', ${s.staffId}) returning id`;
         await audit(tx, s, 'rates.proposed', { type: 'rate_table', id: r!.id as string }, { after: i });
-        return { id: r!.id, message: `Draft v${v!.v} created. Publishing needs a second approver.` };
+        return { id: r!.id, message: `Draft v${v!.v} created (effective ${effective.toUTCString()}). Publishing needs a second approver.` };
       }),
   }),
   'rates.publish': a({ perm: 'rates.propose', reauth: true, schema: z.object({ rateTableId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'rates.publish', { rateTableId: i.rateTableId }, i.reason) }),
