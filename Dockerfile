@@ -9,7 +9,9 @@ ARG DOCKER_TARGET=web
 
 FROM node:${NODE_VERSION}-bookworm-slim AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH NEXT_TELEMETRY_DISABLED=1
-RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
+# Install pnpm with npm: the corepack bundled with Node 22.12 ships outdated npm signing keys and
+# fails signature verification ("Cannot find matching keyid").
+RUN npm install -g pnpm@10.33.0 && pnpm --version
 WORKDIR /repo
 
 FROM base AS deps
@@ -18,7 +20,7 @@ COPY apps/web/package.json apps/web/
 COPY apps/admin/package.json apps/admin/
 COPY apps/worker/package.json apps/worker/
 COPY packages/ packages/
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile --store-dir /pnpm/store
 
 FROM deps AS build
 COPY . .
