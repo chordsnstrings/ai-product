@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError } from '@arkiv/shared';
+import { DomainError, platformsFor, type Platform } from '@arkiv/shared';
 import { composeAd, placeholderFrame, withTempDir, type Aspect, type SceneInput } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
@@ -32,6 +32,23 @@ const ASPECTS: Aspect[] = ['9x16', '4x5', '1x1'];
 const MIN_GEN_SECONDS = 5;
 
 type SceneRow = Record<string, unknown> & { id: string; production_mode: string; duration_ms: number; purpose: string };
+
+const PLATFORM_LABEL: Record<Platform, string> = { TIKTOK: 'TikTok', INSTAGRAM_REELS: 'Instagram Reels', FACEBOOK_FEED: 'Facebook/Instagram feed' };
+
+/** Claims QA for every platform the given exports publish to; a line must be approved on each of them. */
+export async function claimsQaForExports(tx: Tx, skuId: string, lines: string[], aspects: readonly Aspect[]): Promise<CheckResult> {
+  const results: { platform: Platform; check: CheckResult }[] = [];
+  for (const platform of platformsFor(aspects)) results.push({ platform, check: qaClaims(lines, await allowedClaimTexts(tx, skuId, { platforms: [platform] })) });
+  const failing = results.filter((r) => !r.check.pass);
+  if (!failing.length) return { ...results[0]!.check, detail: `${lines.length} lines checked for ${results.map((r) => PLATFORM_LABEL[r.platform]).join(', ')}` };
+  return {
+    check: 'claims',
+    pass: false,
+    hard: true,
+    detail: failing.map((f) => `${PLATFORM_LABEL[f.platform]}: ${f.check.detail}`).join(' | '),
+    data: { platforms: failing.map((f) => ({ platform: f.platform, ...(f.check.data as object) })) },
+  };
+}
 
 /** Production Planner (§23): chooses the medium scene by scene and prices the plan before any spend. */
 export function planProduction(scenes: SceneRow[], voiceChars: number): { lines: CostLine[]; generative: string[] } {
@@ -208,10 +225,10 @@ export async function produceProject(ctx: TenantContext, projectId: string): Pro
         await step(tx, ws, projectId, 'accuracy', 'done', 'Product matches your reference photos');
       });
 
-      // Claims check on everything said or shown, before voice is synthesized (Launch Gate 3).
-      const allowed = await withTenant(ws, (tx) => allowedClaimTexts(tx, sku.id as string));
+      // Claims check on everything said or shown, before voice is synthesized (Launch Gate 3), per platform the
+      // exports are published to (9:16 → TikTok + Reels, 4:5/1:1 → Feed) in the brand's market (§17, §43).
       const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb.hook_text, sb.cta_text].filter(Boolean) as string[];
-      const claimCheck = qaClaims(lines, allowed);
+      const claimCheck = await withTenant(ws, (tx) => claimsQaForExports(tx, sku.id as string, lines, ASPECTS));
       checks.push(claimCheck);
       if (!claimCheck.pass) {
         await withTenant(ws, async (tx) => {

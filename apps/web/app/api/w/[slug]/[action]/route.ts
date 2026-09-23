@@ -164,7 +164,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       return json(await t((tx) => proposeClaim(tx, ctx, i.skuId, { wording: i.wording, origin: 'merchant' })));
     }
     case 'claim-approve': {
-      const i = await body(req, z.object({ claimId: uuid, markets: z.array(z.string()).min(1), platforms: z.array(z.enum(['meta', 'tiktok', 'youtube', 'organic'])).min(1), qualifier: z.string().max(120).nullish(), wording: z.string().max(200).optional() }));
+      // Scope values are normalised (and unknown ones refused) by approveClaim: TIKTOK, META (= Reels + Feed), YOUTUBE, ORGANIC…
+      const i = await body(req, z.object({ claimId: uuid, markets: z.array(z.string().trim().min(2).max(3)).min(1).max(20), platforms: z.array(z.string().trim().min(2).max(32)).min(1).max(10), qualifier: z.string().max(120).nullish(), wording: z.string().max(200).optional() }));
       return json(await t((tx) => approveClaim(tx, ctx, i.claimId, i)));
     }
     case 'reviews': {

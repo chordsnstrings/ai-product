@@ -1,7 +1,7 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, type Angle } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
-import { listClaims, renderableClaims } from './claims';
+import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
 import { classifyClaim, scanCreativeText } from './compliance';
 import type { TenantContext } from './context';
 import { emit } from './events';
@@ -20,6 +20,9 @@ export async function buildContext(tx: Tx, skuId: string) {
   if (!sku) throw new DomainError('NOT_FOUND', 'Product not found');
   const facts = await currentFacts(tx, skuId);
   const claims = await listClaims(tx, skuId);
+  // Only claims usable wherever this ad will be published (every export platform, the brand's market) are
+  // offered as APPROVED; anything narrower would pass here and then fail claims QA after render spend.
+  const usable = new Set((await renderableClaims(tx, skuId, { platforms: AD_PLATFORMS })).map((c) => c.id));
   const themes = await tx`select label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
                           order by prevalence * relevance desc limit 6`;
   const snippets = await tx`select text from customer_signals where sku_id = ${skuId} order by observed_at desc nulls last limit 8`;
@@ -34,7 +37,7 @@ export async function buildContext(tx: Tx, skuId: string) {
     sizeText: factText(facts, 'size'),
     texture: factText(facts, 'texture'),
     ingredients,
-    approvedClaims: claims.filter((c) => c.status === 'VERIFIED' || c.status === 'VERIFIED_WITH_QUALIFIER').map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
+    approvedClaims: claims.filter((c) => usable.has(c.id)).map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
     themes: themes.map((t) => ({ label: t.label as string, signalType: t.signal_type as string })),
     testedAngles: coverage.map((c) => c.angle as string).filter(Boolean),
   };
@@ -50,7 +53,7 @@ export async function buildContext(tx: Tx, skuId: string) {
     },
     claims: {
       APPROVED: productContext.approvedClaims,
-      NEEDS_REVIEW_DO_NOT_USE: claims.filter((c) => c.status === 'MERCHANT_REVIEW_REQUIRED').map((c) => c.preferredWording),
+      NEEDS_REVIEW_DO_NOT_USE: claims.filter((c) => c.status === 'MERCHANT_REVIEW_REQUIRED' || ((c.status === 'VERIFIED' || c.status === 'VERIFIED_WITH_QUALIFIER') && !usable.has(c.id))).map((c) => c.preferredWording),
       BLOCKED_NEVER_USE: claims.filter((c) => c.status === 'BLOCKED' || c.status === 'RESTRICTED').map((c) => c.preferredWording),
     },
     customerThemes: themes.map((t) => ({ label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
@@ -211,7 +214,10 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
   throw lastErr;
 }
 
-/** Claims in use per platform (used by QA and by Creator Packs). */
-export async function allowedClaimTexts(tx: Tx, skuId: string, platform = 'TIKTOK') {
-  return (await renderableClaims(tx, skuId, platform)).map((c) => ({ id: c.id, wording: c.preferredWording, qualifier: c.mandatoryQualifier }));
+/**
+ * Claims usable for a render scope (used by QA, scene edits, hook variants and Creator Packs). Defaults to every
+ * platform a standard ad is exported to, in the brand's market.
+ */
+export async function allowedClaimTexts(tx: Tx, skuId: string, scope: ClaimScope = { platforms: AD_PLATFORMS }) {
+  return (await renderableClaims(tx, skuId, scope)).map((c) => ({ id: c.id, wording: c.preferredWording, qualifier: c.mandatoryQualifier }));
 }

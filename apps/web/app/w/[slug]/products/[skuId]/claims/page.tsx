@@ -2,12 +2,21 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
-import { listClaims } from '@arkiv/core';
+import { claimMarket, listClaims } from '@arkiv/core';
 import { ClaimChip } from '@arkiv/ui';
 import { ActionForm, SheetButton } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Claims · Arkiv' };
+
+/** Stored as canonical platform codes; META covers Instagram Reels + Facebook/Instagram feed. */
+const CLAIM_PLATFORM_OPTIONS = [
+  { value: 'TIKTOK', label: 'TikTok' },
+  { value: 'META', label: 'Meta (Reels + Feed)' },
+  { value: 'YOUTUBE', label: 'YouTube' },
+  { value: 'ORGANIC', label: 'Organic posts' },
+];
+const PLATFORM_LABEL: Record<string, string> = { TIKTOK: 'TikTok', INSTAGRAM_REELS: 'Reels', FACEBOOK_FEED: 'Feed', YOUTUBE: 'YouTube', ORGANIC: 'Organic' };
 
 const ORDER = ['MERCHANT_REVIEW_REQUIRED', 'RESTRICTED', 'VERIFIED', 'VERIFIED_WITH_QUALIFIER', 'INFERRED_ONLY', 'BLOCKED'];
 const GROUP: Record<string, string> = { MERCHANT_REVIEW_REQUIRED: 'Needs your review', RESTRICTED: 'With our compliance team', VERIFIED: 'Approved', VERIFIED_WITH_QUALIFIER: 'Approved with qualifier', INFERRED_ONLY: 'Customer language (not a claim)', BLOCKED: 'Blocked' };
@@ -22,7 +31,7 @@ export default async function Claims({ params }: { params: Promise<{ slug: strin
     if (!sku) return null;
     const claims = await listClaims(tx, skuId);
     const ev = await tx`select claim_id, evidence_type, expiry_date, created_at from claim_evidence where claim_id in ${tx(claims.length ? claims.map((c) => c.id) : ['00000000-0000-0000-0000-000000000000'])}`;
-    return { sku, claims, ev };
+    return { sku, claims, ev, market: await claimMarket(tx, skuId) };
   });
   if (!d) notFound();
   const canApprove = ['OWNER', 'ADMIN'].includes(w.ctx.role);
@@ -52,13 +61,13 @@ export default async function Claims({ params }: { params: Promise<{ slug: strin
                   <ClaimChip status={c.status} />
                 </div>
                 {c.blockReason ? <p className="ak-small">{c.blockReason}</p> : null}
-                <p className="ak-small ak-muted">{c.category} · {c.riskLevel} risk · {c.origin}{c.allowedPlatforms.length ? ` · ${c.allowedPlatforms.join(', ')} · ${c.allowedMarkets.join(', ')}` : ''}{ev.length ? ` · ${ev.length} evidence file${ev.length > 1 ? 's' : ''}` : ''}</p>
+                <p className="ak-small ak-muted">{c.category} · {c.riskLevel} risk · {c.origin}{c.allowedPlatforms.length ? ` · ${c.allowedPlatforms.map((x) => PLATFORM_LABEL[x.toUpperCase()] ?? x).join(', ')} · ${c.allowedMarkets.join(', ')}` : ''}{ev.length ? ` · ${ev.length} evidence file${ev.length > 1 ? 's' : ''}` : ''}</p>
                 {canEdit && !['BLOCKED', 'INFERRED_ONLY'].includes(c.status) ? (
                   <div className="ak-row">
                     {canApprove && ['MERCHANT_REVIEW_REQUIRED', 'VERIFIED', 'VERIFIED_WITH_QUALIFIER'].includes(c.status) ? (
                       <SheetButton variant="text" label="Approve / scope" title="Approve this claim" description="Choose where it may be used.">
-                        <ActionForm slug={slug} action="claim-approve" extra={{ claimId: c.id, markets: ['US'] }} submit="Approve" fields={[
-                          { name: 'platforms', label: 'Platforms', type: 'checkboxes', options: [{ value: 'meta', label: 'Meta' }, { value: 'tiktok', label: 'TikTok' }, { value: 'youtube', label: 'YouTube' }, { value: 'organic', label: 'Organic' }] },
+                        <ActionForm slug={slug} action="claim-approve" extra={{ claimId: c.id, markets: [d.market] }} submit={`Approve for ${d.market}`} fields={[
+                          { name: 'platforms', label: 'Platforms', type: 'checkboxes', options: CLAIM_PLATFORM_OPTIONS },
                           { name: 'qualifier', label: 'Qualifier (optional)', placeholder: 'e.g. in a consumer study of 32 women', defaultValue: c.mandatoryQualifier ?? '' },
                         ]} />
                       </SheetButton>

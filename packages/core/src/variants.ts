@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant } from '@arkiv/db';
+import { platformsFor } from '@arkiv/shared';
 import { composeAd, placeholderFrame, withTempDir, type SceneInput } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { scanCreativeText } from './compliance';
@@ -9,6 +10,9 @@ import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { setExperimentState } from './experiments';
 import { qaExperimentIntegrity, qaExport } from './qa';
+
+/** Hook variants ship as 9:16 + 4:5; their lines must be approved on every platform those publish to. */
+const VARIANT_ASPECTS = ['9x16', '4x5'] as const;
 
 /**
  * Economical hook variants (§5 Creative Test definition): reuse the master's accepted footage and change only
@@ -25,7 +29,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
     const scenes = await tx`select * from scenes where storyboard_id = ${p.storyboard_id} order by position`;
     const [sb] = await tx`select * from storyboards where id = ${p.storyboard_id}`;
     const [sku] = await tx`select * from skus where id = ${p.sku_id}`;
-    const allowed = await allowedClaimTexts(tx, p.sku_id as string);
+    const allowed = await allowedClaimTexts(tx, p.sku_id as string, { platforms: platformsFor(VARIANT_ASPECTS) });
     const sources: { sceneId: string; kind: 'still' | 'video'; bytes: Buffer }[] = [];
     for (const s of scenes) {
       const [render] = await tx`select asset_id from scene_versions where scene_id = ${s.id} and kind = 'render' and status = 'accepted' order by version desc limit 1`;
@@ -57,7 +61,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
         inputs.push({ kind: src.kind, file: f, durationMs: s.duration_ms as number, overlayText: i === 0 ? hook.slice(0, 60) : (s.overlay_text as string | null), motion: 'push' });
       }
       const outs = await composeAd(
-        { scenes: inputs, voiceover: null, endCard: { productName: data.sku.name as string, cta: (data.sb.cta_text as string) ?? 'Shop now', index: v.code as string, durationMs: cta }, aspects: ['9x16', '4x5'] },
+        { scenes: inputs, voiceover: null, endCard: { productName: data.sku.name as string, cta: (data.sb.cta_text as string) ?? 'Shop now', index: v.code as string, durationMs: cta }, aspects: [...VARIANT_ASPECTS] },
         dir,
       );
       const checks = [...(await qaExport(outs[0]!.file, '9x16', 15000)), qaExperimentIntegrity({ changed: ['hook'], heldConstant: ['body', 'offer', 'cta', 'product'] }, { changed: ['hook'] })];

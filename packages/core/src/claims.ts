@@ -1,5 +1,5 @@
 import type { Tx } from '@arkiv/db';
-import { DomainError, RENDERABLE_CLAIM_STATUSES, type ClaimStatus } from '@arkiv/shared';
+import { DomainError, ExportFormat, normalizeClaimPlatforms, normalizeMarkets, platformsFor, RENDERABLE_CLAIM_STATUSES, type ClaimStatus } from '@arkiv/shared';
 import { assertCan } from './authz';
 import { classifyClaim, type SuggestedStatus } from './compliance';
 import type { TenantContext } from './context';
@@ -82,6 +82,9 @@ export async function approveClaim(
   const isStaff = ctx.actor.kind === 'staff';
   if (!isStaff) assertCan(ctx, 'claim.approve');
   if (!scope.markets.length || !scope.platforms.length) throw new DomainError('INVALID', 'Choose where this claim may be used');
+  // Stored scope is canonical (upper-case, aliases expanded) so the render check can match it exactly (§17).
+  const platforms = normalizeClaimPlatforms(scope.platforms);
+  const markets = normalizeMarkets(scope.markets);
   const [c] = await tx`select * from claims where id = ${claimId} for update`;
   if (!c) throw new DomainError('NOT_FOUND', 'Claim not found');
   const wording = scope.wording?.trim() || (c.preferred_wording as string);
@@ -99,10 +102,10 @@ export async function approveClaim(
   const status: ClaimStatus = qualifier ? 'VERIFIED_WITH_QUALIFIER' : 'VERIFIED';
   const [r] = await tx`
     update claims set status = ${status}, preferred_wording = ${wording}, mandatory_qualifier = ${qualifier ?? null},
-      allowed_markets = ${scope.markets}, allowed_platforms = ${scope.platforms}, merchant_approved = ${!isStaff},
+      allowed_markets = ${markets}, allowed_platforms = ${platforms}, merchant_approved = ${!isStaff},
       approved_by = ${actorString(ctx)}, reviewed_at = now()
     where id = ${claimId} returning *`;
-  await emit(tx, ctx, 'CLAIM_APPROVED', { type: 'claim', id: claimId }, { status, scope });
+  await emit(tx, ctx, 'CLAIM_APPROVED', { type: 'claim', id: claimId }, { status, scope: { markets, platforms, qualifier: qualifier ?? null } });
   return toClaim(r!);
 }
 
@@ -135,10 +138,39 @@ export async function listClaims(tx: Tx, skuId: string): Promise<ClaimRow[]> {
   return (await tx`select * from claims where sku_id = ${skuId} order by created_at`).map(toClaim);
 }
 
-/** Claims usable in a final render for a platform/market (Launch Gate 3). */
-export async function renderableClaims(tx: Tx, skuId: string, platform: string, market = 'US'): Promise<ClaimRow[]> {
+/** Where a render is published: the platforms of its exports and the brand's market. */
+export interface ClaimScope {
+  platforms: readonly string[];
+  /** Defaults to the SKU's brand market (Brand Brain), else US. */
+  market?: string | null;
+}
+
+/** Every platform an ad's standard exports (9:16, 4:5, 1:1) are published to. */
+export const AD_PLATFORMS = platformsFor(ExportFormat);
+
+/** Market a SKU's creative is made for: its brand's Brand Brain market, else the workspace's first brand, else US. */
+export async function claimMarket(tx: Tx, skuId: string): Promise<string> {
+  const [r] = await tx`select coalesce((select b.brain->>'market' from brands b where b.id = s.brand_id and b.workspace_id = s.workspace_id),
+                                       (select b.brain->>'market' from brands b where b.workspace_id = s.workspace_id order by b.created_at limit 1)) as market
+                       from skus s where s.id = ${skuId}`;
+  const m = (r?.market as string | null) ?? 'US';
+  try {
+    return normalizeMarkets([m])[0]!;
+  } catch {
+    return 'US';
+  }
+}
+
+/**
+ * Claims usable in a final render published on *every* platform in `scope`, in its market (Launch Gate 3, §43
+ * "US approval does not imply UK/EU approval"). Compared on canonical values, tolerant of legacy casing.
+ */
+export async function renderableClaims(tx: Tx, skuId: string, scope: ClaimScope): Promise<ClaimRow[]> {
+  const platforms = normalizeClaimPlatforms(scope.platforms);
+  const market = scope.market ? normalizeMarkets([scope.market])[0]! : await claimMarket(tx, skuId);
   const rows = await tx`select * from claims where sku_id = ${skuId} and status in ${tx(RENDERABLE_CLAIM_STATUSES as string[])}
-                        and ${platform} = any(allowed_platforms) and ${market} = any(allowed_markets)`;
+                        and array(select upper(p) from unnest(allowed_platforms) p) @> ${platforms}::text[]
+                        and exists (select 1 from unnest(allowed_markets) m where upper(m) = ${market})`;
   return rows.map(toClaim);
 }
 

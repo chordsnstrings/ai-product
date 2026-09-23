@@ -8,6 +8,7 @@ import {
   assertStaff,
   audit,
   blockClaim,
+  claimMarket,
   classifyClaim,
   decideApproval,
   endBreakGlass,
@@ -251,13 +252,19 @@ export const ACTIONS = {
   /* ── Claims (tenant routed these to our compliance team; views are audited as content access) ── */
   'claim.decide': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('meta,tiktok'), reason }),
+    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('TIKTOK,META'), markets: z.string().optional(), reason }),
     run: async (s, i) => {
       if (i.decision === 'unblock') return requestOrExecute(s, 'claim.unblock', { workspaceId: i.workspaceId, claimId: i.claimId }, i.reason);
       return withAdmin(async (tx) => {
         const ctx = { workspaceId: i.workspaceId, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, actor: { kind: 'staff' as const, id: s.staffId }, requestId: newId() };
         if (i.decision === 'block') await blockClaim(tx, ctx, i.claimId, i.reason);
-        else await approveClaim(tx, ctx, i.claimId, { markets: ['US'], platforms: i.platforms.split(',').map((p) => p.trim()), qualifier: i.qualifier ?? null, wording: i.wording });
+        else {
+          // Market defaults to the brand's (Brand Brain), never silently to US (§43); platforms are normalised by approveClaim.
+          const [cl] = await tx`select sku_id from claims where id = ${i.claimId} and workspace_id = ${i.workspaceId}`;
+          if (!cl) throw new DomainError('NOT_FOUND', 'Claim not found');
+          const markets = i.markets?.trim() ? i.markets.split(',').map((m) => m.trim()).filter(Boolean) : [await claimMarket(tx, cl.sku_id as string)];
+          await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording });
+        }
         await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier } });
         const [c] = await tx`select preferred_wording from claims where id = ${i.claimId}`;
         for (const to of await ownerEmails(i.workspaceId)) await sendEmail('claim_review_result', to, { claim: c?.preferred_wording as string, outcome: i.decision === 'block' ? `Blocked: ${i.reason}` : 'Approved for use', url: `${env().APP_URL}/app` }, { idempotencyKey: `claimrev:${i.claimId}:${i.decision}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
