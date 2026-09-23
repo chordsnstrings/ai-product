@@ -98,6 +98,9 @@ export interface ConceptRun {
   batch: number;
 }
 
+/** Output budget of one concept-set call; reservations for a concept batch must cover at least this. */
+export const CONCEPTS_MAX_TOKENS = 6000;
+
 export async function generateConcepts(run: ConceptRun) {
   const { productContext, packet } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
   const content: ContentPart[] = [
@@ -119,7 +122,7 @@ export async function generateConcepts(run: ConceptRun) {
       schema: ConceptSet,
       mock: () => mockConcepts(productContext, run.batch),
       effort: 'high',
-      maxTokens: 6000,
+      maxTokens: CONCEPTS_MAX_TOKENS,
     });
     gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims));
     const valid = gated.filter((g) => g.ok);

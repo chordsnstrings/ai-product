@@ -17,6 +17,7 @@ export type Action =
   | 'member.manage_owner'
   | 'billing.manage'
   | 'workspace.delete'
+  | 'workspace.cancel_deletion'
   | 'workspace.transfer'
   | 'workspace.export';
 
@@ -35,12 +36,19 @@ const MATRIX: Record<Action, readonly Role[]> = {
   'member.manage_owner': ['OWNER'],
   'billing.manage': ['OWNER'],
   'workspace.delete': ['OWNER'],
+  'workspace.cancel_deletion': ['OWNER'],
   'workspace.transfer': ['OWNER'],
   'workspace.export': ['OWNER'],
 };
 
 /** Actions still allowed when the workspace is on hold / lapsed (plan 02 §2 table). */
 const READ_ONLY_OK: ReadonlySet<Action> = new Set(['workspace.view', 'workspace.export', 'billing.manage']);
+
+/**
+ * Actions that only make sense in one lifecycle state, and stay allowed there even though that state blocks
+ * writes: "PURGE_SCHEDULED — Owner can still cancel the purge until T-0" (plan 02 §2 table, §7).
+ */
+const ONLY_IN_STATE: Partial<Record<Action, WorkspaceState>> = { 'workspace.cancel_deletion': 'PURGE_SCHEDULED' };
 
 const WRITE_BLOCKED_STATES: ReadonlySet<WorkspaceState> = new Set(['LOCKED', 'SUSPENDED', 'PURGE_SCHEDULED', 'PURGED']);
 const SPEND_BLOCKED_STATES: ReadonlySet<WorkspaceState> = new Set([
@@ -54,6 +62,8 @@ const SPEND_BLOCKED_STATES: ReadonlySet<WorkspaceState> = new Set([
 
 export function can(ctx: Pick<TenantContext, 'role' | 'workspaceState'>, action: Action): boolean {
   if (!MATRIX[action].includes(ctx.role)) return false;
+  const only = ONLY_IN_STATE[action];
+  if (only) return ctx.workspaceState === only;
   if (WRITE_BLOCKED_STATES.has(ctx.workspaceState) && !READ_ONLY_OK.has(action)) return false;
   if (SPEND_BLOCKED_STATES.has(ctx.workspaceState) && (action === 'spend.creative_test' || action === 'storyboard.approve'))
     return false;
@@ -73,5 +83,5 @@ export function assertCan(ctx: Pick<TenantContext, 'role' | 'workspaceState'>, a
   }
 }
 
-/** Role hierarchy for "Admins can manage non-owners" rules. */
+/** Role hierarchy (display ordering; the Owner-only rules are expressed as `member.manage_owner`). */
 export const roleRank: Record<Role, number> = { OWNER: 3, ADMIN: 2, MEMBER: 1, VIEWER: 0 };

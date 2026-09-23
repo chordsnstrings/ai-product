@@ -1,5 +1,6 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, type PortfolioSlot, type SkuMaturity } from '@arkiv/shared';
+import { assertCan } from './authz';
 import { classifyClaim } from './compliance';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
@@ -224,6 +225,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
 }
 
 export async function dismissRecommendation(tx: Tx, ctx: TenantContext, id: string, reason: string) {
+  assertCan(ctx, 'experiment.create');
   const r = await tx`update recommendations set status = 'dismissed', dismiss_reason = ${reason} where id = ${id} and status = 'open' returning id`;
   if (!r.length) throw new DomainError('NOT_FOUND', 'Recommendation not found');
   await emit(tx, ctx, 'RECOMMENDATION_DISMISSED', { type: 'recommendation', id }, { reason });

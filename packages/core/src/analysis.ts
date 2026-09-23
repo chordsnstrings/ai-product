@@ -1,22 +1,22 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, PROVISIONAL, newId } from '@arkiv/shared';
+import { DomainError, PROVISIONAL, newId, type ProjectState } from '@arkiv/shared';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
 import { proposeClaim } from './claims';
 import { excludedProductReason, nonSkincareCategory } from './compliance';
 import type { TenantContext } from './context';
-import { authorize, settle } from './cost-governor';
-import { generateConcepts } from './creative-director';
+import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
+import { CONCEPTS_MAX_TOKENS, generateConcepts } from './creative-director';
 import { emit } from './events';
 import { recordFunnel } from './funnel';
 import { fetchImage, importProductUrl, type ExtractedProduct } from './ingest';
 import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
-import { llmJson } from './model-gateway';
-import { enqueue, Queues } from './outbox';
+import { llmJson, route } from './model-gateway';
+import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
-import { transition } from './projects';
+import { isTerminal, transition } from './projects';
 import { EXTRACT_PRODUCT_SYSTEM } from './prompts';
 import { cutout, dominantColors, toJpegBase64 } from './vision';
 import { nextCatalogueNo } from './workspaces';
@@ -61,7 +61,7 @@ export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPrevi
            values (${projectId}, ${ctx.workspaceId}, ${skuId}, 'preview', 'PRODUCT_UPLOADED', ${ctx.actor.kind + ':' + ctx.actor.id})`;
   await planSteps(tx, ctx.workspaceId, skuId, input.url ? ANALYSIS_STEPS : ANALYSIS_STEPS.filter((s) => s.key !== 'read_page'));
   await emit(tx, ctx, 'UPLOAD_COMPLETED', { type: 'sku', id: skuId }, { method: input.url ? 'url' : 'photos' });
-  await enqueue(tx, ctx.workspaceId, Queues.analyzeProduct, { skuId, projectId, actor: ctx.actor }, { priority: ctx.workspaceState === 'PROVISIONAL' || ctx.workspaceState === 'ACTIVE_FREE' ? 0 : 10 });
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.analyzeProduct, ctx), { skuId, projectId, actor: ctx.actor }, { priority: priorityFor(ctx) });
   await recordFunnel('UPLOAD_COMPLETED', { visitorId: input.visitorId, workspaceId: ctx.workspaceId, props: { method: input.url ? 'url' : 'photos' } }, tx);
   return { skuId, projectId, catalogueNo: no };
 }
@@ -266,29 +266,100 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
   }
 }
 
-/** "Try 3 more" (plan 03 P5): limited on provisional workspaces to bound free COGS. */
-export async function regenerateConcepts(ctx: TenantContext, projectId: string) {
-  const ws = ctx.workspaceId;
-  const { skuId, batch } = await withTenant(ws, async (tx) => {
-    const [p] = await tx`select sku_id from projects where id = ${projectId}`;
-    if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
-    const [b] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
-    return { skuId: p.sku_id as string, batch: Number(b!.b) + 1 };
-  });
+/** Progress key for one requested concept batch (subject: the project). */
+export const conceptStepKey = (batch: number) => `concepts.batch.${batch}`;
+/** A request older than this with no result is treated as abandoned (crashed worker) and may be re-issued. */
+const CONCEPT_REQUEST_STALE_MINUTES = 10;
+
+/**
+ * "Try 3 more" (plan 03 P5). Only records the request and enqueues it in the same transaction (§34: AI work is
+ * asynchronous and resumable); the concepts are drafted by the `generate-concepts` job. Limited on provisional
+ * workspaces to bound free COGS. A double-click or second tab gets the request already in flight.
+ */
+export async function requestConcepts(tx: Tx, ctx: TenantContext, projectId: string): Promise<{ batch: number; subjectId: string; replayed: boolean }> {
+  assertCan(ctx, 'sku.edit');
+  const [p] = await tx`select sku_id, state from projects where id = ${projectId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  if (!['CONCEPTS_READY', 'CONCEPT_SELECTED', 'STORYBOARD_READY'].includes(p.state as string))
+    throw new DomainError('CONFLICT', p.state === 'STORYBOARD_APPROVED' || isTerminal(p.state as ProjectState) ? 'This ad is already in production.' : 'Your first ideas are still being drafted.');
+  const [pending] = await tx`select step_key from progress_steps where subject_id = ${projectId} and step_key like 'concepts.batch.%'
+                             and status in ('pending','active') and started_at > now() - make_interval(mins => ${CONCEPT_REQUEST_STALE_MINUTES})
+                             order by started_at desc limit 1`;
+  if (pending) return { batch: Number(String(pending.step_key).split('.').pop()), subjectId: projectId, replayed: true };
+  const [b] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
+  const batch = Number(b!.b) + 1;
   if (ctx.workspaceState === 'PROVISIONAL' && batch > 1 + PROVISIONAL.MAX_CONCEPT_REGENERATIONS)
     throw new DomainError('PAYMENT_REQUIRED', 'Save your work to see more ideas.', { needsAccount: true });
-  const auth = await withTenant(ws, (tx) =>
-    authorize(tx, ctx, {
-      purpose: ctx.workspaceState === 'PROVISIONAL' ? 'free_preview' : 'storyboard',
-      skuId,
-      projectId,
-      lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 6_000, outputTokens: 3_500 }],
-      idempotencyKey: `concepts:${projectId}:${batch}`,
-    }),
-  );
-  try {
-    return await generateConcepts({ ctx, token: auth.token, skuId, projectId, batch });
-  } finally {
-    await withTenant(ws, (tx) => settle(tx, ctx, auth.authorizationId, 'consumed'));
+  await tx`insert into progress_steps (workspace_id, subject_id, step_key, label, status, started_at, position)
+           values (${ctx.workspaceId}, ${projectId}, ${conceptStepKey(batch)}, 'Drafting three more ideas', 'pending', now(), 0)
+           on conflict (workspace_id, subject_id, step_key) do update set status = 'pending', detail = null, started_at = now(), completed_at = null`;
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateConcepts, ctx), { projectId, batch, actor: ctx.actor },
+    { singletonKey: `concepts:${projectId}:${batch}`, priority: priorityFor(ctx) });
+  return { batch, subjectId: projectId, replayed: false };
+}
+
+/**
+ * Worker (`generate-concepts`): draft one requested batch under its own Cost Governor authorization, keyed
+ * `concepts:<project>:<batch>`. Idempotent: an existing batch is never redrafted, a live duplicate delivery is
+ * skipped, and a reservation stranded by a crashed attempt is taken over.
+ */
+export async function generateConceptBatch(ctx: TenantContext, projectId: string, batch: number): Promise<'done' | 'skipped'> {
+  const ws = ctx.workspaceId;
+  const key = conceptStepKey(batch);
+  const info = await withTenant(ws, async (tx) => {
+    const [p] = await tx`select sku_id from projects where id = ${projectId}`;
+    if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+    const [done] = await tx`select 1 from concepts where project_id = ${projectId} and batch = ${batch} limit 1`;
+    return { skuId: p.sku_id as string, done: !!done };
+  });
+  if (info.done) {
+    await withTenant(ws, (tx) => step(tx, ws, projectId, key, 'done', 'Three more ideas ready'));
+    return 'done';
   }
+  let auth: Awaited<ReturnType<typeof authorize>>;
+  try {
+    auth = await withTenant(ws, async (tx) => {
+      // Priced on the routed model for the concepts task, with the call's full output budget.
+      const r = await route(tx, 'creative_director.concepts');
+      const a = await authorizeOrTakeOver(
+        tx,
+        ctx,
+        {
+          purpose: ctx.workspaceState === 'PROVISIONAL' ? 'free_preview' : 'storyboard',
+          skuId: info.skuId,
+          projectId,
+          lines: [{ kind: 'llm', provider: r.provider, model: r.model, inputTokens: 6_000, outputTokens: CONCEPTS_MAX_TOKENS }],
+          idempotencyKey: `concepts:${projectId}:${batch}`,
+        },
+        CONCEPT_REQUEST_STALE_MINUTES,
+      );
+      await step(tx, ws, projectId, key, 'active');
+      return a;
+    });
+  } catch (e) {
+    if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped'; // a live duplicate delivery is drafting it
+    await withTenant(ws, (tx) => step(tx, ws, projectId, key, 'failed', conceptFailure(e)));
+    throw e;
+  }
+  try {
+    await generateConcepts({ ctx, token: auth.token, skuId: info.skuId, projectId, batch });
+    await withTenant(ws, async (tx) => {
+      await settle(tx, ctx, auth.authorizationId, 'consumed');
+      await step(tx, ws, projectId, key, 'done', 'Three more ideas ready');
+    });
+    return 'done';
+  } catch (e) {
+    await withTenant(ws, async (tx) => {
+      await settle(tx, ctx, auth.authorizationId, 'consumed');
+      await step(tx, ws, projectId, key, 'failed', conceptFailure(e));
+    });
+    throw e;
+  }
+}
+
+function conceptFailure(e: unknown): string {
+  if (e instanceof DomainError && (e.code === 'GATE_BLOCKED' || e.code === 'PAYMENT_REQUIRED' || e.code === 'UNAVAILABLE')) {
+    return e.code === 'GATE_BLOCKED' && /ceiling/i.test(e.message) ? 'You’ve seen all the free ideas for this product. Save your work to see more.' : e.message;
+  }
+  return 'We couldn’t draft more ideas just now. Please try again.';
 }

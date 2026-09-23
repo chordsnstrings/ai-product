@@ -1,6 +1,6 @@
 import { zipSync, strToU8 } from 'fflate';
 import { withSystem, withTenant, type Tx } from '@arkiv/db';
-import { DomainError, RETENTION } from '@arkiv/shared';
+import { DomainError, RETENTION, type WorkspaceState } from '@arkiv/shared';
 import { saveAsset, assetUrl } from './assets';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
@@ -48,16 +48,40 @@ export async function buildExport(ctx: TenantContext): Promise<{ assetId: string
 
 export async function scheduleDeletion(tx: Tx, ctx: TenantContext) {
   assertCan(ctx, 'workspace.delete');
-  const [s] = await tx`select count(*)::int as n from subscriptions where status in ('active','trialing','past_due') and not cancel_at_period_end`;
+  const [s] = await tx`select count(*)::int as n from subscriptions where workspace_id = ${ctx.workspaceId}
+                         and status in ('active','trialing','past_due') and not cancel_at_period_end`;
   if (s!.n > 0) throw new DomainError('CONFLICT', 'Cancel your plan before deleting the workspace.');
+  const [w] = await tx`select state from workspaces where id = ${ctx.workspaceId} for update`;
   await transitionWorkspace(tx, ctx, 'PURGE_SCHEDULED', 'owner requested deletion');
-  await tx`update workspaces set purge_at = now() + make_interval(days => ${RETENTION.PURGE_GRACE_DAYS}) where id = ${ctx.workspaceId}`;
+  // Remember where the workspace was so a cancelled deletion puts it back exactly there (plan 02 §7).
+  await tx`update workspaces set purge_at = now() + make_interval(days => ${RETENTION.PURGE_GRACE_DAYS}),
+             state_before_purge = ${(w?.state as string) ?? null} where id = ${ctx.workspaceId}`;
+}
+
+/**
+ * Leave PURGE_SCHEDULED for the state the workspace had before deletion was scheduled. A paid workspace whose
+ * subscription ran out during the grace period comes back as CANCELLED (its archive is kept, nothing charged).
+ * Shared by the Owner's "undo" and the staff console.
+ */
+export async function restoreFromScheduledPurge(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, reason: string): Promise<WorkspaceState> {
+  const [w] = await tx`select state, state_before_purge, plan_code from workspaces where id = ${ctx.workspaceId} for update`;
+  if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
+  if (w.state !== 'PURGE_SCHEDULED') throw new DomainError('CONFLICT', 'This workspace is not scheduled for deletion.');
+  // Explicit workspace filter: the staff console calls this as admin_rw, whose policy is not tenant-scoped.
+  const [sub] = await tx`select count(*)::int as n from subscriptions where workspace_id = ${ctx.workspaceId} and status in ('active','trialing','past_due')`;
+  const before = (w.state_before_purge as WorkspaceState | null) ?? 'CANCELLED';
+  let to: WorkspaceState;
+  if (before === 'ACTIVE_PAID' || before === 'PAST_DUE') to = sub!.n > 0 && w.plan_code ? 'ACTIVE_PAID' : 'CANCELLED';
+  else if (before === 'ACTIVE_FREE' || before === 'CANCELLED') to = before;
+  else to = 'CANCELLED'; // e.g. a provisional workspace swept for expiry has no owner state to return to
+  await transitionWorkspace(tx, ctx, to, reason);
+  await tx`update workspaces set purge_at = null, state_before_purge = null where id = ${ctx.workspaceId}`;
+  return to;
 }
 
 export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
-  assertCan(ctx, 'workspace.delete');
-  await transitionWorkspace(tx, ctx, 'CANCELLED', 'owner cancelled deletion');
-  await tx`update workspaces set purge_at = null where id = ${ctx.workspaceId}`;
+  assertCan(ctx, 'workspace.cancel_deletion');
+  return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
 const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brands', 'integrations', 'invites', 'memberships', 'offers', 'purchases', 'subscriptions', 'outbox', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'break_glass_sessions', 'tenant_notes'];

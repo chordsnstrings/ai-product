@@ -17,6 +17,7 @@ import {
   registerExecutor,
   requestOpsCommand,
   requestOrExecute,
+  restoreFromScheduledPurge,
   scanCreativeText,
   setTenantFlags,
   setTenantHold,
@@ -136,9 +137,8 @@ export const ACTIONS = {
     schema: z.object({ workspaceId: uuid, reason }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        await transitionWorkspace(tx, staffCtx(s, i.workspaceId), 'CANCELLED', `staff: ${i.reason}`);
-        await tx`update workspaces set purge_at = null where id = ${i.workspaceId}`;
-        await audit(tx, s, 'tenant.cancel_purge', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason });
+        const to = await restoreFromScheduledPurge(tx, staffCtx(s, i.workspaceId), `staff: ${i.reason}`);
+        await audit(tx, s, 'tenant.cancel_purge', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { state: to } });
       }),
   }),
   'tenant.export': a({

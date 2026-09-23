@@ -5,7 +5,7 @@ import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
 import type { Proposal } from './intel-schemas';
-import { enqueue, Queues } from './outbox';
+import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps } from './progress';
 import { STORYBOARD_STEPS } from './storyboard';
 import { compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, toRate, type RateMetric, type VariantEvidence } from './statistics';
@@ -73,7 +73,7 @@ export async function createExperiment(
   const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${concept!.id}, 'generating') returning id`;
   await tx`update projects set state = 'CONCEPT_SELECTED', selected_concept_id = ${concept!.id}, storyboard_id = ${sb!.id} where id = ${projectId}`;
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
-  await enqueue(tx, ctx.workspaceId, Queues.generateStoryboard, { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true });
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true }, { priority: priorityFor(ctx) });
   await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: expId }, { mode, slot: input.slot, primaryVariable: p.primaryVariable });
   if (input.recommendationId) {
     await tx`update recommendations set status = 'accepted', experiment_id = ${expId} where id = ${input.recommendationId}`;
@@ -84,7 +84,21 @@ export async function createExperiment(
 
 const EXP_FLOW: ExperimentState[] = ['DRAFT', 'RECOMMENDED', 'APPROVED', 'PRODUCING', 'READY_TO_RUN', 'GATHERING_SIGNAL', 'DIRECTIONAL', 'ACTIONABLE', 'ARCHIVED'];
 
-export async function setExperimentState(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, experimentId: string, to: ExperimentState, reason?: string) {
+/**
+ * Experiment state transitions. A merchant-initiated change is authorised here (a Viewer or a held workspace
+ * cannot move an experiment); system transitions (results, variants) pass a system actor.
+ */
+export async function setExperimentState(
+  tx: Tx,
+  ctx: Pick<TenantContext, 'workspaceId' | 'actor'> & Partial<Pick<TenantContext, 'role' | 'workspaceState'>>,
+  experimentId: string,
+  to: ExperimentState,
+  reason?: string,
+) {
+  if (ctx.actor.kind === 'user' || ctx.actor.kind === 'provisional') {
+    if (!ctx.role || !ctx.workspaceState) throw new DomainError('FORBIDDEN', 'Your role does not allow this action.');
+    assertCan({ role: ctx.role, workspaceState: ctx.workspaceState }, 'experiment.create');
+  }
   const [e] = await tx`select state from experiments where id = ${experimentId} for update`;
   if (!e) throw new DomainError('NOT_FOUND', 'Experiment not found');
   const from = e.state as ExperimentState;
@@ -100,6 +114,8 @@ export async function setExperimentState(tx: Tx, ctx: Pick<TenantContext, 'works
 
 /** Link a platform ad to a variant (manual, or automatic from the variant code in the ad name). */
 export async function linkAdToVariant(tx: Tx, ctx: TenantContext, platform: 'meta' | 'tiktok', adId: string, variantId: string) {
+  // Rewrites performance attribution, so it needs the same right as creating the experiment.
+  assertCan(ctx, 'experiment.create');
   const [v] = await tx`select id, creative_id from variants where id = ${variantId}`;
   if (!v) throw new DomainError('NOT_FOUND', 'Variant not found');
   await tx`update performance_observations set variant_id = ${variantId}, creative_id = ${v.creative_id ?? null}

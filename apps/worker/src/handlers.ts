@@ -5,7 +5,9 @@ import {
   buildExport,
   clusterThemes,
   computeResults,
+  draftRecoveryConcept,
   extractGenome,
+  generateConceptBatch,
   generateRecommendations,
   generateStoryboard,
   processUpload,
@@ -13,10 +15,12 @@ import {
   produceProject,
   purgeWorkspace,
   refreshMaturity,
+  regenerateFrame,
   Queues,
   syncIntegration,
   weekOf,
   enqueue,
+  priorityFor,
   type TenantContext,
 } from '@arkiv/core';
 import { jobContext, paused } from './context';
@@ -46,16 +50,23 @@ async function withRenderLease<T>(ctx: TenantContext, jobId: string, fn: () => P
 
 export const handlers: Record<string, Handler> = {
   [Queues.analyzeProduct]: (ctx, d) => analyzeProduct(ctx, d.skuId as string, d.projectId as string),
+  [Queues.analyzeProductFree]: (ctx, d) => analyzeProduct(ctx, d.skuId as string, d.projectId as string),
   [Queues.generateStoryboard]: (ctx, d) => generateStoryboard(ctx, d.projectId as string, d.storyboardId as string, d.conceptId as string),
+  [Queues.generateStoryboardFree]: (ctx, d) => generateStoryboard(ctx, d.projectId as string, d.storyboardId as string, d.conceptId as string),
+  [Queues.generateConcepts]: (ctx, d) => generateConceptBatch(ctx, d.projectId as string, Number(d.batch)),
+  [Queues.generateConceptsFree]: (ctx, d) => generateConceptBatch(ctx, d.projectId as string, Number(d.batch)),
+  [Queues.regenerateFrame]: (ctx, d) => regenerateFrame(ctx, d.sceneId as string, String(d.instruction ?? ''), Number(d.version)),
+  [Queues.regenerateFrameFree]: (ctx, d) => regenerateFrame(ctx, d.sceneId as string, String(d.instruction ?? ''), Number(d.version)),
   [Queues.produceProject]: async (ctx, d, jobId) => {
     const r = await withRenderLease(ctx, jobId, () => produceProject(ctx, d.projectId as string));
     if (r === 'requeued') {
       // Truthful queued state: the job waits its turn instead of competing (plan 03 P9).
-      await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.produceProject, d, { runAfter: new Date(Date.now() + 20_000), singletonKey: `produce:${d.projectId}:wait:${Date.now()}` }));
+      await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.produceProject, d, { runAfter: new Date(Date.now() + 20_000), singletonKey: `produce:${d.projectId}:wait:${Date.now()}`, priority: priorityFor(ctx, 'production') }));
     }
     return r;
   },
   [Queues.hookVariants]: (ctx, d) => produceHookVariants(ctx, d.projectId as string),
+  [Queues.recoveryConcept]: (ctx, d) => draftRecoveryConcept(ctx, d.projectId as string),
   [Queues.processUpload]: (ctx, d) => withTenant(ctx.workspaceId, (tx) => processUpload(tx, ctx, d.uploadId as string, (d.skuId as string) ?? null)),
   [Queues.sendEmail]: (ctx, d, jobId) => sendQueuedEmail(ctx, d, jobId),
   [Queues.syncIntegration]: (ctx, d) => syncIntegration(ctx, d.integrationId as string, { full: !!d.full }),

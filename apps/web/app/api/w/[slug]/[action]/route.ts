@@ -41,6 +41,7 @@ import { workspaceBySlug } from '@/lib/tenant';
 
 const uuid = z.string().uuid();
 const PLAN = z.enum(['LAUNCH', 'GROWTH', 'SCALE']);
+const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative']);
 
 /**
  * Workspace-scoped mutations (plan 03 Part B). Every action resolves membership from the session (layer 1),
@@ -52,32 +53,42 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
   const ctx = w.ctx;
   const t = <T>(fn: Parameters<typeof withTenant<T>>[1]) => withTenant<T>(ctx.workspaceId, fn);
 
-  // Multipart actions first (files).
-  if (action === 'performance-csv' || action === 'evidence' || action === 'import-creative') {
+  // Multipart actions first (files). Each one is authorised by role, here or inside the core function.
+  if (MULTIPART.has(action)) {
     const form = await req.formData();
     const file = form.get('file');
-    if (action === 'performance-csv') {
-      assertCan(ctx, 'integration.manage');
-      if (!(file instanceof File)) throw new DomainError('INVALID', 'Choose a CSV file');
-      if (file.size > 10 * 1024 * 1024) throw new DomainError('INVALID', 'CSV must be under 10 MB');
-      const rows = parsePerformanceCsv(await file.text());
-      if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
-      const r = await t((tx) => ingestObservations(tx, ctx, null, rows));
-      return json({ ok: true, ...r });
+    switch (action) {
+      case 'performance-csv': {
+        assertCan(ctx, 'integration.manage');
+        if (!(file instanceof File)) throw new DomainError('INVALID', 'Choose a CSV file');
+        if (file.size > 10 * 1024 * 1024) throw new DomainError('INVALID', 'CSV must be under 10 MB');
+        const rows = parsePerformanceCsv(await file.text());
+        if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
+        const r = await t((tx) => ingestObservations(tx, ctx, null, rows));
+        return json({ ok: true, ...r });
+      }
+      case 'evidence': {
+        const claimId = uuid.parse(form.get('claimId'));
+        const type = z.enum(['clinical_study', 'consumer_perception', 'lab_test', 'certificate', 'ingredient_spec', 'other']).parse(form.get('type'));
+        assertCan(ctx, 'sku.edit');
+        await t(async (tx) => {
+          const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'evidence_doc', null, { filename: file.name })).id : null;
+          await attachEvidence(tx, ctx, claimId, { type, assetId, location: (form.get('location') as string) || null, applicability: (form.get('applicability') as string) || null, expiry: (form.get('expiry') as string) || null });
+        });
+        return json({ ok: true });
+      }
+      case 'import-creative': {
+        // A past ad (copy + optional video) → genome extraction (standard §6 cold start).
+        const skuId = uuid.parse(form.get('skuId'));
+        const copy = z.string().trim().min(3).max(2000).parse(form.get('copy'));
+        assertCan(ctx, 'sku.create');
+        const id = await t(async (tx) => {
+          const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
+          return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform: (form.get('platform') as 'meta' | 'tiktok') || null, adId: (form.get('adId') as string) || null });
+        });
+        return json({ ok: true, creativeId: id });
+      }
     }
-    if (action === 'evidence') {
-      const claimId = uuid.parse(form.get('claimId'));
-      const type = z.enum(['clinical_study', 'consumer_perception', 'lab_test', 'certificate', 'ingredient_spec', 'other']).parse(form.get('type'));
-      const assetId = file instanceof File && file.size ? (await t(async (tx) => ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'evidence_doc', null, { filename: file.name }))).id : null;
-      await t((tx) => attachEvidence(tx, ctx, claimId, { type, assetId, location: (form.get('location') as string) || null, applicability: (form.get('applicability') as string) || null, expiry: (form.get('expiry') as string) || null }));
-      return json({ ok: true });
-    }
-    // import-creative: a past ad (copy + optional video) → genome extraction (standard §6 cold start).
-    const skuId = uuid.parse(form.get('skuId'));
-    const copy = z.string().trim().min(3).max(2000).parse(form.get('copy'));
-    const assetId = file instanceof File && file.size ? (await t(async (tx) => ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name }))).id : null;
-    const id = await t((tx) => importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform: (form.get('platform') as 'meta' | 'tiktok') || null, adId: (form.get('adId') as string) || null }));
-    return json({ ok: true, creativeId: id });
   }
 
   switch (action) {
@@ -93,6 +104,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     case 'rec-dismiss': {
       const { id, reason } = await body(req, z.object({ id: uuid, reason: z.string().min(2).max(200) }));
+      assertCan(ctx, 'experiment.create');
       await t((tx) => dismissRecommendation(tx, ctx, id, reason));
       return json({ ok: true });
     }
@@ -123,11 +135,13 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     case 'experiment-live': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
+      assertCan(ctx, 'experiment.create');
       await t((tx) => setExperimentState(tx, ctx, experimentId, 'GATHERING_SIGNAL', 'merchant marked as running'));
       return json({ ok: true });
     }
     case 'link-ad': {
       const i = await body(req, z.object({ platform: z.enum(['meta', 'tiktok']), adId: z.string().min(3).max(64), variantId: uuid }));
+      assertCan(ctx, 'experiment.create');
       await t((tx) => linkAdToVariant(tx, ctx, i.platform, i.adId, i.variantId));
       return json({ ok: true });
     }
@@ -219,7 +233,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     case 'portal': {
       assertCan(ctx, 'billing.manage');
-      const [c] = await t((tx) => tx`select customer_id from stripe_customers limit 1`);
+      // Always this workspace's own customer (explicit id, not "any row the role can see").
+      const [c] = await t((tx) => tx`select customer_id from stripe_customers where workspace_id = ${ctx.workspaceId}`);
       if (!c) throw new DomainError('NOT_FOUND', 'No billing account yet.');
       return json({ url: await billingGateway().portalUrl(c.customer_id as string, `${env().APP_URL}/w/${slug}/settings/billing`) });
     }

@@ -88,6 +88,8 @@ export async function recordAutoRenewConsent(
   ctx: TenantContext,
   input: { userId: string; plan: PlanCode; agreed: boolean; ip?: string | null; userAgent?: string | null },
 ) {
+  // Consent records are append-only; never write one for someone who cannot start the subscription.
+  assertCan(ctx, 'billing.manage');
   if (!input.agreed) throw new DomainError('INVALID', 'Please tick the box to agree to the recurring charge.');
   const text = autoRenewText(input.plan);
   const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)

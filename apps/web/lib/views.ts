@@ -15,7 +15,12 @@ export async function projectView(workspaceId: string, projectId: string) {
     const concepts = await tx`select id, idx, proposal, is_pick, pick_reason, batch from concepts where project_id = ${projectId} and batch = ${maxBatch!.b} order by idx`;
     let storyboard: Awaited<ReturnType<typeof storyboardBlock>> | null = null;
     if (p.storyboard_id) storyboard = await storyboardBlock(tx, p.storyboard_id as string);
-    const productionSteps = await listSteps(tx, projectId);
+    // Project-subject steps also hold queued concept requests ("concepts.batch.N"); production shows only its own.
+    const projectSteps = await listSteps(tx, projectId);
+    const productionSteps = projectSteps.filter((s) => !String(s.step_key).startsWith('concepts.batch.'));
+    const conceptStep = projectSteps
+      .filter((s) => String(s.step_key).startsWith('concepts.batch.'))
+      .sort((a, b) => Number(String(b.step_key).split('.').pop()) - Number(String(a.step_key).split('.').pop()))[0];
     const quote = await currentQuote(tx);
     const [purchase] = await tx`select status, kind, amount_micros from purchases where project_id = ${projectId} order by created_at desc limit 1`;
     let exports: { aspect: string; assetId: string; url: string; download: string }[] = [];
@@ -66,6 +71,8 @@ export async function projectView(workspaceId: string, projectId: string) {
       facts: factRows,
       claims: claims.map((c) => ({ id: c.id, wording: c.preferredWording, status: c.status, reason: c.blockReason, qualifier: c.mandatoryQualifier })),
       concepts: concepts.map((c) => ({ ...(c.proposal as Proposal), id: c.id as string, idx: c.idx as string, isPick: c.is_pick as boolean, pickReason: c.pick_reason as string | null, batch: Number(c.batch) })),
+      /** Latest "try 3 more" request, drafted by the worker: the UI polls until it is done or failed. */
+      conceptRequest: conceptStep ? { batch: Number(String(conceptStep.step_key).split('.').pop()), status: conceptStep.status as string, detail: (conceptStep.detail as string) ?? null } : null,
       storyboard,
       productionSteps: productionSteps.map(stepJson),
       quote,
@@ -80,6 +87,11 @@ const stepJson = (s: Record<string, unknown>) => ({ key: s.step_key as string, l
 async function storyboardBlock(tx: Tx, storyboardId: string) {
   const v = await storyboardView(tx, storyboardId);
   const steps = await listSteps(tx, storyboardId);
+  // Queued "change picture" requests per scene (latest version only).
+  const regen = await tx`select distinct on (ps.subject_id) ps.subject_id, ps.status, ps.detail from progress_steps ps
+                         join scenes s on s.id = ps.subject_id where s.storyboard_id = ${storyboardId} and ps.step_key like 'frame.v%'
+                         order by ps.subject_id, ps.started_at desc nulls last`;
+  const regenByScene = new Map(regen.map((r) => [r.subject_id as string, { status: r.status as string, detail: (r.detail as string) ?? null }]));
   return {
     id: storyboardId,
     status: v.storyboard.status as string,
@@ -99,6 +111,7 @@ async function storyboardBlock(tx: Tx, storyboardId: string) {
         locked: s.locked as boolean,
         frameUrl: s.frame_asset_id ? await assetUrl(tx, s.frame_asset_id as string) : null,
         freeRegenerationsUsed: Number(s.free_regenerations_used),
+        regeneration: regenByScene.get(s.id as string) ?? null,
       })),
     ),
   };

@@ -3,6 +3,7 @@ import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
 import { DomainError, newId } from '@arkiv/shared';
 import { saveAsset, type AssetKind } from './assets';
+import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { hit } from './rate-limit';
@@ -33,6 +34,7 @@ const ALLOWED: Record<string, 'image' | 'video' | 'pdf'> = {
 };
 
 export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, declaredMime: string, bytes: number) {
+  assertCan(ctx, 'sku.edit');
   await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
   const family = ALLOWED[declaredMime];
   if (!family) throw new DomainError('INVALID', 'That file type isn’t supported. Use JPG, PNG, WebP, MP4 or PDF.');
@@ -108,6 +110,9 @@ export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string
 
 /** Direct server-side upload path (small files posted to our API rather than presigned PUT). */
 export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind: AssetKind, skuId: string | null, origin: Record<string, unknown> = {}) {
+  // Provisional visitors carry an OWNER context on their own PROVISIONAL workspace, so they pass; Viewers and
+  // held workspaces do not.
+  assertCan(ctx, 'sku.edit');
   await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
   const v = await validateMedia(raw);
   return saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });

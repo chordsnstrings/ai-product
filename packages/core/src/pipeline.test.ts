@@ -23,7 +23,7 @@ async function previewToStoryboard(opts: { visualPlanMarker?: string } = {}) {
   const photo = await productPhoto();
   const asset = await withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, photo, 'product_photo', null));
   const { skuId, projectId } = await withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [asset.id] }));
-  expect(await outboxJobs('analyze-product')).toHaveLength(1);
+  expect(await outboxJobs('analyze-product-free')).toHaveLength(1); // free-tier preview → the free pool
   const r = await analyzeProduct(ctx, skuId, projectId);
   expect(r.status).toBe('ready');
   const concepts = await withTenant(t.workspaceId, (tx) => tx`select id, idx, is_pick, proposal from concepts where project_id = ${projectId} order by idx`);

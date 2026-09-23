@@ -14,7 +14,7 @@ import {
   type Role,
   type WorkspaceState,
 } from '@arkiv/shared';
-import { assertCan, roleRank } from './authz';
+import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { storage } from './storage';
@@ -29,7 +29,7 @@ const TRANSITIONS: Record<WorkspaceState, WorkspaceState[]> = {
   ACTIVE_PAID: ['PAST_DUE', 'CANCELLED', 'ACTIVE_FREE', 'SUSPENDED', 'LOCKED', 'PURGE_SCHEDULED'],
   PAST_DUE: ['ACTIVE_PAID', 'CANCELLED', 'SUSPENDED', 'LOCKED'],
   CANCELLED: ['ACTIVE_PAID', 'ACTIVE_FREE', 'PURGE_SCHEDULED', 'SUSPENDED', 'LOCKED'],
-  PURGE_SCHEDULED: ['CANCELLED', 'ACTIVE_FREE', 'PURGED'],
+  PURGE_SCHEDULED: ['CANCELLED', 'ACTIVE_FREE', 'ACTIVE_PAID', 'PURGED'],
   PURGED: [],
   SUSPENDED: [],
   LOCKED: [],
@@ -249,9 +249,9 @@ export async function changeRole(tx: Tx, ctx: TenantContext, userId: string, rol
   const [target] = await tx`select role from memberships where user_id = ${userId} for update`;
   if (!target) throw notFound('Member not found');
   const from = target.role as Role;
+  // Plan 02 §1.1: Admins manage every member except Owners (including other Admins); Owner changes are Owner-only.
   if (from === 'OWNER' || role === 'OWNER') assertCan(ctx, 'member.manage_owner');
   else assertCan(ctx, 'member.change_role');
-  if (ctx.role !== 'OWNER' && roleRank[from] >= roleRank[ctx.role]) throw forbidden('You can only change roles below your own');
   if (from === 'OWNER' && role !== 'OWNER' && (await ownerCount(tx)) <= 1)
     throw conflict('Transfer ownership first: a workspace needs at least one Owner.'); // M1
   await tx`update memberships set role = ${role} where user_id = ${userId}`;
@@ -265,7 +265,6 @@ export async function removeMember(tx: Tx, ctx: TenantContext, userId: string) {
   const self = ctx.actor.kind === 'user' && ctx.actor.id === userId;
   if (!self) {
     assertCan(ctx, target.role === 'OWNER' ? 'member.manage_owner' : 'member.remove');
-    if (ctx.role !== 'OWNER' && roleRank[target.role as Role] >= roleRank[ctx.role]) throw forbidden();
   }
   if (target.role === 'OWNER' && (await ownerCount(tx)) <= 1) throw conflict('Transfer ownership first: a workspace needs at least one Owner.');
   await tx`delete from memberships where user_id = ${userId}`;

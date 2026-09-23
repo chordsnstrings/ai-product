@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
-import { env, formatUsd, PLANS, type PlanCode } from '@arkiv/shared';
+import { env, formatUsd, PLANS, PRICES, type PlanCode } from '@arkiv/shared';
 import { sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import type { TenantContext } from '@arkiv/core';
+import { recoveryEmailKey, recoveryStatus, recoveryUrl, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -21,6 +21,17 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
   const send = async <T extends TemplateName>(t: T, d: TemplateMap[T], to?: string[]) => {
     for (const email of to ?? (await recipients(ws))) {
       await sendEmail(t, email, d, { idempotencyKey: `${jobId}:${t}:${email}`, workspaceId: ws });
+    }
+  };
+  /**
+   * L20 recovery emails: still abandoned, under the 3-per-project cap, owners only. Keyed per project/template/
+   * recipient so the cap can be counted and a redelivered job never sends twice.
+   */
+  const sendRecovery = async <T extends RecoveryTemplate>(t: T, projectId: string, d: TemplateMap[T]) => {
+    const status = await withTenant(ws, (tx) => recoveryStatus(tx, ws, projectId));
+    if (!status.eligible) return;
+    for (const email of await recipients(ws, ['OWNER'])) {
+      await sendEmail(t, email, d, { idempotencyKey: recoveryEmailKey(projectId, t, email), workspaceId: ws });
     }
   };
   switch (data.template) {
@@ -49,17 +60,24 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       return;
     }
     case 'offer_ending': {
-      const [o] = await withTenant(ws, (tx) => tx`select o.price_micros, o.reference_price_micros, o.expires_at, s.name, p.id as project_id
+      const [o] = await withTenant(ws, (tx) => tx`select o.price_micros, o.reference_price_micros, o.expires_at, o.status, s.name, p.id as project_id
                                                    from offers o join projects p on p.id = o.project_id join skus s on s.id = p.sku_id where o.id = ${data.offerId as string}`);
-      if (o) {
+      if (o && o.status === 'active') {
         const endsAt = new Date(o.expires_at as string).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' }) + ' ET';
-        await send('offer_ending', { productName: o.name, url: `${app}/start/${o.project_id}/storyboard`, endsAt, price: formatUsd(Number(o.price_micros), 0), regular: formatUsd(Number(o.reference_price_micros ?? 29_000_000), 0) }, await recipients(ws, ['OWNER']));
+        await sendRecovery('offer_ending', o.project_id as string, { productName: o.name, url: recoveryUrl(app, o.project_id as string, 'offer_ending'), endsAt, price: formatUsd(Number(o.price_micros), 0), regular: formatUsd(Number(o.reference_price_micros ?? 29_000_000), 0) });
       }
       return;
     }
     case 'storyboard_saved': {
       const [p] = await withTenant(ws, (tx) => tx`select s.name from projects p join skus s on s.id = p.sku_id where p.id = ${data.projectId as string}`);
-      if (p) await send('storyboard_saved', { productName: p.name, url: `${app}/start/${data.projectId}/storyboard`, standalonePrice: '$29' }, await recipients(ws, ['OWNER']));
+      if (p) await sendRecovery('storyboard_saved', data.projectId as string, { productName: p.name, url: recoveryUrl(app, data.projectId as string, 'storyboard_saved'), standalonePrice: formatUsd(PRICES.STANDALONE, 0) });
+      return;
+    }
+    case 'new_concept': {
+      const [c] = await withTenant(ws, (tx) => tx`select c.proposal, s.name from concepts c join skus s on s.id = c.sku_id
+                                                   where c.id = ${data.conceptId as string} and c.project_id = ${data.projectId as string}`);
+      const hook = ((c?.proposal as { hookOptions?: string[] } | undefined)?.hookOptions ?? [])[0];
+      if (c && hook) await sendRecovery('new_concept', data.projectId as string, { productName: c.name, url: recoveryUrl(app, data.projectId as string, 'new_concept'), hook });
       return;
     }
     case 'integration_disconnected':

@@ -148,7 +148,10 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
 const RISK: Record<string, string> = { lower_risk: 'Safer bet', adjacent: 'Adjacent', exploratory: 'Exploratory' };
 
 export function ConceptsFlow({ projectId }: { projectId: string }) {
-  const active = useCallback((v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED', []);
+  const active = useCallback(
+    (v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED' || v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active',
+    [],
+  );
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [gate, setGate] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -171,6 +174,7 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
     setBusy('more');
     setErr(null);
     try {
+      // Queued server-side (202); polling picks up the new batch or the request's failure.
       await api(`/api/projects/${projectId}/concepts`, {});
       resume();
       refresh();
@@ -179,10 +183,12 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
     }
     setBusy(null);
   }
+  const drafting = v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active';
 
   return (
     <Shell step={2} title="Three ways to test this product" sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.</>}>
       {err ? <Banner tone="risk">{err}</Banner> : null}
+      {v.conceptRequest?.status === 'failed' && v.conceptRequest.batch > (v.concepts[0]?.batch ?? 0) ? <Banner tone="warn">{v.conceptRequest.detail ?? 'We couldn’t draft more ideas just now. Please try again.'}</Banner> : null}
       {v.concepts.length === 0 ? (
         <p className="ak-muted">Drafting ideas…</p>
       ) : (
@@ -214,7 +220,7 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
       )}
       {v.concepts.length ? (
         <p style={{ marginTop: 24 }}>
-          <button className="ak-textbtn" disabled={!!busy} onClick={more}>{busy === 'more' ? 'Drafting…' : 'None of these — try 3 more'}</button>
+          <button className="ak-textbtn" disabled={!!busy || drafting} onClick={more} aria-live="polite">{busy === 'more' || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
         </p>
       ) : null}
       <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} />
@@ -272,7 +278,10 @@ export function SaveGate({ open, onOpenChange, next, productName }: { open: bool
 const PURPOSE: Record<string, string> = { hook: 'Hook', problem: 'Problem', product_reveal: 'Reveal', demonstration: 'Demo', proof: 'Proof', benefit: 'Benefit', routine: 'Routine', cta: 'Call to action' };
 
 export function StoryboardFlow({ projectId }: { projectId: string }) {
-  const active = useCallback((v: View | null) => !v || !v.storyboard || v.storyboard.status === 'generating', []);
+  const active = useCallback(
+    (v: View | null) => !v || !v.storyboard || v.storyboard.status === 'generating' || v.storyboard.scenes.some((s) => s.regeneration?.status === 'pending' || s.regeneration?.status === 'active'),
+    [],
+  );
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [edit, setEdit] = useState<{ id: string; spokenLine: string; overlayText: string } | null>(null);
   const [regen, setRegen] = useState<{ id: string; text: string } | null>(null);
@@ -316,9 +325,11 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
                 <div className="ak-between"><span className="ak-index">{String(s.position + 1).padStart(2, '0')} · {PURPOSE[s.purpose] ?? s.purpose}</span><span className="ak-index">{(s.durationMs / 1000).toFixed(1)}s</span></div>
                 {s.overlayText ? <p style={{ fontWeight: 600 }}>{s.overlayText}</p> : null}
                 {s.spokenLine ? <p className="ak-muted">“{s.spokenLine}”</p> : null}
+                {s.regeneration?.status === 'pending' || s.regeneration?.status === 'active' ? <p className="ak-small ak-muted" role="status">Redrawing this frame…</p> : null}
+                {s.regeneration?.status === 'failed' ? <p className="ak-small ak-error" role="status">{s.regeneration.detail ?? 'We couldn’t redraw this frame.'}</p> : null}
                 <div className="ak-row">
                   <button className="ak-textbtn" disabled={s.locked} onClick={() => setEdit({ id: s.id, spokenLine: s.spokenLine ?? '', overlayText: s.overlayText ?? '' })}>Edit words</button>
-                  <button className="ak-textbtn" disabled={s.locked} onClick={() => setRegen({ id: s.id, text: '' })}>Change picture</button>
+                  <button className="ak-textbtn" disabled={s.locked || s.regeneration?.status === 'pending' || s.regeneration?.status === 'active'} onClick={() => setRegen({ id: s.id, text: '' })}>Change picture</button>
                   <button className="ak-textbtn" onClick={() => call(`/api/scenes/${s.id}/lock`, { projectId, locked: !s.locked })}>{s.locked ? 'Unlock' : 'Lock'}</button>
                 </div>
               </figcaption>
@@ -374,7 +385,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           <form className="ak-stack" onSubmit={async (e) => { e.preventDefault(); if (await call(`/api/scenes/${regen.id}/regenerate`, { projectId, instruction: regen.text })) { setRegen(null); resume(); } }}>
             <textarea className="ak-textarea" maxLength={200} placeholder="e.g. warmer morning light, marble counter" value={regen.text} onChange={(e) => setRegen({ ...regen, text: e.target.value })} />
             {err ? <p className="ak-error" role="alert">{err}</p> : null}
-            <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Redrawing…' : 'Redraw'}</Button>
+            <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Sending…' : 'Redraw'}</Button>
           </form>
         ) : null}
       </Sheet>

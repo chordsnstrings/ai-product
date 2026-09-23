@@ -5,14 +5,14 @@ import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
 import { classifyClaim, scanCreativeText } from './compliance';
 import type { TenantContext } from './context';
-import { authorize, settle } from './cost-governor';
+import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
 import { allowedClaimTexts, planStoryboard } from './creative-director';
 import { emit } from './events';
 import { recordFunnel } from './funnel';
 import type { StoryboardPlan } from './intel-schemas';
-import { generateImage } from './model-gateway';
+import { generateImage, route } from './model-gateway';
 import { issueTasteOffer } from './offers';
-import { enqueue, Queues } from './outbox';
+import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { transition } from './projects';
 import { toDataUrl } from './vision';
@@ -43,7 +43,7 @@ export async function selectConcept(tx: Tx, ctx: TenantContext, projectId: strin
   await tx`update storyboards set status = 'superseded' where project_id = ${projectId} and id <> ${sb!.id} and status in ('ready','generating')`;
   await tx`update projects set storyboard_id = ${sb!.id} where id = ${projectId}`;
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
-  await enqueue(tx, ctx.workspaceId, Queues.generateStoryboard, { projectId, storyboardId: sb!.id, conceptId, actor: ctx.actor }, { singletonKey: `sb:${sb!.id}` });
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId, actor: ctx.actor }, { singletonKey: `sb:${sb!.id}`, priority: priorityFor(ctx) });
   return { storyboardId: sb!.id as string, replayed: false };
 }
 
@@ -205,25 +205,86 @@ export async function setSceneLock(tx: Tx, ctx: TenantContext, sceneId: string, 
   await tx`update scenes set locked = ${locked} where id = ${sceneId}`;
 }
 
-/** Regenerate one frame (pre-purchase: 3 free per storyboard). Locked scenes are never regenerated (§13). */
-export async function regenerateFrame(ctx: TenantContext, sceneId: string, instruction: string) {
+/** Progress key for one requested frame version (subject: the scene). */
+export const frameStepKey = (version: number) => `frame.v${version}`;
+const FRAME_REQUEST_STALE_MINUTES = 10;
+
+/**
+ * "Change picture" (pre-purchase: 3 free per storyboard). Validates and enqueues in one transaction; the frame
+ * is drawn by the `regenerate-frame` job (§34). Locked scenes are never regenerated (§13). In-flight requests
+ * count against the free allowance so parallel clicks cannot exceed it.
+ */
+export async function requestFrameRegeneration(tx: Tx, ctx: TenantContext, sceneId: string, instruction: string) {
+  assertCan(ctx, 'sku.edit');
+  const text = instruction.trim();
+  if (!text) throw new DomainError('INVALID', 'Describe the change you want.');
+  const [s] = await tx`select s.id, s.locked, sb.id as sb_id, sb.status as sb_status from scenes s join storyboards sb on sb.id = s.storyboard_id
+                       where s.id = ${sceneId} for update of s`;
+  if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
+  if (s.locked) throw new DomainError('CONFLICT', 'This scene is locked.');
+  if (s.sb_status === 'approved') throw new DomainError('CONFLICT', 'This storyboard is approved for production.');
+  const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${sceneId} and kind = 'frame'`;
+  const version = Number(v!.v);
+  const [inflight] = await tx`select step_key from progress_steps where subject_id = ${sceneId} and step_key = ${frameStepKey(version)}
+                              and status in ('pending','active') and started_at > now() - make_interval(mins => ${FRAME_REQUEST_STALE_MINUTES})`;
+  if (inflight) return { sceneId, version, replayed: true };
+  const [u] = await tx`select coalesce(sum(free_regenerations_used), 0)::int as used,
+                              (select count(*)::int from progress_steps ps join scenes x on x.id = ps.subject_id
+                               where x.storyboard_id = ${s.sb_id} and ps.step_key like 'frame.v%' and ps.status in ('pending','active')
+                                 and ps.started_at > now() - make_interval(mins => ${FRAME_REQUEST_STALE_MINUTES})) as pending
+                       from scenes where storyboard_id = ${s.sb_id}`;
+  if (u!.used + u!.pending >= FREE_FRAME_REGENERATIONS) throw new DomainError('PAYMENT_REQUIRED', 'You’ve used the free frame changes. Your ad can still be adjusted after production.');
+  const c = classifyClaim(text);
+  if (c.status === 'BLOCKED') throw new DomainError('GATE_BLOCKED', c.matched[0]!.reason);
+  await tx`insert into progress_steps (workspace_id, subject_id, step_key, label, status, started_at, position)
+           values (${ctx.workspaceId}, ${sceneId}, ${frameStepKey(version)}, 'Redrawing this frame', 'pending', now(), 0)
+           on conflict (workspace_id, subject_id, step_key) do update set status = 'pending', detail = null, started_at = now(), completed_at = null`;
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.regenerateFrame, ctx), { sceneId, version, instruction: text.slice(0, 200), actor: ctx.actor },
+    { singletonKey: `frame:${sceneId}:${version}`, priority: priorityFor(ctx) });
+  return { sceneId, version, replayed: false };
+}
+
+/**
+ * Worker (`regenerate-frame`): draw one requested frame version under its own authorization keyed
+ * `frame:<scene>:<version>`. Idempotent per version; the free allowance is counted only on success.
+ */
+export async function regenerateFrame(ctx: TenantContext, sceneId: string, instruction: string, version: number): Promise<'done' | 'skipped'> {
   const ws = ctx.workspaceId;
+  const key = frameStepKey(version);
   const info = await withTenant(ws, async (tx) => {
-    assertCan(ctx, 'sku.edit');
-    const [s] = await tx`select s.*, sb.project_id, sb.id as sb_id, p.sku_id, sk.name from scenes s join storyboards sb on sb.id = s.storyboard_id
+    const [s] = await tx`select s.*, sb.project_id, sb.id as sb_id, sb.status as sb_status, p.sku_id, sk.name from scenes s join storyboards sb on sb.id = s.storyboard_id
                          join projects p on p.id = sb.project_id join skus sk on sk.id = p.sku_id where s.id = ${sceneId}`;
     if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
-    if (s.locked) throw new DomainError('CONFLICT', 'This scene is locked.');
-    const [u] = await tx`select coalesce(sum(free_regenerations_used), 0)::int as n from scenes where storyboard_id = ${s.sb_id}`;
-    if (u!.n >= FREE_FRAME_REGENERATIONS) throw new DomainError('PAYMENT_REQUIRED', 'You’ve used the free frame changes. Your ad can still be adjusted after production.');
-    const c = classifyClaim(instruction);
-    if (c.status === 'BLOCKED') throw new DomainError('GATE_BLOCKED', c.matched[0]!.reason);
-    const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${sceneId} and kind = 'frame'`;
-    return { s, nextVersion: Number(v!.v), cut: await productCutout(tx, s.sku_id as string), refs: await referenceDataUrls(tx, s.sku_id as string) };
+    const [done] = await tx`select 1 from scene_versions where scene_id = ${sceneId} and kind = 'frame' and version = ${version}`;
+    return { s, done: !!done, cut: done ? null : await productCutout(tx, s.sku_id as string), refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string) };
   });
-  const auth = await withTenant(ws, (tx) =>
-    authorize(tx, ctx, { purpose: 'storyboard', projectId: info.s.project_id as string, lines: [{ kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 }], idempotencyKey: `frame:${sceneId}:${info.nextVersion}` }),
-  );
+  if (info.done) {
+    await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'done'));
+    return 'done';
+  }
+  if (info.s.locked || info.s.sb_status === 'approved') {
+    // Locked or approved after the request was made: never redraw (§13).
+    await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'skipped', info.s.locked ? 'This scene is locked.' : 'This storyboard is approved for production.'));
+    return 'skipped';
+  }
+  let auth: Awaited<ReturnType<typeof authorize>>;
+  try {
+    auth = await withTenant(ws, async (tx) => {
+      const r = await route(tx, 'image.storyboard_frame');
+      const a = await authorizeOrTakeOver(
+        tx,
+        ctx,
+        { purpose: 'storyboard', projectId: info.s.project_id as string, lines: [{ kind: 'image', provider: r.provider, model: r.model, images: 1 }], idempotencyKey: `frame:${sceneId}:${version}` },
+        FRAME_REQUEST_STALE_MINUTES,
+      );
+      await step(tx, ws, sceneId, key, 'active');
+      return a;
+    });
+  } catch (e) {
+    if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
+    await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'failed', frameFailure(e)));
+    throw e;
+  }
   try {
     const img = await generateImage({
       ctx,
@@ -236,19 +297,28 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
       mockLabel: `${info.s.purpose} · ${instruction}`.slice(0, 90),
     });
     const bytes = info.cut && info.s.production_mode !== 'GENERATIVE_INTERACTION' ? await compositeProduct(img.bytes, info.cut, '9x16', { scale: 0.4, anchor: 'lower' }) : img.bytes;
-    return await withTenant(ws, async (tx) => {
+    await withTenant(ws, async (tx) => {
       const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: info.s.sku_id as string, source: 'generated', lineage: { sceneId, instruction } });
       const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status)
-                           values (${ws}, ${sceneId}, ${info.nextVersion}, 'frame', ${a.id}, 'generated', ${img.modelVersion}, 'succeeded') returning id`;
+                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, 'generated', ${img.modelVersion}, 'succeeded') returning id`;
       await tx`update scenes set current_version_id = ${v!.id}, free_regenerations_used = free_regenerations_used + 1,
                  visual_plan = ${`${info.s.visual_plan}. ${instruction}`.slice(0, 300)} where id = ${sceneId}`;
       await settle(tx, ctx, auth.authorizationId, 'consumed');
-      return { sceneVersionId: v!.id as string, assetId: a.id };
+      await step(tx, ws, sceneId, key, 'done');
     });
+    return 'done';
   } catch (e) {
-    await withTenant(ws, (tx) => settle(tx, ctx, auth.authorizationId, 'consumed'));
+    await withTenant(ws, async (tx) => {
+      await settle(tx, ctx, auth.authorizationId, 'consumed');
+      await step(tx, ws, sceneId, key, 'failed', frameFailure(e));
+    });
     throw e;
   }
+}
+
+function frameFailure(e: unknown): string {
+  if (e instanceof DomainError && (e.code === 'GATE_BLOCKED' || e.code === 'UNAVAILABLE')) return e.message;
+  return 'We couldn’t redraw this frame just now. Your free changes weren’t used — please try again.';
 }
 
 export async function storyboardView(tx: Tx, storyboardId: string) {

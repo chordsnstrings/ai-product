@@ -12,7 +12,7 @@ import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { append, type LedgerUnit } from './ledger';
 import { generateVideo, synthesizeVoice } from './model-gateway';
-import { enqueue, Queues } from './outbox';
+import { enqueue, priorityFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { getProject, transition } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
@@ -65,7 +65,7 @@ export async function approveForProduction(tx: Tx, ctx: TenantContext, projectId
   await tx`update storyboards set status = 'approved', approved_at = now(), approved_by = ${ctx.actor.kind + ':' + ctx.actor.id} where id = ${p.storyboard_id}`;
   await transition(tx, ctx, projectId, 'STORYBOARD_APPROVED', { patch: { entitlement_unit: unit, kind: unit === 'creative_test' ? 'creative_test' : unit } });
   await planSteps(tx, ctx.workspaceId, projectId, PRODUCTION_STEPS);
-  await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor }, { singletonKey: `produce:${projectId}`, priority: 20 });
+  await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor }, { singletonKey: `produce:${projectId}`, priority: priorityFor(ctx, 'production') });
   return { replayed: false };
 }
 
@@ -317,9 +317,11 @@ export async function produceProject(ctx: TenantContext, projectId: string): Pro
 /** Retry a failed production (entitlement was returned on failure, so this re-reserves it). */
 export async function retryProduction(tx: Tx, ctx: TenantContext, projectId: string) {
   const p = await getProject(tx, projectId);
+  // A retry re-reserves the entitlement: the same right as approving production in the first place.
+  if (ctx.actor.kind === 'user') assertCan(ctx, p.entitlement_unit === 'creative_test' ? 'spend.creative_test' : 'storyboard.approve');
   if (!['PROVIDER_FAILED', 'NEEDS_USER_ACTION'].includes(p.state as string)) throw new DomainError('CONFLICT', 'Nothing to retry');
   await tx`update cost_authorizations set idempotency_key = idempotency_key || ':retired:' || extract(epoch from now())::bigint
            where project_id = ${projectId} and idempotency_key = ${'produce:' + projectId} and status <> 'active'`;
   await transition(tx, ctx, projectId, 'STORYBOARD_APPROVED');
-  await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor, retry: true }, { singletonKey: `produce:${projectId}:${Date.now()}` });
+  await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor, retry: true }, { singletonKey: `produce:${projectId}:${Date.now()}`, priority: priorityFor(ctx, 'production') });
 }

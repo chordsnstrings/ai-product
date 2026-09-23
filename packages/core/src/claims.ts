@@ -123,6 +123,7 @@ export async function attachEvidence(
   claimId: string,
   e: { type: string; assetId?: string | null; location?: string | null; applicability?: string | null; strength?: 'weak' | 'moderate' | 'strong'; expiry?: string | null },
 ) {
+  if (ctx.actor.kind !== 'staff') assertCan(ctx, 'sku.edit');
   await tx`insert into claim_evidence (workspace_id, claim_id, evidence_type, source_asset_id, source_location, supplied_by,
              applicability, evidence_strength, expiry_date)
            values (${ctx.workspaceId}, ${claimId}, ${e.type}, ${e.assetId ?? null}, ${e.location ?? null}, ${actorString(ctx)},
