@@ -9,12 +9,12 @@ not added later.
 
 ## Phase 0: Foundations
 **Deliverables**
-1. Monorepo: pnpm + Turborepo; `apps/{web,admin,worker}`, `packages/{shared,db,core,auth,billing,providers,media,integrations,ui,email}`; ESLint (incl. custom rules: no raw DB client in apps, cache calls need a TenantContext), Prettier, strict TS.
+1. Monorepo: pnpm workspaces (no Turborepo needed; packages are consumed as TypeScript source); `apps/{web,admin,worker}`, `packages/{shared,db,core,auth,billing,providers,media,integrations,ui,email}`; ESLint (incl. custom rules: no raw DB client in apps, cache calls need a TenantContext), Prettier, strict TS.
 2. CI (GitHub Actions): lint, typecheck, unit, migration dry-run, **RLS coverage test**, bundle-size check, Lighthouse CI on marketing pages.
-3. DB v0 (Drizzle + SQL migrations), all with RLS per 02 §3:
+3. DB v0 (postgres.js + SQL migrations — Drizzle was dropped to keep RLS/policies/definer functions explicit in SQL), all with RLS per 02 §3:
    - global: `users`, `user_identities` (google/apple/email), `sessions`, `magic_links`, `passkeys`, `staff_users`, `staff_sessions`, `admin_audit_log`, `feature_flags`, `platform_settings`
    - tenant: `workspaces`, `workspace_slug_history`, `memberships`, `invites`, `events`, `idempotency_keys`, `workspace_semaphores`, `assets`, `uploads`
-   - DB roles: `app_rw` (no BYPASSRLS), `migrator`, `admin_ro`, `admin_rw`.
+   - DB roles: `app_rw`, `admin_rw`, `system_rw` (none with BYPASSRLS; explicit per-role policies) plus the owner for migrations.
 4. `TenantContext` + `withTenantTx()` (SET LOCAL) + tenant-scoped repository base; cross-tenant 404 middleware.
 5. Auth (in-house): email magic link (Resend), Google OAuth, Apple Sign In, sessions, rate limits, confirm-page magic links (scanner-safe), session list and revoke. Passkeys come in Phase 3.
 6. Email: `packages/email` with React Email arkiv templates; Resend domain `mail.<domain>` (SPF/DKIM/DMARC `p=none` → `quarantine` after 30 days); Resend `Idempotency-Key` on every send; webhook receiver (delivered/bounced/complained → suppression).

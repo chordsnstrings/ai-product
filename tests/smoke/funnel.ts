@@ -3,7 +3,7 @@
  *   photo → analysis → concepts → save gate → magic link → storyboard → checkout → production → exports → app pages.
  * Usage: BASE=http://localhost:3000 WEB_LOG=path/to/web.log tsx tests/smoke/funnel.ts
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { productPhoto } from '@arkiv/core/testing';
 
 const BASE = process.env.BASE ?? 'http://localhost:3000';
@@ -77,9 +77,15 @@ async function main() {
   step('Magic link sign-in (dev email log)');
   const email = `smoke+${Date.now()}@example.com`;
   await ok(post('/api/auth/magic', { email, next: `/concepts/${projectId}` }));
-  if (!WEB_LOG) throw new Error('WEB_LOG not set');
-  const url = await until('magic link in log', async () => {
-    const m = [...readFileSync(WEB_LOG, 'utf8').matchAll(/\[email:dev\] magic_link → ([^:]+): .*?"url":"([^"]+)"/g)].filter((x) => x[1] === email).pop();
+  const MAIL = process.env.EMAIL_DEV_FILE;
+  if (!WEB_LOG && !MAIL) throw new Error('set EMAIL_DEV_FILE (preferred) or WEB_LOG');
+  const url = await until('magic link', async () => {
+    if (MAIL) {
+      const hit = (existsSync(MAIL) ? readFileSync(MAIL, 'utf8') : '').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as { to: string; template: string; data: { url: string } })
+        .filter((m) => m.to === email && m.template === 'magic_link').pop();
+      return hit?.data.url ?? null;
+    }
+    const m = [...readFileSync(WEB_LOG!, 'utf8').matchAll(/\[email:dev\] magic_link → ([^:]+): .*?"url":"([^"]+)"/g)].filter((x) => x[1] === email).pop();
     return m?.[2] ?? null;
   }, 20_000);
   const token = url.split('/').pop()!;

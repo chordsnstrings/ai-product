@@ -30,7 +30,7 @@ visually: the archive visibly grows.
 ## 2. Tokens
 
 All tokens are CSS custom properties generated from `packages/ui/tokens.ts`.
-Tailwind v4 reads them via `@theme`.
+They are plain CSS custom properties in `packages/ui/src/styles.css`; components use `ak-*` classes (no Tailwind).
 
 ### 2.1 Colour: light ("Paper")
 

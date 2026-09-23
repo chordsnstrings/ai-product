@@ -81,6 +81,9 @@ export function env(): Env {
       const required: (keyof Env)[] = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'RESEND_API_KEY'];
       for (const k of required) if (!parsed[k]) throw new Error(`Missing required env ${k} in production`);
       if (parsed.APP_SECRET.startsWith('dev-secret')) throw new Error('APP_SECRET must be set in production');
+      if (parsed.TOKEN_ENCRYPTION_KEY === EnvSchema.shape.TOKEN_ENCRYPTION_KEY.parse(undefined)) throw new Error('TOKEN_ENCRYPTION_KEY must be set in production');
+      if (parsed.STORAGE_DRIVER !== 's3') throw new Error('STORAGE_DRIVER must be s3 (DigitalOcean Spaces) in production');
+      if (parsed.PROVIDERS_MODE === 'mock' && process.env.ALLOW_MOCK_PROVIDERS !== '1') throw new Error('PROVIDERS_MODE=mock is not allowed in production');
     }
     cached = parsed;
   }

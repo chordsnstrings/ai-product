@@ -51,6 +51,11 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
       devOutbox.push({ to: email, template, subject: built.subject, html, data });
       if (devOutbox.length > 200) devOutbox.shift();
       if (env().NODE_ENV === 'development') console.info(`[email:dev] ${template} → ${email}: ${built.subject}`, JSON.stringify(data));
+      // Local/e2e: optional JSONL outbox so browser tests can follow magic links across processes.
+      if (process.env.EMAIL_DEV_FILE && env().NODE_ENV !== 'production') {
+        const { appendFile } = await import('node:fs/promises');
+        await appendFile(process.env.EMAIL_DEV_FILE, `${JSON.stringify({ at: new Date().toISOString(), to: email, template, subject: built.subject, data })}\n`).catch(() => {});
+      }
       await t`update email_log set status = 'logged' where id = ${ins[0]!.id}`;
       return { status: 'logged' };
     }

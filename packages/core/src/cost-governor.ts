@@ -139,7 +139,9 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
       authorizationId: auth!.id,
       projectId: input.projectId,
       periodKey: input.entitlement.periodKey ?? null,
-      idempotencyKey: `reserve:${input.idempotencyKey}`,
+      // Keyed on the authorization itself: a retry creates a new authorization and must reserve again. (Keying on
+      // the request key let a retried production skip its reservation — found by the chaos suite.)
+      idempotencyKey: `reserve:${auth!.id}`,
     });
   }
   return { authorizationId: auth!.id, token, estimate: est, maxCostMicros: est.totalMicros, replayed: false };

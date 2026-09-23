@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22.12'
+  PNPM_VERSION: '10.33.0'
+  NEXT_TELEMETRY_DISABLED: '1'
+  # Runtime + test databases (roles/passwords are created by `pnpm db:migrate` in non-production).
+  DATABASE_URL: postgres://dev:dev@localhost:5432/arkiv
+  APP_DATABASE_URL: postgres://app_rw:app_rw@localhost:5432/arkiv
+  ADMIN_DATABASE_URL: postgres://admin_rw:admin_rw@localhost:5432/arkiv
+  PROVIDERS_MODE: mock
+  STORAGE_DRIVER: local
+
+jobs:
+  checks:
+    name: Typecheck, unit + integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - name: Create test database
+        run: PGPASSWORD=dev psql -h localhost -U dev -d arkiv -c 'create database arkiv_test'
+      - run: pnpm -r --parallel typecheck
+      - run: pnpm test
+      - name: Every table is registered and tenant tables are RLS-forced
+        run: pnpm vitest run packages/db/src/rls.test.ts
+
+  build:
+    name: Build web + admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @arkiv/web build
+      - run: pnpm --filter @arkiv/admin build
+
+  e2e:
+    name: E2E (browser + HTTP smoke)
+    runs-on: ubuntu-latest
+    needs: [checks]
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      EMAIL_DEV_FILE: ${{ github.workspace }}/.storage/e2e-mail.jsonl
+      STORAGE_LOCAL_DIR: ${{ github.workspace }}/.storage/files
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: mkdir -p .storage && pnpm db:migrate
+      - name: Start worker, web and admin
+        run: |
+          nohup pnpm --filter @arkiv/worker start > worker.log 2>&1 &
+          nohup pnpm --filter @arkiv/web dev > web.log 2>&1 &
+          nohup pnpm --filter @arkiv/admin dev > admin.log 2>&1 &
+          for u in http://localhost:3000/api/health http://localhost:3001/login; do
+            for i in $(seq 1 90); do curl -fs "$u" > /dev/null && break; sleep 2; done
+          done
+      - name: Browser e2e (reuses the running servers)
+        run: pnpm e2e
+      - name: HTTP smoke — funnel + retention loop
+        run: pnpm smoke
+        env: { BASE: 'http://localhost:3000' }
+      - name: HTTP smoke — admin console
+        run: pnpm smoke:admin
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            playwright-report
+            test-results
+            worker.log
+            web.log
+            admin.log
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix: { target: [web, admin, worker] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}

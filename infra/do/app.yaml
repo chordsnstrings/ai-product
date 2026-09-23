@@ -28,7 +28,7 @@ envs:
   - { key: APP_URL, value: https://arkiv.app, scope: RUN_AND_BUILD_TIME }
   - { key: ADMIN_URL, value: https://admin.arkiv.app, scope: RUN_AND_BUILD_TIME }
   - { key: PROVIDERS_MODE, value: live, scope: RUN_TIME }
-  - { key: STORAGE_DRIVER, value: spaces, scope: RUN_TIME }
+  - { key: STORAGE_DRIVER, value: s3, scope: RUN_TIME }   # DO Spaces is S3-compatible
   - { key: SPACES_REGION, value: nyc3, scope: RUN_TIME }
   - { key: SPACES_ENDPOINT, value: https://nyc3.digitaloceanspaces.com, scope: RUN_TIME }
   - { key: SPACES_BUCKET, value: arkiv-prod, scope: RUN_TIME }
@@ -39,6 +39,8 @@ envs:
   - { key: ADMIN_DATABASE_URL, value: CHANGE_ME_admin_pool_url, scope: RUN_TIME, type: SECRET }
   - { key: SYSTEM_DATABASE_URL, value: CHANGE_ME_direct_system_rw_url, scope: RUN_TIME, type: SECRET }
   - { key: APP_SECRET, value: CHANGE_ME_64_random_chars, scope: RUN_TIME, type: SECRET }
+  - { key: TOKEN_ENCRYPTION_KEY, value: CHANGE_ME_base64_32_bytes, scope: RUN_TIME, type: SECRET }   # AES-256-GCM for OAuth tokens
+  - { key: EMAIL_FROM, value: "Arkiv <hello@mail.arkiv.app>", scope: RUN_TIME }
   - { key: ANTHROPIC_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: ARK_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: MINIMAX_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }

@@ -135,7 +135,7 @@ Any single layer failing must not leak data. We implement **all** of them.
     with check (workspace_id = current_setting('app.workspace_id')::uuid);
   ```
 - The app connects as role `app_rw`, **without** `BYPASSRLS`. Each unit of work runs in a transaction that begins `SET LOCAL app.workspace_id = $1`. If it's unset, `current_setting` throws, so a query with no tenant fails closed.
-- `migrator` role runs migrations. `admin_ro` / `admin_rw` roles have `BYPASSRLS` and are used **only** by the admin app. Every admin query is audited (see 05-admin-panel).
+- The table owner runs migrations. `admin_rw` (staff console) and `system_rw` (worker: dispatcher, sweeps, purge) do **not** have `BYPASSRLS`; every tenant table carries explicit `staff_access` / `system_access` policies instead, so access stays visible in the schema and revocable per table. `admin_rw` is used **only** by the admin app, where every query of tenant data is audited and tenant *content* additionally requires break-glass (see 05-admin-panel). As implemented.
 - **CI guard:** a test lists every table with a `workspace_id` column and fails if RLS isn't enabled+forced with a policy. A second list declares the global tables; a table in neither list fails CI.
 - Connection pooling: DigitalOcean's PgBouncer in **transaction** mode is compatible because we only use `SET LOCAL` inside transactions, never session-level `SET`.
 

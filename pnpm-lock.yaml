@@ -11,6 +11,9 @@ importers:
       '@arkiv/auth':
         specifier: workspace:*
         version: link:packages/auth
+      '@arkiv/billing':
+        specifier: workspace:*
+        version: link:packages/billing
       '@arkiv/core':
         specifier: workspace:*
         version: link:packages/core

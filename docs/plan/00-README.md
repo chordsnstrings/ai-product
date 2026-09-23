@@ -17,13 +17,13 @@ The product standard ([`../standard/`](../standard/), V1.2) defines *what* and
 | Layer | Choice |
 | --- | --- |
 | Apps | Next.js (`apps/web` customer + marketing, `apps/admin` staff), Node worker (`apps/worker`, FFmpeg) |
-| Data | Postgres (DigitalOcean Managed) with Row-Level Security, Drizzle, pg-boss queue |
+| Data | Postgres 16 (DigitalOcean Managed) with forced Row-Level Security, postgres.js + hand-written SQL migrations, pg-boss queue fed by a transactional outbox |
 | Storage | DigitalOcean Spaces + CDN (marketing only) |
 | Payments | Stripe Embedded Checkout + Billing + Tax |
 | Auth | In-house: magic link, Google, Apple, passkeys |
 | Email | Resend + React Email |
 | AI | Anthropic Opus 5.5; BytePlus Seedream 5.0 Pro + Seedance 2.5; MiniMax / BytePlus Seed Speech voice |
-| UI | Radix primitives, Tailwind v4 tokens, Motion, React `<ViewTransition>` |
+| UI | Radix primitives, plain CSS custom-property tokens (`packages/ui/src/styles.css`), CSS motion tokens with reduced-motion support |
 
 ## Repository layout
 
@@ -34,7 +34,7 @@ apps/
   worker/         pg-boss workers: analysis, render, qa, compose, sync, sweeps, purge
 packages/
   shared/         enums, event catalogue, Zod schemas, money/ID types
-  db/             Drizzle schema, SQL migrations, RLS policies, tenant repositories
+  db/             SQL migrations, RLS policies, role-scoped pools (withTenant / withAdmin / withSystem)
   core/           domain modules (standard §33): product-truth, claims, customer-signal,
                   creative-genome, experiments, recommendations, statistics,
                   context-builder, creative-director, production-planner,
