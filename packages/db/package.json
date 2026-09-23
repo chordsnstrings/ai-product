@@ -1,0 +1,14 @@
+{
+  "name": "@arkiv/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./testing": "./src/testing.ts" },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "migrate": "tsx src/cli.ts migrate",
+    "reset": "tsx src/cli.ts reset",
+    "seed": "tsx src/cli.ts seed"
+  },
+  "dependencies": { "@arkiv/shared": "workspace:*", "postgres": "^3.4.9" }
+}
