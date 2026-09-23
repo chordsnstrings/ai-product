@@ -18,6 +18,7 @@ export function MarketingShell({ children, loggedIn }: { children: ReactNode; lo
             <Link href="/pricing">Pricing</Link>
             <Link href="/legal/terms">Terms</Link>
             <Link href="/legal/privacy">Privacy</Link>
+            <Link href="/legal/subprocessors">Subprocessors</Link>
             <a href="mailto:support@arkiv.app">Contact</a>
           </span>
         </div>

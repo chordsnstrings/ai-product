@@ -1,12 +1,16 @@
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
+import { DATA_RECIPIENTS, type DataRecipient } from '@arkiv/shared';
 import { MarketingShell } from '@/components/marketing';
 import { currentUser } from '@/lib/session';
 
 /**
  * Placeholder legal pages. These MUST be replaced by counsel-reviewed text before paid launch
  * (plan 06 Phase 6: consumer-protection review of checkout, plans and cancel flows).
+ * The subprocessor list is generated from the data inventory in @arkiv/shared (standard §40), which a test
+ * keeps in step with every external host the code talks to.
  */
-const DOCS: Record<string, { title: string; body: string[] }> = {
+const DOCS: Record<string, { title: string; body: string[]; recipients?: boolean }> = {
   terms: {
     title: 'Terms of Service',
     body: [
@@ -22,20 +26,55 @@ const DOCS: Record<string, { title: string; body: string[] }> = {
       'Draft — pending legal review. We process your product data, uploads, ad performance and account details only to provide the service to your brand.',
       'We never use one customer’s data to serve another customer.',
       'You can export or delete your workspace at any time. Deleted data is purged after a 7-day grace period; backups expire within 14 days. Financial records are retained as required by law.',
-      'Subprocessors: DigitalOcean (hosting), Stripe (payments), Resend (email), Anthropic, BytePlus and MiniMax (AI processing).',
+      'The companies that process data for us, what they receive and where, are listed below and on the subprocessors page.',
     ],
+    recipients: true,
+  },
+  subprocessors: {
+    title: 'Subprocessors and connected services',
+    body: ['Draft — pending legal review. Every service that receives customer or visitor data, what it receives, and where it is processed.'],
+    recipients: true,
   },
 };
 
+function RecipientTable({ rows }: { rows: readonly DataRecipient[] }) {
+  return (
+    <div className="ak-scroll-x">
+      <table className="ak-table">
+        <thead>
+          <tr><th>Service</th><th>Purpose</th><th>Data</th><th>Where</th></tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.name}><td>{r.name}</td><td>{r.purpose}</td><td>{r.data}</td><td>{r.region}</td></tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default async function LegalPage({ params }: { params: Promise<{ doc: string }> }) {
-  const d = DOCS[(await params).doc];
+  const doc = (await params).doc;
+  const d = DOCS[doc];
   if (!d) notFound();
   const user = await currentUser();
   return (
     <MarketingShell loggedIn={!!user}>
-      <article className="ak-wrap ak-stack" style={{ maxWidth: 720, paddingTop: 24, paddingBottom: 48 }}>
+      <article className="ak-wrap ak-stack" style={{ maxWidth: 880, paddingTop: 24, paddingBottom: 48 }}>
         <h1 className="ak-display">{d.title}</h1>
         {d.body.map((p, i) => <p key={i} className="ak-muted">{p}</p>)}
+        {d.recipients ? (
+          <>
+            <h2 className="ak-h2">Subprocessors</h2>
+            <p className="ak-small ak-muted">They process data on our behalf to run Arkiv.</p>
+            <RecipientTable rows={DATA_RECIPIENTS.filter((r) => r.kind === 'subprocessor')} />
+            <h2 className="ak-h2">Services you choose to connect or sign in with</h2>
+            <p className="ak-small ak-muted">Only used if you sign in with them or connect your store or ad account; you can disconnect at any time.</p>
+            <RecipientTable rows={DATA_RECIPIENTS.filter((r) => r.kind !== 'subprocessor')} />
+            {doc === 'privacy' ? <p className="ak-small"><Link href="/legal/subprocessors">Subprocessors page</Link></p> : null}
+          </>
+        ) : null}
       </article>
     </MarketingShell>
   );
