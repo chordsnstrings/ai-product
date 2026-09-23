@@ -16,13 +16,13 @@ export default async function Profile({ params }: { params: Promise<{ slug: stri
   return (
     <div className="ak-stack" style={{ ['--stack' as string]: '32px', maxWidth: 720 }}>
       <section className="ak-panel">
-        <p className="ak-label">You</p>
+        <h2 className="ak-label">You</h2>
         <p style={{ margin: 0 }}>{u.email}</p>
         <p className="ak-small ak-muted">Signed in with {[...new Set(identities.map((i) => i.provider as string))].join(', ') || 'email'}</p>
         <NameForm initial={u.name ?? ''} />
       </section>
       <section className="ak-panel">
-        <p className="ak-label">Passkeys</p>
+        <h2 className="ak-label">Passkeys</h2>
         {passkeys.map((p) => (
           <div key={p.id as string} className="ak-index-row">
             <span>{(p.name as string) ?? 'Passkey'}<span className="ak-small ak-muted" style={{ display: 'block' }}>added {new Date(p.created_at as string).toLocaleDateString()}{p.last_used_at ? ` · used ${new Date(p.last_used_at as string).toLocaleDateString()}` : ''}</span></span>
@@ -32,7 +32,7 @@ export default async function Profile({ params }: { params: Promise<{ slug: stri
         <PasskeyRegister />
       </section>
       <section className="ak-panel">
-        <p className="ak-label">Sessions</p>
+        <h2 className="ak-label">Sessions</h2>
         {sessions.map((s) => (
           <div key={s.id as string} className="ak-index-row">
             <span>{String(s.user_agent ?? 'Unknown device').slice(0, 80)}<span className="ak-small ak-muted" style={{ display: 'block' }}>{s.ip as string} · last active {new Date(s.last_seen_at as string).toLocaleString()}{s.id === u.sessionId ? ' · this device' : ''}</span></span>

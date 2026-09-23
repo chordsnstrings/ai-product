@@ -82,7 +82,7 @@ export async function Landing({ slug, searchParams }: { slug: string; searchPara
         </section>
 
         <section className="ak-wrap ak-section" style={{ paddingTop: 0 }}>
-          <p className="ak-label">What we check</p>
+          <h2 className="ak-label">What we check</h2>
           <hr className="ak-rule-ink" style={{ margin: '12px 0 8px' }} />
           <table className="ak-meta">
             <tbody>
@@ -94,7 +94,7 @@ export async function Landing({ slug, searchParams }: { slug: string; searchPara
         </section>
 
         <section className="ak-wrap ak-section" style={{ paddingTop: 0 }}>
-          <p className="ak-label">Questions</p>
+          <h2 className="ak-label">Questions</h2>
           <hr className="ak-rule-ink" style={{ margin: '12px 0 8px' }} />
           {[
             ['What does it cost?', 'The analysis and three ideas are free. Your first finished ad is $19 during a 60-minute intro window after your storyboard is ready; after that it’s $29. Plans start at $49/month.'],

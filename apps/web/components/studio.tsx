@@ -44,7 +44,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
       {err ? <Banner tone="risk">{err}</Banner> : null}
       {pre ? (
         <>
-          <p className="ak-label">Storyboard · master variant</p>
+          <h2 className="ak-label">Storyboard · master variant</h2>
           {!sb || sb.status === 'generating' ? <Ledger steps={sb?.steps ?? []} /> : null}
           {sb?.scenes.length ? (
             <div className="ak-scroll-row" role="list">
@@ -77,14 +77,14 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
 
       {producing ? (
         <>
-          <p className="ak-label">Producing</p>
+          <h2 className="ak-label">Producing</h2>
           <Ledger steps={v?.productionSteps ?? []} />
         </>
       ) : null}
 
       {!pre ? (
         <section>
-          <p className="ak-label">Variants</p>
+          <h2 className="ak-label">Variants</h2>
           <p className="ak-small ak-muted">Put each code in your ad’s name (e.g. “Serum spring — {variants[0]?.code}”). We’ll match results automatically when your ad account is connected.</p>
           <table className="ak-table">
             <thead><tr><th>Code</th><th>Hook</th><th>Files</th><th /></tr></thead>

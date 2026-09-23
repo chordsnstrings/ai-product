@@ -62,7 +62,7 @@ export default async function Members({ params }: { params: Promise<{ slug: stri
       </div>
       {isAdmin ? (
         <div className="ak-panel">
-          <p className="ak-label">Invite someone</p>
+          <h2 className="ak-label">Invite someone</h2>
           <ActionForm slug={slug} action="invite" submit="Send invite" fields={[
             { name: 'email', label: 'Email', type: 'email', required: true },
             { name: 'role', label: 'Role', type: 'select', defaultValue: 'MEMBER', options: [{ value: 'ADMIN', label: 'Admin — billing, members, integrations' }, { value: 'MEMBER', label: 'Member — products and tests' }, { value: 'VIEWER', label: 'Viewer — read only' }] },

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { staffCreds, totp } from './helpers';
+import { headingOutline, staffCreds, totp } from './helpers';
 
 const ADMIN = 'http://localhost:3001';
 
@@ -12,9 +12,13 @@ test('staff can sign in and use the console', async ({ page }) => {
   await page.getByLabel('Authenticator code').fill(totp(c.secret));
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('heading', { name: 'Platform Pulse' })).toBeVisible();
+  await headingOutline(page);
   await page.getByRole('link', { name: 'Tenants' }).click();
   await expect(page.getByRole('heading', { name: 'Tenants' })).toBeVisible();
+  await expect(page.getByLabel('Search tenants')).toBeVisible(); // filters have visible labels, not placeholders only
   await page.getByRole('link', { name: 'Flags & config' }).click();
+  await expect(page.getByRole('heading', { name: 'Kill switches' })).toBeVisible(); // Section titles are headings
+  await headingOutline(page);
   // Turning a kill switch on asks for confirmation and a reason (and a fresh code if 2FA is older than 5 min).
   const dialogs: string[] = [];
   page.on('dialog', async (d) => {

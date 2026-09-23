@@ -15,7 +15,7 @@ export default async function Brand({ params }: { params: Promise<{ slug: string
   return (
     <div className="ak-grid-2" style={{ alignItems: 'start' }}>
       <div className="ak-panel">
-        <p className="ak-label">Brand brain</p>
+        <h2 className="ak-label">Brand brain</h2>
         {canEdit ? (
           <ActionForm slug={slug} action="brand" submit="Save brand" fields={[
             { name: 'name', label: 'Brand name', required: true, defaultValue: (b?.name as string) ?? w.name, max: 80 },

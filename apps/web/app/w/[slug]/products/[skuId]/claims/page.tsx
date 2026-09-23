@@ -42,7 +42,7 @@ export default async function Claims({ params }: { params: Promise<{ slug: strin
       <p className="ak-small ak-muted" style={{ maxWidth: 640 }}>Only approved claims can appear in ads, and only on the platforms and markets you choose. Evidence expiring within 14 days moves a claim back to review.</p>
       {groups.map((g) => (
         <section key={g.s} className="ak-section">
-          <p className="ak-label">{GROUP[g.s]}</p>
+          <h2 className="ak-label">{GROUP[g.s]}</h2>
           {g.items.map((c) => {
             const ev = d.ev.filter((e) => e.claim_id === c.id);
             return (

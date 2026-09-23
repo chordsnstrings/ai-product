@@ -29,7 +29,7 @@ export function Page({ title, sub, actions, children }: { title: string; sub?: R
 export function Section({ title, children, right }: { title: string; children: ReactNode; right?: ReactNode }) {
   return (
     <section style={{ marginTop: 24 }}>
-      <div className="ak-between"><p className="ak-label">{title}</p>{right}</div>
+      <div className="ak-between"><h2 className="ak-label">{title}</h2>{right}</div>
       {children}
     </section>
   );

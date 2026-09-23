@@ -54,7 +54,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
         </div>
       )}
       <section className="ak-section">
-        <p className="ak-label">What your tests have taught you</p>
+        <h2 className="ak-label">What your tests have taught you</h2>
         {d.learnings.length === 0 ? (
           <p className="ak-small ak-muted">Learnings appear once a test reaches a directional or actionable signal. Each one is scoped to the platform and measurement it came from.</p>
         ) : (

@@ -116,7 +116,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
               {err ? <p className="ak-error" role="alert">{err}</p> : null}
               {v.claims.length ? (
                 <div>
-                  <p className="ak-label">Claims we found</p>
+                  <h2 className="ak-label">Claims we found</h2>
                   <ul className="ak-stack" style={{ listStyle: 'none', padding: 0 }}>
                     {v.claims.map((c) => (
                       <li key={c.id} className="ak-between ak-small" style={{ gap: 12 }}>
@@ -331,7 +331,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         <section className="ak-panel" style={{ marginTop: 40 }} id="offer">
           <div className="ak-between" style={{ alignItems: 'start', flexWrap: 'wrap', gap: 24 }}>
             <div>
-              <p className="ak-label">Make this ad</p>
+              <h2 className="ak-label">Make this ad</h2>
               <p className="ak-price">
                 {usd(q.priceMicros)}
                 {taste && q.referencePriceMicros ? <span className="ak-strike ak-muted" style={{ marginLeft: 12, fontSize: '0.5em' }}>{usd(q.referencePriceMicros)}</span> : null}
@@ -372,7 +372,10 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
       <Sheet open={!!regen} onOpenChange={(o) => !o && setRegen(null)} title="Change this picture" description="Describe what to change. Your product stays exactly as it is.">
         {regen ? (
           <form className="ak-stack" onSubmit={async (e) => { e.preventDefault(); if (await call(`/api/scenes/${regen.id}/regenerate`, { projectId, instruction: regen.text })) { setRegen(null); resume(); } }}>
-            <textarea className="ak-textarea" maxLength={200} placeholder="e.g. warmer morning light, marble counter" value={regen.text} onChange={(e) => setRegen({ ...regen, text: e.target.value })} />
+            <label className="ak-field">
+              <span className="ak-label">What to change</span>
+              <textarea className="ak-textarea" maxLength={200} placeholder="e.g. warmer morning light, marble counter" value={regen.text} onChange={(e) => setRegen({ ...regen, text: e.target.value })} />
+            </label>
             {err ? <p className="ak-error" role="alert">{err}</p> : null}
             <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Redrawing…' : 'Redraw'}</Button>
           </form>
@@ -476,7 +479,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
         <div className="ak-well ak-well--916">{primary ? <video src={primary.url} controls playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : null}</div>
         <div className="ak-stack">
-          <p className="ak-label">Download</p>
+          <h2 className="ak-label">Download</h2>
           {v.exports.map((e) => (
             <a key={e.assetId} className="ak-index-row" href={e.download} download>
               <span>{ASPECT[e.aspect] ?? e.aspect}</span>
@@ -490,7 +493,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
             </details>
           ) : null}
           <hr className="ak-rule" />
-          <p className="ak-label">What to do next</p>
+          <h2 className="ak-label">What to do next</h2>
           <ol className="ak-small">
             <li>Upload the 9:16 file to TikTok or Reels as a new ad.</li>
             <li>Run it for 5–7 days alongside your current best ad.</li>

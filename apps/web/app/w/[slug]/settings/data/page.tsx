@@ -21,16 +21,16 @@ export default async function Data({ params }: { params: Promise<{ slug: string 
   return (
     <div className="ak-stack" style={{ ['--stack' as string]: '32px', maxWidth: 680 }}>
       <section className="ak-panel">
-        <p className="ak-label">Export everything</p>
+        <h2 className="ak-label">Export everything</h2>
         <p className="ak-small">A ZIP of your products, facts, claims and evidence, tests, results, learnings and files. We email a download link (valid 24 hours) when it’s ready.</p>
         {canExport ? <ActionButton slug={slug} action="export">Request export</ActionButton> : <p className="ak-small ak-muted">Owners and admins can export.</p>}
       </section>
       <section className="ak-panel">
-        <p className="ak-label">Retention</p>
+        <h2 className="ak-label">Retention</h2>
         <p className="ak-small">After a plan ends, your archive is kept for {archiveDays} days. Anonymous previews are deleted after {PROVISIONAL.TTL_DAYS} days. Deleting a workspace removes all files and records after a {graceDays}-day grace period; payment and consent records are kept as the law requires, without your content.</p>
       </section>
       <section className="ak-panel">
-        <p className="ak-label">Delete workspace</p>
+        <h2 className="ak-label">Delete workspace</h2>
         {ws?.state === 'PURGE_SCHEDULED' ? (
           <>
             <Banner tone="risk">Scheduled for deletion on {new Date(ws.purge_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}.</Banner>

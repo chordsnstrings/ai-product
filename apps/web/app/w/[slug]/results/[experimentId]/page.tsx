@@ -41,7 +41,7 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
       ) : (
         contexts.map((ctx) => (
           <section key={ctx} className="ak-section">
-            <p className="ak-label">{CONTEXT[ctx] ?? ctx}</p>
+            <h2 className="ak-label">{CONTEXT[ctx] ?? ctx}</h2>
             <div className="ak-scroll-x">
               <table className="ak-table">
                 <thead><tr><th>Variant</th><th>Metric</th><th>Observed</th><th>Estimated</th><th>Range (90%)</th><th>Chance best</th><th>Signal</th></tr></thead>
@@ -64,11 +64,11 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
         ))
       )}
       <section className="ak-section">
-        <p className="ak-label">How to read this</p>
+        <h2 className="ak-label">How to read this</h2>
         <p className="ak-small ak-muted" style={{ maxWidth: 640 }}>Estimates shrink small samples toward your product’s average so one lucky day doesn’t look like a winner. “Gathering” means not enough data yet; “Directional” is a lean; “Actionable” means the evidence floor was met and it will shape next week’s recommendations.</p>
         {d.conf.length ? (
           <>
-            <p className="ak-label">Confounders in this period</p>
+            <h3 className="ak-label">Confounders in this period</h3>
             {d.conf.map((c, i) => <div key={i} className="ak-index-row"><span>{String(c.kind).replace(/_/g, ' ')}{c.note ? ` — ${c.note}` : ''}</span><span className="ak-index">{new Date(c.starts_at as string).toLocaleDateString()}</span></div>)}
           </>
         ) : null}

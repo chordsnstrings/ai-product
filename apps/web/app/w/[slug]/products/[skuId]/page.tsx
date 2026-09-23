@@ -77,7 +77,7 @@ export default async function Product({ params, searchParams }: { params: Promis
           />
           {canEdit ? (
             <div className="ak-panel">
-              <p className="ak-label">Correct a fact</p>
+              <h2 className="ak-label">Correct a fact</h2>
               <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. Shopify values that disagree are kept and marked disputed.</p>
               <ActionForm slug={slug} action="fact" extra={{ skuId }} submit="Save" fields={[{ name: 'key', label: 'Field', type: 'select', options: Object.entries(LABEL).map(([value, label]) => ({ value, label })) }, { name: 'value', label: 'Value', type: 'textarea', required: true, max: 2000 }]} />
             </div>
@@ -113,7 +113,7 @@ export default async function Product({ params, searchParams }: { params: Promis
           </div>
           {canEdit ? (
             <div className="ak-panel">
-              <p className="ak-label">Import reviews</p>
+              <h2 className="ak-label">Import reviews</h2>
               <ActionForm slug={slug} action="reviews" extra={{ skuId }} submit="Import" fields={[{ name: 'text', label: 'Paste reviews (one per line or a CSV export)', type: 'textarea', required: true, hint: 'Names and emails are removed automatically.' }]} />
             </div>
           ) : null}
@@ -141,7 +141,7 @@ export default async function Product({ params, searchParams }: { params: Promis
           </div>
           {canEdit ? (
             <div className="ak-panel">
-              <p className="ak-label">Import a past ad</p>
+              <h2 className="ak-label">Import a past ad</h2>
               <ActionForm slug={slug} action="import-creative" multipart extra={{ skuId }} submit="Import" fields={[
                 { name: 'copy', label: 'Ad copy / script', type: 'textarea', required: true },
                 { name: 'file', label: 'Video (optional)', type: 'file', accept: 'video/mp4,video/quicktime' },

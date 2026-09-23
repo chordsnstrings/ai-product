@@ -57,6 +57,8 @@ img, video { max-width: 100%; display: block; }
 .ak-muted { color: var(--ink-2); }
 .ak-stone { color: var(--stone); }
 .ak-label { font: 500 11px/1.2 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--stone); }
+/* Section titles are real headings (WCAG 1.3.1) but keep the label look and paragraph rhythm. */
+:where(h2, h3, h4).ak-label { margin: 1em 0; }
 .ak-index { font: 400 11px/1 var(--font-mono); letter-spacing: 0.02em; color: var(--stone); }
 .ak-mono { font-family: var(--font-mono); }
 .ak-serif { font-family: var(--font-serif); }

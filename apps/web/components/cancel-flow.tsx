@@ -17,7 +17,7 @@ const REASONS = [
  * A9: two screens, maximum. Screen 1 states consequences, takes an optional reason, and offers one honest
  * alternative (downgrade) once. Screen 2 confirms. No retention maze (ROSCA / FTC click-to-cancel).
  */
-export function CancelFlow({ slug, endsOn, planCode }: { slug: string; endsOn: string; planCode: string }) {
+export function CancelFlow({ slug, endsOn, planCode, archiveDays }: { slug: string; endsOn: string; planCode: string; archiveDays: number }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
   const [reason, setReason] = useState<string>('');
   const [detail, setDetail] = useState('');
@@ -29,18 +29,18 @@ export function CancelFlow({ slug, endsOn, planCode }: { slug: string; endsOn: s
   if (step === 2)
     return (
       <div className="ak-panel" role="status">
-        <p className="ak-h2" style={{ marginTop: 0 }}>Cancelled. Your plan ends {ends}.</p>
-        <p>You keep full access until then. Your archive is kept for 90 days after that, and you can export everything anytime.</p>
+        <h3 className="ak-h2" style={{ marginTop: 0 }}>Cancelled. Your plan ends {ends}.</h3>
+        <p>You keep full access until then. Your archive is kept for {archiveDays} days after that, and you can export everything anytime.</p>
         <a className="ak-btn ak-btn--secondary" href={`/w/${slug}/settings/data`}>Export my data</a>
       </div>
     );
   return (
     <div className="ak-panel ak-stack">
-      <p className="ak-h2" style={{ margin: 0 }}>Before you go</p>
+      <h3 className="ak-h2" style={{ margin: 0 }}>Before you go</h3>
       <ul className="ak-small" style={{ margin: 0 }}>
         <li>Your plan runs until <strong>{endsOn}</strong>; tests already in production finish.</li>
         <li>Unused Creative Tests expire at the end of the period.</li>
-        <li>Your archive, learnings and exports are kept for 90 days.</li>
+        <li>Your archive, learnings and exports are kept for {archiveDays} days.</li>
       </ul>
       <label className="ak-field">
         <span className="ak-label">Reason (optional)</span>
@@ -49,7 +49,12 @@ export function CancelFlow({ slug, endsOn, planCode }: { slug: string; endsOn: s
           {REASONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
       </label>
-      {reason ? <textarea className="ak-textarea" maxLength={500} placeholder="Anything we should know? (optional)" value={detail} onChange={(e) => setDetail(e.target.value)} /> : null}
+      {reason ? (
+        <label className="ak-field">
+          <span className="ak-label">Anything we should know? (optional)</span>
+          <textarea className="ak-textarea" maxLength={500} value={detail} onChange={(e) => setDetail(e.target.value)} />
+        </label>
+      ) : null}
       {planCode !== 'LAUNCH' && (reason === 'too_expensive' || reason === 'not_enough_value') ? (
         <p className="ak-small">Alternatively, Launch is $49/month with 3 tests — you can switch at renewal from “Change plan” above.</p>
       ) : null}

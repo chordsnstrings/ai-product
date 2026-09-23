@@ -16,7 +16,12 @@ export default async function Audit({ searchParams }: { searchParams: Promise<{ 
   const qs = new URLSearchParams(sp as Record<string, string>).toString();
   return (
     <Page title="Audit log" actions={<a className="ak-btn ak-btn--secondary" href={`/api/audit.csv?${qs}`}>Export CSV</a>}>
-      <form className="ak-row" style={{ marginBottom: 12 }}><input className="ak-input" name="q" placeholder="Action or target" defaultValue={sp.q} /><input className="ak-input" name="staff" placeholder="Staff email" defaultValue={sp.staff} /><input className="ak-input" name="ws" placeholder="Workspace id" defaultValue={sp.ws} /><button className="ak-btn ak-btn--sm">Filter</button></form>
+      <form className="ak-row" style={{ marginBottom: 12, alignItems: 'end', flexWrap: 'wrap' }}>
+        <label className="ak-field"><span className="ak-label">Action or target</span><input className="ak-input" name="q" defaultValue={sp.q} /></label>
+        <label className="ak-field"><span className="ak-label">Staff email</span><input className="ak-input" name="staff" defaultValue={sp.staff} /></label>
+        <label className="ak-field"><span className="ak-label">Workspace id</span><input className="ak-input" name="ws" defaultValue={sp.ws} /></label>
+        <button className="ak-btn ak-btn--sm">Filter</button>
+      </form>
       <Table head={['#', 'When', 'Staff', 'Action', 'Target', 'Workspace', 'Reason', 'Change', 'IP']} rows={rows.map((r) => [r.id as number, dt(r.at), (r.name as string) ?? '—', <Mono key="a">{r.action as string}</Mono>, <Mono key="t">{`${r.target_type ?? ''}:${String(r.target_id ?? '').slice(0, 12)}`}</Mono>, <Mono key="w">{String(r.workspace_id ?? '').slice(0, 8)}</Mono>, <span key="r" className="ak-small">{(r.reason as string) ?? ''}</span>, <Mono key="c">{r.after ? JSON.stringify(r.after).slice(0, 80) : ''}</Mono>, <Mono key="ip">{String(r.ip ?? '')}</Mono>])} />
     </Page>
   );

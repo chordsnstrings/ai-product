@@ -13,7 +13,10 @@ export default async function Users({ searchParams }: { searchParams: Promise<{ 
     from users u where u.deleted_at is null and (${q} = '' or u.email ilike ${'%' + q + '%'} or u.name ilike ${'%' + q + '%'} or u.id::text = ${q}) order by u.created_at desc limit 200`);
   return (
     <Page title="Users" sub="Customer identities. Staff accounts are separate even with the same email.">
-      <form className="ak-row" style={{ marginBottom: 12 }}><input className="ak-input" name="q" defaultValue={q} placeholder="Email, name or ID" style={{ minWidth: 320 }} /><button className="ak-btn ak-btn--sm">Search</button></form>
+      <form className="ak-row" style={{ marginBottom: 12, alignItems: 'end' }}>
+        <label className="ak-field"><span className="ak-label">Search users</span><input className="ak-input" name="q" defaultValue={q} placeholder="Email, name or ID" style={{ minWidth: 320 }} /></label>
+        <button className="ak-btn ak-btn--sm">Search</button>
+      </form>
       <Table head={['User', 'Workspaces', 'Last seen', 'Created', 'Status']} rows={rows.map((u) => [<Link key="u" href={`/users/${u.id}`}>{u.email as string}{u.name ? <span className="ak-small ak-muted"> · {u.name as string}</span> : null}</Link>, u.workspaces as number, ago(u.last_seen), d(u.created_at), u.locked_at ? 'locked' : 'active'])} />
     </Page>
   );
