@@ -39,12 +39,29 @@ describe('HEIC uploads', () => {
     expect((err as DomainError).message).toMatch(/too large/);
   });
 
+  it('still converts AV1-coded HEIF (which the WASM decoder lacks) through sharp', async () => {
+    const avif = await sharp({ create: { width: 300, height: 240, channels: 3, background: '#c9a27e' } }).avif().toBuffer();
+    avif.write('mif1', 8, 'latin1'); // generic HEIF brand: detected as image/heif, not image/avif
+    const out = await validateMedia(avif);
+    expect(out.mime).toBe('image/jpeg');
+    expect(await sharp(out.bytes).metadata()).toMatchObject({ format: 'jpeg', width: 300, height: 240 });
+  });
+
   it('keeps the friendly message only for HEIC files nothing can decode', async () => {
     const raw = Buffer.from(fixture('iphone-photo.heic'));
     raw.fill(0, 400); // header intact (still detected as HEIC), coded image data destroyed
     const err = await validateMedia(raw).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(DomainError);
     expect((err as DomainError).message).toMatch(/iPhone photo/);
+  });
+
+  it('turns a decode failure after a readable header into a customer-safe error', async () => {
+    const png = await sharp({ create: { width: 400, height: 400, channels: 3, background: '#336699' } }).png({ compressionLevel: 0 }).toBuffer();
+    const broken = Buffer.from(png);
+    broken.fill(0xff, 200, 2000); // header intact, pixel data corrupted
+    const err = await validateMedia(broken).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DomainError);
+    expect((err as DomainError).message).toMatch(/damaged/);
   });
 
   it('stores the converted JPEG when a HEIC is ingested', async () => {

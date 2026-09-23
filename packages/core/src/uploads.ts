@@ -68,25 +68,25 @@ function sharpDecodesHeic(): boolean {
  * is converted server-side like any other upload (plan 03 P2). The pixel limit is checked from the container
  * header before any pixel is decoded (decompression bombs), and again on the decoded raster. libheif applies
  * the container's rotation/mirror itself; the pixels carry no metadata, so the re-encode has no EXIF/GPS.
+ * Returns null when this decoder can't read the file (e.g. AV1-coded HEIF, which sharp decodes).
  */
-async function decodeHeic(raw: Buffer): Promise<ReturnType<typeof sharp>> {
+async function decodeHeic(raw: Buffer): Promise<ReturnType<typeof sharp> | null> {
   const { default: heic } = await import('heic-decode');
   let frames: Awaited<ReturnType<typeof heic.all>>;
   try {
     frames = await heic.all({ buffer: raw });
   } catch {
-    throw new DomainError('INVALID', HEIC_UNREADABLE);
+    return null;
   }
   try {
     const primary = frames[0];
-    if (!primary) throw new DomainError('INVALID', HEIC_UNREADABLE);
+    if (!primary) return null;
     if (primary.width * primary.height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
-    const decoded = await primary.decode().catch(() => {
-      throw new DomainError('INVALID', HEIC_UNREADABLE);
-    });
+    const decoded = await primary.decode().catch(() => null);
+    if (!decoded) return null;
     const { width, height, data } = decoded;
     if (width * height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
-    if (data.byteLength !== width * height * 4) throw new DomainError('INVALID', HEIC_UNREADABLE);
+    if (data.byteLength !== width * height * 4) return null;
     return sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { raw: { width, height, channels: 4 } }).removeAlpha();
   } finally {
     frames.dispose();
@@ -100,32 +100,37 @@ export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
   if (!ft || !family) throw new DomainError('INVALID', 'We couldn’t read that file. Try a JPG or PNG.');
   if (raw.length > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.');
   if (family === 'image') {
-    let img: ReturnType<typeof sharp>;
+    const heif = ft.mime === 'image/heic' || ft.mime === 'image/heif';
+    const unreadable = heif ? HEIC_UNREADABLE : 'That image looks damaged or too large to process.';
+    // Our sharp build reads HEIC headers but can't decode HEVC pixels, so HEIC goes to the WASM decoder first.
+    let img = heif && !sharpDecodesHeic() ? await decodeHeic(raw) : null;
     let hasAlpha = false;
-    if ((ft.mime === 'image/heic' || ft.mime === 'image/heif') && !sharpDecodesHeic()) {
-      img = await decodeHeic(raw);
+    if (img) {
       const meta = await img.metadata();
       if ((meta.width ?? 0) < 200 || (meta.height ?? 0) < 200) throw new DomainError('INVALID', TOO_SMALL);
     } else {
       try {
         // limitInputPixels rejects decompression bombs before decoding the full raster.
-        img = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
-        const meta = await img.metadata();
+        const s = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
+        const meta = await s.metadata();
         if (!meta.width || !meta.height) throw new Error('no dimensions');
         if (meta.width < 200 || meta.height < 200) throw new DomainError('INVALID', TOO_SMALL);
         hasAlpha = !!meta.hasAlpha;
+        img = s.rotate(); // apply EXIF orientation before the metadata is dropped
       } catch (e) {
         if (e instanceof DomainError) throw e;
-        if (/heif|heic/i.test(ft.mime)) throw new DomainError('INVALID', HEIC_UNREADABLE);
-        throw new DomainError('INVALID', 'That image looks damaged or too large to process.');
+        throw new DomainError('INVALID', unreadable);
       }
-      img = img.rotate(); // apply EXIF orientation before the metadata is dropped
     }
-    // Re-encode: strips EXIF/GPS metadata.
+    // Re-encode: strips EXIF/GPS metadata. Pixels are only decoded here, so a codec failure surfaces here too.
     const out = img.resize({ width: UPLOAD_LIMITS.image.maxEdge, height: UPLOAD_LIMITS.image.maxEdge, fit: 'inside', withoutEnlargement: true });
-    return hasAlpha
-      ? { bytes: await out.png().toBuffer(), mime: 'image/png' }
-      : { bytes: await out.jpeg({ quality: 90, mozjpeg: true }).toBuffer(), mime: 'image/jpeg' };
+    try {
+      return hasAlpha
+        ? { bytes: await out.png().toBuffer(), mime: 'image/png' }
+        : { bytes: await out.jpeg({ quality: 90, mozjpeg: true }).toBuffer(), mime: 'image/jpeg' };
+    } catch {
+      throw new DomainError('INVALID', unreadable);
+    }
   }
   if (family === 'video') return { bytes: raw, mime: 'video/mp4' };
   return { bytes: raw, mime: 'application/pdf' };
