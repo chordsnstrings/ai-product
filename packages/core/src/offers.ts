@@ -2,7 +2,7 @@ import type { Tx } from '@arkiv/db';
 import { DomainError, OFFER_RULES, PRICES, type Micros } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { emit } from './events';
-import { assignVariant } from './flags';
+import { assignVariantOrNull } from './flags';
 
 /**
  * Offer Engine (standard §5, §7; plan 04 L8–L10). Deterministic and experimentable — never LLM-priced.
@@ -59,8 +59,8 @@ export async function issueTasteOffer(tx: Tx, ctx: TenantContext, projectId: str
   let window = Number(def.window_minutes ?? OFFER_RULES.TASTE_WINDOW_MINUTES);
   let price = Number(def.price_micros);
   let variant: string | null = null;
-  if (exp?.variants?.length) {
-    variant = assignVariant(exp.key, ctx.workspaceId, exp.variants);
+  variant = exp ? assignVariantOrNull(exp.key, ctx.workspaceId, exp.variants) : null;
+  if (exp && variant) {
     const v = exp.variants.find((x) => x.key === variant)!;
     window = v.windowMinutes ?? window;
     price = v.priceMicros ?? price;

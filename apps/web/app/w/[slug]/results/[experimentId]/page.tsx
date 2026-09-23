@@ -3,12 +3,12 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import { experimentView } from '@arkiv/core';
+import { MeasurementContextCaveat, measurementContextLabel, type MeasurementContext } from '@arkiv/shared';
 import { Banner, SignalChip } from '@arkiv/ui';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Test results · Arkiv' };
 
-const CONTEXT: Record<string, string> = { meta_paid: 'Meta · paid', tiktok_paid: 'TikTok · paid', tiktok_gmv_max: 'TikTok GMV Max (includes organic + affiliate)', manual_csv: 'Uploaded CSV' };
 const pct = (n: number | null) => (n == null ? '—' : `${(Number(n) * 100).toFixed(2)}%`);
 
 /** Metrics shown only inside their measurement context — Meta paid and TikTok GMV Max are never merged (§30). */
@@ -41,7 +41,8 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
       ) : (
         contexts.map((ctx) => (
           <section key={ctx} className="ak-section">
-            <p className="ak-label">{CONTEXT[ctx] ?? ctx}</p>
+            <p className="ak-label">{measurementContextLabel(ctx)}</p>
+            {MeasurementContextCaveat[ctx as MeasurementContext] ? <Banner tone="warn">{MeasurementContextCaveat[ctx as MeasurementContext]}</Banner> : null}
             <div className="ak-scroll-x">
               <table className="ak-table">
                 <thead><tr><th>Variant</th><th>Metric</th><th>Observed</th><th>Estimated</th><th>Range (90%)</th><th>Chance best</th><th>Signal</th></tr></thead>

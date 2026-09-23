@@ -284,7 +284,7 @@ export const ACTIONS = {
   /* ── Growth: landing pages, offers, testimonials ── */
   'lp.save': a({
     perm: 'growth.manage',
-    schema: z.object({ slug: z.string().regex(/^[a-z0-9-]{2,40}$/), archetype: z.string().min(2), content: z.record(z.string(), z.unknown()), variants: z.array(z.object({ key: z.string(), weight: z.number().min(0), content: z.record(z.string(), z.unknown()) })).default([]), utmMatch: z.string().default('') }),
+    schema: z.object({ slug: z.string().regex(/^[a-z0-9-]{2,40}$/), archetype: z.string().min(2), content: z.record(z.string(), z.unknown()), variants: z.array(z.object({ key: z.string().min(1), weight: z.number().finite().positive('Variant weights must be greater than 0'), content: z.record(z.string(), z.unknown()) })).default([]), utmMatch: z.string().default('') }),
     run: (s, i) =>
       withAdmin(async (tx) => {
         const lint = lintMarketing([i.content, i.variants]);

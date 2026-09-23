@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
+import { measurementContextLabel } from '@arkiv/shared';
 import { Empty, SignalChip } from '@arkiv/ui';
 import { ActionForm, SheetButton } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
@@ -60,7 +61,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
         ) : (
           d.learnings.map((l, i) => (
             <div key={i} className="ak-index-row">
-              <span>{l.statement as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>{l.name as string} · {l.scope_platform as string} · {String(l.measurement_context).replace(/_/g, ' ')}</span></span>
+              <span>{l.statement as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>{l.name as string} · {l.scope_platform as string} · {measurementContextLabel(String(l.measurement_context))}</span></span>
               <SignalChip state={String(l.state)} />
             </div>
           ))

@@ -79,6 +79,25 @@ export const MeasurementContext = [
 ] as const; // §30
 export type MeasurementContext = (typeof MeasurementContext)[number];
 
+/** Customer-facing label per measurement context (§30). Contexts are shown side by side, never merged. */
+export const MeasurementContextLabel: Record<MeasurementContext, string> = {
+  META_PAID_ATTRIBUTED: 'Meta · paid (attributed)',
+  TIKTOK_PAID_ATTRIBUTED: 'TikTok · paid (attributed)',
+  TIKTOK_GMV_MAX_TOTAL: 'TikTok GMV Max · total (includes organic + affiliate)',
+  SHOPIFY_BLENDED_ORDER: 'Shopify · blended orders',
+  MERCHANT_IMPORTED: 'Imported by you (CSV)',
+};
+
+/** Scope caveats that must travel with a context wherever its numbers are shown (§45). */
+export const MeasurementContextCaveat: Partial<Record<MeasurementContext, string>> = {
+  TIKTOK_GMV_MAX_TOTAL: 'GMV Max totals include organic and affiliate sales, so they are not comparable to paid-only ROAS.',
+  SHOPIFY_BLENDED_ORDER: 'Blended store orders include every channel; they are not attributed to a single ad.',
+};
+
+export function measurementContextLabel(context: string): string {
+  return (MeasurementContextLabel as Record<string, string>)[context] ?? context.replace(/_/g, ' ').toLowerCase();
+}
+
 export const ProductionMode = [
   'STRICT_COMPOSITE',
   'GENERATIVE_INTERACTION',
