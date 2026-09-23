@@ -1,4 +1,4 @@
-import { withSystem } from '@arkiv/db';
+import { withSystem, withTenant } from '@arkiv/db';
 import {
   RECOVERY_EMAIL_CAP,
   duePurges,
@@ -99,16 +99,14 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
         return ws.length;
       }),
   },
+  // Listing workspaces is cross-tenant (system); each refresh runs in its own tenant transaction (app_rw + RLS),
+  // so one workspace's indicators can never read or resolve another's.
   'risk-flags': {
     cron: '30 7 * * *',
-    run: () =>
-      withSystem(async (tx) => {
-        const ws = await tx`select id from workspaces where state in ('ACTIVE_PAID','PAST_DUE','ACTIVE_FREE')`;
-        for (const w of ws) {
-          await tx`select set_config('app.workspace_id', ${w.id as string}, true)`;
-          await refreshRiskFlags(tx, w.id as string);
-        }
-        return ws.length;
-      }),
+    run: async () => {
+      const ws = await withSystem((tx) => tx`select id from workspaces where state in ('ACTIVE_PAID','PAST_DUE','ACTIVE_FREE')`);
+      for (const w of ws) await withTenant(w.id as string, (tx) => refreshRiskFlags(tx, w.id as string));
+      return ws.length;
+    },
   },
 };

@@ -139,34 +139,40 @@ export interface RiskIndicator {
   evidence: Record<string, unknown>;
 }
 
-/** Leading churn indicators (§10). Each maps to a value intervention in the admin playbooks. */
-export async function computeRisk(tx: Tx): Promise<RiskIndicator[]> {
+/**
+ * Leading churn indicators (§10). Each maps to a value intervention in the admin playbooks. Every query names
+ * the workspace explicitly: this must be correct under any role, including system_rw whose policies are not
+ * tenant-scoped (defence in depth on top of RLS).
+ */
+export async function computeRisk(tx: Tx, workspaceId: string): Promise<RiskIndicator[]> {
+  const ws = workspaceId;
   const out: RiskIndicator[] = [];
-  const [act] = await tx`select max(at) as last from events where actor like 'user:%'`;
+  const [act] = await tx`select max(at) as last from events where workspace_id = ${ws} and actor like 'user:%'`;
   if (act?.last && Date.now() - new Date(act.last as string).getTime() > 7 * 86400_000) out.push({ indicator: 'no_activity_7d', evidence: { lastActivity: act.last } });
-  const [paidNoExport] = await tx`select count(*)::int as n from projects p where p.state = 'COMPLETE' and p.kind in ('taste','standalone')
-                                  and not exists (select 1 from events e where e.type = 'ASSET_EXPORTED' and e.subject_id = p.id)`;
+  const [paidNoExport] = await tx`select count(*)::int as n from projects p where p.workspace_id = ${ws} and p.state = 'COMPLETE' and p.kind in ('taste','standalone')
+                                  and not exists (select 1 from events e where e.workspace_id = ${ws} and e.type = 'ASSET_EXPORTED' and e.subject_id = p.id)`;
   if (paidNoExport!.n > 0) out.push({ indicator: 'paid_no_export', evidence: { projects: paidNoExport!.n } });
-  const [qa] = await tx`select count(*)::int as n from events where type = 'QA_FAILED' and at > now() - interval '30 days'`;
+  const [qa] = await tx`select count(*)::int as n from events where workspace_id = ${ws} and type = 'QA_FAILED' and at > now() - interval '30 days'`;
   if (qa!.n >= 3) out.push({ indicator: 'repeated_qa_rejection', evidence: { count: qa!.n } });
-  const [ignored] = await tx`select count(distinct week_of)::int as n from recommendations where status = 'open' and week_of < now() - interval '7 days'`;
+  const [ignored] = await tx`select count(distinct week_of)::int as n from recommendations where workspace_id = ${ws} and status = 'open' and week_of < now() - interval '7 days'`;
   if (ignored!.n >= 3) out.push({ indicator: 'recommendations_ignored', evidence: { weeks: ignored!.n } });
-  const [disc] = await tx`select count(*)::int as n from integrations where provider in ('meta','tiktok') and status in ('revoked','degraded')`;
+  const [disc] = await tx`select count(*)::int as n from integrations where workspace_id = ${ws} and provider in ('meta','tiktok') and status in ('revoked','degraded')`;
   if (disc!.n > 0) out.push({ indicator: 'ad_account_disconnected', evidence: { count: disc!.n } });
-  const [oos] = await tx`select count(*)::int as n from skus where status = 'out_of_stock'`;
+  const [oos] = await tx`select count(*)::int as n from skus where workspace_id = ${ws} and status = 'out_of_stock'`;
   if (oos!.n > 0) out.push({ indicator: 'product_out_of_stock', evidence: { skus: oos!.n } });
-  const [perf] = await tx`select count(*)::int as n from experiments where state in ('GATHERING_SIGNAL','DIRECTIONAL','ACTIONABLE') and updated_at > now() - interval '30 days'`;
-  const [sub] = await tx`select count(*)::int as n from subscriptions where status = 'active'`;
+  const [perf] = await tx`select count(*)::int as n from experiments where workspace_id = ${ws} and state in ('GATHERING_SIGNAL','DIRECTIONAL','ACTIONABLE') and updated_at > now() - interval '30 days'`;
+  const [sub] = await tx`select count(*)::int as n from subscriptions where workspace_id = ${ws} and status = 'active'`;
   if (sub!.n > 0 && perf!.n === 0) out.push({ indicator: 'no_performance_linked_test_30d', evidence: {} });
   return out;
 }
 
+/** Recompute one workspace's flags: resolve what no longer applies, raise what is new. Scoped explicitly. */
 export async function refreshRiskFlags(tx: Tx, workspaceId: string) {
-  const current = await computeRisk(tx);
+  const current = await computeRisk(tx, workspaceId);
   const names = current.map((c) => c.indicator);
-  await tx`update risk_flags set resolved_at = now() where resolved_at is null and not (indicator = any(${names}))`;
+  await tx`update risk_flags set resolved_at = now() where workspace_id = ${workspaceId} and resolved_at is null and not (indicator = any(${names}))`;
   for (const c of current) {
-    const [open] = await tx`select 1 from risk_flags where indicator = ${c.indicator} and resolved_at is null`;
+    const [open] = await tx`select 1 from risk_flags where workspace_id = ${workspaceId} and indicator = ${c.indicator} and resolved_at is null`;
     if (!open) await tx`insert into risk_flags (workspace_id, indicator, evidence) values (${workspaceId}, ${c.indicator}, ${tx.json(c.evidence as never)})`;
   }
   return current;
