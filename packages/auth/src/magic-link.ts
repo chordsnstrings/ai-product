@@ -1,0 +1,91 @@
+import { createHash, randomBytes } from 'node:crypto';
+import { globalTx } from '@arkiv/db';
+import { DomainError, env } from '@arkiv/shared';
+import { hit } from '@arkiv/core';
+import { sendEmail } from '@arkiv/email';
+import { createSession, findOrCreateUser } from './sessions';
+
+/**
+ * Email magic links (plan 04 L5: email-only signup). The emailed URL opens a confirm page; only a POST consumes
+ * the token, so email security scanners that pre-fetch links cannot burn it (plan 03 Part C).
+ */
+const hash = (t: string) => createHash('sha256').update(t).digest('hex');
+const TTL_MIN = 15;
+
+const TYPO_DOMAINS: Record<string, string> = { 'gmial.com': 'gmail.com', 'gmai.com': 'gmail.com', 'gmail.co': 'gmail.com', 'hotmial.com': 'hotmail.com', 'yaho.com': 'yahoo.com', 'outlok.com': 'outlook.com', 'icloud.co': 'icloud.com' };
+
+export function emailSuggestion(email: string): string | null {
+  const [local, domain] = email.toLowerCase().split('@');
+  const fix = domain ? TYPO_DOMAINS[domain] : undefined;
+  return fix ? `${local}@${fix}` : null;
+}
+
+export function validEmail(email: string) {
+  return /^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$/.test(email.trim());
+}
+
+/** Plus-addressing counts against the base mailbox for abuse limits (plan 02 §3 layer 8). */
+export const baseMailbox = (email: string) => email.toLowerCase().replace(/\+[^@]*@/, '@');
+
+export async function requestMagicLink(input: {
+  email: string;
+  purpose: 'login' | 'claim' | 'resume' | 'step_up';
+  provisionalWorkspaceId?: string | null;
+  redirectTo?: string | null;
+  ip?: string | null;
+  productName?: string | null;
+}): Promise<{ sent: true; suggestion: string | null }> {
+  const email = input.email.trim().toLowerCase();
+  if (!validEmail(email)) throw new DomainError('INVALID', 'Enter a valid email address.', { suggestion: emailSuggestion(email) });
+  await hit(`magic:email:${baseMailbox(email)}`, 5, 3600);
+  if (input.ip) await hit(`magic:ip:${input.ip}`, 30, 3600);
+  const token = randomBytes(32).toString('base64url');
+  const redirect = input.redirectTo && input.redirectTo.startsWith('/') && !input.redirectTo.startsWith('//') ? input.redirectTo : null;
+  await globalTx((tx) => tx`
+    insert into magic_links (email, token_hash, purpose, provisional_workspace_id, redirect_to, expires_at, created_ip)
+    values (${email}, ${hash(token)}, ${input.purpose}, ${input.provisionalWorkspaceId ?? null}, ${redirect},
+            now() + make_interval(mins => ${TTL_MIN}), ${input.ip ?? null})`);
+  await sendEmail('magic_link', email, { url: `${env().APP_URL}/auth/magic/${token}`, purpose: input.purpose, productName: input.productName ?? null }, { idempotencyKey: `magic:${hash(token)}` });
+  return { sent: true, suggestion: emailSuggestion(email) };
+}
+
+export interface MagicLinkPreview {
+  status: 'ok' | 'expired' | 'used' | 'invalid';
+  email?: string;
+  purpose?: string;
+}
+
+/** GET handler: inspect without consuming (scanner-safe). */
+export async function previewMagicLink(token: string): Promise<MagicLinkPreview> {
+  const [m] = await globalTx((tx) => tx`select email, purpose, expires_at, consumed_at from magic_links where token_hash = ${hash(token)}`);
+  if (!m) return { status: 'invalid' };
+  if (m.consumed_at) return { status: 'used', email: m.email };
+  if (new Date(m.expires_at as string) < new Date()) return { status: 'expired', email: m.email };
+  return { status: 'ok', email: m.email, purpose: m.purpose };
+}
+
+/** POST handler: consume once, create/verify user, create session. */
+export async function consumeMagicLink(token: string, meta: { ip?: string | null; userAgent?: string | null }) {
+  return globalTx(async (tx) => {
+    const [m] = await tx`update magic_links set consumed_at = now()
+                         where token_hash = ${hash(token)} and consumed_at is null and expires_at > now()
+                         returning email, purpose, provisional_workspace_id, redirect_to`;
+    if (!m) {
+      const p = await previewMagicLink(token);
+      throw new DomainError('CONFLICT', p.status === 'used' ? 'This link was already used.' : 'This link has expired.', { status: p.status, email: p.email });
+    }
+    const user = await findOrCreateUser(tx, m.email as string, { verified: true });
+    await tx`insert into user_identities (user_id, provider, provider_subject, email) values (${user.userId}, 'email', ${m.email}, ${m.email})
+             on conflict (provider, provider_subject) do nothing`;
+    const session = await createSession(user.userId, meta, tx);
+    return {
+      ...session,
+      userId: user.userId,
+      email: user.email,
+      created: user.created,
+      purpose: m.purpose as string,
+      provisionalWorkspaceId: (m.provisional_workspace_id as string) ?? null,
+      redirectTo: (m.redirect_to as string) ?? null,
+    };
+  });
+}

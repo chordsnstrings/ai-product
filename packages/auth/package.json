@@ -1,0 +1,17 @@
+{
+  "name": "@arkiv/auth",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@arkiv/core": "workspace:*",
+    "@arkiv/db": "workspace:*",
+    "@arkiv/email": "workspace:*",
+    "@arkiv/shared": "workspace:*",
+    "@node-rs/argon2": "^2.2.1",
+    "@simplewebauthn/server": "^14.0.2",
+    "jose": "^6.2.12"
+  }
+}
