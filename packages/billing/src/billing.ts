@@ -1,6 +1,7 @@
 import { globalTx, withSystem, withTenant, type Tx } from '@arkiv/db';
 import { DomainError, PLANS, env, formatUsd, microsToCents, type PlanCode } from '@arkiv/shared';
 import {
+  isFlagOn,
   append,
   approveForProduction,
   assertCan,
@@ -47,6 +48,7 @@ async function ensureCustomer(tx: Tx, ctx: TenantContext, email: string): Promis
 /** P8: one-time checkout for the current storyboard at the quoted price (Taste if active, else $29). */
 export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projectId: string, user: { id: string; email: string }) {
   assertCan(ctx, 'storyboard.approve');
+  if (await isFlagOn(tx, 'kill.checkout')) throw new DomainError('UNAVAILABLE', 'Checkout is paused for a few minutes for maintenance. Your storyboard is saved.');
   const [p] = await tx`select p.state, p.storyboard_id, s.name from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
   if (p.state !== 'STORYBOARD_READY') throw new DomainError('CONFLICT', p.state === 'COMPLETE' || String(p.state).startsWith('REN') ? 'This ad is already in production.' : 'The storyboard isn’t ready yet.');
@@ -98,6 +100,7 @@ export async function recordAutoRenewConsent(
 /** P11: subscription checkout; requires a consent record created in the same flow (plan 04 §3). */
 export async function startSubscriptionCheckout(tx: Tx, ctx: TenantContext, plan: PlanCode, consentId: string, user: { id: string; email: string }) {
   assertCan(ctx, 'billing.manage');
+  if (await isFlagOn(tx, 'kill.checkout')) throw new DomainError('UNAVAILABLE', 'Checkout is paused for a few minutes for maintenance.');
   const [consent] = await tx`select id, context from consent_records where id = ${consentId} and kind = 'auto_renew' and created_at > now() - interval '30 minutes'`;
   if (!consent || (consent.context as { plan: string }).plan !== plan) throw new DomainError('INVALID', 'Please confirm the recurring charge again.');
   const [active] = await tx`select id from subscriptions where status in ('active','trialing','past_due')`;

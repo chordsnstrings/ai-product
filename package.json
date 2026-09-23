@@ -19,7 +19,8 @@
     "dev:admin": "pnpm --filter @arkiv/admin dev",
     "dev:worker": "pnpm --filter @arkiv/worker dev",
     "e2e": "playwright test",
-    "smoke": "tsx tests/smoke/funnel.ts"
+    "smoke": "tsx tests/smoke/funnel.ts",
+    "smoke:admin": "tsx tests/smoke/admin.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",
@@ -32,6 +33,7 @@
     "typescript-eslint": "^8.70.1",
     "vitest": "^5.0.1",
     "@arkiv/core": "workspace:*",
-    "@arkiv/db": "workspace:*"
+    "@arkiv/db": "workspace:*",
+    "@arkiv/auth": "workspace:*"
   }
 }

@@ -36,3 +36,5 @@ export * from './customer-language';
 export * from './genome';
 export * from './lifecycle';
 export * from './vision';
+export * from './admin';
+export * from './evals';

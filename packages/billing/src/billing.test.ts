@@ -86,6 +86,17 @@ describe('Taste checkout (P7/P8, plan 02 B1–B5)', () => {
   }, 60_000);
 });
 
+describe('kill switches (plan 05 §20)', () => {
+  it('kill.checkout pauses checkout without losing the storyboard', async () => {
+    const { t, ctx, projectId } = await storyboardReady();
+    await ownerPool()`update feature_flags set enabled = true where key = 'kill.checkout'`;
+    await expect(withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }))).rejects.toThrow(/paused/);
+    await ownerPool()`update feature_flags set enabled = false where key = 'kill.checkout'`;
+    const co = await withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }));
+    expect(co.sessionId).toBeTruthy();
+  });
+});
+
 describe('subscriptions (P11, plan 04 §3)', () => {
   it('requires explicit auto-renew consent, grants the period tests, supports upgrade + cancel', async () => {
     const t = await makeTenant();

@@ -5,6 +5,7 @@ import { Queues } from '@arkiv/core';
 import { processStripeEvent } from '@arkiv/billing';
 import { processPendingStripeEvents, runJob } from './handlers';
 import { sweeps } from './sweeps';
+import { grantQueueVisibility, processOpsCommands } from './ops';
 
 /**
  * Worker process (plan 01 §2 layout). Responsibilities:
@@ -77,6 +78,8 @@ async function main() {
     });
   }
 
+  await grantQueueVisibility();
+
   // Dispatcher: LISTEN for outbox inserts, with polling as the correctness floor.
   let busy = false;
   const tick = async () => {
@@ -85,6 +88,7 @@ async function main() {
     try {
       while ((await dispatchOnce(boss)) === 100);
       await processPendingStripeEvents(processStripeEvent);
+      await processOpsCommands(boss);
     } catch (e) {
       log('dispatch error', (e as Error).message);
     } finally {

@@ -32,10 +32,13 @@ function urlFor(role: RoleName): string {
 function pool(role: RoleName): Sql {
   let p = pools.get(role);
   if (!p) {
-    const url = role === 'system' ? (process.env.SYSTEM_DATABASE_URL ?? urlFor(role)) : urlFor(role);
+    const url = role === 'system' ? (env().SYSTEM_DATABASE_URL ?? urlFor(role)) : urlFor(role);
     p = postgres(url, {
       max: role === 'owner' ? 3 : 10,
       idle_timeout: 20,
+      // PgBouncer transaction pooling can't keep named prepared statements; tenant context uses set_config(..., true)
+      // (transaction-local), which is pooling-safe. The owner and system roles connect directly.
+      prepare: !(env().DB_PGBOUNCER === '1' && (role === 'app' || role === 'admin')),
       onnotice: () => {},
       // bigint → number is safe for our magnitudes (micros < 2^53) and keeps the domain code simple.
       types: {

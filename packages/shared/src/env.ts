@@ -12,7 +12,11 @@ const EnvSchema = z.object({
 
   DATABASE_URL: z.string().default('postgres://dev:dev@localhost:5432/arkiv'), // migrator (owner)
   APP_DATABASE_URL: z.string().default('postgres://app_rw:app_rw@localhost:5432/arkiv'), // RLS-bound
-  ADMIN_DATABASE_URL: z.string().default('postgres://admin_rw:admin_rw@localhost:5432/arkiv'), // BYPASSRLS, audited
+  ADMIN_DATABASE_URL: z.string().default('postgres://admin_rw:admin_rw@localhost:5432/arkiv'), // explicit staff policies, audited in app
+  // Cross-tenant system role (dispatcher, sweeps, purge). Must be a DIRECT connection: it uses LISTEN.
+  SYSTEM_DATABASE_URL: z.string().optional(),
+  // Set when APP/ADMIN URLs go through PgBouncer in transaction mode (DO connection pools): disables prepared statements.
+  DB_PGBOUNCER: z.enum(['0', '1']).default('0'),
 
   PROVIDERS_MODE: z.enum(['mock', 'live']).default('mock'),
   ANTHROPIC_API_KEY: z.string().optional(),

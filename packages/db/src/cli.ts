@@ -1,5 +1,5 @@
 import { env } from '@arkiv/shared';
-import { migrate, resetDatabase, setDevRolePasswords } from './migrate';
+import { migrate, resetDatabase, setDevRolePasswords, setRolePasswords } from './migrate';
 
 const cmd = process.argv[2];
 const url = env().DATABASE_URL;
@@ -12,6 +12,10 @@ async function main() {
   }
   if (cmd === 'migrate' || cmd === 'reset') {
     if (env().NODE_ENV !== 'production') await setDevRolePasswords(url);
+    else {
+      const set = await setRolePasswords(url, { app_rw: process.env.APP_DB_PASSWORD, admin_rw: process.env.ADMIN_DB_PASSWORD, system_rw: process.env.SYSTEM_DB_PASSWORD });
+      if (set.length) console.log(`role passwords set: ${set.join(', ')}`);
+    }
     const ran = await migrate(url, console.log);
     console.log(ran.length ? `${ran.length} migration(s) applied` : 'up to date');
   }

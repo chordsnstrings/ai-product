@@ -1,6 +1,17 @@
 import { NextResponse } from 'next/server';
 import type { z } from 'zod';
+import { globalTx } from '@arkiv/db';
+import { isFlagOn } from '@arkiv/core';
 import { DomainError, env, httpStatusFor } from '@arkiv/shared';
+
+/** Kill switch `kill.read_only` (plan 05 §20), cached for 5s so it costs ~nothing per request. */
+let roCache: { at: number; on: boolean } | null = null;
+async function readOnly() {
+  if (roCache && Date.now() - roCache.at < 5000) return roCache.on;
+  const on = await globalTx((tx) => isFlagOn(tx, 'kill.read_only')).catch(() => false);
+  roCache = { at: Date.now(), on };
+  return on;
+}
 
 /** Consistent API responses: domain errors map to status codes with customer-safe messages; internals never leak. */
 export function json(data: unknown, init?: number | ResponseInit) {
@@ -32,6 +43,9 @@ export function route<C = { params: Promise<Record<string, string>> }>(fn: (req:
   return async (req: Request, ctx: C) => {
     try {
       assertSameOrigin(req);
+      if (req.method !== 'GET' && !new URL(req.url).pathname.startsWith('/api/auth/') && (await readOnly())) {
+        throw new DomainError('UNAVAILABLE', 'Arkiv is in read-only mode for maintenance. Nothing you’ve done is lost — try again shortly.');
+      }
       return await fn(req, ctx);
     } catch (e) {
       return errorResponse(e);

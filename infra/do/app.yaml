@@ -1,0 +1,116 @@
+# DigitalOcean App Platform spec (production). Staging: copy with name/domains/instance sizes changed.
+#   doctl apps create --spec infra/do/app.yaml       (first time)
+#   doctl apps update <APP_ID> --spec infra/do/app.yaml
+# Secrets are App Platform encrypted env vars (type: SECRET) — never committed. Values below marked
+# CHANGE_ME must be set in the DO console or with `doctl apps update` before the first deploy.
+name: arkiv
+region: nyc
+domains:
+  - domain: arkiv.app
+    type: PRIMARY
+  - domain: admin.arkiv.app
+    type: ALIAS
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+
+databases:
+  # Managed Postgres 16 cluster (created separately so it survives app re-creation). Two connection pools
+  # (transaction mode) are created in the DO console: `app_pool` (user app_rw) and `admin_pool` (user admin_rw).
+  - name: db
+    engine: PG
+    version: "16"
+    production: true
+    cluster_name: arkiv-pg
+
+envs:
+  - { key: NODE_ENV, value: production, scope: RUN_AND_BUILD_TIME }
+  - { key: APP_URL, value: https://arkiv.app, scope: RUN_AND_BUILD_TIME }
+  - { key: ADMIN_URL, value: https://admin.arkiv.app, scope: RUN_AND_BUILD_TIME }
+  - { key: PROVIDERS_MODE, value: live, scope: RUN_TIME }
+  - { key: STORAGE_DRIVER, value: spaces, scope: RUN_TIME }
+  - { key: SPACES_REGION, value: nyc3, scope: RUN_TIME }
+  - { key: SPACES_ENDPOINT, value: https://nyc3.digitaloceanspaces.com, scope: RUN_TIME }
+  - { key: SPACES_BUCKET, value: arkiv-prod, scope: RUN_TIME }
+  - { key: DB_PGBOUNCER, value: "1", scope: RUN_TIME }
+  # Owner/direct connection (migrations, pg-boss, LISTEN) and runtime roles.
+  - { key: DATABASE_URL, value: "${db.DATABASE_URL}", scope: RUN_TIME, type: SECRET }
+  - { key: APP_DATABASE_URL, value: CHANGE_ME_app_pool_url, scope: RUN_TIME, type: SECRET }
+  - { key: ADMIN_DATABASE_URL, value: CHANGE_ME_admin_pool_url, scope: RUN_TIME, type: SECRET }
+  - { key: SYSTEM_DATABASE_URL, value: CHANGE_ME_direct_system_rw_url, scope: RUN_TIME, type: SECRET }
+  - { key: APP_SECRET, value: CHANGE_ME_64_random_chars, scope: RUN_TIME, type: SECRET }
+  - { key: ANTHROPIC_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: ARK_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: MINIMAX_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: SPACES_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: SPACES_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: STRIPE_SECRET_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: STRIPE_WEBHOOK_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: STRIPE_PUBLISHABLE_KEY, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: STRIPE_PRICE_STANDALONE, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: STRIPE_PRICE_LAUNCH, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: STRIPE_PRICE_GROWTH, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: STRIPE_PRICE_SCALE, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: RESEND_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: RESEND_WEBHOOK_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: GOOGLE_CLIENT_ID, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: GOOGLE_CLIENT_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: APPLE_CLIENT_ID, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: APPLE_TEAM_ID, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: APPLE_KEY_ID, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: APPLE_PRIVATE_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: SHOPIFY_API_KEY, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: SHOPIFY_API_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: META_APP_ID, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: META_APP_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: TIKTOK_APP_ID, value: CHANGE_ME, scope: RUN_TIME }
+  - { key: TIKTOK_APP_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: TURNSTILE_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+
+jobs:
+  - name: migrate
+    kind: PRE_DEPLOY
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github: { repo: chordsnstrings/ai-product, branch: main, deploy_on_push: true }
+    build_command: ""
+    run_command: pnpm db:migrate
+    instance_size_slug: basic-xs
+    envs:
+      - { key: APP_DB_PASSWORD, value: CHANGE_ME_24plus_chars, scope: RUN_TIME, type: SECRET }
+      - { key: ADMIN_DB_PASSWORD, value: CHANGE_ME_24plus_chars, scope: RUN_TIME, type: SECRET }
+      - { key: SYSTEM_DB_PASSWORD, value: CHANGE_ME_24plus_chars, scope: RUN_TIME, type: SECRET }
+
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github: { repo: chordsnstrings/ai-product, branch: main, deploy_on_push: true }
+    http_port: 8080
+    instance_size_slug: apps-s-1vcpu-2gb
+    instance_count: 2
+    routes: [{ path: / }]
+    health_check: { http_path: /api/health, initial_delay_seconds: 10, period_seconds: 15 }
+    # Build target selected with a build arg understood by App Platform's Dockerfile builds.
+    envs: [{ key: DOCKER_TARGET, value: web, scope: BUILD_TIME }]
+
+  - name: admin
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github: { repo: chordsnstrings/ai-product, branch: main, deploy_on_push: true }
+    http_port: 8080
+    instance_size_slug: apps-s-1vcpu-1gb
+    instance_count: 1
+    routes: [{ path: /, preserve_path_prefix: true }]
+    # Served on admin.arkiv.app via a DO ingress rule on the Host header (configured in the console);
+    # additionally lock down with DO App Platform's IP allowlist / Cloudflare Access in front.
+    envs: [{ key: DOCKER_TARGET, value: admin, scope: BUILD_TIME }]
+
+workers:
+  - name: worker
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github: { repo: chordsnstrings/ai-product, branch: main, deploy_on_push: true }
+    instance_size_slug: apps-d-2vcpu-4gb   # FFmpeg composition is CPU-bound
+    instance_count: 1
+    envs: [{ key: DOCKER_TARGET, value: worker, scope: BUILD_TIME }]

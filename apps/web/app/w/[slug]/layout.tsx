@@ -4,6 +4,7 @@ import { withTenant } from '@arkiv/db';
 import { freshness, periodUsage } from '@arkiv/core';
 import { Banner } from '@arkiv/ui';
 import { AppNav, TabBar } from '@/components/app-nav';
+import { StatusBanner } from '@/components/status-banner';
 import { requireUser } from '@/lib/session';
 import { userWorkspaces, workspacePage } from '@/lib/tenant';
 
@@ -32,6 +33,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
         <span className="ak-small ak-muted">{meter ?? w.name}</span>
       </header>
       <main className="ak-main">
+        <StatusBanner />
         {ws?.state === 'PURGE_SCHEDULED' ? (
           <Banner tone="risk">This workspace is scheduled for deletion on {new Date(ws.purge_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}. <Link href={`/w/${slug}/settings/data`}>Cancel deletion</Link></Banner>
         ) : null}

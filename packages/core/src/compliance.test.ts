@@ -68,3 +68,12 @@ describe('scope detection', () => {
     expect(nonSkincareCategory('Niacinamide 10% serum')).toBeNull();
   });
 });
+
+describe('golden datasets (regression, plan 05 §11)', () => {
+  it.each(['compliance.classify', 'compliance.scan'])('%s passes with no missed blocks', async (dataset) => {
+    const { runDeterministicEval } = await import('./evals');
+    const r = runDeterministicEval(dataset);
+    expect(r.results.filter((x) => !x.ok)).toEqual([]);
+    expect(r.passed).toBe(true);
+  });
+});

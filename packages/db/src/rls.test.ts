@@ -23,7 +23,7 @@ describe('RLS coverage (plan 02 §8.1)', () => {
     for (const r of rows) {
       expect(r.rls, `${r.table_name} rls`).toBe(true);
       expect(r.forced, `${r.table_name} forced`).toBe(true);
-      const staffOnly = r.table_name === 'tenant_notes';
+      const staffOnly = r.table_name === 'tenant_notes' || r.table_name === 'qa_reviews';
       if (!staffOnly) expect(r.policies, r.table_name).toContain('tenant_isolation');
     }
   });
