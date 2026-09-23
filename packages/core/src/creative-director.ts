@@ -1,7 +1,8 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, type Angle } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
-import { listClaims, renderableClaims } from './claims';
+import { brandBrainFor } from './brand';
+import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
 import { classifyClaim, scanCreativeText } from './compliance';
 import type { TenantContext } from './context';
 import { emit } from './events';
@@ -20,21 +21,25 @@ export async function buildContext(tx: Tx, skuId: string) {
   if (!sku) throw new DomainError('NOT_FOUND', 'Product not found');
   const facts = await currentFacts(tx, skuId);
   const claims = await listClaims(tx, skuId);
+  // Only claims usable wherever this ad will be published (every export platform, the brand's market) are
+  // offered as APPROVED; anything narrower would pass here and then fail claims QA after render spend.
+  const usable = new Set((await renderableClaims(tx, skuId, { platforms: AD_PLATFORMS })).map((c) => c.id));
   const themes = await tx`select label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
                           order by prevalence * relevance desc limit 6`;
   const snippets = await tx`select text from customer_signals where sku_id = ${skuId} order by observed_at desc nulls last limit 8`;
   const coverage = await tx`select genes->>'angle' as angle, state, count(*)::int as n from experiments where sku_id = ${skuId}
                             group by 1, 2`;
   const learnings = await tx`select statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
-                             and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') order by confidence desc limit 6`;
+                             and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') and not confounded order by confidence desc limit 6`;
   const ingredients = (factText(facts, 'key_ingredients') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const brand = await brandBrainFor(tx, skuId);
   const productContext: ProductContext = {
     name: sku.name as string,
     category: (factText(facts, 'category') ?? sku.category ?? 'skincare') as string,
     sizeText: factText(facts, 'size'),
     texture: factText(facts, 'texture'),
     ingredients,
-    approvedClaims: claims.filter((c) => c.status === 'VERIFIED' || c.status === 'VERIFIED_WITH_QUALIFIER').map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
+    approvedClaims: claims.filter((c) => usable.has(c.id)).map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
     themes: themes.map((t) => ({ label: t.label as string, signalType: t.signal_type as string })),
     testedAngles: coverage.map((c) => c.angle as string).filter(Boolean),
   };
@@ -50,16 +55,20 @@ export async function buildContext(tx: Tx, skuId: string) {
     },
     claims: {
       APPROVED: productContext.approvedClaims,
-      NEEDS_REVIEW_DO_NOT_USE: claims.filter((c) => c.status === 'MERCHANT_REVIEW_REQUIRED').map((c) => c.preferredWording),
+      NEEDS_REVIEW_DO_NOT_USE: claims.filter((c) => c.status === 'MERCHANT_REVIEW_REQUIRED' || ((c.status === 'VERIFIED' || c.status === 'VERIFIED_WITH_QUALIFIER') && !usable.has(c.id))).map((c) => c.preferredWording),
       BLOCKED_NEVER_USE: claims.filter((c) => c.status === 'BLOCKED' || c.status === 'RESTRICTED').map((c) => c.preferredWording),
     },
     customerThemes: themes.map((t) => ({ label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
     coverage: coverage.map((c) => ({ angle: c.angle, state: c.state, count: c.n })),
     learnings: learnings.map((l) => ({ statement: l.statement, state: l.state, platform: l.scope_platform })),
+    // The merchant's own Brand Brain (versioned): shapes voice and visuals, never overrides claim rules.
+    brand: brand
+      ? { name: brand.name, tone: brand.brain.tone, neverShowOrSay: brand.brain.prohibited, requiredDisclosures: brand.brain.disclosures, preferredCta: brand.brain.cta, colors: brand.brain.colors, market: brand.brain.market }
+      : null,
     platform: 'TikTok + Instagram Reels (9:16)',
     objective: 'Find the next creative test worth running for this SKU',
   };
-  return { sku, facts, productContext, packet, snippets: snippets.map((s) => s.text as string) };
+  return { sku, facts, productContext, packet, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
 }
 
 /** Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). */
@@ -98,8 +107,11 @@ export interface ConceptRun {
   batch: number;
 }
 
+/** Output budget of one concept-set call; reservations for a concept batch must cover at least this. */
+export const CONCEPTS_MAX_TOKENS = 6000;
+
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, brandBrainVersionId } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -119,7 +131,7 @@ export async function generateConcepts(run: ConceptRun) {
       schema: ConceptSet,
       mock: () => mockConcepts(productContext, run.batch),
       effort: 'high',
-      maxTokens: 6000,
+      maxTokens: CONCEPTS_MAX_TOKENS,
     });
     gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims));
     const valid = gated.filter((g) => g.ok);
@@ -134,9 +146,9 @@ export async function generateConcepts(run: ConceptRun) {
     const pick = Math.min(res!.data.pickIndex, valid.length - 1);
     for (const [i, g] of valid.entries()) {
       const [c] = await tx`
-        insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, pick_reason, gate_results, prompt_version, model)
+        insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, pick_reason, gate_results, prompt_version, model, brand_brain_version_id)
         values (${run.ctx.workspaceId}, ${run.skuId}, ${run.projectId}, ${run.batch}, ${letters[i]!}, ${tx.json(g.cleaned as never)},
-          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons } as never)}, ${res!.promptVersion}, ${res!.model})
+          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons } as never)}, ${res!.promptVersion}, ${res!.model}, ${brandBrainVersionId})
         on conflict (workspace_id, project_id, batch, idx) do update set proposal = excluded.proposal
         returning id`;
       ids.push(c!.id as string);
@@ -174,8 +186,8 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[]): Storybo
   return { ...plan, scenes };
 }
 
-export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string }> {
-  const { productContext, packet, concept } = await withTenant(run.ctx.workspaceId, async (tx) => {
+export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string; brandBrainVersionId: string | null }> {
+  const { productContext, packet, concept, brandBrainVersionId } = await withTenant(run.ctx.workspaceId, async (tx) => {
     const c = await buildContext(tx, run.skuId);
     const [row] = await tx`select proposal from concepts where id = ${run.conceptId}`;
     if (!row) throw new DomainError('NOT_FOUND', 'Concept not found');
@@ -200,7 +212,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       maxTokens: 5000,
     });
     try {
-      return { plan: normalizePlan(res.data, productContext.approvedClaims), promptVersion: res.promptVersion, model: res.model };
+      return { plan: normalizePlan(res.data, productContext.approvedClaims), promptVersion: res.promptVersion, model: res.model, brandBrainVersionId };
     } catch (e) {
       lastErr = e;
     }
@@ -208,7 +220,10 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
   throw lastErr;
 }
 
-/** Claims in use per platform (used by QA and by Creator Packs). */
-export async function allowedClaimTexts(tx: Tx, skuId: string, platform = 'TIKTOK') {
-  return (await renderableClaims(tx, skuId, platform)).map((c) => ({ id: c.id, wording: c.preferredWording, qualifier: c.mandatoryQualifier }));
+/**
+ * Claims usable for a render scope (used by QA, scene edits, hook variants and Creator Packs). Defaults to every
+ * platform a standard ad is exported to, in the brand's market.
+ */
+export async function allowedClaimTexts(tx: Tx, skuId: string, scope: ClaimScope = { platforms: AD_PLATFORMS }) {
+  return (await renderableClaims(tx, skuId, scope)).map((c) => ({ id: c.id, wording: c.preferredWording, qualifier: c.mandatoryQualifier }));
 }

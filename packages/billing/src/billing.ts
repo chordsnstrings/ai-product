@@ -14,6 +14,7 @@ import {
   Queues,
   recordFunnel,
   redeemOffer,
+  transition,
   transitionWorkspace,
   type TenantContext,
 } from '@arkiv/core';
@@ -90,6 +91,8 @@ export async function recordAutoRenewConsent(
   ctx: TenantContext,
   input: { userId: string; plan: PlanCode; agreed: boolean; ip?: string | null; userAgent?: string | null },
 ) {
+  // Consent records are append-only; never write one for someone who cannot start the subscription.
+  assertCan(ctx, 'billing.manage');
   if (!input.agreed) throw new DomainError('INVALID', 'Please tick the box to agree to the recurring charge.');
   const text = autoRenewText(input.plan);
   const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)
@@ -176,9 +179,9 @@ export async function receiveStripeWebhook(raw: string, signature: string | null
   } catch {
     throw new DomainError('FORBIDDEN', 'Invalid signature');
   }
-  const ins = await globalTx((tx) => tx`insert into stripe_events (id, type, payload) values (${event.id}, ${event.type}, ${tx.json(event as never)})
-                                        on conflict (id) do nothing returning id`);
-  return { id: event.id, duplicate: ins.length === 0 };
+  // Stored through a dedupe function: the app role can insert events but never read other tenants' payloads.
+  const [r] = await globalTx((tx) => tx`select stripe_event_receive(${event.id}, ${event.type}, ${tx.json(event as never)}) as inserted`);
+  return { id: event.id, duplicate: !r?.inserted };
 }
 
 async function resolveWorkspace(tx: Tx, customerId: string | null, metaWorkspace: string | null): Promise<string | null> {
@@ -381,6 +384,55 @@ async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice) {
   }
   if (ctx.workspaceState === 'PAST_DUE' || ctx.workspaceState === 'ACTIVE_FREE' || ctx.workspaceState === 'CANCELLED') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'invoice paid');
   return 'processed';
+}
+
+// ───────────── Quality guarantee (plan 04 L12, plan 03 P7) ─────────────
+
+/**
+ * Worker job `refund-purchase`, queued in the same transaction that failed a paid Taste/Standalone production:
+ * "if we can't deliver an ad that passes our checks, you're refunded automatically". Ordered so it is safe to
+ * retry at any point, and booked through the same refund mirror as console and Stripe-initiated refunds:
+ * (1) the project moves to REFUNDED (so it can no longer be retried and delivered) and a pending `refunds` row
+ *     is committed, so a charge.refunded webhook arriving mid-way finds the refund already on file;
+ * (2) Stripe refunds with the same idempotency key;
+ * (3) the mirror row, the purchase, the CREDIT_REFUNDED ledger entry and the email follow in one transaction.
+ * The failed production already returned the entitlement, so it is taken back out: money or credit, never both.
+ */
+export async function refundProjectPurchase(ctx: TenantContext, purchaseId: string, reason = 'guarantee'): Promise<'refunded' | 'skipped'> {
+  const ws = ctx.workspaceId;
+  const idem = `guarantee:${purchaseId}`;
+  const pu = await withTenant(ws, async (tx) => {
+    const [row] = await tx`select pu.*, p.state from purchases pu join projects p on p.id = pu.project_id
+                           where pu.id = ${purchaseId} and pu.workspace_id = ${ws} for update of p`;
+    if (!row || row.status !== 'paid' || !['PROVIDER_FAILED', 'REFUNDED'].includes(row.state as string)) return null;
+    await transition(tx, ctx, row.project_id as string, 'REFUNDED', { from: 'PROVIDER_FAILED', reason: 'Refunded automatically: this ad didn’t pass our quality checks.' });
+    const remaining = Number(row.amount_micros) - Number(row.refunded_micros ?? 0);
+    if (row.stripe_payment_intent_id && remaining > 0) {
+      await tx`insert into refunds (workspace_id, purchase_id, payment_intent_id, amount_micros, reason_code, customer_note, idempotency_key)
+               values (${ws}, ${purchaseId}, ${row.stripe_payment_intent_id as string}, ${remaining}, 'service_failure', 'Quality guarantee: the ad did not pass our checks', ${idem})
+               on conflict (workspace_id, idempotency_key) do nothing`;
+    }
+    return row;
+  });
+  if (!pu) return 'skipped';
+  const [mirror] = await withTenant(ws, (tx) => tx`select id from refunds where workspace_id = ${ws} and idempotency_key = ${idem}`);
+  const refundId = mirror ? await billingGateway().refund(pu.stripe_payment_intent_id as string, undefined, idem) : null;
+  const done = await withTenant(ws, async (tx) => {
+    if (mirror) {
+      const r = await applySucceededRefund(tx, ctx, mirror.id as string, refundId);
+      if (r.replayed) return false;
+    } else {
+      // No captured payment on record: nothing goes back through Stripe, only the entitlement is withdrawn.
+      const [upd] = await tx`update purchases set status = 'refunded', refunded_at = now() where id = ${purchaseId} and status = 'paid' returning id`;
+      if (!upd) return false;
+      const [consumed] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and project_id = ${pu.project_id} and type = 'CREDIT_CONSUMED' limit 1`;
+      await append(tx, ctx, { type: 'CREDIT_REFUNDED', unit: pu.kind as 'taste' | 'standalone', amount: consumed ? 0 : -1, projectId: pu.project_id as string, idempotencyKey: `refund:purchase:${purchaseId}`, reference: idem, reason: 'Guarantee refund: payment returned instead of the credit' });
+    }
+    await emit(tx, ctx, 'CREDIT_REFUNDED', { type: 'project', id: pu.project_id as string }, { purchaseId, amountMicros: Number(pu.amount_micros), refundId, reason });
+    await enqueue(tx, ws, Queues.sendEmail, { template: 'refund_issued', purchaseId }, { singletonKey: `refund-email:${purchaseId}` });
+    return true;
+  });
+  return done ? 'refunded' : 'skipped';
 }
 
 // ───────────── Mock checkout (dev/test) ─────────────

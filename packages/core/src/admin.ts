@@ -3,6 +3,7 @@ import { DomainError, newId, type ProjectState, type StaffRole, type WorkspaceSt
 import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { adjust, type LedgerUnit } from './ledger';
+import { restoreFromScheduledPurge } from './lifecycle';
 import { Queues } from './outbox';
 import { retryProduction } from './production';
 import { transition } from './projects';
@@ -368,18 +369,17 @@ export async function scheduleTenantPurge(s: Staff, workspaceId: string, reason:
 
 /**
  * Danger zone: cancel a scheduled purge. The workspace returns to the state it had when the purge was
- * scheduled (a paying tenant stays paying); legacy rows without a recorded state fall back to CANCELLED.
+ * scheduled (a paying tenant stays paying while its subscription is live); shares restoreFromScheduledPurge
+ * with the Owner's own cancel.
  */
 export async function cancelTenantPurge(s: Staff, workspaceId: string, reason: string): Promise<WorkspaceState> {
   assertStaff(s, 'tenant.purge');
   if (reason.trim().length < 4) throw new DomainError('INVALID', 'A reason is required.');
   return withAdmin(async (tx) => {
-    const [w] = await tx`select state, state_before_purge from workspaces where id = ${workspaceId} for update`;
+    const [w] = await tx`select state from workspaces where id = ${workspaceId} for update`;
     if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
     if (w.state !== 'PURGE_SCHEDULED') throw new DomainError('CONFLICT', 'No purge is scheduled for this workspace.');
-    const to = ((w.state_before_purge as WorkspaceState | null) ?? 'CANCELLED') as WorkspaceState;
-    await transitionWorkspace(tx, staffCtx(s, workspaceId), to, `staff cancelled purge: ${reason}`);
-    await tx`update workspaces set purge_at = null where id = ${workspaceId}`;
+    const to = await restoreFromScheduledPurge(tx, staffCtx(s, workspaceId), `staff cancelled purge: ${reason}`);
     await audit(tx, s, 'tenant.cancel_purge', { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { state: 'PURGE_SCHEDULED' }, after: { state: to } });
     return to;
   });
@@ -423,9 +423,11 @@ export async function retryProjectProduction(s: Staff, workspaceId: string, proj
     if (ctx.workspaceState === 'SUSPENDED') throw new DomainError('CONFLICT', 'Workspace is suspended; retries are blocked.');
     const [p] = await tx`select state from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
     if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
-    await retryProduction(tx, ctx, projectId);
-    await audit(tx, s, 'project.retry', { type: 'project', id: projectId }, { workspaceId, reason, before: { state: p.state }, after: { state: 'STORYBOARD_APPROVED' } });
-    return { message: 'Retry queued. The worker re-authorises cost before any provider call.' };
+    // A failed run re-reserves through the Cost Governor; a stalled one (worker lost mid-run) resumes from its
+    // durable state under the reservation it already holds.
+    const r = await retryProduction(tx, ctx, projectId);
+    await audit(tx, s, 'project.retry', { type: 'project', id: projectId }, { workspaceId, reason, before: { state: p.state }, after: r.resumed ? { state: p.state, resumed: true } : { state: 'STORYBOARD_APPROVED' } });
+    return { message: r.resumed ? 'Resume queued: the run continues from where it stopped, with no new reservation.' : 'Retry queued. The worker re-authorises cost before any provider call.' };
   });
 }
 

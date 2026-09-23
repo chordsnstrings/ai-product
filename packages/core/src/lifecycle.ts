@@ -20,7 +20,7 @@ export async function requestExport(tx: Tx, ctx: TenantContext) {
   await enqueue(tx, ctx.workspaceId, Queues.exportWorkspace, { requestedBy: ctx.actor }, { singletonKey: `export:${ctx.workspaceId}` });
 }
 
-const EXPORT_TABLES = ['skus', 'product_facts', 'claims', 'claim_evidence', 'customer_signals', 'customer_themes', 'experiments', 'variants', 'learnings', 'recommendations', 'creatives', 'performance_observations', 'confounders', 'events'];
+const EXPORT_TABLES = ['brand_brain_versions', 'skus', 'product_facts', 'claims', 'claim_evidence', 'customer_signals', 'customer_themes', 'experiments', 'variants', 'learnings', 'recommendations', 'creatives', 'performance_observations', 'confounders', 'events'];
 
 export async function buildExport(ctx: TenantContext): Promise<{ assetId: string; url: string }> {
   const ws = ctx.workspaceId;
@@ -49,22 +49,45 @@ export async function buildExport(ctx: TenantContext): Promise<{ assetId: string
 
 export async function scheduleDeletion(tx: Tx, ctx: TenantContext) {
   assertCan(ctx, 'workspace.delete');
-  const [s] = await tx`select count(*)::int as n from subscriptions where status in ('active','trialing','past_due') and not cancel_at_period_end`;
+  const [s] = await tx`select count(*)::int as n from subscriptions where workspace_id = ${ctx.workspaceId}
+                         and status in ('active','trialing','past_due') and not cancel_at_period_end`;
   if (s!.n > 0) throw new DomainError('CONFLICT', 'Cancel your plan before deleting the workspace.');
+  const [w] = await tx`select state from workspaces where id = ${ctx.workspaceId} for update`;
   await transitionWorkspace(tx, ctx, 'PURGE_SCHEDULED', 'owner requested deletion');
-  await tx`update workspaces set purge_at = now() + make_interval(days => ${await setting(tx, 'retention.purge_grace_days')}) where id = ${ctx.workspaceId}`;
+  // Remember where the workspace was so a cancelled deletion puts it back exactly there (plan 02 §7).
+  await tx`update workspaces set purge_at = now() + make_interval(days => ${await setting(tx, 'retention.purge_grace_days')}),
+             state_before_purge = ${(w?.state as string) ?? null} where id = ${ctx.workspaceId}`;
+}
+
+/**
+ * Leave PURGE_SCHEDULED for the state the workspace had before deletion was scheduled. A subscribed workspace
+ * whose subscription ran out during the grace period comes back as CANCELLED (its archive is kept, nothing
+ * charged); a one-off buyer (no plan) keeps its paid state. Shared by the Owner's "undo" and the staff console.
+ */
+export async function restoreFromScheduledPurge(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, reason: string): Promise<WorkspaceState> {
+  const [w] = await tx`select state, state_before_purge, plan_code from workspaces where id = ${ctx.workspaceId} for update`;
+  if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
+  if (w.state !== 'PURGE_SCHEDULED') throw new DomainError('CONFLICT', 'This workspace is not scheduled for deletion.');
+  // Explicit workspace filter: the staff console calls this as admin_rw, whose policy is not tenant-scoped.
+  const [sub] = await tx`select count(*)::int as n from subscriptions where workspace_id = ${ctx.workspaceId} and status in ('active','trialing','past_due')`;
+  const before = (w.state_before_purge as WorkspaceState | null) ?? 'CANCELLED';
+  let to: WorkspaceState;
+  if (before === 'ACTIVE_PAID' && !w.plan_code) to = 'ACTIVE_PAID';
+  else if (before === 'ACTIVE_PAID' || before === 'PAST_DUE') to = sub!.n > 0 && w.plan_code ? 'ACTIVE_PAID' : 'CANCELLED';
+  else if (before === 'ACTIVE_FREE' || before === 'CANCELLED') to = before;
+  else to = 'CANCELLED'; // e.g. a provisional workspace swept for expiry has no owner state to return to
+  await transitionWorkspace(tx, ctx, to, reason);
+  await tx`update workspaces set purge_at = null, state_before_purge = null where id = ${ctx.workspaceId}`;
+  return to;
 }
 
 /** Owner cancels a deletion: the workspace returns to the state it had before (CANCELLED for legacy rows). */
 export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
-  assertCan(ctx, 'workspace.delete');
-  const [w] = await tx`select state, state_before_purge from workspaces where id = ${ctx.workspaceId}`;
-  if (w?.state !== 'PURGE_SCHEDULED') throw new DomainError('CONFLICT', 'No deletion is scheduled.');
-  await transitionWorkspace(tx, ctx, ((w.state_before_purge as WorkspaceState | null) ?? 'CANCELLED') as WorkspaceState, 'owner cancelled deletion');
-  await tx`update workspaces set purge_at = null where id = ${ctx.workspaceId}`;
+  assertCan(ctx, 'workspace.cancel_deletion');
+  return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
-const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brands', 'integrations', 'invites', 'memberships', 'offers', 'refunds', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'break_glass_sessions', 'tenant_notes'];
+const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integrations', 'invites', 'memberships', 'offers', 'refunds', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'break_glass_sessions', 'tenant_notes'];
 
 /**
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,

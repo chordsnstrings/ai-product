@@ -58,3 +58,22 @@ describe('risk-flags sweep (plan 05 §17)', () => {
     expect(open.map((f) => f.indicator)).toEqual(['idle_7d', 'repeated_qa_rejects']);
   });
 });
+
+describe('risk-flags sweep resolution (plan 02 §3: system_rw is not tenant-scoped)', () => {
+  it('computes and resolves flags per workspace, never across tenants', async () => {
+    const a = await makeTenant({ state: 'ACTIVE_FREE' });
+    const b = await makeTenant({ state: 'ACTIVE_FREE' });
+    const bSku = await makeSku(b.workspaceId, 'B cream');
+    await ownerPool()`update skus set status = 'out_of_stock' where id = ${bSku}`;
+    // B already has an open flag for that; A has a stale flag that should resolve.
+    await ownerPool()`insert into risk_flags (workspace_id, indicator) values (${b.workspaceId}, 'stockout'), (${a.workspaceId}, 'ad_account_disconnected')`;
+
+    await sweeps['risk-flags']!.run();
+
+    const open = await ownerPool()`select workspace_id, indicator from risk_flags where resolved_at is null order by indicator`;
+    // Before: A inherited B's stockout (unscoped count) and A's refresh resolved B's open flag.
+    expect(open.map((r) => [r.workspace_id === a.workspaceId ? 'A' : 'B', r.indicator])).toEqual([['B', 'stockout']]);
+    const [resolvedA] = await ownerPool()`select resolved_at from risk_flags where workspace_id = ${a.workspaceId} and indicator = 'ad_account_disconnected'`;
+    expect(resolvedA!.resolved_at).not.toBeNull();
+  });
+});

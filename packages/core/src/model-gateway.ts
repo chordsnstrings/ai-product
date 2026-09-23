@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, sleep, type Micros } from '@arkiv/shared';
+import { DomainError, providerVoiceId, sleep, type LogicalVoice, type Micros } from '@arkiv/shared';
 import {
   providers,
   ProviderError,
@@ -212,6 +212,8 @@ export interface VideoCall extends CallMeta {
   mockLabel?: string;
   timeoutMs?: number;
   pollMs?: number;
+  /** Called while waiting on the provider (at most once a minute) so the caller can keep its run lease alive. */
+  heartbeat?: () => Promise<void>;
 }
 
 /**
@@ -231,7 +233,12 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
     await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId} where id = ${started.jobId}`);
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
     let res: VideoPoll;
+    let beat = Date.now();
     for (;;) {
+      if (call.heartbeat && Date.now() - beat > 60_000) {
+        beat = Date.now();
+        await call.heartbeat();
+      }
       res = await withTransientRetry(() => p.video.poll(requestId!));
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
       if (Date.now() > deadline) {
@@ -263,35 +270,46 @@ const TTS_FALLBACK = { provider: 'byteplus', model: 'seed-speech-2-0' } as const
 
 export interface TtsCall extends CallMeta {
   text: string;
-  voice: string;
+  /** Logical voice from the catalogue (e.g. warm_female); resolved per provider below. */
+  voice: LogicalVoice;
 }
 
-/** Voice-over with provider fallback (MiniMax primary, BytePlus Seed Speech fallback). */
+/**
+ * Voice-over with provider fallback (MiniMax primary, BytePlus Seed Speech fallback). The logical voice is
+ * resolved to each provider's own voice id; a provider without an approved id for it is skipped.
+ */
 export async function synthesizeVoice(call: TtsCall): Promise<TtsResult & { jobId: string }> {
   const p = await providers();
+  const primaryVoice = providerVoiceId(call.voice, p.tts.name);
+  const fallbackVoice = providerVoiceId(call.voice, p.ttsFallback.name);
+  if (!primaryVoice && !fallbackVoice) throw new DomainError('UNAVAILABLE', `No provider voice configured for ${call.voice}`);
   // Priced and called with the routed model (canary included), never a hard-coded one.
   const lineFor = (rt: Route): CostLine => ({ kind: 'tts', provider: rt.provider, model: rt.model, chars: call.text.length });
   const fingerprint = { text: call.text, voice: call.voice };
-  // A killed primary provider goes straight to the approved fallback (plan 05 §10/§20).
-  let fallbackOnly = false;
+  // A killed primary provider, or one with no voice for this logical voice, goes straight to the approved
+  // fallback (plan 05 §10/§20).
+  let fallbackOnly = !primaryVoice;
   let started: Awaited<ReturnType<typeof begin>>;
-  try {
-    started = await begin(call, lineFor, fingerprint);
-  } catch (e) {
-    if (!(e instanceof DomainError && (e.details as { killSwitch?: string } | undefined)?.killSwitch)) throw e;
-    started = await begin(call, lineFor, fingerprint, { provider: TTS_FALLBACK.provider });
-    fallbackOnly = true;
+  if (fallbackOnly) started = await begin(call, lineFor, fingerprint, { provider: TTS_FALLBACK.provider });
+  else {
+    try {
+      started = await begin(call, lineFor, fingerprint);
+    } catch (e) {
+      if (!(e instanceof DomainError && (e.details as { killSwitch?: string } | undefined)?.killSwitch) || !fallbackVoice) throw e;
+      started = await begin(call, lineFor, fingerprint, { provider: TTS_FALLBACK.provider });
+      fallbackOnly = true;
+    }
   }
   const t0 = Date.now();
   try {
     let r: TtsResult;
-    if (fallbackOnly) r = await p.ttsFallback.synthesize({ model: TTS_FALLBACK.model, text: call.text, voice: call.voice });
+    if (fallbackOnly) r = await p.ttsFallback.synthesize({ model: TTS_FALLBACK.model, text: call.text, voice: fallbackVoice! });
     else {
       try {
-        r = await withTransientRetry(() => p.tts.synthesize({ model: p.wireModel(started.route.model), text: call.text, voice: call.voice }));
+        r = await withTransientRetry(() => p.tts.synthesize({ model: p.wireModel(started.route.model), text: call.text, voice: primaryVoice! }));
       } catch (primaryErr) {
-        if (!(primaryErr instanceof ProviderError)) throw primaryErr;
-        r = await p.ttsFallback.synthesize({ model: TTS_FALLBACK.model, text: call.text, voice: call.voice });
+        if (!(primaryErr instanceof ProviderError) || !fallbackVoice) throw primaryErr;
+        r = await p.ttsFallback.synthesize({ model: TTS_FALLBACK.model, text: call.text, voice: fallbackVoice });
       }
     }
     await finish(call, started, { ok: true, actualLine: { ...(started.line as Extract<CostLine, { kind: 'tts' }>), chars: r.chars }, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });

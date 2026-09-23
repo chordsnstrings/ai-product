@@ -36,7 +36,8 @@ export default async function Claims() {
             { name: 'decision', label: 'Decision', type: 'select', options: ['approve', 'block'] },
             { name: 'wording', label: 'Exact wording', defaultValue: c.preferred_wording as string },
             { name: 'qualifier', label: 'Qualifier' },
-            { name: 'platforms', label: 'Platforms', defaultValue: 'meta,tiktok' },
+            { name: 'platforms', label: 'Platforms (TIKTOK, META = Reels + Feed, YOUTUBE, ORGANIC)', defaultValue: 'TIKTOK,META' },
+            { name: 'markets', label: 'Markets (blank = brand market)' },
             { name: 'reason', label: 'Reason', required: true },
           ]} />,
         ])} empty="Nothing waiting for compliance review." />

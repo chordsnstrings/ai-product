@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { decideFact, regenerateConcepts, retryProduction, selectConcept } from '@arkiv/core';
+import { decideFact, requestConcepts, retryProduction, selectConcept } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -8,7 +8,7 @@ import { projectAccess } from '@/lib/tenant';
 
 /**
  * Funnel actions on a project:
- *   concepts  – "Try 3 more" (limited for provisional workspaces)
+ *   concepts  – "Try 3 more" (limited for provisional workspaces). Queued: 202 + the batch to poll for
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
  *   retry     – retry a failed production (entitlement was returned on failure)
@@ -17,9 +17,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
   const { id, action } = await params;
   const a = await projectAccess(id);
   switch (action) {
-    case 'concepts':
-      await regenerateConcepts(a.ctx, id);
-      return json({ ok: true });
+    case 'concepts': {
+      // Drafting runs in the worker (§34); the funnel polls GET /api/projects/:id until the batch appears.
+      const r = await withTenant(a.ctx.workspaceId, (tx) => requestConcepts(tx, a.ctx, id));
+      return json({ ok: true, queued: true, ...r }, 202);
+    }
     case 'select': {
       if (a.provisional) throw new DomainError('FORBIDDEN', 'Save your work to see the storyboard.', { needsAccount: true });
       const { conceptId } = await body(req, z.object({ conceptId: z.string().uuid() }));

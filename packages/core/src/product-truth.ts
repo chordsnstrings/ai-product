@@ -1,5 +1,6 @@
 import type { Tx } from '@arkiv/db';
 import { DomainError, type DataState } from '@arkiv/shared';
+import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
@@ -99,6 +100,7 @@ export async function recordFacts(tx: Tx, ctx: TenantContext, skuId: string, fac
  * When the prior value came from Shopify, the conflict stays visible rather than breaking source truth (§28).
  */
 export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key: string, value: { text?: string | null; number?: number | null; json?: unknown }) {
+  if (ctx.actor.kind === 'user' || ctx.actor.kind === 'provisional') assertCan(ctx, 'sku.edit');
   const prior = await tx`select id, source_type from product_facts where sku_id = ${skuId} and normalized_key = ${key} and status <> 'SUPERSEDED'`;
   const [row] = await tx`
     insert into product_facts (workspace_id, sku_id, fact_type, normalized_key, value_text, value_number, value_json,
@@ -118,6 +120,7 @@ export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key:
 
 /** Confirm an observed fact without changing it (becomes merchant-confirmed, still OBSERVED). */
 export async function confirmFact(tx: Tx, ctx: TenantContext, factId: string) {
+  if (ctx.actor.kind === 'user' || ctx.actor.kind === 'provisional') assertCan(ctx, 'sku.edit');
   const [f] = await tx`update product_facts set merchant_confirmed = true where id = ${factId} returning sku_id, normalized_key`;
   if (!f) throw new DomainError('NOT_FOUND', 'Fact not found');
   await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: f.sku_id as string }, { key: f.normalized_key, confirmed: true });

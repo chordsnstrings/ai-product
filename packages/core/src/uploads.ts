@@ -1,8 +1,10 @@
+/// <reference path="./heic-decode.d.ts" />
 import { fileTypeFromBuffer } from 'file-type';
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
 import { DomainError, newId } from '@arkiv/shared';
 import { saveAsset, type AssetKind } from './assets';
+import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { hit } from './rate-limit';
@@ -33,6 +35,7 @@ const ALLOWED: Record<string, 'image' | 'video' | 'pdf'> = {
 };
 
 export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, declaredMime: string, bytes: number) {
+  assertCan(ctx, 'sku.edit');
   await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
   const family = ALLOWED[declaredMime];
   if (!family) throw new DomainError('INVALID', 'That file type isn’t supported. Use JPG, PNG, WebP, MP4 or PDF.');
@@ -49,6 +52,47 @@ export interface ValidatedMedia {
   mime: 'image/png' | 'image/jpeg' | 'image/webp' | 'video/mp4' | 'application/pdf';
 }
 
+const TOO_SMALL = 'That image is too small to use. Please upload at least 800px.';
+const TOO_LARGE = 'That image is too large to process.';
+/** Final fallback only: the photo is HEIC but neither decoder could read it. */
+const HEIC_UNREADABLE = 'We couldn’t read that iPhone photo. Choose “Most Compatible” in Camera settings, or upload a screenshot.';
+
+/** The prebuilt sharp/libvips decodes AVIF but not HEVC-coded HEIF (iPhone HEIC). */
+function sharpDecodesHeic(): boolean {
+  const heif = (sharp.format as unknown as Record<string, { input?: { fileSuffix?: string[] } } | undefined>).heif;
+  return (heif?.input?.fileSuffix ?? []).includes('.heic');
+}
+
+/**
+ * iPhone HEIC → display-oriented RGB pixels via libheif compiled to WASM (no native dependency), so the photo
+ * is converted server-side like any other upload (plan 03 P2). The pixel limit is checked from the container
+ * header before any pixel is decoded (decompression bombs), and again on the decoded raster. libheif applies
+ * the container's rotation/mirror itself; the pixels carry no metadata, so the re-encode has no EXIF/GPS.
+ * Returns null when this decoder can't read the file (e.g. AV1-coded HEIF, which sharp decodes).
+ */
+async function decodeHeic(raw: Buffer): Promise<ReturnType<typeof sharp> | null> {
+  const { default: heic } = await import('heic-decode');
+  let frames: Awaited<ReturnType<typeof heic.all>>;
+  try {
+    frames = await heic.all({ buffer: raw });
+  } catch {
+    return null;
+  }
+  try {
+    const primary = frames[0];
+    if (!primary) return null;
+    if (primary.width * primary.height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
+    const decoded = await primary.decode().catch(() => null);
+    if (!decoded) return null;
+    const { width, height, data } = decoded;
+    if (width * height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
+    if (data.byteLength !== width * height * 4) return null;
+    return sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { raw: { width, height, channels: 4 } }).removeAlpha();
+  } finally {
+    frames.dispose();
+  }
+}
+
 /** Validate untrusted bytes. Throws INVALID with a customer-safe reason. */
 export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
   const ft = await fileTypeFromBuffer(raw);
@@ -56,25 +100,37 @@ export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
   if (!ft || !family) throw new DomainError('INVALID', 'We couldn’t read that file. Try a JPG or PNG.');
   if (raw.length > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.');
   if (family === 'image') {
-    let img: ReturnType<typeof sharp>;
-    try {
-      // limitInputPixels rejects decompression bombs before decoding the full raster.
-      img = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
+    const heif = ft.mime === 'image/heic' || ft.mime === 'image/heif';
+    const unreadable = heif ? HEIC_UNREADABLE : 'That image looks damaged or too large to process.';
+    // Our sharp build reads HEIC headers but can't decode HEVC pixels, so HEIC goes to the WASM decoder first.
+    let img = heif && !sharpDecodesHeic() ? await decodeHeic(raw) : null;
+    let hasAlpha = false;
+    if (img) {
       const meta = await img.metadata();
-      if (!meta.width || !meta.height) throw new Error('no dimensions');
-      if (meta.width < 200 || meta.height < 200) throw new DomainError('INVALID', 'That image is too small to use. Please upload at least 800px.');
-    } catch (e) {
-      if (e instanceof DomainError) throw e;
-      if (/heif|heic/i.test(ft.mime))
-        throw new DomainError('INVALID', 'iPhone HEIC photos need converting. Choose “Most Compatible” in Camera settings, or upload a screenshot.');
-      throw new DomainError('INVALID', 'That image looks damaged or too large to process.');
+      if ((meta.width ?? 0) < 200 || (meta.height ?? 0) < 200) throw new DomainError('INVALID', TOO_SMALL);
+    } else {
+      try {
+        // limitInputPixels rejects decompression bombs before decoding the full raster.
+        const s = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
+        const meta = await s.metadata();
+        if (!meta.width || !meta.height) throw new Error('no dimensions');
+        if (meta.width < 200 || meta.height < 200) throw new DomainError('INVALID', TOO_SMALL);
+        hasAlpha = !!meta.hasAlpha;
+        img = s.rotate(); // apply EXIF orientation before the metadata is dropped
+      } catch (e) {
+        if (e instanceof DomainError) throw e;
+        throw new DomainError('INVALID', unreadable);
+      }
     }
-    // Re-encode: normalizes orientation and strips EXIF/GPS metadata.
-    const hasAlpha = (await img.metadata()).hasAlpha;
-    const out = img.rotate().resize({ width: UPLOAD_LIMITS.image.maxEdge, height: UPLOAD_LIMITS.image.maxEdge, fit: 'inside', withoutEnlargement: true });
-    return hasAlpha
-      ? { bytes: await out.png().toBuffer(), mime: 'image/png' }
-      : { bytes: await out.jpeg({ quality: 90, mozjpeg: true }).toBuffer(), mime: 'image/jpeg' };
+    // Re-encode: strips EXIF/GPS metadata. Pixels are only decoded here, so a codec failure surfaces here too.
+    const out = img.resize({ width: UPLOAD_LIMITS.image.maxEdge, height: UPLOAD_LIMITS.image.maxEdge, fit: 'inside', withoutEnlargement: true });
+    try {
+      return hasAlpha
+        ? { bytes: await out.png().toBuffer(), mime: 'image/png' }
+        : { bytes: await out.jpeg({ quality: 90, mozjpeg: true }).toBuffer(), mime: 'image/jpeg' };
+    } catch {
+      throw new DomainError('INVALID', unreadable);
+    }
   }
   if (family === 'video') return { bytes: raw, mime: 'video/mp4' };
   return { bytes: raw, mime: 'application/pdf' };
@@ -108,6 +164,9 @@ export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string
 
 /** Direct server-side upload path (small files posted to our API rather than presigned PUT). */
 export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind: AssetKind, skuId: string | null, origin: Record<string, unknown> = {}) {
+  // Provisional visitors carry an OWNER context on their own PROVISIONAL workspace, so they pass; Viewers and
+  // held workspaces do not.
+  assertCan(ctx, 'sku.edit');
   await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
   const v = await validateMedia(raw);
   return saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });

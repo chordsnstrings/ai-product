@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
+import { measurementContextLabel } from '@arkiv/shared';
 import { Empty, SignalChip } from '@arkiv/ui';
 import { ActionForm, SheetButton } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
@@ -13,7 +14,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
   const w = await workspacePage(slug);
   const d = await withTenant(w.ctx.workspaceId, async (tx) => ({
     exps: await tx`select e.id, e.hypothesis, e.state, e.mode, e.created_at, s.name, s.catalogue_no from experiments e join skus s on s.id = e.sku_id order by e.created_at desc limit 100`,
-    learnings: await tx`select l.statement, l.state, l.scope_platform, l.measurement_context, l.confidence, s.name from learnings l join skus s on s.id = l.sku_id order by l.last_revalidated_at desc limit 30`,
+    learnings: await tx`select l.statement, l.state, l.scope_platform, l.measurement_context, l.confidence, l.confounded, s.name from learnings l join skus s on s.id = l.sku_id order by l.last_revalidated_at desc limit 30`,
     skus: await tx`select id, name from skus where status = 'active' order by catalogue_no`,
   }));
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
@@ -60,7 +61,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
         ) : (
           d.learnings.map((l, i) => (
             <div key={i} className="ak-index-row">
-              <span>{l.statement as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>{l.name as string} · {l.scope_platform as string} · {String(l.measurement_context).replace(/_/g, ' ')}</span></span>
+              <span>{l.statement as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>{l.name as string} · {l.scope_platform as string} · {measurementContextLabel(String(l.measurement_context))}{l.confounded ? ' · confounded period — not used for recommendations' : ''}</span></span>
               <SignalChip state={String(l.state)} />
             </div>
           ))

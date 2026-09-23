@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { editScene, regenerateFrame, setSceneLock } from '@arkiv/core';
+import { editScene, requestFrameRegeneration, setSceneLock } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
@@ -20,9 +20,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     case 'lock':
       await withTenant(a.ctx.workspaceId, (tx) => setSceneLock(tx, a.ctx, id, !!input.locked));
       return json({ ok: true });
-    case 'regenerate':
+    case 'regenerate': {
       if (!input.instruction?.trim()) throw new DomainError('INVALID', 'Describe the change you want.');
-      return json(await regenerateFrame(a.ctx, id, input.instruction));
+      // Drawn by the worker (§34); the storyboard polls the project view until this scene's request settles.
+      const r = await withTenant(a.ctx.workspaceId, (tx) => requestFrameRegeneration(tx, a.ctx, id, input.instruction!));
+      return json({ ok: true, queued: true, ...r }, 202);
+    }
     default:
       throw new DomainError('NOT_FOUND', 'Unknown action');
   }

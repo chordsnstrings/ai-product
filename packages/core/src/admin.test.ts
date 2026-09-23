@@ -158,6 +158,9 @@ describe('tenant actions', () => {
 describe('purge scheduling (plan 05 §2.2 danger zone)', () => {
   it('cancelling a purge restores a paying tenant instead of cancelling it', async () => {
     const t = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    // Paying = a live subscription (a lapsed one would come back CANCELLED).
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, current_period_start, current_period_end, consent_record_id)
+                      values (${t.workspaceId}, ${'sub_purge_' + t.workspaceId.slice(0, 8)}, 'GROWTH', 'active', now(), now() + interval '1 month', gen_random_uuid())`;
     const ops = await staff(['OPS']);
     await scheduleTenantPurge(ops, t.workspaceId, 'legal hold request');
     const [s] = await ownerPool()`select state, state_before_purge, purge_at from workspaces where id = ${t.workspaceId}`;

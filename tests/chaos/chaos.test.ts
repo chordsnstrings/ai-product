@@ -9,13 +9,13 @@ import {
   available,
   generateStoryboard,
   ingestBytes,
+  OUTAGE_MESSAGE,
   produceProject,
-  retryProduction,
   selectConcept,
   startPreview,
   sweepExpiredAuthorizations,
 } from '@arkiv/core';
-import { ctxFor, productPhoto } from '@arkiv/core/testing';
+import { ctxFor, MockImage, MockLlm, MockTts, MockVideo, productPhoto, setProviders, type VideoProvider } from '@arkiv/core/testing';
 import { MockStripe, processStripeEvent, receiveStripeWebhook, setBillingGateway } from '@arkiv/billing';
 
 /**
@@ -46,39 +46,56 @@ async function readyForProduction(marker?: string) {
   return { t, ctx, projectId, storyboardId };
 }
 
-describe('provider outage', () => {
-  it('a video-model outage degrades to the exact product composite instead of failing the order', async () => {
-    const { t, ctx, projectId } = await readyForProduction('[[fail:render]]');
+describe('provider outage (§44: queue/pause, preserve reservation, clear status; never degrade to avoid cost)', () => {
+  it('a video-model outage pauses the order with its credit held, then resumes and charges once', async () => {
+    const { t, ctx, projectId, storyboardId } = await readyForProduction('[[fail:render]]');
+    expect(await produceProject(ctx, projectId)).toBe('paused');
+    await withTenant(t.workspaceId, async (tx) => {
+      const [p] = await tx`select state, outage, failure_reason, qa_report from projects where id = ${projectId}`;
+      expect(p!.state).toBe('NEEDS_USER_ACTION');
+      expect((p!.outage as { task: string }).task).toBe('video.scene');
+      expect(p!.failure_reason).toBe(OUTAGE_MESSAGE);
+      expect(JSON.stringify(p!.qa_report)).not.toMatch(/switched to exact product composite/); // no degraded output
+      expect(await available(tx, 'taste')).toBe(0); // reservation held, not released
+      const [a] = await tx`select status, expires_at > now() + interval '5 hours' as held from cost_authorizations where project_id = ${projectId} and idempotency_key like 'produce:%'`;
+      expect(a).toMatchObject({ status: 'active', held: true });
+      expect((await tx`select count(*)::int as n from assets where kind = 'final_export'`)[0]!.n).toBe(0);
+    });
+    // Provider recovers → the paused production resumes on the same reservation and is charged exactly once.
+    await ownerPool()`update scenes set visual_plan = replace(visual_plan, ' [[fail:render]]', '') where storyboard_id = ${storyboardId}`;
     expect(await produceProject(ctx, projectId)).toBe('complete');
     await withTenant(t.workspaceId, async (tx) => {
-      const [p] = await tx`select qa_report from projects where id = ${projectId}`;
-      expect(JSON.stringify(p!.qa_report)).toMatch(/switched to exact product composite/);
-      const [consumed] = await tx`select count(*)::int as n from ledger_entries where type = 'CREDIT_CONSUMED'`;
-      expect(consumed!.n).toBe(1);
+      const [p] = await tx`select state, outage, qa_report from projects where id = ${projectId}`;
+      expect(p).toMatchObject({ state: 'COMPLETE', outage: null });
+      expect(JSON.stringify(p!.qa_report)).not.toMatch(/switched to exact product composite/);
+      expect(await available(tx, 'taste')).toBe(0);
+      const [n] = await tx`select count(*) filter (where type = 'CREDIT_RESERVED')::int as reserved, count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed from ledger_entries`;
+      expect(n).toMatchObject({ reserved: 1, consumed: 1 });
     });
-  }, 180_000);
+  }, 240_000);
 
-  it('a voice outage on primary and fallback fails cleanly, refunds the entitlement, and a retry charges once', async () => {
+  it('a voice outage on primary and fallback pauses after rendering, then resumes reusing the accepted scenes', async () => {
     const { t, ctx, projectId, storyboardId } = await readyForProduction();
     await ownerPool()`update scenes set spoken_line = coalesce(spoken_line, 'Soft skin.') || ' [[fail:server]]' where storyboard_id = ${storyboardId} and position = 0`;
-    await expect(produceProject(ctx, projectId)).rejects.toThrow();
+    expect(await produceProject(ctx, projectId)).toBe('paused');
+    const rendersBefore = (await ownerPool()`select count(*)::int as n from scene_versions where kind = 'render' and workspace_id = ${t.workspaceId}`)[0]!.n;
     await withTenant(t.workspaceId, async (tx) => {
-      const [p] = await tx`select state from projects where id = ${projectId}`;
-      expect(p!.state).toBe('PROVIDER_FAILED');
-      expect(await available(tx, 'taste')).toBe(1); // entitlement returned
-      const [active] = await tx`select count(*)::int as n from cost_authorizations where status = 'active'`;
-      expect(active!.n).toBe(0); // nothing stranded
+      const [p] = await tx`select state, outage from projects where id = ${projectId}`;
+      expect(p!.state).toBe('NEEDS_USER_ACTION');
+      expect((p!.outage as { task: string }).task).toBe('tts.voiceover');
+      expect(await available(tx, 'taste')).toBe(0);
       const [consumed] = await tx`select count(*)::int as n from ledger_entries where type = 'CREDIT_CONSUMED'`;
       expect(consumed!.n).toBe(0);
     });
-    // Provider recovers → retry (merchant or staff) → delivered, charged exactly once.
     await ownerPool()`update scenes set spoken_line = replace(spoken_line, ' [[fail:server]]', '') where storyboard_id = ${storyboardId}`;
-    await withTenant(t.workspaceId, (tx) => retryProduction(tx, ctx, projectId));
     expect(await produceProject(ctx, projectId)).toBe('complete');
     await withTenant(t.workspaceId, async (tx) => {
       expect(await available(tx, 'taste')).toBe(0);
-      const [consumed] = await tx`select count(*)::int as n from ledger_entries where type = 'CREDIT_CONSUMED'`;
-      expect(consumed!.n).toBe(1);
+      const [n] = await tx`select count(*) filter (where type = 'CREDIT_RESERVED')::int as reserved, count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed from ledger_entries`;
+      expect(n).toMatchObject({ reserved: 1, consumed: 1 });
+      // Accepted renders from before the pause were reused, not paid for again.
+      const [r] = await tx`select count(*)::int as n from scene_versions where kind = 'render'`;
+      expect(r!.n).toBe(rendersBefore);
     });
   }, 240_000);
 });
@@ -117,6 +134,45 @@ describe('crashed worker', () => {
     // Idempotent: a second sweep does nothing.
     expect(await withSystem((tx) => sweepExpiredAuthorizations(tx))).toBe(0);
   });
+
+  it('a production interrupted mid-render resumes from durable state: one reservation, one creative, one charge', async () => {
+    const { t, ctx, projectId } = await readyForProduction();
+    // The first worker's render never returns (the process "dies" while waiting on the provider).
+    const mock = new MockVideo();
+    let hungTask: string | null = null;
+    const hanging: VideoProvider = {
+      name: 'byteplus',
+      submit: async (req) => {
+        const r = await mock.submit(req);
+        hungTask ??= r.providerRequestId;
+        return r;
+      },
+      poll: (id) => (id === hungTask ? new Promise(() => {}) : mock.poll(id)),
+      cancel: (id) => mock.cancel(id),
+    };
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: hanging, tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    void produceProject(ctx, projectId);
+    for (let i = 0; i < 200 && !hungTask; i++) await new Promise((r) => setTimeout(r, 50));
+    expect(hungTask).not.toBeNull();
+    // While the first run holds its lease, a redelivered job is a duplicate and stands down.
+    expect(await produceProject(ctx, projectId)).toBe('skipped');
+
+    // Crash: the lease lapses. A redelivery (or the stuck-production sweep) resumes the same order.
+    await ownerPool()`update workspace_leases set expires_at = now() - interval '1 second' where resource = ${`produce:${projectId}`}`;
+    setProviders(undefined);
+    expect(await produceProject(ctx, projectId)).toBe('complete');
+    await withTenant(t.workspaceId, async (tx) => {
+      const [p] = await tx`select state from projects where id = ${projectId}`;
+      expect(p!.state).toBe('COMPLETE');
+      const [n] = await tx`select count(*) filter (where type = 'CREDIT_RESERVED')::int as reserved, count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed from ledger_entries`;
+      expect(n).toMatchObject({ reserved: 1, consumed: 1 });
+      const [auths] = await tx`select count(*)::int as n from cost_authorizations where project_id = ${projectId} and idempotency_key like 'produce:%'`;
+      expect(auths!.n).toBe(1); // the live reservation was taken over, not re-reserved
+      const [cr] = await tx`select count(*)::int as n from creatives where project_id = ${projectId}`;
+      expect(cr!.n).toBe(1);
+      expect(await available(tx, 'taste')).toBe(0);
+    });
+  }, 240_000);
 });
 
 describe('webhook storm', () => {

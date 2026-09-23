@@ -10,6 +10,7 @@ import {
   blockClaim,
   cancelProjectBeforeDispatch,
   cancelTenantPurge,
+  claimMarket,
   classifyClaim,
   clearSettingsCache,
   decideApproval,
@@ -346,13 +347,19 @@ export const ACTIONS = {
   /* ── Claims (tenant routed these to our compliance team; views are audited as content access) ── */
   'claim.decide': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('meta,tiktok'), reason }),
+    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('TIKTOK,META'), markets: z.string().optional(), reason }),
     run: async (s, i) => {
       if (i.decision === 'unblock') return requestOrExecute(s, 'claim.unblock', { workspaceId: i.workspaceId, claimId: i.claimId }, i.reason);
       return withAdmin(async (tx) => {
         const ctx = { workspaceId: i.workspaceId, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, actor: { kind: 'staff' as const, id: s.staffId }, requestId: newId() };
         if (i.decision === 'block') await blockClaim(tx, ctx, i.claimId, i.reason);
-        else await approveClaim(tx, ctx, i.claimId, { markets: ['US'], platforms: i.platforms.split(',').map((p) => p.trim()), qualifier: i.qualifier ?? null, wording: i.wording });
+        else {
+          // Market defaults to the brand's (Brand Brain), never silently to US (§43); platforms are normalised by approveClaim.
+          const [cl] = await tx`select sku_id from claims where id = ${i.claimId} and workspace_id = ${i.workspaceId}`;
+          if (!cl) throw new DomainError('NOT_FOUND', 'Claim not found');
+          const markets = i.markets?.trim() ? i.markets.split(',').map((m) => m.trim()).filter(Boolean) : [await claimMarket(tx, cl.sku_id as string)];
+          await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording });
+        }
         await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier } });
         const [c] = await tx`select preferred_wording from claims where id = ${i.claimId}`;
         for (const to of await ownerEmails(i.workspaceId)) await sendEmail('claim_review_result', to, { claim: c?.preferred_wording as string, outcome: i.decision === 'block' ? `Blocked: ${i.reason}` : 'Approved for use', url: `${env().APP_URL}/app` }, { idempotencyKey: `claimrev:${i.claimId}:${i.decision}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
@@ -391,7 +398,7 @@ export const ACTIONS = {
   /* ── Growth: landing pages, offers, testimonials ── */
   'lp.save': a({
     perm: 'growth.manage',
-    schema: z.object({ slug: z.string().regex(/^[a-z0-9-]{2,40}$/), archetype: z.string().min(2), content: z.record(z.string(), z.unknown()), variants: z.array(z.object({ key: z.string(), weight: z.number().min(0), content: z.record(z.string(), z.unknown()) })).default([]), utmMatch: z.string().default('') }),
+    schema: z.object({ slug: z.string().regex(/^[a-z0-9-]{2,40}$/), archetype: z.string().min(2), content: z.record(z.string(), z.unknown()), variants: z.array(z.object({ key: z.string().min(1), weight: z.number().finite().positive('Variant weights must be greater than 0'), content: z.record(z.string(), z.unknown()) })).default([]), utmMatch: z.string().default('') }),
     run: (s, i) =>
       withAdmin(async (tx) => {
         const lint = lintMarketing([i.content, i.variants]);

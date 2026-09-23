@@ -19,7 +19,7 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
     const [sub] = await tx`select * from subscriptions where status in ('active','trialing','past_due') order by created_at desc limit 1`;
     const usage = sub ? await periodUsage(tx, new Date(sub.current_period_start as string).toISOString().slice(0, 10)) : null;
     const purchases = await tx`select p.kind, p.amount_micros, p.status, p.paid_at, p.created_at, s.name from purchases p left join projects pr on pr.id = p.project_id left join skus s on s.id = pr.sku_id where p.status in ('paid','refunded') order by p.created_at desc limit 20`;
-    const [cust] = await tx`select customer_id from stripe_customers limit 1`;
+    const [cust] = await tx`select customer_id from stripe_customers where workspace_id = ${w.ctx.workspaceId}`;
     return { sub, usage, purchases, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
   });
   const canManage = ['OWNER', 'ADMIN'].includes(w.ctx.role);

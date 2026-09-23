@@ -13,15 +13,16 @@
   },
   "dependencies": {
     "@arkiv/db": "workspace:*",
-    "@arkiv/shared": "workspace:*",
-    "@arkiv/providers": "workspace:*",
+    "@arkiv/integrations": "workspace:*",
     "@arkiv/media": "workspace:*",
+    "@arkiv/providers": "workspace:*",
+    "@arkiv/shared": "workspace:*",
     "@aws-sdk/client-s3": "^3.1138.0",
     "@aws-sdk/s3-request-presigner": "^3.1138.0",
-    "file-type": "^22.1.1",
-    "sharp": "^0.35.4",
-    "zod": "^4.6.5",
     "fflate": "^0.8.2",
-    "@arkiv/integrations": "workspace:*"
+    "file-type": "^22.1.1",
+    "heic-decode": "^2.1.0",
+    "sharp": "^0.35.4",
+    "zod": "^4.6.5"
   }
 }

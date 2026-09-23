@@ -1,7 +1,14 @@
-import { withSystem } from '@arkiv/db';
+import { withSystem, withTenant } from '@arkiv/db';
 import { sendEmail } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import {
+  OUTAGE_MAX_HOURS,
+  RECOVERY_EMAIL_CAP,
+  STUCK_DEADLINE_MINUTES,
+  failProduction,
+  JOB_HOLD_STATES,
+  systemContext,
+  type TenantContext,
   duePurges,
   evaluateCanaries,
   expiredFlagAlerts,
@@ -20,11 +27,19 @@ import {
  * Scheduled maintenance (§39: reservations must never be stranded; plan 02 lifecycle; plan 04 L20 recovery).
  * Each sweep runs as the system role and fans out tenant work through the outbox.
  */
-async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], workspaceId: string, queue: string, payload: Record<string, unknown>, singletonKey: string) {
+async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], workspaceId: string, queue: string, payload: Record<string, unknown>, singletonKey: string, priority = 0) {
   const [dup] = await tx`select 1 from outbox where queue = ${queue} and singleton_key = ${singletonKey} limit 1`;
   if (dup) return;
-  await tx`insert into outbox (workspace_id, queue, payload, singleton_key) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey})`;
+  await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority})`;
 }
+
+const sysCtx = (workspaceId: string, id: string): TenantContext => ({ ...systemContext(workspaceId, id), actor: { kind: 'system', id } });
+
+/**
+ * Productions of a held workspace (suspended, or purge pending) are not stalled but paused: their jobs are
+ * parked until the hold ends, so the resume/fail sweeps leave them alone (plan 05 §2.3). Fragment over `p`.
+ */
+const notHeld = (tx: Parameters<Parameters<typeof withSystem>[0]>[0]) => tx`not exists (select 1 from workspaces w where w.id = p.workspace_id and w.state = any(${[...JOB_HOLD_STATES]}))`;
 
 /** pg-boss queue for a schedule — never the same name as a job queue (see main.ts). */
 export const sweepQueue = (key: string) => `cron-${key}`;
@@ -33,19 +48,83 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   'sweep-authorizations': { cron: '* * * * *', run: () => withSystem((tx) => sweepExpiredAuthorizations(tx)) },
   'sweep-offers': { cron: '* * * * *', run: () => withSystem((tx) => expireOffers(tx)) },
   // L8/L20: a single honest reminder 15 minutes before the Taste window closes; then T+24h and T+3d nudges.
+  // At most three recovery emails per project (counted in email_log), none after a purchase. Runs as system_rw,
+  // so every predicate ties rows to their own workspace explicitly.
   'offer-reminders': {
     cron: '* * * * *',
     run: () =>
       withSystem(async (tx) => {
-        const due = await tx`select o.id, o.workspace_id from offers o where o.type = 'TASTE' and o.status = 'active'
-                             and o.expires_at between now() + interval '13 minutes' and now() + interval '16 minutes'
-                             and not exists (select 1 from purchases p where p.workspace_id = o.workspace_id and p.status = 'paid')`;
+        // Fragments over the project alias `p` (fresh per query).
+        const underCap = () => tx`(select count(distinct l.template) from email_log l where l.workspace_id = p.workspace_id
+                                     and l.idempotency_key like 'recovery:' || p.id::text || ':%') < ${RECOVERY_EMAIL_CAP}`;
+        const notPurchased = () => tx`not exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.status = 'paid')`;
+        const due = await tx`select o.id, o.workspace_id from offers o join projects p on p.id = o.project_id and p.workspace_id = o.workspace_id
+                             where o.type = 'TASTE' and o.status = 'active'
+                               and o.expires_at between now() + interval '13 minutes' and now() + interval '16 minutes'
+                               and ${notPurchased()} and ${underCap()}`;
         for (const o of due) await enqueueFor(tx, o.workspace_id as string, 'send-email', { template: 'offer_ending', offerId: o.id }, `offer-ending:${o.id}`);
         const stale = await tx`select p.id, p.workspace_id from projects p where p.state = 'STORYBOARD_READY' and p.kind = 'preview'
-                               and p.updated_at between now() - interval '25 hours' and now() - interval '24 hours'`;
+                               and p.updated_at between now() - interval '25 hours' and now() - interval '24 hours'
+                               and ${notPurchased()} and ${underCap()}`;
         for (const p of stale) await enqueueFor(tx, p.workspace_id as string, 'send-email', { template: 'storyboard_saved', projectId: p.id }, `saved:${p.id}`);
-        return due.length + stale.length;
+        // T+3d: a new concept for the same SKU (≈ one concepts call, no render), then the new_concept email.
+        const cold = await tx`select p.id, p.workspace_id from projects p join workspaces w on w.id = p.workspace_id
+                              where p.state = 'STORYBOARD_READY' and p.kind = 'preview' and w.state in ('ACTIVE_FREE','ACTIVE_PAID')
+                                and p.updated_at between now() - interval '73 hours' and now() - interval '72 hours'
+                                and ${notPurchased()} and ${underCap()}`;
+        for (const p of cold) await enqueueFor(tx, p.workspace_id as string, 'recovery-concept', { projectId: p.id }, `recovery-concept:${p.id}`);
+        return due.length + stale.length + cold.length;
       }),
+  },
+  // §39/§44: productions paused by a provider outage resume (with backoff) once the provider's circuit is closed
+  // and renders aren't kill-switched; an outage past OUTAGE_MAX_HOURS ends the attempt (entitlement returned,
+  // paid one-off orders refunded).
+  'resume-paused-productions': {
+    cron: '* * * * *',
+    run: async () => {
+      const rows = await withSystem((tx) => tx`
+        select p.id, p.workspace_id, p.outage,
+          (p.outage->>'since')::timestamptz < now() - make_interval(hours => ${OUTAGE_MAX_HOURS}) as exhausted,
+          coalesce((select r.circuit_open from model_routes r where r.task = p.outage->>'task'), false)
+            or exists (select 1 from feature_flags f where f.key = 'kill.renders' and f.enabled) as blocked,
+          (p.outage->>'lastAt')::timestamptz < now() - make_interval(mins => least(30, power(2, greatest(0, coalesce((p.outage->>'attempts')::int, 1) - 1))::int)) as due
+        from projects p where p.state = 'NEEDS_USER_ACTION' and p.outage is not null and ${notHeld(tx)} limit 200`);
+      let n = 0;
+      for (const r of rows) {
+        if (r.exhausted) {
+          await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'outage-sweep'), r.id as string, 'provider outage did not recover in time'));
+          n++;
+        } else if (!r.blocked && r.due) {
+          const attempts = Number((r.outage as { attempts?: number }).attempts ?? 1);
+          await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:resume:${attempts}`, 20));
+          n++;
+        }
+      }
+      return n;
+    },
+  },
+  // prod-07: a production in RENDER_RESERVED..FINAL_QA with no live run (worker crashed) is resumed; if it has been
+  // stuck past STUCK_DEADLINE_MINUTES — before its reservation's 180-minute TTL — it is failed and refunded instead.
+  'sweep-stuck-productions': {
+    cron: '* * * * *',
+    run: async () => {
+      const rows = await withSystem((tx) => tx`
+        select p.id, p.workspace_id, a.created_at < now() - make_interval(mins => ${STUCK_DEADLINE_MINUTES}) as overdue
+        from projects p left join cost_authorizations a on a.id = p.authorization_id and a.workspace_id = p.workspace_id
+        where p.state in ('RENDER_RESERVED','RENDERING','QA_RUNNING','COMPOSING','PLATFORM_VARIANTS','FINAL_QA')
+          and p.updated_at < now() - interval '2 minutes'
+          and not exists (select 1 from workspace_leases l where l.workspace_id = p.workspace_id
+                          and l.resource = 'produce:' || p.id::text and l.expires_at > now())
+          and not exists (select 1 from outbox o where o.workspace_id = p.workspace_id and o.queue = 'produce-project'
+                          and o.dispatched_at is null and o.payload->>'projectId' = p.id::text)
+          and ${notHeld(tx)}
+        limit 200`);
+      for (const r of rows) {
+        if (r.overdue) await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'stuck-sweep'), r.id as string, 'production stalled (no live worker) past the deadline'));
+        else await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:stuck:${Math.floor(Date.now() / 300_000)}`, 20));
+      }
+      return rows.length;
+    },
   },
   'sweep-provisional': { cron: '*/15 * * * *', run: () => withSystem((tx) => sweepProvisional(tx)) },
   'sweep-retention': { cron: '0 * * * *', run: () => withSystem((tx) => sweepRetention(tx)) },

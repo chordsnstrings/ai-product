@@ -34,8 +34,9 @@ export async function saveIntegration(
   assertCan(ctx, 'integration.manage');
   if (input.provider === 'shopify') {
     // One active workspace per shop — webhook routing must be unambiguous (plan 02 §3 layer 8).
-    const [owner] = await tx`select workspace_id from shopify_shops where shop_domain = ${input.externalAccountId}`;
-    if (owner && owner.workspace_id !== ctx.workspaceId) {
+    // shopify_shops is tenant-scoped; the cross-tenant "connected elsewhere" check is a narrow definer function.
+    const [owner] = await tx`select shop_connected_elsewhere(${input.externalAccountId}) as elsewhere`;
+    if (owner?.elsewhere) {
       throw new DomainError('CONFLICT', 'This store is connected to another workspace. Ask its owner to disconnect it, or request a transfer.', { transfer: true });
     }
   }
@@ -231,7 +232,7 @@ export async function freshness(tx: Tx): Promise<Freshness[]> {
 
 /** Resolve a Shopify webhook to its workspace via the global routing table (never guessed). */
 export async function workspaceForShop(shop: string): Promise<string | null> {
-  const [r] = await globalTx((tx) => tx`select workspace_id from shopify_shops where shop_domain = ${shop}`);
+  const [r] = await globalTx((tx) => tx`select workspace_for_shop(${shop}) as workspace_id`);
   return (r?.workspace_id as string) ?? null;
 }
 

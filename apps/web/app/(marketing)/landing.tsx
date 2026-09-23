@@ -1,6 +1,7 @@
 import { headers } from 'next/headers';
 import { globalTx, withSystem } from '@arkiv/db';
-import { assignVariant, recordFunnel } from '@arkiv/core';
+import { env } from '@arkiv/shared';
+import { assignVariantOrNull, recordFunnel } from '@arkiv/core';
 import { StickyCta } from '@arkiv/ui/client';
 import { MarketingShell } from '@/components/marketing';
 import { UploadModule } from '@/components/upload-module';
@@ -31,7 +32,7 @@ export async function Landing({ slug, searchParams }: { slug: string; searchPara
   });
   const vid = await visitorId();
   const variants = (page?.variants as { key: string; weight: number; content: Partial<LandingContent> }[]) ?? [];
-  const variant = variants.length ? assignVariant(`lp:${page!.slug}`, vid, variants) : null;
+  const variant = page ? assignVariantOrNull(`lp:${page.slug}`, vid, variants) : null;
   const content: LandingContent = { ...(page?.content as LandingContent), ...(variants.find((v) => v.key === variant)?.content ?? {}) };
   const user = await currentUser();
   const ua = (await headers()).get('user-agent') ?? '';
@@ -56,7 +57,7 @@ export async function Landing({ slug, searchParams }: { slug: string; searchPara
                 <li>04 Your ad</li>
               </ol>
             </div>
-            <UploadModule page={page?.slug as string} variant={variant} />
+            <UploadModule page={page?.slug as string} variant={variant} turnstileSiteKey={env().TURNSTILE_SITE_KEY ?? null} />
           </div>
         </section>
 

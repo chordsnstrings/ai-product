@@ -22,7 +22,7 @@ create index risk_flags_open on risk_flags (workspace_id, indicator) where resol
 alter table tenant_notes add column sentiment text check (sentiment in ('positive','neutral','negative'));
 
 -- §2.2 Danger zone: cancelling a purge restores the state the workspace was in before it was scheduled.
-alter table workspaces add column state_before_purge text check (state_before_purge in
+alter table workspaces add column if not exists state_before_purge text check (state_before_purge in
   ('PROVISIONAL','ACTIVE_FREE','ACTIVE_PAID','PAST_DUE','CANCELLED'));
 
 -- §2.3 Suspension: jobs are paused, not dropped. A job that reaches a worker while its workspace is held

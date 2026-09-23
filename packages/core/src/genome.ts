@@ -1,5 +1,6 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { Taxonomy } from '@arkiv/shared';
+import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { emit } from './events';
@@ -19,6 +20,8 @@ export async function importHistoricalCreative(
   ctx: TenantContext,
   input: { skuId: string; secondarySkuIds?: string[]; copy: string; platform?: 'meta' | 'tiktok' | null; adId?: string | null; assetId?: string | null },
 ) {
+  // Import enqueues model spend (genome extraction), so it is a create-level right, not view.
+  assertCan(ctx, 'sku.create');
   const [c] = await tx`
     insert into creatives (workspace_id, sku_id, secondary_sku_ids, origin, platform_refs, final_asset_ids)
     values (${ctx.workspaceId}, ${input.skuId}, ${input.secondarySkuIds ?? []}, 'imported',

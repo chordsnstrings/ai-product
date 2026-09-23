@@ -24,7 +24,7 @@ afterAll(closeAll);
 async function speak(workspaceId: string, userId: string) {
   const ctx = ctxFor(workspaceId, userId);
   const auth = await withTenant(workspaceId, (tx) => authorize(tx, ctx, { purpose: 'taste', lines: [{ kind: 'tts', provider: 'minimax', model: 'speech-2.8-hd', chars: 2000 }], idempotencyKey: `tts:${newId()}` }));
-  await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: null, text: 'Soft, dewy skin in one step.', voice: 'English_Graceful_Lady' });
+  await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: null, text: 'Soft, dewy skin in one step.', voice: 'warm_female' });
   const [job] = await ownerPool()`select provider, model, arm from provider_jobs where workspace_id = ${workspaceId} order by created_at desc limit 1`;
   return job!;
 }

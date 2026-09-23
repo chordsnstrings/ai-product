@@ -3,6 +3,7 @@ import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, r
 import { DomainError, env } from '@arkiv/shared';
 import { clientIp, json, route } from '@/lib/http';
 import { currentUser, provisionalToken, setProvisionalCookie, visitorId } from '@/lib/session';
+import { verifyTurnstile } from '@/lib/turnstile';
 
 /**
  * P2 → start the free preview (plan 04 L2/L5). No account needed: anonymous visitors get a provisional
@@ -18,9 +19,8 @@ export const POST = route(async (req) => {
   await recordFunnel('UPLOAD_STARTED', { visitorId: vid, page: (form.get('page') as string) ?? null, variant: (form.get('variant') as string) ?? null, props: { method: url ? 'url' : 'photos' } });
 
   if (env().TURNSTILE_SECRET) {
-    // Bots: invisible challenge on submit only (plan 03 P1 edge cases).
-    const token = form.get('cf-turnstile-response') as string | null;
-    const ok = token && (await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: new URLSearchParams({ secret: env().TURNSTILE_SECRET!, response: token, remoteip: ip ?? '' }) }).then((r) => r.json()).then((j: { success: boolean }) => j.success).catch(() => false));
+    // Bots: invisible challenge on submit only (plan 03 P1 edge cases). The form sends the token (UploadModule).
+    const ok = await verifyTurnstile(form.get('cf-turnstile-response') as string | null, env().TURNSTILE_SECRET!, ip);
     if (!ok) throw new DomainError('FORBIDDEN', 'Please confirm you’re human and try again.', { challenge: true });
   }
 

@@ -1,3 +1,5 @@
+import { DomainError } from './core';
+
 // Canonical enums from the Product Standard (V1.2). Values are persisted: never rename, only add.
 
 export const DataState = ['OBSERVED', 'INFERRED', 'DECIDED'] as const; // §15
@@ -79,6 +81,25 @@ export const MeasurementContext = [
 ] as const; // §30
 export type MeasurementContext = (typeof MeasurementContext)[number];
 
+/** Customer-facing label per measurement context (§30). Contexts are shown side by side, never merged. */
+export const MeasurementContextLabel: Record<MeasurementContext, string> = {
+  META_PAID_ATTRIBUTED: 'Meta · paid (attributed)',
+  TIKTOK_PAID_ATTRIBUTED: 'TikTok · paid (attributed)',
+  TIKTOK_GMV_MAX_TOTAL: 'TikTok GMV Max · total (includes organic + affiliate)',
+  SHOPIFY_BLENDED_ORDER: 'Shopify · blended orders',
+  MERCHANT_IMPORTED: 'Imported by you (CSV)',
+};
+
+/** Scope caveats that must travel with a context wherever its numbers are shown (§45). */
+export const MeasurementContextCaveat: Partial<Record<MeasurementContext, string>> = {
+  TIKTOK_GMV_MAX_TOTAL: 'GMV Max totals include organic and affiliate sales, so they are not comparable to paid-only ROAS.',
+  SHOPIFY_BLENDED_ORDER: 'Blended store orders include every channel; they are not attributed to a single ad.',
+};
+
+export function measurementContextLabel(context: string): string {
+  return (MeasurementContextLabel as Record<string, string>)[context] ?? context.replace(/_/g, ' ').toLowerCase();
+}
+
 export const ProductionMode = [
   'STRICT_COMPOSITE',
   'GENERATIVE_INTERACTION',
@@ -127,6 +148,52 @@ export type Platform = (typeof Platform)[number];
 
 export const ExportFormat = ['9x16', '4x5', '1x1'] as const;
 export type ExportFormat = (typeof ExportFormat)[number];
+
+/** Where each export is published (§30): 9:16 → TikTok + Reels; 4:5 and 1:1 → Facebook/Instagram feed. */
+export const EXPORT_PLATFORMS: Record<ExportFormat, readonly Platform[]> = {
+  '9x16': ['TIKTOK', 'INSTAGRAM_REELS'],
+  '4x5': ['FACEBOOK_FEED'],
+  '1x1': ['FACEBOOK_FEED'],
+};
+export const platformsFor = (formats: readonly ExportFormat[]): Platform[] => [...new Set(formats.flatMap((f) => EXPORT_PLATFORMS[f]))];
+
+/**
+ * Claim scope (§17, §43): the platforms a claim may be used on. Stored upper-case; the export platforms plus
+ * YouTube and organic posts. Merchant-facing shorthands expand: META = Reels + Feed.
+ */
+export const ClaimPlatform = [...Platform, 'YOUTUBE', 'ORGANIC'] as const;
+export type ClaimPlatform = (typeof ClaimPlatform)[number];
+export const CLAIM_PLATFORM_ALIASES: Record<string, readonly ClaimPlatform[]> = {
+  META: ['INSTAGRAM_REELS', 'FACEBOOK_FEED'],
+  INSTAGRAM: ['INSTAGRAM_REELS'],
+  REELS: ['INSTAGRAM_REELS'],
+  FACEBOOK: ['FACEBOOK_FEED'],
+  FEED: ['FACEBOOK_FEED'],
+  YOUTUBE_SHORTS: ['YOUTUBE'],
+};
+
+/** Normalise a platform scope (any case, aliases) to stored values; unknown values are refused, never guessed. */
+export function normalizeClaimPlatforms(input: readonly string[]): ClaimPlatform[] {
+  const out = new Set<ClaimPlatform>();
+  for (const raw of input) {
+    const v = raw.trim().toUpperCase().replace(/[\s-]+/g, '_');
+    const expanded = CLAIM_PLATFORM_ALIASES[v] ?? ((ClaimPlatform as readonly string[]).includes(v) ? [v as ClaimPlatform] : null);
+    if (!expanded) throw new DomainError('INVALID', `Unknown platform “${raw}”.`, { platform: raw });
+    for (const p of expanded) out.add(p);
+  }
+  return ClaimPlatform.filter((p) => out.has(p));
+}
+
+/** Markets are ISO-style upper-case codes (US, GB, EU…); US approval never implies another market (§43). */
+export function normalizeMarkets(input: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const raw of input) {
+    const v = raw.trim().toUpperCase();
+    if (!/^[A-Z]{2,3}$/.test(v)) throw new DomainError('INVALID', `Unknown market “${raw}”.`, { market: raw });
+    out.add(v);
+  }
+  return [...out];
+}
 
 /** Appendix A — Initial Creative Taxonomy (v1). */
 export const Taxonomy = {

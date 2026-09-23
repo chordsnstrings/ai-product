@@ -1,11 +1,11 @@
 import { PgBoss } from 'pg-boss';
 import { closeAll, systemPool, withSystem } from '@arkiv/db';
 import { env } from '@arkiv/shared';
-import { Queues } from '@arkiv/core';
 import { processStripeEvent } from '@arkiv/billing';
 import { processPendingStripeEvents, runJob } from './handlers';
 import { sweepQueue, sweeps } from './sweeps';
 import { grantQueueVisibility, processOpsCommands } from './ops';
+import { QUEUE_CONFIG } from './queues';
 
 /**
  * Worker process (plan 01 §2 layout). Responsibilities:
@@ -13,25 +13,11 @@ import { grantQueueVisibility, processOpsCommands } from './ops';
  *     mark can't create a duplicate job).
  *  2. Workers: one per queue, with bounded retries + dead letter, separate from creative QA retries (§39).
  *  3. Scheduled sweeps (cron) and Stripe event processing.
- * Free-preview analysis runs on its own queue with lower concurrency so paying tenants never wait on it.
+ * Free-tier AI work (provisional/free previews, storyboards, concept and frame requests) runs on separate `-free`
+ * queues with their own, smaller worker pools, so paying tenants never wait behind preview traffic (plan 02 §3
+ * layer 5). Paid work also carries a higher priority within its queue.
  */
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), '[worker]', ...a);
-
-const QUEUE_CONFIG: Record<string, { concurrency: number; expireInSeconds: number; retryLimit: number }> = {
-  [Queues.analyzeProduct]: { concurrency: 4, expireInSeconds: 300, retryLimit: 2 },
-  [Queues.generateStoryboard]: { concurrency: 4, expireInSeconds: 300, retryLimit: 2 },
-  [Queues.produceProject]: { concurrency: 6, expireInSeconds: 3600, retryLimit: 1 },
-  [Queues.hookVariants]: { concurrency: 2, expireInSeconds: 900, retryLimit: 2 },
-  [Queues.processUpload]: { concurrency: 4, expireInSeconds: 120, retryLimit: 2 },
-  [Queues.sendEmail]: { concurrency: 4, expireInSeconds: 60, retryLimit: 5 },
-  [Queues.syncIntegration]: { concurrency: 2, expireInSeconds: 1800, retryLimit: 3 },
-  [Queues.computeResults]: { concurrency: 2, expireInSeconds: 300, retryLimit: 3 },
-  [Queues.weeklyRecommendations]: { concurrency: 2, expireInSeconds: 1800, retryLimit: 2 },
-  [Queues.exportWorkspace]: { concurrency: 1, expireInSeconds: 1800, retryLimit: 2 },
-  [Queues.purgeWorkspace]: { concurrency: 1, expireInSeconds: 1800, retryLimit: 3 },
-  [Queues.extractGenome]: { concurrency: 2, expireInSeconds: 300, retryLimit: 2 },
-  [Queues.customerThemes]: { concurrency: 1, expireInSeconds: 600, retryLimit: 2 },
-};
 
 async function dispatchOnce(boss: PgBoss): Promise<number> {
   return withSystem(async (tx) => {

@@ -16,8 +16,11 @@ import { Queues } from './outbox';
 export const JOB_HOLD_STATES: ReadonlySet<WorkspaceState> = new Set(['SUSPENDED', 'PURGE_SCHEDULED']);
 /** States in which finished work is not delivered. */
 export const DELIVERY_HOLD_STATES: ReadonlySet<WorkspaceState> = new Set(['SUSPENDED']);
-/** Staff-requested export on legal request runs regardless of holds. */
-export const HOLD_EXEMPT_QUEUES: ReadonlySet<string> = new Set([Queues.exportWorkspace]);
+/**
+ * Run regardless of holds: the staff-requested export on legal request, and the quality-guarantee refund
+ * (money owed back to the customer never waits on a hold, and a purge would otherwise drop it).
+ */
+export const HOLD_EXEMPT_QUEUES: ReadonlySet<string> = new Set([Queues.exportWorkspace, Queues.refundPurchase]);
 /** Emails that deliver finished work. Other transactional mail (billing, security) is still sent. */
 export const DELIVERY_TEMPLATES: ReadonlySet<string> = new Set(['asset_ready', 'export_ready']);
 

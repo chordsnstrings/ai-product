@@ -226,6 +226,10 @@ async function Projects({ id, canManage, focus }: { id: string; canManage: boole
                 <ActButton small action="tenant.project_retry" payload={{ workspaceId: id, projectId: p.id }} confirm={`Retry this production? A fresh Cost Governor authorisation re-reserves the customer’s entitlement${est != null ? ` (estimate ${money(est)} at current rates)` : ''}; the customer is not charged again.`} reason="Retry reason (ticket / incident)">
                   Retry{est != null ? ` (est. ${money(est)})` : ''}
                 </ActButton>
+              ) : stuck && p.state !== 'STORYBOARD_APPROVED' ? (
+                <ActButton small action="tenant.project_retry" payload={{ workspaceId: id, projectId: p.id }} confirm="Resume this stalled production? It continues from where it stopped under the reservation it already holds; nothing is reserved or charged again." reason="Resume reason (ticket / incident)">
+                  Resume
+                </ActButton>
               ) : null}
               {(CANCELLABLE_BEFORE_DISPATCH as readonly string[]).includes(p.state as string) ? (
                 <ActButton small danger action="tenant.project_cancel" payload={{ workspaceId: id, projectId: p.id }} confirm="Cancel before dispatch? The project ends cancelled and any reservation returns to the customer’s balance." reason="Cancel reason">

@@ -148,7 +148,10 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
 const RISK: Record<string, string> = { lower_risk: 'Safer bet', adjacent: 'Adjacent', exploratory: 'Exploratory' };
 
 export function ConceptsFlow({ projectId }: { projectId: string }) {
-  const active = useCallback((v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED', []);
+  const active = useCallback(
+    (v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED' || v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active',
+    [],
+  );
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [gate, setGate] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -171,6 +174,7 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
     setBusy('more');
     setErr(null);
     try {
+      // Queued server-side (202); polling picks up the new batch or the request's failure.
       await api(`/api/projects/${projectId}/concepts`, {});
       resume();
       refresh();
@@ -179,10 +183,12 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
     }
     setBusy(null);
   }
+  const drafting = v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active';
 
   return (
     <Shell step={2} title="Three ways to test this product" sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.</>}>
       {err ? <Banner tone="risk">{err}</Banner> : null}
+      {v.conceptRequest?.status === 'failed' && v.conceptRequest.batch > (v.concepts[0]?.batch ?? 0) ? <Banner tone="warn">{v.conceptRequest.detail ?? 'We couldn’t draft more ideas just now. Please try again.'}</Banner> : null}
       {v.concepts.length === 0 ? (
         <p className="ak-muted">Drafting ideas…</p>
       ) : (
@@ -214,7 +220,7 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
       )}
       {v.concepts.length ? (
         <p style={{ marginTop: 24 }}>
-          <button className="ak-textbtn" disabled={!!busy} onClick={more}>{busy === 'more' ? 'Drafting…' : 'None of these — try 3 more'}</button>
+          <button className="ak-textbtn" disabled={!!busy || drafting} onClick={more} aria-live="polite">{busy === 'more' || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
         </p>
       ) : null}
       <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} />
@@ -272,7 +278,10 @@ export function SaveGate({ open, onOpenChange, next, productName }: { open: bool
 const PURPOSE: Record<string, string> = { hook: 'Hook', problem: 'Problem', product_reveal: 'Reveal', demonstration: 'Demo', proof: 'Proof', benefit: 'Benefit', routine: 'Routine', cta: 'Call to action' };
 
 export function StoryboardFlow({ projectId }: { projectId: string }) {
-  const active = useCallback((v: View | null) => !v || !v.storyboard || v.storyboard.status === 'generating', []);
+  const active = useCallback(
+    (v: View | null) => !v || !v.storyboard || v.storyboard.status === 'generating' || v.storyboard.scenes.some((s) => s.regeneration?.status === 'pending' || s.regeneration?.status === 'active'),
+    [],
+  );
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [edit, setEdit] = useState<{ id: string; spokenLine: string; overlayText: string } | null>(null);
   const [regen, setRegen] = useState<{ id: string; text: string } | null>(null);
@@ -316,9 +325,11 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
                 <div className="ak-between"><span className="ak-index">{String(s.position + 1).padStart(2, '0')} · {PURPOSE[s.purpose] ?? s.purpose}</span><span className="ak-index">{(s.durationMs / 1000).toFixed(1)}s</span></div>
                 {s.overlayText ? <p style={{ fontWeight: 600 }}>{s.overlayText}</p> : null}
                 {s.spokenLine ? <p className="ak-muted">“{s.spokenLine}”</p> : null}
+                {s.regeneration?.status === 'pending' || s.regeneration?.status === 'active' ? <p className="ak-small ak-muted" role="status">Redrawing this frame…</p> : null}
+                {s.regeneration?.status === 'failed' ? <p className="ak-small ak-error" role="status">{s.regeneration.detail ?? 'We couldn’t redraw this frame.'}</p> : null}
                 <div className="ak-row">
                   <button className="ak-textbtn" disabled={s.locked} onClick={() => setEdit({ id: s.id, spokenLine: s.spokenLine ?? '', overlayText: s.overlayText ?? '' })}>Edit words</button>
-                  <button className="ak-textbtn" disabled={s.locked} onClick={() => setRegen({ id: s.id, text: '' })}>Change picture</button>
+                  <button className="ak-textbtn" disabled={s.locked || s.regeneration?.status === 'pending' || s.regeneration?.status === 'active'} onClick={() => setRegen({ id: s.id, text: '' })}>Change picture</button>
                   <button className="ak-textbtn" onClick={() => call(`/api/scenes/${s.id}/lock`, { projectId, locked: !s.locked })}>{s.locked ? 'Unlock' : 'Lock'}</button>
                 </div>
               </figcaption>
@@ -344,7 +355,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
               <li>Exports for TikTok, Reels (9:16), Feed (4:5) and Square</li>
               <li>Your real packaging, checked scene by scene</li>
               <li>Every claim checked against FDA cosmetic rules</li>
-              <li>If it fails our quality check twice, you’re refunded automatically</li>
+              <li>If we can’t deliver an ad that passes our quality checks, you’re refunded automatically</li>
             </ul>
           </div>
           <div style={{ marginTop: 24 }}>
@@ -377,7 +388,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
               <textarea className="ak-textarea" maxLength={200} placeholder="e.g. warmer morning light, marble counter" value={regen.text} onChange={(e) => setRegen({ ...regen, text: e.target.value })} />
             </label>
             {err ? <p className="ak-error" role="alert">{err}</p> : null}
-            <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Redrawing…' : 'Redraw'}</Button>
+            <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Sending…' : 'Redraw'}</Button>
           </form>
         ) : null}
       </Sheet>
@@ -432,7 +443,8 @@ export function CheckoutFlow({ projectId, publishableKey }: { projectId: string;
 /* ───────────── P9 · Production ───────────── */
 
 export function ProduceFlow({ projectId }: { projectId: string }) {
-  const active = useCallback((v: View | null) => !v || (v.project.state !== 'COMPLETE' && !['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION', 'CANCELLED'].includes(v.project.state)), []);
+  // A production paused by a provider outage resumes by itself, so keep polling it.
+  const active = useCallback((v: View | null) => !v || v.project.paused || (v.project.state !== 'COMPLETE' && !['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION', 'CANCELLED'].includes(v.project.state)), []);
   const { data: v, error, resume } = useProject(projectId, active);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
@@ -440,15 +452,17 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
   }, [v?.project.state, projectId]);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
   const waitingPayment = v.project.state === 'STORYBOARD_READY';
-  const failed = ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION'].includes(v.project.state);
+  const paused = v.project.paused;
+  const failed = !paused && ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION'].includes(v.project.state);
   return (
-    <Shell step={4} title={failed ? 'We couldn’t finish this ad' : waitingPayment ? 'Confirming your payment' : 'Making your ad'} sub={failed ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
+    <Shell step={4} title={failed ? 'We couldn’t finish this ad' : paused ? 'Your ad is paused' : waitingPayment ? 'Confirming your payment' : 'Making your ad'} sub={failed ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
       {waitingPayment ? <p className="ak-muted">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
+      {paused ? <Banner tone="warn">{v.project.failureReason ?? 'A production service is temporarily unavailable. We’ll resume automatically.'}</Banner> : null}
       {failed ? (
         <div className="ak-stack">
           <Banner tone="risk">{v.project.failureReason ?? 'Something went wrong while producing your ad.'}</Banner>
-          {v.project.state === 'REFUNDED' ? <p>Your payment has been refunded in full. It can take 5–10 days to appear on your statement.</p> : <p>You haven’t lost anything — your credit was returned.</p>}
-          {v.project.state === 'PROVIDER_FAILED' ? (
+          {v.project.state === 'REFUNDED' ? <p>Your payment has been refunded in full. It can take 5–10 days to appear on your statement.</p> : v.purchase?.status === 'paid' && v.project.state === 'PROVIDER_FAILED' ? <p>Your payment is being refunded automatically.</p> : <p>You haven’t lost anything — your credit was returned.</p>}
+          {v.project.state === 'PROVIDER_FAILED' && v.purchase?.status !== 'paid' ? (
             <Button onClick={async () => { setErr(null); try { await api(`/api/projects/${projectId}/retry`, {}); resume(); } catch (e) { setErr((e as Error).message); } }}>Try again</Button>
           ) : null}
           {err ? <p className="ak-error">{err}</p> : null}
