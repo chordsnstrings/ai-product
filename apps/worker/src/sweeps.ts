@@ -1,6 +1,10 @@
 import { withSystem } from '@arkiv/db';
+import { sendEmail } from '@arkiv/email';
+import { env } from '@arkiv/shared';
 import {
   duePurges,
+  evaluateCanaries,
+  expiredFlagAlerts,
   expireOffers,
   refreshRiskFlags,
   retireSupersededRates,
@@ -58,6 +62,25 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   // A scheduled rate-table version replaces its predecessor at its effective time (plan 05 §9); pricing already
   // uses the newest version in effect, this keeps the table's statuses truthful.
   'retire-superseded-rates': { cron: '*/5 * * * *', run: () => withSystem((tx) => retireSupersededRates(tx)) },
+  // Canary rollout guard (plan 05 §11): automatic, audited rollback when the canary arm's QA first-pass or
+  // claim-block rate regresses against stable.
+  // Flags past expiry alert their owner once a day until removed or extended (plan 05 §20).
+  'flag-expiry': {
+    cron: '0 13 * * *',
+    run: async () => {
+      const alerts = await withSystem((tx) => expiredFlagAlerts(tx));
+      const day = new Date().toISOString().slice(0, 10);
+      let sent = 0;
+      for (const a of alerts) {
+        for (const to of a.to) {
+          const r = await sendEmail('flag_expired', to, { flagKey: a.key, owner: a.owner, expiredOn: a.expiredAt.slice(0, 10), url: `${env().ADMIN_URL}/flags` }, { idempotencyKey: `flag-expired:${a.key}:${to}:${day}` });
+          if (r.status !== 'duplicate') sent++;
+        }
+      }
+      return sent;
+    },
+  },
+  'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
   'sync-integrations': {
     cron: '0 */6 * * *',

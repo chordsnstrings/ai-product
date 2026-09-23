@@ -13,6 +13,7 @@ export * from './ledger';
 export * from './rates';
 export * from './cost-governor';
 export * from './model-gateway';
+export * from './canary';
 export * from './storage';
 export * from './assets';
 export * from './uploads';

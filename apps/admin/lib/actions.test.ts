@@ -83,6 +83,39 @@ describe('offer.create (plan 05 §6)', () => {
   });
 });
 
+describe('route.update and eval.run (plan 05 §10–11)', () => {
+  it('requires a passing golden-set eval for exactly the proposed template × model', async () => {
+    const eng = await staff(['ENGINEERING']);
+    const task = 'creative_director.storyboard';
+    try {
+      await expect(act(eng, 'route.update', { task: 'tts.voiceover', rolloutPct: '5', model: 'speech-2.8-turbo', reason: 'cheaper voice' })).rejects.toThrow(/No golden dataset covers tts\.voiceover/);
+      await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing compliance\.scan eval for creative_director\.storyboard · claude-opus-5-5 · storyboard@1\.1\.0/);
+      // A passing run of the dataset for some other candidate doesn't count.
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@9.9.9', 'claude-opus-5-5', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing/);
+      // eval.run records the run for the candidate and queues it for the worker.
+      await act(eng, 'eval.run', { task, promptVersion: 'storyboard@1.1.0', reason: 'candidate' });
+      const [run] = await ownerPool()`select id, task, model, prompt_version, dataset, status from eval_runs where prompt_version = 'storyboard@1.1.0'`;
+      expect(run).toMatchObject({ task, model: 'claude-opus-5-5', dataset: 'compliance.scan', status: 'queued' });
+      expect(await ownerPool()`select 1 from ops_commands where kind = 'eval.run' and payload->>'evalRunId' = ${run!.id as string}`).toHaveLength(1);
+      await ownerPool()`update eval_runs set status = 'passed' where id = ${run!.id}`; // the worker's verdict
+      const r = await act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' });
+      expect(r.message).toMatch(/Canary at 5%/);
+      const [c] = await ownerPool()`select canary from model_routes where task = ${task}`;
+      expect(c!.canary).toMatchObject({ model: 'claude-opus-5-5', promptVersion: 'storyboard@1.1.0', pct: 5, evalRunId: run!.id });
+      const started = (c!.canary as { startedAt: string }).startedAt;
+      await act(eng, 'route.update', { task, rolloutPct: '25', promptVersion: 'storyboard@1.1.0', reason: 'step up' });
+      const [c2] = await ownerPool()`select canary from model_routes where task = ${task}`;
+      expect(c2!.canary).toMatchObject({ pct: 25, startedAt: started }); // same candidate keeps its window
+      await act(eng, 'route.update', { task, rolloutPct: '0', reason: 'end canary' });
+      const [c3] = await ownerPool()`select canary from model_routes where task = ${task}`;
+      expect(c3!.canary).toBeNull();
+    } finally {
+      await ownerPool()`update model_routes set canary = null`;
+    }
+  });
+});
+
 describe('privacy.create (plan 05 §21)', () => {
   it('accepts every kind the console offers', async () => {
     const c = await staff(['COMPLIANCE']);

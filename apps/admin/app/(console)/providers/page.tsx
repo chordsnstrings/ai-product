@@ -19,6 +19,11 @@ export default async function Providers() {
                      from provider_jobs where created_at > now() - interval '24 hours' group by provider`,
     drift: await tx`select task, model, model_version_returned, count(*)::int as n, max(created_at) as last from provider_jobs
                     where model_version_returned is not null and model_version_returned <> model and created_at > now() - interval '7 days' group by 1, 2, 3`,
+    arms: await tx`select task, arm, count(*)::int as n, count(*) filter (where status = 'failed')::int as failed from provider_jobs
+                   where arm is not null and created_at > now() - interval '7 days' group by 1, 2 order by 1, 2`,
+    // The audit log is SUPER_ADMIN-only (§0.4); others see a rollback as the canary disappearing from the route.
+    rollbacks: staffCan(s.roles, 'audit.read') ? await tx`select target_id, reason, at from admin_audit_log where action = 'route.canary_rollback' order by at desc limit 10` : [],
+    kills: await tx`select key, enabled from feature_flags where key like 'kill.provider.%' order by key`,
   }));
   const keys: [string, string, boolean][] = [
     ['anthropic', 'ANTHROPIC_API_KEY', !!e.ANTHROPIC_API_KEY],
@@ -40,11 +45,12 @@ export default async function Providers() {
         ])} />
       </Section>
       {staffCan(s.roles, 'routes.manage') ? (
-        <Section title="Change a route (canary → 100% needs a passing eval and, at 100%, a second approver)">
+        <Section title="Change a route (needs a passing eval for this template × model; 100% also needs a second approver)">
           <div className="ak-panel" style={{ maxWidth: 560 }}>
+            <p className="ak-small ak-muted">Canary traffic is split per workspace; each call records its arm. A canary whose QA first-pass or claim-block rate regresses is rolled back automatically. 0% ends the canary.</p>
             <ActForm action="route.update" submit="🔐 Apply" fields={[
               { name: 'task', label: 'Task', type: 'select', options: d0.routes.map((r) => r.task as string) },
-              { name: 'rolloutPct', label: 'Rollout %', type: 'select', options: ['5', '25', '100'] },
+              { name: 'rolloutPct', label: 'Rollout %', type: 'select', options: ['5', '25', '100', '0'] },
               { name: 'model', label: 'Model (optional)' },
               { name: 'promptVersion', label: 'Prompt version (optional)' },
               { name: 'reason', label: 'Reason', required: true },
@@ -52,6 +58,11 @@ export default async function Providers() {
           </div>
         </Section>
       ) : null}
+      <Section title="Rollout arms (7d)">
+        <Table head={['Task', 'Arm', 'Calls', 'Failed']} rows={d0.arms.map((a) => [<Mono key="t">{a.task as string}</Mono>, a.arm as string, a.n as number, a.failed as number])} empty="No calls in 7 days." />
+        <Table head={['Rolled back', 'Route', 'Why']} rows={d0.rollbacks.map((r) => [dt(r.at), <Mono key="t">{r.target_id as string}</Mono>, r.reason as string])} empty="No automatic canary rollbacks." />
+      </Section>
+      <Section title="Provider kill switches"><Table head={['Switch', 'State']} rows={d0.kills.map((k) => [<Mono key="k">{k.key as string}</Mono>, k.enabled ? <span key="s" className="ak-chip ak-chip--risk">ON — calls refused</span> : 'off'])} empty="—" /><p className="ak-small ak-muted">Toggle in Flags & config (🔐).</p></Section>
       <Section title="Version drift (7d)"><Table head={['Task', 'Pinned', 'Returned', 'Calls', 'Last']} rows={d0.drift.map((x) => [x.task as string, <Mono key="p">{x.model as string}</Mono>, <Mono key="r">{x.model_version_returned as string}</Mono>, x.n as number, dt(x.last)])} empty="No drift detected." /></Section>
     </Page>
   );

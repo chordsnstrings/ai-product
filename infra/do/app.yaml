@@ -25,6 +25,7 @@ databases:
 
 envs:
   - { key: NODE_ENV, value: production, scope: RUN_AND_BUILD_TIME }
+  - { key: APP_ENV, value: production, scope: RUN_TIME }   # per-environment feature flag values (a staging app sets "staging")
   - { key: APP_URL, value: https://arkiv.app, scope: RUN_AND_BUILD_TIME }
   - { key: ADMIN_URL, value: https://admin.arkiv.app, scope: RUN_AND_BUILD_TIME }
   - { key: PROVIDERS_MODE, value: live, scope: RUN_TIME }

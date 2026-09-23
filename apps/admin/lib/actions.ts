@@ -15,6 +15,7 @@ import {
   decideApproval,
   endBreakGlass,
   enqueue,
+  evalDatasetFor,
   GOLDEN,
   normalizeAllowKey,
   QA_VERDICT_KEY,
@@ -246,23 +247,64 @@ export const ACTIONS = {
   'route.update': a({
     perm: 'routes.manage',
     reauth: true,
-    schema: z.object({ task: z.string(), rolloutPct: z.number().int().min(0).max(100), model: z.string().optional(), promptVersion: z.string().optional(), reason }),
+    schema: z.object({ task: z.string(), rolloutPct: z.coerce.number().int().min(0).max(100), model: z.string().optional(), promptVersion: z.string().optional(), reason }),
     run: async (s, i) => {
-      const dataset = GOLDEN[i.task] ? i.task : i.task.startsWith('compliance') || i.task.startsWith('creative_director') ? 'compliance.scan' : null;
-      if (dataset) {
-        const [ev] = await withAdmin((tx) => tx`select status from eval_runs where dataset = ${dataset} and created_at > now() - interval '7 days' order by created_at desc limit 1`);
-        if (ev?.status !== 'passed') throw new DomainError('CONFLICT', `Run a passing ${dataset} eval (within 7 days) before changing this route.`);
+      const [cur] = await withAdmin((tx) => tx`select * from model_routes where task = ${i.task}`);
+      if (!cur) throw new DomainError('NOT_FOUND', 'Unknown route');
+      if (i.rolloutPct === 0) {
+        // Ending a canary is a rollback: never gated.
+        return withAdmin(async (tx) => {
+          await tx`update model_routes set canary = null, updated_at = now() where task = ${i.task}`;
+          await audit(tx, s, 'route.canary_cleared', { type: 'route', id: i.task }, { reason: i.reason, before: { canary: cur.canary } });
+          return { message: 'Canary ended; all traffic on the stable route.' };
+        });
       }
-      if (i.rolloutPct >= 100) return requestOrExecute(s, 'route.promote', { task: i.task, rolloutPct: i.rolloutPct, model: i.model ?? null, promptVersion: i.promptVersion ?? null }, i.reason);
+      // Plan 05 §10: a passing golden-set eval for exactly this template × model within 7 days.
+      const model = i.model ?? (cur.model as string);
+      const promptVersion = i.promptVersion ?? (cur.prompt_version as string);
+      const dataset = evalDatasetFor(i.task);
+      if (!dataset) throw new DomainError('CONFLICT', `No golden dataset covers ${i.task} yet. Add one (plan 05 §11) before changing this route.`);
+      const [ev] = await withAdmin((tx) => tx`select id from eval_runs where task = ${i.task} and model = ${model} and prompt_version = ${promptVersion} and dataset = ${dataset}
+                                                 and status = 'passed' and created_at > now() - interval '7 days' limit 1`);
+      if (!ev) throw new DomainError('CONFLICT', `Run a passing ${dataset} eval for ${i.task} · ${model} · ${promptVersion} (within 7 days) before changing this route.`);
+      if (i.rolloutPct >= 100) return requestOrExecute(s, 'route.promote', { task: i.task, rolloutPct: i.rolloutPct, model, promptVersion }, i.reason);
       return withAdmin(async (tx) => {
-        const [b] = await tx`select * from model_routes where task = ${i.task}`;
-        await tx`update model_routes set canary = ${tx.json({ model: i.model ?? b?.model, promptVersion: i.promptVersion ?? b?.prompt_version, pct: i.rolloutPct })}, updated_at = now() where task = ${i.task}`;
-        await audit(tx, s, 'route.canary', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: i });
-        return { message: `Canary at ${i.rolloutPct}%` };
+        const prev = cur.canary as { model?: string; promptVersion?: string; startedAt?: string } | null;
+        // Moving the same candidate from 5% to 25% keeps its comparison window; a new candidate starts afresh.
+        const sameCandidate = prev && prev.model === model && prev.promptVersion === promptVersion;
+        const canary = { model, promptVersion, pct: i.rolloutPct, startedAt: sameCandidate && prev.startedAt ? prev.startedAt : new Date().toISOString(), evalRunId: ev.id };
+        await tx`update model_routes set canary = ${tx.json(canary)}, updated_at = now() where task = ${i.task}`;
+        await audit(tx, s, 'route.canary', { type: 'route', id: i.task }, { reason: i.reason, before: cur, after: canary });
+        return { message: `Canary at ${i.rolloutPct}%. It rolls back automatically if QA first-pass or claim-block rates regress.` };
       });
     },
   }),
-  'eval.run': a({ perm: 'evals.run', schema: z.object({ dataset: z.string(), reason: z.string().default('manual eval run') }), run: async (s, i) => { if (!GOLDEN[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset'); const [r] = await withAdmin((tx) => tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${i.dataset}, 'rules', 'deterministic', ${i.dataset}, 'queued', ${s.staffId}) returning id`); await requestOpsCommand(s, 'eval.run', { dataset: i.dataset, evalRunId: r!.id }, i.reason); return { message: 'Eval queued; results appear in a few seconds.' }; } }),
+  // A dataset alone runs the rules baseline; with a task, the run is recorded for that template × model and is
+  // what route.update requires before a change (plan 05 §10–11).
+  'eval.run': a({
+    perm: 'evals.run',
+    schema: z.object({ dataset: z.string().optional(), task: z.string().optional(), model: z.string().optional(), promptVersion: z.string().optional(), reason: z.string().default('manual eval run') }),
+    run: async (s, i) => {
+      let task: string;
+      let model: string;
+      let promptVersion: string;
+      let dataset: string;
+      if (i.task) {
+        const [route] = await withAdmin((tx) => tx`select model, prompt_version from model_routes where task = ${i.task!}`);
+        if (!route) throw new DomainError('NOT_FOUND', 'Unknown route');
+        const ds = evalDatasetFor(i.task);
+        if (!ds) throw new DomainError('CONFLICT', `No golden dataset covers ${i.task} yet.`);
+        if (i.dataset && i.dataset !== ds) throw new DomainError('INVALID', `${i.task} is gated by the ${ds} dataset.`);
+        [task, model, promptVersion, dataset] = [i.task, i.model || (route.model as string), i.promptVersion || (route.prompt_version as string), ds];
+      } else {
+        if (!i.dataset || !GOLDEN[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset');
+        [task, model, promptVersion, dataset] = [i.dataset, 'deterministic', 'rules', i.dataset];
+      }
+      const [r] = await withAdmin((tx) => tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, ${promptVersion}, ${model}, ${dataset}, 'queued', ${s.staffId}) returning id`);
+      await requestOpsCommand(s, 'eval.run', { dataset, evalRunId: r!.id, task, model, promptVersion }, i.reason);
+      return { message: `Eval queued for ${task} · ${model} · ${promptVersion}; results appear in a few seconds.` };
+    },
+  }),
 
   /* ── Jobs ── */
   // SUPPORT may retry no-spend queues only; requestOpsCommand enforces the queue check.

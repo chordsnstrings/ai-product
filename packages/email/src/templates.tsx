@@ -64,6 +64,7 @@ export interface TemplateMap {
   new_concept: { productName: string; url: string; hook: string };
   export_ready: { url: string; workspaceName: string };
   refund_issued: { amount: string; description: string; note: string | null; url: string };
+  flag_expired: { flagKey: string; owner: string; expiredOn: string; url: string };
   integration_disconnected: { provider: string; url: string; workspaceName: string };
   claim_review_result: { claim: string; outcome: string; url: string };
   cancellation_confirmed: { planName: string; endsOn: string; exportUrl: string };
@@ -200,6 +201,21 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T]): Built
             <Meta rows={[['Amount', m.amount], ['For', m.description], ['Arrives', 'in 5–10 business days, depending on your bank']]} />
             {m.note ? <P>{m.note}</P> : null}
             <Cta href={m.url}>View billing</Cta>
+          </Layout>
+        ),
+      };
+    }
+    case 'flag_expired': {
+      const m = d as TemplateMap['flag_expired'];
+      return {
+        subject: `Feature flag past expiry: ${m.flagKey}`,
+        stream: 'transactional',
+        element: (
+          <Layout preview={`${m.flagKey} expired on ${m.expiredOn}. It now evaluates as off.`} label="Staff · Feature flags">
+            <H>A flag you own has expired</H>
+            <Meta rows={[['Flag', m.flagKey], ['Owner', m.owner], ['Expired', m.expiredOn]]} />
+            <P>Expired flags evaluate as off. Remove the flag from code, or extend its expiry if it is still needed.</P>
+            <Cta href={m.url}>Open flags</Cta>
           </Layout>
         ),
       };

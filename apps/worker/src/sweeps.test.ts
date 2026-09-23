@@ -16,6 +16,20 @@ describe('schedules', () => {
   });
 });
 
+describe('flag-expiry sweep (plan 05 §20)', () => {
+  it('emails the owner of an expired flag once a day', async () => {
+    await ownerPool()`insert into feature_flags (key, description, owner, kind, expires_at) values ('test.expired', 'x', 'owner@arkiv.test', 'boolean', now() - interval '1 day')`;
+    try {
+      expect(await sweeps['flag-expiry']!.run()).toBe(1);
+      expect(await sweeps['flag-expiry']!.run()).toBe(0);
+      const mails = await ownerPool()`select to_email, template from email_log where template = 'flag_expired'`;
+      expect(mails).toEqual([{ to_email: 'owner@arkiv.test', template: 'flag_expired' }]);
+    } finally {
+      await ownerPool()`delete from feature_flags where key = 'test.expired'`;
+    }
+  });
+});
+
 describe('risk-flags sweep (plan 05 §17)', () => {
   it('flags each workspace only on its own evidence', async () => {
     // Regression: the sweep runs as the system role (policies see every tenant) and the indicator queries had
