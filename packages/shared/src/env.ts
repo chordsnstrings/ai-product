@@ -24,7 +24,7 @@ const EnvSchema = z.object({
   ARK_API_KEY: z.string().optional(),
   ARK_BASE_URL: z.string().default('https://ark.ap-southeast.bytepluses.com/api/v3'),
   SEEDREAM_MODEL: z.string().default('dola-seedream-5-0-pro-260628'),
-  SEEDANCE_MODEL: z.string().default('dreamina-seedance-2-0-260128'),
+  SEEDANCE_MODEL: z.string().default('dreamina-seedance-2-5-260628'),
   MINIMAX_API_KEY: z.string().optional(),
   MINIMAX_BASE_URL: z.string().default('https://api.minimax.io'),
   MINIMAX_TTS_MODEL: z.string().default('speech-2.8-hd'),
