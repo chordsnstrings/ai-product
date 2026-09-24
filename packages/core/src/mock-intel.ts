@@ -192,7 +192,8 @@ export function mockThemes(snippets: string[]) {
   const themes = buckets
     .map(([re, label, signalType]) => {
       const idx = snippets.map((s, i) => (re.test(s) ? i : -1)).filter((i) => i >= 0);
-      return { label, signalType, intensity: Math.min(1, idx.length / Math.max(3, snippets.length / 3)), snippetIndexes: idx.slice(0, 5), count: idx.length };
+      const sentiment = signalType === 'objection' ? -0.6 : signalType === 'benefit' ? 0.7 : signalType === 'question' ? 0 : idx.some((i) => /love|great|lovely|nice/i.test(snippets[i]!)) ? 0.4 : -0.2;
+      return { label, signalType, intensity: Math.min(1, idx.length / Math.max(3, snippets.length / 3)), sentiment, snippetIndexes: idx.slice(0, 5), matchIndexes: idx, count: idx.length };
     })
     .filter((t) => t.count > 0)
     .sort((a, b) => b.count - a.count)

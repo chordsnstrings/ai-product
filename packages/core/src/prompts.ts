@@ -42,7 +42,10 @@ export const STORYBOARD_SYSTEM = `You are the Creative Director turning one appr
 
 export const THEMES_SYSTEM = `You cluster raw customer reviews and comments about one skincare product into creative themes.
 Return concise labels (e.g. "sticky texture", "pills under makeup", "price concern"). Themes describe what
-customers say — they are never evidence that the product works.`;
+customers say — they are never evidence that the product works.
+- "matchIndexes" lists every snippet index that expresses the theme; "snippetIndexes" up to 5 representative ones.
+- "sentiment" is the polarity of what customers say in the theme (-1 negative … 1 positive); "intensity" how
+  strongly they say it.`;
 
 export const GENOME_SYSTEM = `You annotate a short-form skincare ad with a fixed creative taxonomy. Choose the closest controlled values;
 do not invent new ones. Record the exact hook text if present.`;

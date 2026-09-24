@@ -26,7 +26,7 @@ export default async function Product({ params, searchParams }: { params: Promis
     const facts = await currentFacts(tx, skuId);
     const [fp] = await tx`select * from visual_fingerprints where sku_id = ${skuId} and active`;
     const fps = await tx`select version, created_at from visual_fingerprints where sku_id = ${skuId} order by version desc`;
-    const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence desc limit 20`;
+    const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
     const assets = await tx`select id, kind, mime, created_at, source from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
     const imported = await tx`select id, genome, platform_refs, created_at from creatives where sku_id = ${skuId} and origin = 'imported' order by created_at desc limit 20`;
@@ -137,15 +137,19 @@ export default async function Product({ params, searchParams }: { params: Promis
             <p className="ak-small ak-muted">{d.signalCount} customer comments imported. Themes guide hooks and angles; customer words are never turned into product claims.</p>
             {d.themes.length === 0 ? <p className="ak-muted">No themes yet.</p> : d.themes.map((t) => (
               <div key={t.id as string} className="ak-index-row">
-                <span>{t.label as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>{t.signal_type as string} · {t.trend as string}</span></span>
-                <span className="ak-index">{Math.round(Number(t.prevalence) * 100)}% · n={t.sample_size as number}</span>
+                <span>{t.label as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>
+                  {t.signal_type as string} · {t.trend as string}
+                  {t.sentiment != null ? ` · ${Number(t.sentiment) > 0.2 ? 'positive' : Number(t.sentiment) < -0.2 ? 'negative' : 'mixed'}` : ''}
+                  {Number(t.relevance) < 0.5 ? ' · mostly not about the product' : ''}
+                </span></span>
+                <span className="ak-index" title="Recency-weighted share of comments · comments in this theme">{Math.round(Number(t.prevalence) * 100)}% · n={t.sample_size as number}</span>
               </div>
             ))}
           </div>
           {canEdit ? (
             <div className="ak-panel">
               <h2 className="ak-label">Import reviews</h2>
-              <ActionForm slug={slug} action="reviews" extra={{ skuId }} submit="Import" fields={[{ name: 'text', label: 'Paste reviews (one per line or a CSV export)', type: 'textarea', required: true, hint: 'Names and emails are removed automatically.' }]} />
+              <ActionForm slug={slug} action="reviews" extra={{ skuId }} submit="Import" fields={[{ name: 'text', label: 'Paste reviews (one per line or a CSV export)', type: 'textarea', required: true, hint: 'We keep only the review text, rating and date. Reviewer names are hashed, other columns are dropped, and emails, phone numbers and addresses in the text are removed.' }]} />
             </div>
           ) : null}
         </div>

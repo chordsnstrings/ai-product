@@ -87,7 +87,9 @@ export const ThemeSet = z.object({
         label: z.string().max(60),
         signalType: z.enum(['objection', 'benefit', 'question', 'usage', 'sentiment']),
         intensity: z.number().min(0).max(1),
-        snippetIndexes: z.array(z.number().int().min(0)).max(5),
+        sentiment: z.number().min(-1).max(1).describe('Polarity of what customers say in this theme: -1 negative … 1 positive'),
+        snippetIndexes: z.array(z.number().int().min(0)).max(5).describe('Up to 5 representative snippets'),
+        matchIndexes: z.array(z.number().int().min(0)).max(400).describe('Every snippet that expresses this theme'),
       }),
     )
     .max(10),
