@@ -1,14 +1,20 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import { PLANS, PRICES, formatUsd } from '@arkiv/shared';
+import { globalTx } from '@arkiv/db';
+import { publicOneOffPrices } from '@arkiv/core';
+import { PLANS, formatUsd } from '@arkiv/shared';
 import { MarketingShell } from '@/components/marketing';
 import { currentUser } from '@/lib/session';
 
 export const metadata: Metadata = { title: 'Pricing' };
 
-/** P11 plans (plan 04 L9/L16): Growth recommended in the centre, per-test value anchored to the real $29. */
+/**
+ * P11 plans (plan 04 L9/L16): Growth recommended in the centre, per-test value anchored to the standalone price a
+ * visitor can actually pay today (the live offer definition, never a constant).
+ */
 export default async function Pricing() {
   const user = await currentUser();
+  const oneOff = await globalTx((tx) => publicOneOffPrices(tx));
   const order = ['LAUNCH', 'GROWTH', 'SCALE'] as const;
   return (
     <div className="ak-marketing">
@@ -37,7 +43,7 @@ export default async function Pricing() {
                   <table className="ak-meta">
                     <tbody>
                       <tr><th>Creative Tests</th><td>{p.creativeTestsPerMonth} per month</td></tr>
-                      <tr><th>Per test</th><td>≈ {formatUsd(per, 0)} <span className="ak-small ak-muted">vs {formatUsd(PRICES.STANDALONE, 0)} standalone</span></td></tr>
+                      <tr><th>Per test</th><td>≈ {formatUsd(per, 0)} <span className="ak-small ak-muted">vs {formatUsd(oneOff.standaloneMicros, 0)} standalone</span></td></tr>
                       <tr><th>Brands</th><td>{p.brands}</td></tr>
                       <tr><th>Team</th><td>{p.members} people</td></tr>
                     </tbody>
@@ -52,7 +58,12 @@ export default async function Pricing() {
           <style>{`@media (min-width:900px){.ak-grid-3 .ak-card{order:0 !important}}`}</style>
           <table className="ak-meta" style={{ marginTop: 24 }}>
             <tbody>
-              <tr><th>Try one ad first</th><td>{formatUsd(PRICES.STANDALONE, 0)} one-time, no subscription. New brands get an intro price of {formatUsd(PRICES.TASTE, 0)} for 60 minutes after their first storyboard.</td></tr>
+              <tr><th>Try one ad first</th><td>
+                {formatUsd(oneOff.standaloneMicros, 0)} one-time, no subscription.
+                {oneOff.tasteMicros != null && oneOff.tasteMicros < oneOff.standaloneMicros
+                  ? ` New brands get an intro price of ${formatUsd(oneOff.tasteMicros, 0)} for ${oneOff.tasteWindowMinutes} minutes after their first storyboard.`
+                  : null}
+              </td></tr>
               <tr><th>Cancel</th><td>Online in Settings → Billing. Your plan runs to the end of the period; your archive is kept for 90 days.</td></tr>
               <tr><th>Taxes</th><td>Sales tax, where it applies, is shown before you pay.</td></tr>
             </tbody>

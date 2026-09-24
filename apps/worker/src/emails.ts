@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
-import { env, formatTime, formatUsd, PLANS, PRICES, type PlanCode, type RiskIndicator } from '@arkiv/shared';
+import { env, formatTime, formatUsd, PLANS, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { isTemplateName, quietHoursDelay, sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import { assetUrl, enqueue, Queues, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
+import { assetUrl, enqueue, Queues, quoteAfterOffer, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -96,13 +96,19 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
                                                    from offers o join projects p on p.id = o.project_id join skus s on s.id = p.sku_id where o.id = ${data.offerId as string}`);
       if (o && o.status === 'active') {
         const endsAt = formatTime(o.expires_at as string);
-        await sendRecovery('offer_ending', o.project_id as string, { productName: o.name, url: recoveryUrl(app, o.project_id as string, 'offer_ending'), endsAt, price: formatUsd(Number(o.price_micros), 0), regular: formatUsd(Number(o.reference_price_micros ?? 29_000_000), 0) });
+        // "After that": the price this workspace actually pays once the offer ends (its live standalone or
+        // next-offer version), never a constant anchor.
+        const after = await withTenant(ws, (tx) => quoteAfterOffer(tx));
+        await sendRecovery('offer_ending', o.project_id as string, { productName: o.name, url: recoveryUrl(app, o.project_id as string, 'offer_ending'), endsAt, price: formatUsd(Number(o.price_micros), 0), regular: formatUsd(after.priceMicros, 0) });
       }
       return;
     }
     case 'storyboard_saved': {
       const [p] = await withTenant(ws, (tx) => tx`select s.name from projects p join skus s on s.id = p.sku_id where p.id = ${data.projectId as string}`);
-      if (p) await sendRecovery('storyboard_saved', data.projectId as string, { productName: p.name, url: recoveryUrl(app, data.projectId as string, 'storyboard_saved'), standalonePrice: formatUsd(PRICES.STANDALONE, 0) });
+      if (p) {
+        const price = await withTenant(ws, (tx) => quoteAfterOffer(tx)); // the standing price, whatever intro offer runs
+        await sendRecovery('storyboard_saved', data.projectId as string, { productName: p.name, url: recoveryUrl(app, data.projectId as string, 'storyboard_saved'), standalonePrice: formatUsd(price.priceMicros, 0) });
+      }
       return;
     }
     case 'new_concept': {

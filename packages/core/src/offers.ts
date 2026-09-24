@@ -264,6 +264,18 @@ export async function currentQuote(tx: Tx): Promise<PriceQuote> {
   if (o) {
     const q = await quoteFromOffer(tx, o);
     if (q.status === 'active' && o.status === 'active') return q;
+  }
+  return quoteAfterOffer(tx);
+}
+
+/**
+ * The price this workspace pays once its Taste offer (if any) is over: what its next-eligible-offer policy names,
+ * else the live standalone version. It is what "after that" and "regular" copy must state (plan 04 L9: an anchor
+ * references a live, purchasable price, never a constant).
+ */
+export async function quoteAfterOffer(tx: Tx): Promise<PriceQuote> {
+  const [o] = await tx`select definition_code from offers where type = 'TASTE'`;
+  if (o) {
     const def = await definition(tx, o.definition_code as string);
     const next = (def?.next_offer_policy as { next?: string } | null)?.next;
     if (next) {
@@ -274,16 +286,46 @@ export async function currentQuote(tx: Tx): Promise<PriceQuote> {
   return standaloneQuote(tx);
 }
 
+/** Facts of a first-time visitor (no workspace yet): what the public pricing page quotes. */
+const VISITOR_FACTS: OfferFacts = { never_purchased: true, new_workspace: true, workspace_age_days: 0, state: 'ACTIVE_FREE', plan: null, source_page: null };
+
+/**
+ * The one-off prices a first-time visitor can actually buy today, from the live offer definitions (plan 04 L9, §3):
+ * the standalone price, and the intro Taste price and window when a Taste version is live (null otherwise).
+ */
+export async function publicOneOffPrices(tx: Tx): Promise<{ standaloneMicros: Micros; tasteMicros: Micros | null; tasteWindowMinutes: number | null }> {
+  const standalone = await standaloneQuote(tx, VISITOR_FACTS);
+  const taste = await resolveDefinition(tx, 'TASTE', VISITOR_FACTS);
+  return {
+    standaloneMicros: standalone.priceMicros,
+    tasteMicros: taste ? Number(taste.price_micros) : null,
+    tasteWindowMinutes: taste ? Number(taste.window_minutes ?? OFFER_RULES.TASTE_WINDOW_MINUTES) : null,
+  };
+}
+
 /** Mark the Taste offer redeemed once payment is confirmed. */
 export async function redeemOffer(tx: Tx, ctx: TenantContext, offerId: string) {
   const [o] = await tx`update offers set status = 'redeemed' where id = ${offerId} and status in ('active','expired') returning id`;
   if (o) await emit(tx, ctx, 'OFFER_REDEEMED', { type: 'offer', id: offerId }, {});
 }
 
-/** Sweep: flip expired offers (display is already time-based; this keeps the table truthful). */
+/**
+ * Sweep: flip expired offers (display is already time-based; this keeps the table truthful) and record each one as
+ * OFFER_EXPIRED (§36, Appendix B), for the tenant it belongs to. Expired offers remain expired (§7).
+ */
 export async function expireOffers(tx: Tx): Promise<number> {
   const r = await tx`update offers set status = 'expired' where status = 'active' and expires_at is not null
-                     and expires_at <= now() returning id, workspace_id`;
+                     and expires_at <= now() returning id, workspace_id, definition_code, variant, expires_at, project_id`;
+  for (const o of r) {
+    await emit(
+      tx,
+      { workspaceId: o.workspace_id as string, actor: { kind: 'system', id: 'sweep-offers' } },
+      'OFFER_EXPIRED',
+      { type: 'offer', id: o.id as string },
+      { code: o.definition_code as string, variant: (o.variant as string | null) ?? null, expiresAt: o.expires_at },
+      { projectId: (o.project_id as string | null) ?? null },
+    );
+  }
   return r.count;
 }
 

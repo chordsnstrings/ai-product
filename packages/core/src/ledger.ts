@@ -58,14 +58,18 @@ export async function append(
       ${actorString(ctx)}, ${e.idempotencyKey})
     on conflict (workspace_id, idempotency_key) do nothing
     returning id`;
-  if (rows.length && e.type !== 'PROVIDER_COST_RECORDED') {
+  // Every entry is mirrored as a domain event (§36: the minimum events include CREDIT_* and PROVIDER_COST_RECORDED,
+  // with actor, time, tenant, object IDs and schema version). A provider cost is about its provider job.
+  if (rows.length) {
+    const subject =
+      e.type === 'PROVIDER_COST_RECORDED' && e.providerJobId ? { type: 'provider_job', id: e.providerJobId } : e.projectId ? { type: 'project', id: e.projectId } : null;
     await emit(
       tx,
       ctx,
       e.type,
-      e.projectId ? { type: 'project', id: e.projectId } : null,
+      subject,
       { unit: e.unit, amount: e.amount, ledgerType: e.type, reference: e.reference, periodKey: e.periodKey ?? null },
-      { ledgerEntryId: rows[0]!.id as string, authorizationId: e.authorizationId, providerJobId: e.providerJobId },
+      { ledgerEntryId: rows[0]!.id as string, authorizationId: e.authorizationId, providerJobId: e.providerJobId, projectId: e.projectId },
     );
   }
   return rows.length > 0;

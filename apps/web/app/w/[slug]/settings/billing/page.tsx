@@ -1,8 +1,8 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
-import { periodUsage, setting } from '@arkiv/core';
-import { formatUsd, PLANS, PRICES, type PlanCode } from '@arkiv/shared';
+import { periodUsage, quoteAfterOffer, setting } from '@arkiv/core';
+import { formatUsd, PLANS, type PlanCode } from '@arkiv/shared';
 import { Banner, LinkButton } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
 import { CancelFlow } from '@/components/cancel-flow';
@@ -21,7 +21,9 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
     const usage = sub ? await periodUsage(tx, new Date(sub.current_period_start as string).toISOString().slice(0, 10)) : null;
     const purchases = await tx`select p.kind, p.amount_micros, p.status, p.paid_at, p.created_at, s.name from purchases p left join projects pr on pr.id = p.project_id left join skus s on s.id = pr.sku_id where p.status in ('paid','refunded') order by p.created_at desc limit 20`;
     const [cust] = await tx`select customer_id from stripe_customers where workspace_id = ${w.ctx.workspaceId}`;
-    return { sub, usage, purchases, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
+    // The per-ad price this workspace would pay today (its live standalone version), not a constant.
+    const perAd = sub ? null : (await quoteAfterOffer(tx)).priceMicros;
+    return { sub, usage, purchases, perAd, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
   });
   const canManage = ['OWNER', 'ADMIN'].includes(w.ctx.role);
   const plan = d.sub ? PLANS[d.sub.plan_code as PlanCode] : null;
@@ -30,7 +32,7 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
       {!d.sub ? (
         <div className="ak-panel">
           <h2 className="ak-label">No plan</h2>
-          <p>You’re paying per ad ({formatUsd(PRICES.STANDALONE, 0)} each). Choose a plan to test continuously.</p>
+          <p>You’re paying per ad ({formatUsd(d.perAd ?? 0, 0)} each). Choose a plan to test continuously.</p>
           {canManage ? <LinkButton href="/app/plan">See plans</LinkButton> : null}
         </div>
       ) : (
