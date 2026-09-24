@@ -126,6 +126,17 @@ export const ProductionMode = [
 ] as const; // §23
 export type ProductionMode = (typeof ProductionMode)[number];
 
+/** §8: what the merchant wants the ad to do. Recommendations default to performance. */
+export const CreativeGoal = ['performance', 'ugc_review', 'explainer', 'premium'] as const;
+export type CreativeGoal = (typeof CreativeGoal)[number];
+/** The brief each goal gives the Creative Director (the context packet's objective). */
+export const CREATIVE_GOAL_BRIEF: Record<CreativeGoal, string> = {
+  performance: 'Sell the product: find the next creative test most likely to lift sales for this SKU',
+  ugc_review: 'A UGC-style review: a customer-voiced, handheld, native-feeling ad (a generated person never claims to be a real customer)',
+  explainer: 'Explain the product: what it is, how to use it and where it fits in a routine',
+  premium: 'Premium creative: polished studio visuals that make the product look high-end',
+};
+
 export const WorkspaceState = [
   'PROVISIONAL',
   'ACTIVE_FREE',

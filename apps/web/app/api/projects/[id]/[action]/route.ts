@@ -2,13 +2,13 @@ import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
 import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
-import { DomainError } from '@arkiv/shared';
+import { CreativeGoal, DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
 
 /**
  * Funnel actions on a project:
- *   concepts  – "Try 3 more" (limited for provisional workspaces). Queued: 202 + the batch to poll for
+ *   concepts  – "Try 3 more" (limited for provisional workspaces), optionally for a new §8 goal. Queued: 202 + the batch to poll for
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
  *   retry     – retry a failed production (entitlement was returned on failure)
@@ -32,8 +32,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       // Drafting runs in the worker (§34); the funnel polls GET /api/projects/:id until the batch appears.
       // A checkout still open for the storyboard being replaced is closed once the change is made (a payment
       // already made is still honoured for the storyboard it was for).
+      // Optional §8 goal (sell / UGC review / explainer / premium): the new ideas are drafted for it.
+      const { goal } = await body(req, z.object({ goal: z.enum(CreativeGoal).optional() }));
       const r = await withTenant(a.ctx.workspaceId, async (tx) => {
-        const out = await requestConcepts(tx, a.ctx, id);
+        const out = await requestConcepts(tx, a.ctx, id, { goal });
         if (!a.provisional) await closeOpenCheckouts(tx, a.ctx, id);
         return out;
       });

@@ -167,6 +167,34 @@ describe('free-preview SKU cap under concurrency (plan 02 §4, standard §48)', 
   });
 });
 
+describe('creative goal (standard §8)', () => {
+  it('defaults to performance; a chosen goal is recorded and drafts the next ideas for it', async () => {
+    const { t, ctx, skuId, projectId } = await preview();
+    await analyzeProduct(ctx, skuId, projectId);
+    const [p0] = await ownerPool()`select goal from projects where id = ${projectId}`;
+    expect(p0!.goal).toBe('performance');
+    expect((await withTenant(t.workspaceId, (tx) => buildContext(tx, skuId, { projectId }))).packet.goal).toBe('performance');
+    // Weekly recommendations (no project) stay performance-oriented.
+    expect((await withTenant(t.workspaceId, (tx) => buildContext(tx, skuId))).packet.goal).toBe('performance');
+
+    const r = await withTenant(t.workspaceId, (tx) => requestConcepts(tx, ctx, projectId, { goal: 'ugc_review' }));
+    expect(r).toMatchObject({ batch: 2, replayed: false });
+    // A second goal while that batch is still drafting is refused rather than silently ignored.
+    await expect(withTenant(t.workspaceId, (tx) => requestConcepts(tx, ctx, projectId, { goal: 'premium' }))).rejects.toMatchObject({ code: 'CONFLICT' });
+    const [p1] = await ownerPool()`select goal from projects where id = ${projectId}`;
+    expect(p1!.goal).toBe('ugc_review');
+    const [ev] = await ownerPool()`select payload from events where type = 'PROJECT_GOAL_CHANGED' and subject_id = ${projectId}`;
+    expect(ev!.payload).toMatchObject({ from: 'performance', to: 'ugc_review', batch: 2 });
+    const packet = (await withTenant(t.workspaceId, (tx) => buildContext(tx, skuId, { projectId }))).packet;
+    expect(packet.objective).toMatch(/UGC-style review/);
+
+    await generateConceptBatch(ctx, projectId, 2);
+    const [lead] = await ownerPool()`select proposal, is_pick from concepts where project_id = ${projectId} and batch = 2 order by idx limit 1`;
+    expect(lead!.is_pick).toBe(true);
+    expect(lead!.proposal).toMatchObject({ treatment: 'RAW_UGC' });
+  }, 60_000);
+});
+
 describe('bounded free exploration for signed-in, non-paying workspaces (standard §5)', () => {
   it('limits new products a day, concept batches and storyboards per product, with a friendly prompt', async () => {
     const { t, ctx, skuId, projectId } = await preview();

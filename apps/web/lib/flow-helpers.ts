@@ -18,3 +18,29 @@ export function disputeChoices(key: string, candidates: { value: string; source:
   }
   return [...seen.values()];
 }
+
+/** Where a concept's customer tension came from (plan 03 P5 "Customer tension (with source if from reviews)"). */
+const TENSION_SOURCE: Record<string, string> = { reviews: 'From your reviews', category_pattern: 'Category pattern', product_page: 'From your product page', performance: 'From your results' };
+export const tensionSourceWords = (source: string): string => TENSION_SOURCE[source] ?? 'Our read';
+
+const usd = (micros: number) => `$${(micros / 1_000_000).toFixed(micros % 1_000_000 === 0 ? 0 : 2)}`;
+
+/**
+ * A concept's estimated entitlement in the customer's terms (standard §13): one Creative Test for a subscriber;
+ * in the funnel, the intro ad while its offer is live, otherwise the one-time price.
+ */
+export function conceptCost(projectKind: string, quote: { kind: string; status: string; priceMicros: number }): string {
+  if (projectKind === 'creative_test') return '1 Creative Test';
+  if (quote.kind === 'taste' && quote.status === 'active') return `Included in your ${usd(quote.priceMicros)} intro ad`;
+  return `One ad · ${usd(quote.priceMicros)} one-time`;
+}
+
+/**
+ * P9 while the project waits at the storyboard (plan 03 P8 edge cases): only a checkout that is actually pending
+ * (or just paid) earns "Confirming your payment"; with none, the customer belongs back on the storyboard where the
+ * offer still is. Null when the project is not waiting for a payment at all.
+ */
+export function awaitingPayment(v: { project: { state: string; resumable: boolean }; purchase: { status: string } | null }): 'confirming' | 'unpaid' | null {
+  if (v.project.state !== 'STORYBOARD_READY' || v.project.resumable) return null;
+  return v.purchase?.status === 'pending' || v.purchase?.status === 'paid' ? 'confirming' : 'unpaid';
+}

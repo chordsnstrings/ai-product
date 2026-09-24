@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, FREE_EXPLORATION, PROVISIONAL, newId, type ProjectState } from '@arkiv/shared';
+import { DomainError, FREE_EXPLORATION, PROVISIONAL, newId, type CreativeGoal, type ProjectState } from '@arkiv/shared';
 import { notePromptInjection, recordAbuseSignal } from './abuse';
 import { allowKey, isAllowlisted } from './allowlist';
 import { assetBytes, saveAsset } from './assets';
@@ -590,22 +590,30 @@ const CONCEPT_REQUEST_STALE_MINUTES = 10;
  * asynchronous and resumable); the concepts are drafted by the `generate-concepts` job. Limited on provisional
  * workspaces to bound free COGS. A double-click or second tab gets the request already in flight.
  */
-export async function requestConcepts(tx: Tx, ctx: TenantContext, projectId: string): Promise<{ batch: number; subjectId: string; replayed: boolean }> {
+export async function requestConcepts(tx: Tx, ctx: TenantContext, projectId: string, opts: { goal?: CreativeGoal } = {}): Promise<{ batch: number; subjectId: string; replayed: boolean }> {
   assertCan(ctx, 'sku.edit');
-  const [p] = await tx`select sku_id, state from projects where id = ${projectId} for update`;
+  const [p] = await tx`select sku_id, state, goal from projects where id = ${projectId} for update`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
   if (!['CONCEPTS_READY', 'CONCEPT_SELECTED', 'STORYBOARD_READY'].includes(p.state as string))
     throw new DomainError('CONFLICT', p.state === 'STORYBOARD_APPROVED' || isTerminal(p.state as ProjectState) ? 'This ad is already in production.' : 'Your first ideas are still being drafted.');
   const [pending] = await tx`select step_key from progress_steps where subject_id = ${projectId} and step_key like 'concepts.batch.%'
                              and status in ('pending','active') and started_at > now() - make_interval(mins => ${CONCEPT_REQUEST_STALE_MINUTES})
                              order by started_at desc limit 1`;
-  if (pending) return { batch: Number(String(pending.step_key).split('.').pop()), subjectId: projectId, replayed: true };
+  if (pending) {
+    if (opts.goal && opts.goal !== p.goal) throw new DomainError('CONFLICT', 'We’re still drafting your last ideas. Change the goal once they’re ready.');
+    return { batch: Number(String(pending.step_key).split('.').pop()), subjectId: projectId, replayed: true };
+  }
   const [b] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
   const batch = Number(b!.b) + 1;
   if (ctx.workspaceState === 'PROVISIONAL' && batch > 1 + PROVISIONAL.MAX_CONCEPT_REGENERATIONS)
     throw new DomainError('PAYMENT_REQUIRED', 'Save your work to see more ideas.', { needsAccount: true });
   if (ctx.workspaceState !== 'PROVISIONAL' && isFreeTier(ctx) && batch > FREE_EXPLORATION.CONCEPT_BATCHES_PER_SKU)
     throw new DomainError('PAYMENT_REQUIRED', 'Produce this one to keep exploring — you’ve seen all the free ideas for this product.', { freeLimit: 'concept_batches' });
+  // §8: a new goal applies to this batch and the ones after it (the worker reads it from the project).
+  if (opts.goal && opts.goal !== p.goal) {
+    await tx`update projects set goal = ${opts.goal} where id = ${projectId} and workspace_id = ${ctx.workspaceId}`;
+    await emit(tx, ctx, 'PROJECT_GOAL_CHANGED', { type: 'project', id: projectId }, { from: p.goal as string, to: opts.goal, batch });
+  }
   await tx`insert into progress_steps (workspace_id, subject_id, step_key, label, status, started_at, position)
            values (${ctx.workspaceId}, ${projectId}, ${conceptStepKey(batch)}, 'Drafting three more ideas', 'pending', now(), 0)
            on conflict (workspace_id, subject_id, step_key) do update set status = 'pending', detail = null, started_at = now(), completed_at = null`;

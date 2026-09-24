@@ -27,7 +27,7 @@ import {
   type QaReport,
 } from '@arkiv/core';
 import type { ProjectState } from '@arkiv/shared';
-import { PLANS, type WorkspaceState } from '@arkiv/shared';
+import { CreativeGoal, PLANS, PROVISIONAL, type WorkspaceState } from '@arkiv/shared';
 
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
 export async function projectView(workspaceId: string, projectId: string) {
@@ -158,6 +158,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** The size/shade this ad is for (§42). */
         variantId: (p.sku_variant_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
+        /** §8 creative goal the ideas are drafted for (performance by default). */
+        goal: ((CreativeGoal as readonly string[]).includes(p.goal as string) ? p.goal : 'performance') as CreativeGoal,
         deliveryHeld,
       },
       sku: {
@@ -202,6 +204,8 @@ export async function projectView(workspaceId: string, projectId: string) {
       bonus: { offered: quote.kind === 'taste' && bonusHooks(quote.bonus) > 0, exports: bonusExports, pending: bonusPending, failed: !!p.bonus_hook_failed_at },
       disclosure,
       /** The plan the delivery continuation points to (plan 04 L17). */
+      /** How long an unsaved preview is kept (plan 02 §2.1), for truthful "saved" copy. */
+      previewDays: PROVISIONAL.TTL_DAYS,
       upsell: { growthName: PLANS.GROWTH.name, growthTestsPerMonth: PLANS.GROWTH.creativeTestsPerMonth },
     };
   });

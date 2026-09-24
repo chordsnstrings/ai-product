@@ -8,7 +8,8 @@ import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
 import { EmailLinkForm } from './email-link';
 import { registerPasskey } from './profile';
 import type { ProjectView } from '@/lib/views';
-import { disputeChoices } from '@/lib/flow-helpers';
+import { awaitingPayment, conceptCost, disputeChoices, tensionSourceWords } from '@/lib/flow-helpers';
+import type { CreativeGoal } from '@arkiv/shared';
 
 type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null; passkeyPrompt?: boolean } };
 
@@ -500,7 +501,13 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                 </div>
               ) : null}
               {failed ? null : ready ? (
-                <LinkButton href={`/concepts/${projectId}`} block id="cta" onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
+                <>
+                  <LinkButton href={`/concepts/${projectId}`} block id="cta" onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
+                  {/* Plan 04 L19: the next step stays in reach on a phone once the button scrolls away. */}
+                  <StickyCta watchId="cta" mobileOnly>
+                    <LinkButton href={`/concepts/${projectId}`} block onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
+                  </StickyCta>
+                </>
               ) : v.project.state === 'NEEDS_USER_ACTION' ? (
                 <Banner tone="warn">{v.project.failureReason ?? 'We need a clearer photo of the product. Add one to continue.'}</Banner>
               ) : conceptsDrafting ? null : (
@@ -518,6 +525,32 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
 
 const RISK: Record<string, string> = { lower_risk: 'Safer bet', adjacent: 'Adjacent', exploratory: 'Exploratory' };
 
+/** §8 goals, in customer words; the default is performance ("sell the product"). */
+const GOALS: { value: CreativeGoal; label: string }[] = [
+  { value: 'performance', label: 'Sell the product' },
+  { value: 'ugc_review', label: 'UGC-style review' },
+  { value: 'explainer', label: 'Explain the product' },
+  { value: 'premium', label: 'Premium look' },
+];
+
+type ConceptCard = View['concepts'][number];
+
+/** P5 "Why this?" (M6, standard §13): the evidence and the gap behind a recommended idea, one click away. */
+export function WhyThis({ c, pickReason }: { c: Pick<ConceptCard, 'whyNow' | 'customerTension' | 'customerTensionSource' | 'primaryVariable' | 'angle' | 'ifTestFails'>; pickReason?: string | null }) {
+  return (
+    <details className="ak-small">
+      <summary>Why this?</summary>
+      <dl className="ak-meta" style={{ marginTop: 8 }}>
+        <dt>Why now</dt><dd>{c.whyNow}</dd>
+        <dt>Evidence</dt><dd>{tensionSourceWords(c.customerTensionSource)}: {c.customerTension}</dd>
+        <dt>The gap</dt><dd>It changes only the {String(c.primaryVariable).replace(/_/g, ' ')} to test the {String(c.angle).replace(/_/g, ' ').toLowerCase()} angle.</dd>
+        {pickReason ? <><dt>Our pick</dt><dd>{pickReason}</dd></> : null}
+        <dt>If it loses</dt><dd>{c.ifTestFails}</dd>
+      </dl>
+    </details>
+  );
+}
+
 export function ConceptsFlow({ projectId, providers }: { projectId: string; providers: { google: boolean; apple: boolean } }) {
   const active = useCallback(
     (v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED' || v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active',
@@ -525,6 +558,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
   );
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [gate, setGate] = useState<string | null>(null);
+  const [gateDismissed, setGateDismissed] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   if (!v) return error ? <PreviewUnavailable projectId={projectId} error={error} /> : <Loading />;
@@ -541,12 +575,12 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
       setErr((e as Error).message);
     }
   }
-  async function more() {
-    setBusy('more');
+  async function more(goal?: CreativeGoal) {
+    setBusy(goal ? `goal:${goal}` : 'more');
     setErr(null);
     try {
       // Queued server-side (202); polling picks up the new batch or the request's failure.
-      await api(`/api/projects/${projectId}/concepts`, {});
+      await api(`/api/projects/${projectId}/concepts`, goal ? { goal } : {});
       resume();
       refresh();
     } catch (e) {
@@ -555,19 +589,38 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
     setBusy(null);
   }
   const drafting = v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active';
+  const pick = v.concepts.find((c) => c.isPick) ?? v.concepts[0];
+  const cost = conceptCost(v.project.kind, v.quote);
 
   return (
-    <Shell step={2} title="Three ways to test this product" sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.</>}>
+    // While the save gate is open, steps 1–2 are done (plan 04 L4: we ask for the account after the value).
+    <Shell
+      step={gate ? 3 : 2}
+      title="Three ways to test this product"
+      sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.{v.access.provisional ? null : ' Your concepts are saved in your archive.'}</>}
+    >
       {err ? <Banner tone="risk">{err}</Banner> : null}
+      {gateDismissed && v.access.provisional ? <Banner>Your ideas are kept in this browser for {v.previewDays} days. Save your work to keep them in your archive.</Banner> : null}
       {v.conceptRequest?.status === 'failed' && v.conceptRequest.batch > (v.concepts[0]?.batch ?? 0) ? <Banner tone="warn">{v.conceptRequest.detail ?? 'We couldn’t draft more ideas just now. Please try again.'}</Banner> : null}
+      {v.concepts.length ? (
+        <fieldset className="ak-row" style={{ flexWrap: 'wrap', gap: 8, border: 0, padding: 0, margin: '0 0 24px' }} disabled={!!busy || drafting}>
+          <legend className="ak-label" style={{ marginBottom: 8 }}>What should this ad do?</legend>
+          {GOALS.map((g) => (
+            <label key={g.value} className={`ak-chip${v.project.goal === g.value ? ' ak-chip--dec' : ''}`} style={{ cursor: 'pointer' }}>
+              <input type="radio" name="goal" value={g.value} className="ak-sr" checked={v.project.goal === g.value} onChange={() => void more(g.value)} />
+              {g.label}
+            </label>
+          ))}
+        </fieldset>
+      ) : null}
       {v.concepts.length === 0 ? (
         <p className="ak-muted">Drafting ideas…</p>
       ) : (
-        <div className="ak-grid-3">
+        <div className="ak-carousel" role="list" aria-label="Ad ideas">
           {v.concepts.map((c) => {
             const hooks = c.hookOptions ?? [];
             return (
-              <article key={c.id} className={`ak-card${c.isPick ? ' ak-card--pick' : ''}`}>
+              <article key={c.id} role="listitem" className={`ak-card${c.isPick ? ' ak-card--pick' : ''}`}>
                 <div className="ak-between">
                   <span className="ak-index">{c.idx}</span>
                   {c.isPick ? <span className="ak-chip ak-chip--dec">Our pick</span> : <span className="ak-chip">{RISK[c.riskProfile] ?? ''}</span>}
@@ -575,12 +628,16 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
                 <h2 className="ak-h2 ak-serif" style={{ marginTop: 16 }}>“{hooks[0]}”</h2>
                 <p className="ak-small">{c.hypothesis}</p>
                 <dl className="ak-meta ak-small">
+                  <dt>Customer tension</dt>
+                  <dd>{c.customerTension} <span className="ak-chip" style={{ marginLeft: 4 }}>{tensionSourceWords(c.customerTensionSource)}</span></dd>
                   <dt>Tests</dt><dd>{String(c.primaryVariable)}</dd>
                   <dt>Angle</dt><dd>{String(c.angle).replace(/_/g, ' ')}</dd>
                   <dt>Proof</dt><dd>{String(c.proofMechanism).replace(/_/g, ' ')}</dd>
+                  <dt>Production style</dt><dd className="ak-mono">{String(c.treatment).replace(/_/g, ' ').toLowerCase()}</dd>
                   <dt>You’ll learn</dt><dd>{c.expectedLearning}</dd>
+                  <dt>Cost</dt><dd>{cost}{c.estimatedGenerationClass === 'premium' ? <span className="ak-chip" style={{ marginLeft: 4 }}>Premium production</span> : null}</dd>
                 </dl>
-                {c.isPick && c.pickReason ? <p className="ak-small ak-muted">Why: {c.pickReason}</p> : null}
+                <WhyThis c={c} pickReason={c.isPick ? c.pickReason : null} />
                 <Button block variant={c.isPick ? 'primary' : 'secondary'} disabled={!!busy} onClick={() => choose(c.id)} id={c.isPick ? 'cta' : undefined}>
                   {busy === c.id ? 'Building storyboard…' : 'Build this storyboard'}
                 </Button>
@@ -591,10 +648,26 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
       )}
       {v.concepts.length ? (
         <p style={{ marginTop: 24 }}>
-          <button className="ak-textbtn" disabled={!!busy || drafting} onClick={more} aria-live="polite">{busy === 'more' || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
+          <button className="ak-textbtn" disabled={!!busy || drafting} onClick={() => void more()} aria-live="polite">{busy === 'more' || busy?.startsWith('goal:') || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
         </p>
       ) : null}
-      <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} providers={providers} />
+      {pick ? (
+        <StickyCta watchId="cta" mobileOnly>
+          <Button block disabled={!!busy} onClick={() => choose(pick.id)}>Build the storyboard for idea {pick.idx}</Button>
+        </StickyCta>
+      ) : null}
+      <SaveGate
+        open={!!gate}
+        onOpenChange={(o) => {
+          if (!o) {
+            setGate(null);
+            setGateDismissed(true);
+          }
+        }}
+        next={`/concepts/${projectId}`}
+        productName={v.sku.name}
+        providers={providers}
+      />
     </Shell>
   );
 }
@@ -767,10 +840,57 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
 
 /* ───────────── P8 · Checkout ───────────── */
 
-export function CheckoutFlow({ projectId, publishableKey }: { projectId: string; publishableKey: string | null }) {
+/**
+ * P8 order summary (plan 03 P8, plan 04 L11/L12, standard §8): personalised to the SKU and the chosen idea — what
+ * will be produced, the storyboard, the price and when the offer ends — beside a sealed payment panel.
+ */
+function OrderSummary({ v, priceMicros }: { v: View; priceMicros: number }) {
+  const sb = v.storyboard;
+  const frames = (sb?.scenes ?? []).filter((s) => s.frameUrl);
+  const taste = v.quote.kind === 'taste' && v.quote.status === 'active';
+  return (
+    <section className="ak-panel ak-stack" aria-labelledby="order-summary" style={{ gap: 12 }}>
+      <h2 className="ak-label" id="order-summary">Your order</h2>
+      <div className="ak-row" style={{ alignItems: 'start', gap: 16 }}>
+        {frames[0] ? <div className="ak-well ak-well--916" style={{ width: 72, flex: 'none' }}><img src={frames[0].frameUrl!} alt={`First scene of your storyboard for ${v.sku.name}`} /></div> : null}
+        <div className="ak-stack" style={{ gap: 4 }}>
+          <p style={{ margin: 0 }}><strong>{v.sku.name}</strong> <span className="ak-index">No. {String(v.sku.catalogueNo).padStart(3, '0')}</span></p>
+          {sb?.hook ? <p className="ak-small ak-serif" style={{ margin: 0 }}>“{sb.hook}”</p> : null}
+          <p className="ak-small ak-muted" style={{ margin: 0 }}>15-second ad · one-time {usd(priceMicros)}</p>
+        </div>
+      </div>
+      {frames.length > 1 ? (
+        <div className="ak-row" style={{ gap: 6, overflowX: 'auto' }} aria-label="Your storyboard">
+          {frames.map((s) => (
+            <div key={s.id} className="ak-well ak-well--916" style={{ width: 40, flex: 'none' }}><img src={s.frameUrl!} alt="" /></div>
+          ))}
+        </div>
+      ) : null}
+      <ul className="ak-small" style={{ margin: 0, paddingLeft: 18 }}>
+        <li>One finished 15-second ad with voiceover and captions</li>
+        <li>Exports for TikTok, Reels (9:16), Feed (4:5) and Square</li>
+        {taste && v.bonus.offered ? <li>+ An alternate opening hook, free with this price</li> : null}
+      </ul>
+      <dl className="ak-meta ak-small" style={{ margin: 0 }}>
+        <dt>Ad</dt>
+        <dd>
+          {usd(priceMicros)}
+          {taste && v.quote.referencePriceMicros ? <span className="ak-strike ak-muted" style={{ marginLeft: 8 }}>{usd(v.quote.referencePriceMicros)}</span> : null}
+        </dd>
+        <dt>Tax</dt><dd>Calculated by Stripe from your address, before you pay</dd>
+        <dt>Total</dt><dd>{usd(priceMicros)} + any tax · one-time, no subscription</dd>
+      </dl>
+      {taste && v.quote.expiresAt ? <OfferExpiry expiresAt={v.quote.expiresAt} serverNow={v.serverNow} /> : null}
+    </section>
+  );
+}
+
+export function CheckoutFlow({ projectId, publishableKey, supportEmail }: { projectId: string; publishableKey: string | null; supportEmail?: string | null }) {
   const [state, setState] = useState<{ clientSecret: string | null; url: string | null; quote: { priceMicros: number } } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [Embedded, setEmbedded] = useState<React.ComponentType<{ clientSecret: string; pk: string }> | null>(null);
+  // The storyboard and the SKU stay in view while paying (plan 04 L11): one read of the project view.
+  const view = usePoll<View>(`/api/projects/${projectId}`, 60_000, false);
   useEffect(() => {
     let alive = true;
     api<{ clientSecret: string | null; url: string | null; quote: { priceMicros: number } }>(`/api/projects/${projectId}/checkout`, {})
@@ -793,18 +913,31 @@ export function CheckoutFlow({ projectId, publishableKey }: { projectId: string;
       alive = false;
     };
   }, [projectId, publishableKey]);
+  const v = view.data;
   return (
-    <Shell step={4} title="Checkout" sub="One-time payment. No subscription is created.">
-      {err ? (
-        <>
-          <Banner tone="risk">{err}</Banner>
-          <LinkButton variant="secondary" href={`/storyboard/${projectId}`}>Back to storyboard</LinkButton>
-        </>
-      ) : Embedded && state?.clientSecret && publishableKey ? (
-        <Embedded clientSecret={state.clientSecret} pk={publishableKey} />
-      ) : (
-        <p className="ak-muted">Opening secure checkout…</p>
-      )}
+    <Shell step={4} title="Make your ad" sub="Step 4 of 4: we’ve done the strategy; this produces it. One-time payment — no subscription is created.">
+      <div className="ak-grid-2" style={{ alignItems: 'start' }}>
+        <div className="ak-stack">
+          {v ? <OrderSummary v={v} priceMicros={state?.quote.priceMicros ?? v.quote.priceMicros} /> : null}
+          {/* Closing checkout keeps the offer: back to the storyboard, where it is still live (plan 03 P8). */}
+          <p className="ak-small" style={{ margin: 0 }}><a href={`/storyboard/${projectId}`}>← Back to storyboard</a></p>
+        </div>
+        <div className="ak-sealed ak-stack" style={{ gap: 12 }}>
+          {err ? (
+            <>
+              <Banner tone="risk">{err}</Banner>
+              <LinkButton variant="secondary" href={`/storyboard/${projectId}`}>Back to storyboard</LinkButton>
+            </>
+          ) : Embedded && state?.clientSecret && publishableKey ? (
+            <Embedded clientSecret={state.clientSecret} pk={publishableKey} />
+          ) : (
+            <p className="ak-muted">Opening secure checkout…</p>
+          )}
+          <p className="ak-small ak-muted" style={{ margin: 0 }}>
+            Payments by Stripe · we never see your card.{supportEmail ? <> Questions? <a href={`mailto:${supportEmail}`}>{supportEmail}</a></> : null}
+          </p>
+        </div>
+      </div>
     </Shell>
   );
 }
@@ -815,17 +948,31 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
   // A production paused by a provider outage resumes by itself, so keep polling it.
   const active = useCallback((v: View | null) => !v || v.project.paused || (v.project.state !== 'COMPLETE' && !STOPPED.includes(v.project.state)), []);
   const { data: v, error, resume } = useProject(projectId, active);
+  // "Payment confirmed, starting production" once the wait for Stripe ends (plan 03 P8).
+  const [confirmed, setConfirmed] = useState(false);
+  const wasWaiting = useRef(false);
+  const wait = v ? awaitingPayment(v) : null;
   useEffect(() => {
     if (v?.project.state === 'COMPLETE') window.location.replace(`/deliver/${projectId}`);
   }, [v?.project.state, projectId]);
+  useEffect(() => {
+    if (wait === 'unpaid') window.location.replace(`/storyboard/${projectId}`);
+    if (wait === 'confirming') wasWaiting.current = true;
+    else if (wasWaiting.current && v && PRODUCING.includes(v.project.state)) {
+      wasWaiting.current = false;
+      setConfirmed(true);
+    }
+  }, [wait, v, projectId]);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
-  const waitingPayment = v.project.state === 'STORYBOARD_READY' && !v.project.resumable;
+  if (wait === 'unpaid') return <Loading />;
+  const waitingPayment = wait === 'confirming';
   const paused = v.project.paused;
   const stopped = !paused && STOPPED.includes(v.project.state);
   const title = v.project.state === 'BLOCKED_COMPLIANCE' ? 'One line needs changing' : v.project.state === 'CANCELLED' ? 'This ad was cancelled' : stopped ? 'We couldn’t finish this ad' : paused ? 'Your ad is queued' : waitingPayment ? 'Confirming your payment' : 'Making your ad';
   return (
     <Shell step={4} title={title} sub={stopped ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
-      {waitingPayment ? <p className="ak-muted">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
+      {waitingPayment ? <p className="ak-muted" role="status">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
+      {confirmed && !waitingPayment ? <Banner>Payment confirmed, starting production.</Banner> : null}
       {v.project.resumable ? (
         <div className="ak-stack">
           <p>Your storyboard is open for the change. You won’t be charged again.</p>
@@ -1233,8 +1380,8 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
           <FactUpdate projectId={projectId} update={v.project.factUpdate} />
           <div className="ak-stack ak-after-play" data-show={after.show || !primary}>
             <h2 className="ak-label">Download</h2>
-            {v.exports.map((e) => (
-              <a key={e.assetId} className="ak-index-row" href={e.download} download onClick={earn}>
+            {v.exports.map((e, i) => (
+              <a key={e.assetId} id={i === 0 ? 'cta' : undefined} className="ak-index-row" href={e.download} download onClick={earn}>
                 <span>{ASPECT[e.aspect] ?? e.aspect}</span>
                 <span className="ak-index">MP4 ↓</span>
               </a>
@@ -1286,6 +1433,11 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
             </ol>
             {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
             {earned || !primary ? <Continuation v={v} /> : null}
+            {primary ? (
+              <StickyCta watchId="cta" mobileOnly>
+                <a className="ak-btn ak-btn--block" href={primary.download} download onClick={earn}>Download · {ASPECT[primary.aspect] ?? primary.aspect}</a>
+              </StickyCta>
+            ) : null}
             <PasskeyPrompt v={v} />
           </div>
         </div>
