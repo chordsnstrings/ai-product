@@ -6,10 +6,10 @@ import { emit } from './events';
 import { classifySubscriptionEvents, mrrTotals, subscriptionEvents } from './finance';
 import { adjust, type LedgerUnit } from './ledger';
 import { restoreFromScheduledPurge, RISK_PLAYBOOKS } from './lifecycle';
-import { enqueue, Queues } from './outbox';
+import { enqueue, queuePolicy, Queues } from './outbox';
 import { retryProduction } from './production';
 import { transition } from './projects';
-import { retireSupersededRates } from './rates';
+import { estimate as priceEstimate, loadRates, retireSupersededRates, type CostLine, type Estimate } from './rates';
 import { planQuota, setting } from './settings';
 import { randomToken, sha256, transitionWorkspace } from './workspaces';
 
@@ -59,6 +59,8 @@ const P = {
   'providers.manage': ['SUPER_ADMIN', 'ENGINEERING', 'OPS'],
   'routes.manage': ['SUPER_ADMIN', 'ENGINEERING'],
   'evals.run': ['SUPER_ADMIN', 'ENGINEERING'],
+  // Add cases to golden datasets (plan 05 §11, §13): engineering, and the reviewers whose disagreements feed them.
+  'golden.add': ['SUPER_ADMIN', 'ENGINEERING', 'COMPLIANCE', 'OPS'],
   'jobs.read': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'ENGINEERING'],
   // SUPPORT may only re-run failed jobs that make no provider spend (§0.2). Cancelling, dead-letter redrive
   // and any retry that can spend stay with OPS.
@@ -620,7 +622,58 @@ export async function cancelProjectBeforeDispatch(s: Staff, workspaceId: string,
  */
 export const NO_SPEND_QUEUES: ReadonlySet<string> = new Set([Queues.sendEmail, Queues.syncIntegration, Queues.computeResults, Queues.processUpload, Queues.exportWorkspace]);
 
-export type OpsCommandKind = 'job.retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks' | 'stripe.reconcile';
+export type OpsCommandKind = 'job.retry' | 'job.bulk_retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks' | 'stripe.reconcile';
+
+export interface RetryEstimate {
+  /** What the retried work would cost at today's published rates. */
+  micros: number;
+  /** What it was estimated at when it was first authorized. */
+  previousMicros: number;
+  /** A rate table the work is priced on changed since then (plan 05 §12 "re-estimates cost first"). */
+  rateChanged: boolean;
+  authorizationId: string;
+  rateVersions: Record<string, number>;
+}
+
+/**
+ * A fresh Cost Governor estimate for re-running a spending job: the lines its last authorization (for the job's
+ * project, or its SKU's analysis) was priced on, re-priced at the rates in effect now. Null when the job never
+ * reached an authorization — the handler then authorizes from scratch, within its class ceiling. Admin role; the
+ * workspace comes from the job and scopes every read.
+ */
+export async function jobRetryEstimate(tx: Tx, data: { workspaceId?: unknown; projectId?: unknown; skuId?: unknown }): Promise<RetryEstimate | null> {
+  const ws = typeof data.workspaceId === 'string' ? data.workspaceId : null;
+  const projectId = typeof data.projectId === 'string' ? data.projectId : null;
+  const skuId = typeof data.skuId === 'string' ? data.skuId : null;
+  if (!ws || (!projectId && !skuId)) return null;
+  const [a] = await tx`select id, estimate from cost_authorizations
+                       where workspace_id = ${ws} and (project_id = ${projectId} or (${skuId}::text is not null and estimate->>'skuId' = ${skuId}))
+                       order by created_at desc limit 1`;
+  const prev = a?.estimate as (Estimate & { lines?: { line: CostLine }[] }) | undefined;
+  const lines = prev?.lines?.map((l) => l.line).filter(Boolean) ?? [];
+  if (!a || !lines.length) return null;
+  let fresh: Estimate;
+  try {
+    fresh = priceEstimate(await loadRates(tx), lines);
+  } catch {
+    throw new DomainError('CONFLICT', 'This job’s work can’t be priced at current rates (a rate table is missing). Publish the rate before retrying.');
+  }
+  const rateChanged = Object.entries(fresh.rateVersions).some(([k, v]) => prev?.rateVersions?.[k] !== v);
+  return { micros: fresh.totalMicros, previousMicros: Number(prev?.totalMicros ?? 0), rateChanged, authorizationId: a.id as string, rateVersions: fresh.rateVersions };
+}
+
+/** A pg-boss job's payload, when the console can see the queue tables (the worker grants read access). */
+async function jobData(tx: Tx, queue: string, jobId: string): Promise<Record<string, unknown> | null> {
+  if (!/^[0-9a-f-]{36}$/i.test(jobId)) return null;
+  try {
+    const [j] = await tx.savepoint((sp) => sp`select data from pgboss.job where name = ${queue} and id = ${jobId}::uuid`);
+    return (j?.data as Record<string, unknown> | undefined) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const usd = (micros: number) => `$${(micros / 1e6).toFixed(2)}`;
 
 function opsPermission(kind: OpsCommandKind): Permission {
   switch (kind) {
@@ -632,6 +685,8 @@ function opsPermission(kind: OpsCommandKind): Permission {
       return 'integrations.manage';
     case 'job.retry':
       return 'jobs.retry_nospend';
+    case 'job.bulk_retry':
+      return 'jobs.manage';
     default:
       return 'jobs.manage'; // cancel, dead-letter redrive
   }
@@ -648,9 +703,34 @@ export async function requestOpsCommand(s: Staff, kind: OpsCommandKind, payload:
   }
   if (reason.trim().length < 4) throw new DomainError('INVALID', 'A reason is required.');
   return withAdmin(async (tx) => {
-    if (payload.workspaceId) {
-      const [w] = await tx`select state from workspaces where id = ${payload.workspaceId as string}`;
-      if (w?.state === 'SUSPENDED' && kind === 'job.retry') throw new DomainError('CONFLICT', 'Workspace is suspended; retries are blocked.');
+    if (kind === 'job.retry' || kind === 'job.bulk_retry') {
+      const queue = String(payload.queue ?? '');
+      const policy = queuePolicy(queue);
+      if (!policy) throw new DomainError('INVALID', `Unknown queue ${queue}`);
+      if (!policy.idempotent) throw new DomainError('CONFLICT', `${queue} jobs aren’t safe to re-run (the handler isn’t idempotent). Act on the tenant instead.`);
+      if (kind === 'job.bulk_retry' && policy.spends) throw new DomainError('CONFLICT', `${queue} jobs spend on providers: retry them one at a time, with a fresh estimate each.`);
+      if (kind === 'job.retry') {
+        // The job's own payload names its workspace; the console's hint is used only when the job isn't visible.
+        const job = (await jobData(tx, queue, String(payload.jobId ?? ''))) ?? {};
+        const data = { ...job, workspaceId: job.workspaceId ?? payload.workspaceId };
+        if (data.workspaceId) payload = { ...payload, workspaceId: data.workspaceId };
+        if (payload.workspaceId) {
+          const [w] = await tx`select state from workspaces where id = ${payload.workspaceId as string}`;
+          if (w?.state === 'SUSPENDED') throw new DomainError('CONFLICT', 'Workspace is suspended; retries are blocked.');
+        }
+        if (policy.spends) {
+          // §12: a retry that can spend runs only with a fresh Cost Governor estimate the operator has seen.
+          const est = await jobRetryEstimate(tx, data);
+          if (est) {
+            if (Number(payload.confirmEstimateMicros) !== est.micros) {
+              throw new DomainError('CONFLICT', `This retry may spend about ${usd(est.micros)} at current rates${est.rateChanged ? ` (rates changed since it was estimated at ${usd(est.previousMicros)})` : ''}. Confirm that estimate to retry.`, { estimate: est });
+            }
+          } else if (payload.confirmSpend !== true) {
+            throw new DomainError('CONFLICT', 'This retry may spend: the handler asks the Cost Governor for a fresh authorization at current rates. Confirm to retry.', { estimate: null });
+          }
+          payload = { ...payload, estimate: est };
+        }
+      }
     }
     const [c] = await tx`insert into ops_commands (kind, payload, requested_by, reason) values (${kind}, ${tx.json(payload as never)}, ${s.staffId}, ${reason}) returning id`;
     await audit(tx, s, `ops.${kind}`, { type: 'ops_command', id: c!.id as string }, { workspaceId: (payload.workspaceId as string) ?? null, reason, after: payload });
@@ -827,12 +907,20 @@ export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
                            where e.workspace_id = p.workspace_id and sb.project_id = p.id and e.type = 'QA_FAILED' and (e.payload->>'attempt')::int >= 2)`;
   const hard = tx`exists (select 1 from jsonb_array_elements(case when jsonb_typeof(p.qa_report->'checks') = 'array' then p.qa_report->'checks' else '[]'::jsonb end) c
                           where c->>'check' = 'product_fidelity' and coalesce((c->>'hard')::boolean, false) and not coalesce((c->>'pass')::boolean, true))`;
+  // The production switched a scene's technique after repeated QA failure (or an unfundable repair).
+  const switched = tx`exists (select 1 from jsonb_array_elements(case when jsonb_typeof(p.qa_report->'checks') = 'array' then p.qa_report->'checks' else '[]'::jsonb end) c
+                              where c->'data' ? 'techniqueSwitch')`;
   const sample = tx`(p.state = 'COMPLETE' and abs(hashtext(p.id::text)) % 50 = 0)`;
   return tx`
     select p.id, p.workspace_id, p.state, p.qa_report, p.updated_at,
-           case when ${hard} then 'hard fidelity fail' when ${failedTwice} then 'failed QA twice' else 'calibration sample' end as why
+           -- A switch explains the earlier hard fails in the same report, so it is named first.
+           case when ${failedTwice} and ${switched} then 'failed QA twice (technique switched)'
+                when ${switched} then 'technique switched'
+                when ${hard} then 'hard fidelity fail'
+                when ${failedTwice} then 'failed QA twice'
+                else 'calibration sample' end as why
     from projects p
     where not exists (select 1 from qa_reviews r where r.project_id = p.id)
       and (${!!opts.includeTest} or p.workspace_id not in (select id from workspaces where is_test))
-      and (${hard} or ${failedTwice} or ${sample})`;
+      and (${hard} or ${failedTwice} or ${switched} or ${sample})`;
 }

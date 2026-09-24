@@ -11,7 +11,6 @@ import { mockConcepts, mockStoryboard, type ProductContext } from './mock-intel'
 import { llmJson } from './model-gateway';
 import { currentFacts, factText } from './product-truth';
 import { listVariants, projectVariant, variantTruth } from './sku-variants';
-import { CONCEPTS_SYSTEM, STORYBOARD_SYSTEM } from './prompts';
 
 /** Sources that observe a real ingredient list (the page, structured data, the store, the label itself). */
 const INGREDIENT_SOURCES: ReadonlySet<string> = new Set(['product_page', 'json_ld', 'shopify', 'photo_ocr']);
@@ -194,7 +193,7 @@ export async function generateConcepts(run: ConceptRun) {
       token: run.token,
       task: 'creative_director.concepts',
       subject: { type: 'project', id: run.projectId },
-      system: CONCEPTS_SYSTEM,
+      template: 'concepts',
       content,
       schema: ConceptSet,
       mock: () => mockConcepts(productContext, run.batch),
@@ -290,7 +289,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       token: run.token,
       task: 'creative_director.storyboard',
       subject: { type: 'project', id: run.projectId },
-      system: STORYBOARD_SYSTEM,
+      template: 'storyboard',
       content: [
         { type: 'text', text: `Context packet:\n${JSON.stringify(packet)}` },
         { type: 'text', text: `Approved concept:\n${JSON.stringify(concept)}` },

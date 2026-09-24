@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { armComparison, staffCan } from '@arkiv/core';
+import { armComparison, CIRCUIT_BREAKER, staffCan } from '@arkiv/core';
 import { env } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
 import { dt, money, Mono, Page, pct, Section, Table } from '@/components/ui';
@@ -18,8 +18,14 @@ export default async function Providers() {
                             percentile_cont(0.5) within group (order by latency_ms)::int as p50, percentile_cont(0.95) within group (order by latency_ms)::int as p95,
                             count(*) filter (where error ilike '%moderation%' or error ilike '%sensitive%')::int as moderated
                      from provider_jobs where created_at > now() - interval '24 hours' group by provider`,
-    drift: await tx`select task, model, model_version_returned, count(*)::int as n, max(created_at) as last from provider_jobs
-                    where model_version_returned is not null and model_version_returned <> model and created_at > now() - interval '7 days' group by 1, 2, 3`,
+    // §48 drift: what providers answered pinned routes with, when it isn't the pinned version (alerts go to Pulse);
+    // for unpinned routes, the versions actually served (pin one of them to freeze behaviour).
+    drift: await tx`select j.task, r.pinned_model_version as pinned, j.model, j.model_version_returned, count(*)::int as n, max(j.created_at) as last
+                    from provider_jobs j join model_routes r on r.task = j.task
+                    where j.model_version_returned is not null and j.created_at > now() - interval '7 days'
+                      and (r.pinned_model_version is null or (j.model_version_returned <> r.pinned_model_version and j.model_version_returned <> r.pinned_model_version || '-mock'))
+                    group by 1, 2, 3, 4 order by max(j.created_at) desc limit 50`,
+    driftAlerts: await tx`select subject_id, message, created_at from platform_alerts where kind = 'version_drift' and resolved_at is null order by created_at desc`,
     arms: await armComparison(tx, 7),
     // The audit log is SUPER_ADMIN-only (§0.4); others see a rollback as the canary disappearing from the route.
     rollbacks: staffCan(s.roles, 'audit.read') ? await tx`select target_id, reason, at from admin_audit_log where action = 'route.canary_rollback' order by at desc limit 10` : [],
@@ -61,10 +67,11 @@ export default async function Providers() {
         })} />
       </Section>
       <Section title="Routes">
+        <p className="ak-small ak-muted">The breaker opens a route automatically when {pct(CIRCUIT_BREAKER.errorRate, 0)} or more of at least {CIRCUIT_BREAKER.minCalls} calls in {CIRCUIT_BREAKER.windowMinutes} min fail outage-class (or its provider does across routes), and tries again after {CIRCUIT_BREAKER.coolDownMinutes} min (defaults; tune under Flags &amp; config → circuit.*). Circuits staff open stay open until closed.</p>
         <Table head={['Task', 'Provider', 'Model', 'Pinned version', 'Prompt', 'Rollout', 'Canary', 'Approved fallback', 'Circuit', '']} rows={d0.routes.map((r) => [
           <Mono key="t">{r.task as string}</Mono>, r.provider as string, <Mono key="m">{r.model as string}</Mono>, r.pinned_model_version ? <Mono key="v">{r.pinned_model_version as string}</Mono> : '—', <Mono key="p">{r.prompt_version as string}</Mono>, `${r.rollout_pct}%`, r.canary ? <Mono key="c">{JSON.stringify(r.canary)}</Mono> : '—',
           r.fallback_task ? <Mono key="f">{r.fallback_task as string}</Mono> : 'queue on outage',
-          r.circuit_open ? <span key="o" className="ak-chip ak-chip--risk">open{r.circuit_until ? ` · back ~${dt(r.circuit_until)}` : ''}</span> : 'closed',
+          r.circuit_open ? <span key="o" title={(r.circuit_reason as string) ?? ''} className="ak-chip ak-chip--risk">{r.circuit_auto ? 'auto-opened' : 'open'}{r.circuit_until ? ` · ${r.circuit_auto ? 'retries' : 'back'} ~${dt(r.circuit_until)}` : ''}</span> : 'closed',
           <span key="a" className="ak-row">
             {staffCan(s.roles, 'providers.circuit') ? <ActButton small action="route.circuit" payload={{ task: r.task, open: !r.circuit_open }} reason danger={!r.circuit_open}>{r.circuit_open ? 'Close circuit' : 'Open circuit'}</ActButton> : null}
           </span>,
@@ -130,7 +137,10 @@ export default async function Providers() {
         <Table head={['Rolled back', 'Route', 'Why']} rows={d0.rollbacks.map((r) => [dt(r.at), <Mono key="t">{r.target_id as string}</Mono>, r.reason as string])} empty="No automatic canary rollbacks." />
       </Section>
       <Section title="Provider kill switches"><Table head={['Switch', 'State']} rows={d0.kills.map((k) => [<Mono key="k">{k.key as string}</Mono>, k.enabled ? <span key="s" className="ak-chip ak-chip--risk">ON — calls refused</span> : 'off'])} empty="—" /><p className="ak-small ak-muted">Toggle in Flags & config (🔐).</p></Section>
-      <Section title="Version drift (7d)"><Table head={['Task', 'Pinned', 'Returned', 'Calls', 'Last']} rows={d0.drift.map((x) => [x.task as string, <Mono key="p">{x.model as string}</Mono>, <Mono key="r">{x.model_version_returned as string}</Mono>, x.n as number, dt(x.last)])} empty="No drift detected." /></Section>
+      <Section title="Version drift (7d)">
+        {d0.driftAlerts.length ? <p className="ak-banner ak-banner--risk">Pinned routes answered with another version: {d0.driftAlerts.map((a) => a.subject_id as string).join(', ')}. Resolve the alert on Pulse once re-pinned or rolled back.</p> : null}
+        <Table head={['Task', 'Pinned', 'Configured', 'Returned', 'Calls', 'Last']} rows={d0.drift.map((x) => [x.task as string, x.pinned ? <Mono key="p">{x.pinned as string}</Mono> : <span key="p" className="ak-muted">not pinned</span>, <Mono key="m">{x.model as string}</Mono>, <Mono key="r">{x.model_version_returned as string}</Mono>, x.n as number, dt(x.last)])} empty="No drift detected." />
+      </Section>
     </Page>
   );
 }

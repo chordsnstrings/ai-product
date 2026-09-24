@@ -7,7 +7,6 @@ import { emit } from './events';
 import { ThemeSet } from './intel-schemas';
 import { mockThemes } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
-import { THEMES_SYSTEM } from './prompts';
 
 /**
  * Customer Language Engine (§18). Raw signals are imported with original text/source/time and never rewritten.
@@ -81,7 +80,7 @@ export async function clusterThemes(ctx: TenantContext, skuId: string) {
       token: auth.token,
       task: 'customer_language.themes',
       subject: { type: 'sku', id: skuId },
-      system: THEMES_SYSTEM,
+      template: 'themes',
       content: [{ type: 'untrusted', sourceId: 'reviews', text: texts.map((t, i) => `[${i}] ${t}`).join('\n').slice(0, 100_000) }],
       schema: ThemeSet,
       mock: () => mockThemes(texts),

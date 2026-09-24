@@ -1,4 +1,5 @@
 import sharp from 'sharp';
+import type { Tx } from '@arkiv/db';
 import { keyBackground, type KeyedCutout } from '@arkiv/media';
 
 function dist(a: number[], b: number[]) {
@@ -44,4 +45,44 @@ export async function toJpegBase64(input: Buffer, maxEdge = 1024): Promise<strin
 
 export async function toDataUrl(input: Buffer): Promise<string> {
   return `data:image/jpeg;base64,${await toJpegBase64(input, 1536)}`;
+}
+
+// ───────────── Before/after and possible minors (plan 05 §14; standard §48) ─────────────
+
+export interface MediaReviewFlags {
+  beforeAfter: boolean;
+  possibleMinor: boolean;
+  /** What raised the flag: the product analyst looking at the photo, or the file's name/source. */
+  sources: ('vision' | 'name')[];
+}
+
+const BEFORE_AFTER = /\bbefore\s*(?:and|&|\+|\/|-|_|vs\.?)?\s*after\b|\bb4\s*(?:&|and|-|_)?\s*after\b/i;
+const MINOR = /\b(kids?|child(?:ren)?|teens?|teenagers?|bab(?:y|ies)|toddlers?|minors?|under[-\s]?18|youth)\b/i;
+
+/** Flags a file name, URL or caption raises on its own (cheap, deterministic; the analyst's look comes on top). */
+export function nameReviewFlags(text: string | null | undefined): Pick<MediaReviewFlags, 'beforeAfter' | 'possibleMinor'> {
+  const t = (text ?? '').replace(/[_+]/g, ' ');
+  return { beforeAfter: BEFORE_AFTER.test(t), possibleMinor: MINOR.test(t) };
+}
+
+/**
+ * Hold flagged merchant media for compliance review: it stays `pending` (never used in production) until staff
+ * approve or reject it. Media already decided keeps its decision. Returns the ids newly held.
+ */
+export async function holdForReview(tx: Tx, items: { assetId: string; flags: MediaReviewFlags }[]): Promise<string[]> {
+  const held: string[] = [];
+  for (const { assetId, flags } of items) {
+    if (!flags.beforeAfter && !flags.possibleMinor) continue;
+    const [r] = await tx`update assets set review_flags = ${tx.json(flags as never)}, review_status = 'pending'
+                         where id = ${assetId} and review_status is null returning id`;
+    if (r) held.push(r.id as string);
+  }
+  return held;
+}
+
+/** The given assets minus media held for review or rejected by compliance, in the same order. */
+export async function usableAssetIds(tx: Tx, ids: string[]): Promise<string[]> {
+  if (!ids.length) return [];
+  const blocked = new Set((await tx`select id from assets where id = any(${ids}::uuid[]) and review_status in ('pending', 'rejected')`).map((r) => r.id as string));
+  return ids.filter((id) => !blocked.has(id));
 }

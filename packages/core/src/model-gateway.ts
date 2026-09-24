@@ -17,12 +17,14 @@ import {
 } from '@arkiv/providers';
 import { logger } from '@arkiv/shared/log';
 import type { z } from 'zod';
+import { raiseAlert } from './alerts';
 import { saveAsset } from './assets';
 import type { TenantContext } from './context';
 import { consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
+import { findPrompt } from './prompts';
 import { actualCost, loadRates, priceLine, type CostLine } from './rates';
 
 /**
@@ -183,6 +185,26 @@ interface CallMeta {
   task: string;
   subject?: { type: string; id: string } | null;
   inputRefs?: Record<string, unknown>;
+  /**
+   * Evaluate a candidate instead of the live route (plan 05 §11 eval runs: template version × model): the
+   * call is priced, sent and recorded with this model and prompt version. Internal eval runs only.
+   */
+  candidate?: { model?: string; promptVersion?: string };
+  /**
+   * The prompt template family this call expects (prompts.ts). The route's prompt_version must name a
+   * registered version of it; that version's text is the system prompt sent. (Not `prompt`: image and video
+   * calls carry their generation prompt under that name.)
+   */
+  template?: string;
+}
+
+/** A route's prompt_version resolved to its registered template text; unknown versions are refused (§41). */
+export function routedPrompt(r: Pick<Route, 'task' | 'promptVersion'>, family: string): string {
+  const t = findPrompt(r.promptVersion);
+  if (!t || t.name !== family) {
+    throw new DomainError('UNAVAILABLE', 'Our AI partner is unavailable right now. Your work is saved.', { promptVersion: r.promptVersion, task: r.task, expected: family });
+  }
+  return t.text;
 }
 
 /** The wire model a route is called with: its pinned provider version when staff pinned one, else the configured id. */
@@ -196,6 +218,8 @@ function subjectRefs(subject: CallMeta['subject']): EventRefs {
 
 interface Started {
   route: Route;
+  /** The routed template's text, when the call names a template family. */
+  system: string | null;
   policy: ProviderPolicy;
   line: CostLine;
   jobId: string;
@@ -211,7 +235,11 @@ interface Started {
  */
 async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFingerprint: unknown): Promise<Started> {
   return withTenant(meta.ctx.workspaceId, async (tx) => {
-    const r = await route(tx, meta.task, meta.ctx.workspaceId);
+    const live = await route(tx, meta.task, meta.ctx.workspaceId);
+    const r: Route = meta.candidate
+      ? { ...live, model: meta.candidate.model || live.model, promptVersion: meta.candidate.promptVersion || live.promptVersion, arm: 'stable', pinnedVersion: meta.candidate.model && meta.candidate.model !== live.model ? null : live.pinnedVersion }
+      : live;
+    const system = meta.template ? routedPrompt(r, meta.template) : null;
     // Customer-safe messages: the route and provider travel in `details` (and the job log), never in the text.
     const partner = partnerFor(meta.task).replace(/^./, (c) => c.toUpperCase());
     if (r.circuitOpen) throw new DomainError('UNAVAILABLE', `${partner} is busy right now. Your work is saved.`, { circuitOpen: meta.task });
@@ -244,7 +272,7 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
       { task: meta.task, provider: r.provider, model: r.model, promptVersion: r.promptVersion, arm: r.arm, estimateMicros: expected },
       { authorizationId: auth.authorizationId, projectId: auth.projectId, ...subjectRefs(meta.subject) },
     );
-    return { route: r, policy, line: costLine, jobId, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
+    return { route: r, system, policy, line: costLine, jobId, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
   });
 }
 
@@ -273,12 +301,49 @@ type Outcome =
  * cost is booked, raw response metadata is kept, and PROVIDER_JOB_SUCCEEDED / PROVIDER_JOB_FAILED is emitted.
  * A second close of the same job (the reconciler got there first, or the other way round) changes nothing.
  */
-async function finish(meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>, started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'>, outcome: Outcome): Promise<boolean> {
+async function finish(
+  meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>,
+  started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'> & { route?: Pick<Route, 'task' | 'provider' | 'pinnedVersion'> },
+  outcome: Outcome,
+): Promise<boolean> {
+  const closed = await closeJob(meta, started, outcome);
+  if (closed && outcome.ok && started.route && versionDrift(started.route.pinnedVersion, outcome.modelVersion)) {
+    await raiseVersionDrift(started.route, outcome.modelVersion!, started.jobId).catch((e) => gatewayLog.warn('version drift alert failed', { task: meta.task, error: (e as Error).message }));
+  }
+  return closed;
+}
+
+/**
+ * Version drift (plan 05 §10; standard §48 "pin where possible"): the provider answered a pinned route with a
+ * different model/version than the one pinned. Mock adapters echo the version they were asked for, tagged "-mock".
+ */
+export function versionDrift(pinned: string | null | undefined, returned: string | null | undefined): boolean {
+  if (!pinned || !returned) return false;
+  return returned !== pinned && returned !== `${pinned}-mock`;
+}
+
+/** One open Pulse alert per route (a repeat is a no-op until staff resolve it); raised as the system. */
+async function raiseVersionDrift(r: Pick<Route, 'task' | 'provider' | 'pinnedVersion'>, returned: string, jobId: string) {
+  gatewayLog.warn('provider version drift', { task: r.task, pinned: r.pinnedVersion, returned, providerJobId: jobId });
+  await withSystem((tx) =>
+    raiseAlert(tx, {
+      kind: 'version_drift',
+      severity: 'risk',
+      subject: { type: 'route', id: r.task },
+      message: `${r.provider} answered ${r.task} with ${returned}, not the pinned ${r.pinnedVersion}. Check output quality, then re-pin or roll back.`,
+      details: { provider: r.provider, pinned: r.pinnedVersion, returned, providerJobId: jobId },
+    }),
+  );
+}
+
+async function closeJob(meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>, started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'>, outcome: Outcome): Promise<boolean> {
   return withTenant(meta.ctx.workspaceId, async (tx) => {
     const rates = await loadRates(tx);
     const line = outcome.ok ? outcome.actualLine : outcome.billedLine;
     const actual = outcome.actualMicros ?? (line ? actualCost(rates, line) : 0);
-    const raw = outcome.rawMeta || outcome.wireModel ? { ...(outcome.rawMeta ?? {}), ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}) } : null;
+    // The failure class is kept on the job: the circuit breaker counts outage-class failures per route (plan 05 §10).
+    const extra = { ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}), ...(outcome.ok ? {} : { errorKind: outcome.errorKind }) };
+    const raw = outcome.rawMeta || Object.keys(extra).length ? { ...(outcome.rawMeta ?? {}), ...extra } : null;
     const [closed] = await tx`
       update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual},
         latency_ms = ${outcome.latencyMs}, completed_at = now(),
@@ -377,7 +442,8 @@ async function withRouteFallback<T>(meta: CallMeta, adapter: { name: string }, c
 }
 
 export interface LlmCall<T> extends CallMeta {
-  system: string;
+  /** A fixed system prompt; routed calls name their template family in `template` instead. */
+  system?: string;
   content: ContentPart[];
   schema: z.ZodType<T>;
   mock: () => T;
@@ -387,13 +453,18 @@ export interface LlmCall<T> extends CallMeta {
 
 export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string; task: string }> {
   const p = await providers();
+  // An eval of a candidate measures that candidate: it never fails over to another route.
+  if (call.candidate) return llmOnce(call, p);
   return withRouteFallback(call, p.llm, (m) => llmOnce({ ...call, task: m.task }, p));
 }
 
 async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string; task: string }> {
-  const approxIn = Math.ceil((call.system.length + call.content.reduce((n, c) => n + (c.type === 'image' ? 6000 : c.text.length), 0)) / 4);
+  if (!call.system && !call.template) throw new Error('llmJson needs a system prompt or a prompt template family');
+  const contentLen = call.content.reduce((n, c) => n + (c.type === 'image' ? 6000 : c.text.length), 0);
+  // Priced with the template the route actually sends (its version may be older or newer than the latest).
+  const approxIn = (r: Route) => Math.ceil(((call.system?.length ?? routedPrompt(r, call.template!).length) + contentLen) / 4);
   const maxTokens = call.maxTokens ?? 8000;
-  const started = await begin(call, (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn, outputTokens: maxTokens }), {
+  const started = await begin(call, (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn(r), outputTokens: maxTokens }), {
     task: call.task,
     content: call.content.map((c) => (c.type === 'image' ? { type: 'image', len: c.base64.length } : c)),
   });
@@ -406,7 +477,7 @@ async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet): Promise<LlmJsonResu
       p.llm.json({
         task: call.task,
         model: wire,
-        system: call.system,
+        system: started.system ?? call.system!,
         content: call.content,
         schema: call.schema,
         mock: call.mock,

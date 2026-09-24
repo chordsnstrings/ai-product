@@ -45,6 +45,15 @@ export const SETTING_DEFAULTS = {
   // Standard §46 "cancel after dispatch": up to this share of a production's estimate (basis points) already spent
   // on providers, a cancel still returns the credit or payment; past it, the credit is used and nothing is refunded.
   'production.cancel_release_max_spend_bps': 2500,
+  // Plan 05 §10 automatic circuit breaker: a route (or a whole provider) whose outage-class error rate reaches
+  // `error_rate` over at least `min_calls` finished calls in `window_minutes` is opened for `cooldown_minutes`.
+  'circuit.window_minutes': 15,
+  'circuit.min_calls': 10,
+  'circuit.error_rate': 0.5,
+  'circuit.cooldown_minutes': 15,
+  // Plan 05 §12 job detail "logs and traces (link out)": URL templates with {jobId}, {queue} and {requestId}.
+  'ops.log_url_template': '',
+  'ops.trace_url_template': '',
 } as const;
 export type SettingKey = keyof typeof SETTING_DEFAULTS;
 

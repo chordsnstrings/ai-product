@@ -20,6 +20,8 @@ export const EventType = [
   'CLAIM_RESTRICTED',
   'CLAIM_BLOCKED',
   'CLAIM_UNBLOCKED',
+  // Platform event: our compliance team asked the brand for more evidence on a RESTRICTED claim (plan 05 §14).
+  'CLAIM_EVIDENCE_REQUESTED',
   // Creative
   'CREATIVE_IMPORTED',
   'GENOME_EXTRACTED',
@@ -134,6 +136,7 @@ export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
   CLAIM_RESTRICTED: z.object({ reason: z.string() }).strict(),
   // COMPLIANCE lifted a block (four-eyes): the claim goes back to review, never straight to approved.
   CLAIM_UNBLOCKED: z.object({ from: z.literal('BLOCKED'), to: z.enum(ClaimStatus), reason: z.string() }).strict(),
+  CLAIM_EVIDENCE_REQUESTED: z.object({ note: z.string() }).strict(),
   // Usage-ledger events of the Model Gateway (§37): one per provider call opened and closed. They carry no money
   // amount of their own (the ledger's PROVIDER_COST_RECORDED does); estimate/actual are for reconstruction.
   PROVIDER_JOB_CREATED: z
@@ -245,6 +248,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   CLAIM_RESTRICTED: 'claim',
   CLAIM_BLOCKED: 'claim',
   CLAIM_UNBLOCKED: 'claim',
+  CLAIM_EVIDENCE_REQUESTED: 'claim',
   CREATIVE_IMPORTED: 'creative',
   GENOME_EXTRACTED: 'creative',
   CREATIVE_VERSIONED: 'creative',

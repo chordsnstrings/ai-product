@@ -1,6 +1,7 @@
 import type { Tx } from '@arkiv/db';
 import { compositeProduct, fullBleedFrame, productionBackdrop, type Aspect } from '@arkiv/media';
 import { assetBytes } from './assets';
+import { usableAssetIds } from './vision';
 
 /**
  * Exact-product stills (§23 strict product composite; §44 "repair once then composite exact product"). The product
@@ -21,7 +22,8 @@ export async function productImagery(tx: Tx, skuId: string): Promise<ProductImag
                         from visual_fingerprints f left join assets a on a.id = f.cutout_asset_id and a.workspace_id = f.workspace_id
                         where f.sku_id = ${skuId} and f.active`;
   if (!fp) return { cutout: null, reference: null, palette: [] };
-  const refId = ((fp.reference_asset_ids as string[] | null) ?? [])[0] ?? null;
+  // Media held for compliance review or rejected is never drawn into a frame (plan 05 §14).
+  const refId = (await usableAssetIds(tx, (fp.reference_asset_ids as string[] | null) ?? []))[0] ?? null;
   return {
     // Cut-outs recorded before keying was tracked were keyed ones (the unkeyed fallback always records keyed=false).
     cutout: fp.cutout_asset_id ? { assetId: fp.cutout_asset_id as string, bytes: await assetBytes(tx, fp.cutout_asset_id as string), keyed: fp.keyed !== 'false' } : null,

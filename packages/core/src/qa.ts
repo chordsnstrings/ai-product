@@ -6,7 +6,6 @@ import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
 import { FidelityCheck } from './intel-schemas';
 import { llmJson } from './model-gateway';
-import { FIDELITY_SYSTEM } from './prompts';
 import { paletteDistance, toJpegBase64 } from './vision';
 
 /**
@@ -52,7 +51,7 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     token: i.token,
     task: 'qa.fidelity',
     subject: { type: 'scene', id: i.sceneId },
-    system: FIDELITY_SYSTEM,
+    template: 'fidelity',
     content: [
       ...(await Promise.all(i.referenceBytes.slice(0, 2).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 768) })))),
       { type: 'image', mediaType: 'image/jpeg', base64: await toJpegBase64(frame, 768) },
@@ -69,6 +68,8 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
       skinAlteredUnnaturally: false,
       impliesMedicalResult: false,
       notes: failMock ? 'Label text differs from reference' : 'Matches reference',
+      // A failing mock "reads" a drifted label so the review screen's OCR diff has something to show.
+      labelTextRead: i.fingerprint.labelText ? (failMock ? i.fingerprint.labelText.split(/\s+/).slice(0, -1).concat('SERUMM').join(' ') : i.fingerprint.labelText) : null,
     }),
     effort: 'medium',
     maxTokens: 800,

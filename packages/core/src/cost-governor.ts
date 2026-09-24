@@ -15,7 +15,7 @@ import { setting } from './settings';
  * reservation and returns an authorization token. The Model Gateway accepts only valid tokens.
  */
 
-export type Purpose = 'free_preview' | 'storyboard' | 'taste' | 'standalone' | 'creative_test' | 'premium' | 'repair';
+export type Purpose = 'free_preview' | 'storyboard' | 'taste' | 'standalone' | 'creative_test' | 'premium' | 'repair' | 'eval';
 
 export interface AuthorizeInput {
   projectId?: string | null;

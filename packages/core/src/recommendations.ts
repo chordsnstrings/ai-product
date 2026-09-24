@@ -9,7 +9,6 @@ import { emit } from './events';
 import { ConceptSet, type Proposal } from './intel-schemas';
 import { mockConcepts } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
-import { CONCEPTS_SYSTEM } from './prompts';
 
 /**
  * RecommendationService (§20, §33): hard gates → deterministic Opportunity Score → portfolio composition →
@@ -225,7 +224,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
         token: auth.token,
         task: 'creative_director.recommendations',
         subject: { type: 'sku', id: skuId },
-        system: CONCEPTS_SYSTEM,
+        template: 'recommendations',
         content: [
           { type: 'text', text: `Context packet:\n${JSON.stringify(packet)}` },
           { type: 'text', text: `Weekly planning (${week}). Basis: ${sc.basis}. SKU maturity: ${sc.maturity}. Candidate set ${b} of 2 — make these different from set 1.` },

@@ -14,6 +14,7 @@ import {
   type TenantContext,
   duePurges,
   evaluateCanaries,
+  evaluateCircuits,
   expiredFlagAlerts,
   expireOffers,
   reconcileProviderJobs,
@@ -195,6 +196,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   // §39: provider jobs a crashed worker left dispatched are reconciled by provider request id — finished renders
   // are copied into our storage and booked at their real cost; abandoned calls are closed (never under-counted).
   'reconcile-provider-jobs': { cron: '*/5 * * * *', run: async () => { const r = await reconcileProviderJobs(); return r.succeeded + r.failed ? r : 0; } },
+  // Plan 05 §10: a route (or provider) whose outage-class error rate crosses the threshold is circuit-broken
+  // automatically (audited, Pulse alert) so fallbacks answer or productions queue; it re-tries after the cool-down.
+  'circuit-breaker': { cron: '* * * * *', run: () => withSystem(async (tx) => { const changed = await evaluateCircuits(tx); return changed.length ? changed : 0; }) },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
   // Plan 05 §5: an example asset whose rights expire is removed from every landing page's gallery (Pulse alert).

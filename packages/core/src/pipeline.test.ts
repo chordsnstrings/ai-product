@@ -1,7 +1,8 @@
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
+import { qaQueueSql } from './admin';
 import { newId } from '@arkiv/shared';
 import { probe, withTempDir } from '@arkiv/media';
 import { assetBytes } from './assets';
@@ -181,6 +182,12 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       expect(retry!.n).toBe(1);
       const [p] = await tx`select qa_report, final_creative_id, sku_id from projects where id = ${projectId}`;
       expect(JSON.stringify(p!.qa_report)).toMatch(/switched to exact product composite/);
+      // The switch is recorded on the report for the QA review queue ("failed QA twice, technique switched").
+      const checks = (p!.qa_report as { checks: { check: string; data?: { techniqueSwitch?: { from: string; to: string }; labelTextRead?: string | null } }[] }).checks;
+      expect(checks.find((c) => c.data?.techniqueSwitch)?.data?.techniqueSwitch).toMatchObject({ from: 'generative', to: 'exact_product_composite', why: 'repeated QA failure' });
+      // Each inspection records the label it read on the output (null for a photo-only product with no label
+      // text): the review screen's OCR diff compares it with the reference.
+      expect(checks.filter((c) => c.check === 'product_fidelity' && c.data && 'labelTextRead' in c.data).length).toBeGreaterThan(0);
       // The switch is the exact product from the merchant's own cut-out, QA-checked — never the generated frame.
       const [fp] = await tx`select cutout_asset_id from visual_fingerprints where sku_id = ${p!.sku_id} and active`;
       const [fb] = await tx`select id, technique, lineage, qa from scene_versions where kind = 'frame' and lineage->>'fallback' = 'true'`;
@@ -190,6 +197,9 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       const [cr] = await tx`select composition from creatives where id = ${p!.final_creative_id}`;
       expect((cr!.composition as { scenes: { versionId: string; kind: string }[] }).scenes.find((s) => s.versionId === fb!.id)).toMatchObject({ kind: 'still' });
     });
+    // It lands in the staff QA review queue (plan 05 §13).
+    const [queued] = await withAdmin((tx) => tx`select why from (${qaQueueSql(tx, { includeTest: true })}) q where q.id = ${projectId}`);
+    expect(queued?.why).toMatch(/technique switched/);
   }, 120_000);
 
   it('never renders an unapproved claim (Launch Gate 3)', async () => {

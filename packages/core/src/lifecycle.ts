@@ -98,7 +98,7 @@ export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
   return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
-const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'sku_variants', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes'];
+const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'sku_variants', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes', 'compliance_reviews'];
 
 /**
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,
@@ -112,6 +112,8 @@ export async function purgeWorkspace(workspaceId: string): Promise<Record<string
     const counts: Record<string, number> = {};
     const undeletable: string[] = [];
     await tx`delete from shopify_shops where workspace_id = ${workspaceId}`;
+    // Golden cases built (with consent) from this tenant's production output go with the tenant.
+    await tx`delete from golden_cases where source_workspace_id = ${workspaceId}`;
     const objects = await storage().deletePrefix(`t/${workspaceId}/`).catch((e) => {
       undeletable.push(`storage: ${(e as Error).message}`);
       return 0;

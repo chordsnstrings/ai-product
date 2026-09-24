@@ -61,6 +61,7 @@ export default async function Claims({ params }: { params: Promise<{ slug: strin
                   <ClaimChip status={c.status} />
                 </div>
                 {c.blockReason ? <p className="ak-small">{c.blockReason}</p> : null}
+                {c.status === 'RESTRICTED' && c.complianceNote ? <p className="ak-small">Our compliance team: {c.complianceNote}</p> : null}
                 <p className="ak-small ak-muted">{c.category} · {c.riskLevel} risk · {c.origin}{c.allowedPlatforms.length ? ` · ${c.allowedPlatforms.map((x) => PLATFORM_LABEL[x.toUpperCase()] ?? x).join(', ')} · ${c.allowedMarkets.join(', ')}` : ''}{ev.length ? ` · ${ev.length} evidence file${ev.length > 1 ? 's' : ''}` : ''}</p>
                 {canEdit && !['BLOCKED', 'INFERRED_ONLY'].includes(c.status) ? (
                   <div className="ak-row">

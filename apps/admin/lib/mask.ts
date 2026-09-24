@@ -44,6 +44,30 @@ export function maskText(text: unknown): string {
     .replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, (m) => maskIp(m));
 }
 
+/** Payload keys whose values are secrets or personal data: never shown on a job detail page (plan 05 §12). */
+const SECRET_KEY = /(secret|token|password|passw|api[_-]?key|authorization|cookie|signature|credential|session)/i;
+const PII_KEY = /(email|phone|address|^ip$|ipAddress|userAgent|firstName|lastName|fullName|customerName)/i;
+
+/**
+ * A job payload for display: secret-looking keys are always redacted; personal-data keys are masked, and for
+ * masked viewers every remaining string is PII-masked too. Ids, queues and flags stay readable.
+ */
+export function maskJobPayload(data: unknown, maskPii: boolean, depth = 0): unknown {
+  if (depth > 6) return '…';
+  if (Array.isArray(data)) return data.slice(0, 50).map((v) => maskJobPayload(v, maskPii, depth + 1));
+  if (data && typeof data === 'object') {
+    return Object.fromEntries(
+      Object.entries(data as Record<string, unknown>).map(([k, v]) => {
+        if (SECRET_KEY.test(k)) return [k, '[redacted]'];
+        if (PII_KEY.test(k)) return [k, typeof v === 'string' ? (/@/.test(v) ? maskEmail(v) : maskText(v).replace(/\S(?=\S{2})/g, '•')) : '[masked]'];
+        return [k, maskJobPayload(v, maskPii, depth + 1)];
+      }),
+    );
+  }
+  if (typeof data === 'string') return maskPii ? maskText(data) : data.length > 500 ? `${data.slice(0, 500)}…` : data;
+  return data;
+}
+
 /** Pick the masked or the clear rendering of each kind of PII for one viewer. */
 export function piiView(mask: boolean) {
   return {
