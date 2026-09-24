@@ -47,6 +47,35 @@ jobs:
       - name: Every table is registered and tenant tables are RLS-forced
         run: pnpm vitest run packages/db/src/rls.test.ts
 
+  migrations:
+    # Plan 06 Phase 0 D2 "migration dry-run": the base branch's schema (with seed data) is built first, then this
+    # change's pending migrations are applied to it in one transaction and rolled back, with lock-heavy DDL listed.
+    name: Migration dry run
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - name: Base schema (merge base) with seed data
+        run: |
+          git worktree add ../base "$(git merge-base HEAD origin/${{ github.base_ref }})"
+          cd ../base && pnpm install --frozen-lockfile && pnpm db:migrate && pnpm db:seed
+      - run: pnpm install --frozen-lockfile
+      - name: Apply this change's migrations to it, then roll back
+        run: pnpm db:migrate:dry
+
   build:
     name: Build web + admin
     runs-on: ubuntu-latest
