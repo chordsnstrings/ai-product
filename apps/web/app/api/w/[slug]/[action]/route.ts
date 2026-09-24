@@ -131,6 +131,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     /* ── This Week ── */
     case 'rec-accept': {
       const { id } = await body(req, z.object({ id: uuid }));
+      // Authorise before looking the recommendation up: a Viewer gets 403, not "already handled".
+      assertCan(ctx, 'experiment.create');
       const r = await t((tx) =>
         once(tx, { id }, async () => {
           const [rec] = await tx`select * from recommendations where id = ${id} and status = 'open' for update`;
@@ -390,6 +392,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       return json({ ok: true });
     case 'delete': {
       const { confirm } = await body(req, z.object({ confirm: z.string() }));
+      assertCan(ctx, 'workspace.delete');
       if (confirm !== slug) throw new DomainError('INVALID', `Type ${slug} to confirm.`);
       await t((tx) => scheduleDeletion(tx, ctx));
       return json({ ok: true });

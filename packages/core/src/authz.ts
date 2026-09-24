@@ -53,6 +53,25 @@ const READ_ONLY_OK: ReadonlySet<Action> = new Set(['workspace.view', 'workspace.
  */
 const ONLY_IN_STATE: Partial<Record<Action, WorkspaceState>> = { 'workspace.cancel_deletion': 'PURGE_SCHEDULED' };
 
+/**
+ * CANCELLED — "Read + export + reactivate. Integrations sync paused." (plan 02 §2). Reactivation is a billing action;
+ * the Owner can still delete the workspace, and anyone can still be removed (or leave). Every other write, including
+ * a new SKU (which starts free-preview model spend), connecting an integration or inviting a member, is refused.
+ */
+const CANCELLED_OK: ReadonlySet<Action> = new Set([
+  'workspace.view',
+  'workspace.export',
+  'billing.manage',
+  'workspace.delete',
+  'member.remove',
+]);
+
+/**
+ * PAST_DUE — "Read + export; new paid renders blocked" (plan 02 §2). Spending is blocked below; a new SKU is also
+ * refused because it starts the free-preview analysis (model spend) for a workspace that is not paying.
+ */
+const PAST_DUE_BLOCKED: ReadonlySet<Action> = new Set(['sku.create']);
+
 const WRITE_BLOCKED_STATES: ReadonlySet<WorkspaceState> = new Set(['LOCKED', 'SUSPENDED', 'PURGE_SCHEDULED', 'PURGED']);
 const SPEND_BLOCKED_STATES: ReadonlySet<WorkspaceState> = new Set([
   'PAST_DUE',
@@ -68,6 +87,8 @@ export function can(ctx: Pick<TenantContext, 'role' | 'workspaceState'>, action:
   const only = ONLY_IN_STATE[action];
   if (only) return ctx.workspaceState === only;
   if (WRITE_BLOCKED_STATES.has(ctx.workspaceState) && !READ_ONLY_OK.has(action)) return false;
+  if (ctx.workspaceState === 'CANCELLED' && !CANCELLED_OK.has(action)) return false;
+  if (ctx.workspaceState === 'PAST_DUE' && PAST_DUE_BLOCKED.has(action)) return false;
   if (SPEND_BLOCKED_STATES.has(ctx.workspaceState) && (action === 'spend.creative_test' || action === 'storyboard.approve'))
     return false;
   return true;

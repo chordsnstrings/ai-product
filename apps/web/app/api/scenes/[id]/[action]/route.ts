@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { editScene, requestFrameRegeneration, setSceneLock } from '@arkiv/core';
+import { assertCan, editScene, requestFrameRegeneration, setSceneLock } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
@@ -11,6 +11,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
   const input = await body(req, z.object({ projectId: z.string().uuid(), spokenLine: z.string().max(160).nullish(), overlayText: z.string().max(70).nullish(), locked: z.boolean().optional(), instruction: z.string().max(200).optional() }));
   const a = await projectAccess(input.projectId);
   if (a.provisional) throw new DomainError('FORBIDDEN', 'Save your work to edit the storyboard.', { needsAccount: true });
+  // Every scene action edits the storyboard (plan 02 §1.1): refuse a Viewer before revealing whether the scene exists.
+  assertCan(a.ctx, 'sku.edit');
   // The scene must belong to this project's storyboard (checked under RLS).
   const [owned] = await withTenant(a.ctx.workspaceId, (tx) => tx`select 1 from scenes s join storyboards sb on sb.id = s.storyboard_id where s.id = ${id} and sb.project_id = ${input.projectId}`);
   if (!owned) throw new DomainError('NOT_FOUND', 'Scene not found');
