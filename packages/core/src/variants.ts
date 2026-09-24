@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { platformAssets, platformsFor } from '@arkiv/shared';
+import { DomainError, platformAssets, platformsFor } from '@arkiv/shared';
 import { captionCues, composeAd, layoutVoice, probe, withTempDir, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { brandBrainFor } from './brand';
@@ -106,7 +106,14 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
       // 1. The new spoken hook (if the hook is spoken), fitted into the master's hook slot.
       let newSeg: VoiceSegment | null = null;
       if (spokenHook && hookSeg) {
-        const clip = await hookClip(ctx, v.id as string, hook, manifest.voiceover!.voice, p.sku_id as string, projectId);
+        const clip = await hookClip(ctx, v.id as string, hook, manifest.voiceover!.voice, p.sku_id as string, projectId).catch(async (e) => {
+          // The Cost Governor refused it: this voice-over would take the test past its cost ceiling (§5). The
+          // variant is skipped, never produced over budget.
+          if (!(e instanceof DomainError && e.code === 'GATE_BLOCKED')) throw e;
+          await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'the test’s cost ceiling is reached' }, variantRefs(p)));
+          return null;
+        });
+        if (!clip) return false;
         const file = path.join(dir, 'hook.mp3');
         await writeFile(file, clip.bytes);
         const ms = (await probe(file)).durationMs;

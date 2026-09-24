@@ -49,6 +49,9 @@ export async function estimateCost(tx: Tx, lines: CostLine[]): Promise<Estimate>
   return priceEstimate(await loadRates(tx), lines);
 }
 
+/** Purposes whose ceiling is the standard Creative Test's: cumulative over one production (a project). */
+const PER_TEST_PURPOSES: ReadonlySet<Purpose> = new Set(['creative_test', 'taste', 'standalone']);
+
 async function ceilingFor(tx: Tx, purpose: Purpose): Promise<Micros | null> {
   switch (purpose) {
     case 'creative_test':
@@ -145,6 +148,18 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
       if (spent + est.totalMicros > ceiling) {
         throw new DomainError('PAYMENT_REQUIRED', 'Save your work to continue.', { needsAccount: true, ceilingMicros: ceiling, priorMicros: spent, estimateMicros: est.totalMicros, reason: 'free_preview_workspace_cap' });
       }
+    }
+    if (PER_TEST_PURPOSES.has(input.purpose) && input.projectId) {
+      // Standard §5: the ceiling is per Creative Test, not per authorization. Everything else already authorized
+      // for this production counts — the production run, each hook variant's voice-over, any further work under
+      // the test (active holds at their ceiling, settled ones at what was actually spent). An earlier, failed
+      // attempt that a retry replaced (its key retired) is not part of the plan being checked.
+      const [r] = await tx`select coalesce(sum(case when status = 'active' then max_cost_micros else spent_micros end), 0)::bigint as n
+                           from cost_authorizations
+                           where workspace_id = ${ctx.workspaceId} and project_id = ${input.projectId}
+                             and purpose in ${tx([...PER_TEST_PURPOSES])} and status in ('active','settled')
+                             and idempotency_key not like ${'produce:%:retired:%'} and idempotency_key <> ${input.idempotencyKey}`;
+      prior = Number(r!.n);
     }
     if (input.purpose === 'free_preview' && input.skuId) {
       // Active holds count at their ceiling; settled ones at what was actually spent.
