@@ -1,5 +1,6 @@
 import type { Tx } from '@arkiv/db';
 import type { WorkspaceState } from '@arkiv/shared';
+import { currentRequestId } from '@arkiv/shared/log';
 
 /**
  * Queue names. Free and provisional AI work runs on its own `-free` queues with their own (smaller) worker
@@ -66,6 +67,10 @@ export interface EnqueueOptions {
 /**
  * Transactional enqueue: the job exists iff the surrounding transaction commits. The dispatcher moves rows
  * into pg-boss. Payloads always carry the workspaceId so workers re-enter the tenant context.
+ * A singleton key allows one undispatched job per (workspace, queue, key); the unique index `outbox_singleton_pending`
+ * makes that atomic, so concurrent requests (a double click, two tabs) cannot both enqueue. Returns whether a
+ * job was added. Jobs that must not overlap once running also hold a lease in their handler (leases.ts).
+ * The current request id travels in the payload, so the job's logs join the request that created it (§34).
  */
 export async function enqueue(
   tx: Tx,
@@ -73,14 +78,13 @@ export async function enqueue(
   queue: QueueName,
   payload: Record<string, unknown>,
   opts: EnqueueOptions = {},
-): Promise<void> {
-  if (opts.singletonKey) {
-    const existing = await tx`select 1 from outbox where queue = ${queue} and singleton_key = ${opts.singletonKey}
-                              and dispatched_at is null limit 1`;
-    if (existing.length) return;
-  }
-  await tx`
+): Promise<boolean> {
+  const requestId = (payload.requestId as string | undefined) ?? currentRequestId();
+  const r = await tx`
     insert into outbox (workspace_id, queue, payload, singleton_key, run_after, priority)
-    values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId } as never)}, ${opts.singletonKey ?? null},
-            ${opts.runAfter ?? new Date()}, ${opts.priority ?? 0})`;
+    values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId, ...(requestId ? { requestId } : {}) } as never)}, ${opts.singletonKey ?? null},
+            ${opts.runAfter ?? new Date()}, ${opts.priority ?? 0})
+    on conflict (workspace_id, queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing
+    returning id`;
+  return r.length > 0;
 }

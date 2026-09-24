@@ -58,12 +58,14 @@ export async function append(
     on conflict (workspace_id, idempotency_key) do nothing
     returning id`;
   if (rows.length && e.type !== 'PROVIDER_COST_RECORDED') {
-    await emit(tx, ctx, e.type, e.projectId ? { type: 'project', id: e.projectId } : null, {
-      unit: e.unit,
-      amount: e.amount,
-      ledgerType: e.type,
-      reference: e.reference,
-    });
+    await emit(
+      tx,
+      ctx,
+      e.type,
+      e.projectId ? { type: 'project', id: e.projectId } : null,
+      { unit: e.unit, amount: e.amount, ledgerType: e.type, reference: e.reference, periodKey: e.periodKey ?? null },
+      { ledgerEntryId: rows[0]!.id as string, authorizationId: e.authorizationId, providerJobId: e.providerJobId },
+    );
   }
   return rows.length > 0;
 }

@@ -32,6 +32,8 @@ async function richSku(workspaceId: string) {
     await tx`insert into claim_evidence (workspace_id, claim_id, evidence_type, source_asset_id, supplied_by) values (${workspaceId}, ${c!.id}, 'clinical_study', ${doc.id}, 'user:x')`;
     await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text)
              values (${workspaceId}, ${sku}, 1, ${[photo.id]}, ${cutout.id}, 'DEW SERUM 30 ml')`;
+    await tx`insert into sku_variants (workspace_id, sku_id, source, external_id, title, size, price_micros, currency, available, image_asset_ids)
+             values (${workspaceId}, ${sku}, 'shopify', 'gid-30', '30 ml', '30 ml', 38000000, 'usd', true, ${[photo.id]})`;
     return { sku, photo: photo.id, cutout: cutout.id, doc: doc.id, claim: c!.id as string };
   });
 }
@@ -57,7 +59,7 @@ describe('Transfer SKU to workspace (plan 05 §2.3)', () => {
 
     const r = await transferSku(transferId);
     expect(r.status).toBe('completed');
-    expect(r.counts).toEqual({ skus: 1, assets: 3, product_facts: 2, visual_fingerprints: 1, claims: 1, claim_evidence: 1 });
+    expect(r.counts).toEqual({ skus: 1, assets: 3, product_facts: 2, sku_variants: 1, visual_fingerprints: 1, claims: 1, claim_evidence: 1 });
     const newSku = r.newSkuId!;
     expect(newSku).not.toBe(src.sku);
 
@@ -85,6 +87,9 @@ describe('Transfer SKU to workspace (plan 05 §2.3)', () => {
     expect(ev).toEqual({ claim_id: claim!.id, source_asset_id: byKind.evidence_doc!.id, workspace_id: to.workspaceId });
     const [fp] = await ownerPool()`select reference_asset_ids, cutout_asset_id, label_text from visual_fingerprints where sku_id = ${newSku}`;
     expect(fp).toEqual({ reference_asset_ids: [byKind.product_photo!.id], cutout_asset_id: byKind.cutout!.id, label_text: 'DEW SERUM 30 ml' });
+    // Sizes/shades travel with the SKU, their images pointing at the copied files.
+    const [sv] = await ownerPool()`select workspace_id, title, price_micros, available, image_asset_ids from sku_variants where sku_id = ${newSku}`;
+    expect(sv).toEqual({ workspace_id: to.workspaceId, title: '30 ml', price_micros: 38000000, available: true, image_asset_ids: [byKind.product_photo!.id] });
     // The source keeps its rows (archived) — nothing was moved out from under its history.
     expect(await ownerPool()`select 1 from claims where sku_id = ${src.sku}`).toHaveLength(1);
 

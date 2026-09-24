@@ -13,7 +13,7 @@ import { emit } from './events';
  *  - side states: NEEDS_USER_ACTION / BLOCKED_COMPLIANCE from any live state, PROVIDER_FAILED once production
  *    has been approved;
  *  - recovery: a retry re-approves (→ STORYBOARD_APPROVED), an outage pause resumes rendering, a fixed claim
- *    returns to the storyboard, a new photo resumes analysis;
+ *    returns to the storyboard, a new photo resumes analysis, a retried analysis starts again (→ PRODUCT_UPLOADED);
  *  - CANCELLED before anything is dispatched; REFUNDED once money or entitlement is involved.
  */
 const PRE_RENDER_SIDE: ProjectState[] = ['NEEDS_USER_ACTION', 'BLOCKED_COMPLIANCE', 'CANCELLED'];
@@ -40,6 +40,7 @@ export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
     'STORYBOARD_APPROVED', // merchant/staff retry
     'RENDER_RESERVED', // entitlement restored: production reserves again
     'RENDERING', // provider outage over: the held reservation resumes rendering
+    'PRODUCT_UPLOADED', // the merchant retries a failed analysis: it starts again from the upload
     'PROVIDER_FAILED',
     'CANCELLED',
     'REFUNDED',

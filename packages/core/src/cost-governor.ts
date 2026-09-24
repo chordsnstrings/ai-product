@@ -1,10 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { Tx } from '@arkiv/db';
-import { COST_LIMITS, DomainError, PLANS, type Micros, type PlanCode } from '@arkiv/shared';
+import { COST_LIMITS, DomainError, FREE_EXPLORATION, PLANS, PRICES, type Micros, type PlanCode } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { append, available, providerSpendSince, type LedgerUnit } from './ledger';
 import { estimate as priceEstimate, loadRates, type CostLine, type Estimate } from './rates';
 import { isFlagOn } from './flags';
+import { isFreeTier } from './outbox';
+import { HEARTBEAT_STALE_MS } from './progress';
 import { setting } from './settings';
 
 /**
@@ -63,6 +65,52 @@ async function ceilingFor(tx: Tx, purpose: Purpose): Promise<Micros | null> {
   }
 }
 
+export interface MarginDecision {
+  ok: boolean;
+  /** Revenue value of the reserved entitlement. */
+  revenueMicros: Micros;
+  /** Most this work may cost at the floor: revenue × (1 − MIN_VARIABLE_MARGIN). */
+  maxCostMicros: Micros;
+  estimateMicros: Micros;
+  /** Variable margin at the estimate (null without revenue). */
+  margin: number | null;
+  floor: number;
+}
+
+/**
+ * Revenue value of one unit of entitlement (markup floor, §37): a Creative Test is worth the plan price over its
+ * monthly tests (the lowest per-test price of any plan when the plan is unknown); a Taste or Standalone the
+ * amount paid for this project, or the live offer price when nothing was paid (a goodwill credit, a 100% coupon).
+ */
+export async function revenuePerUnit(tx: Tx, plan: PlanCode | null, unit: Exclude<LedgerUnit, 'usd_micros'>, projectId: string | null): Promise<Micros> {
+  if (unit === 'creative_test') {
+    const perTest = (p: PlanCode) => Math.floor(PLANS[p].priceMicros / PLANS[p].creativeTestsPerMonth);
+    return plan ? perTest(plan) : Math.min(...(Object.keys(PLANS) as PlanCode[]).map(perTest));
+  }
+  if (projectId) {
+    const [pu] = await tx`select amount_micros from purchases where project_id = ${projectId} and status = 'paid' and amount_micros > 0
+                          order by paid_at desc nulls last limit 1`;
+    if (pu) return Number(pu.amount_micros);
+  }
+  const type = unit === 'taste' ? 'TASTE' : 'STANDALONE';
+  const [d] = await tx`select min(price_micros)::bigint as p from offer_definitions where type = ${type} and active and price_micros > 0`;
+  return d?.p != null ? Number(d.p) : unit === 'taste' ? PRICES.TASTE : PRICES.STANDALONE;
+}
+
+export async function marginDecision(tx: Tx, plan: PlanCode | null, unit: Exclude<LedgerUnit, 'usd_micros'>, amount: number, projectId: string | null, estimateMicros: Micros): Promise<MarginDecision> {
+  const floor = COST_LIMITS.MIN_VARIABLE_MARGIN;
+  const revenueMicros = (await revenuePerUnit(tx, plan, unit, projectId)) * amount;
+  const maxCostMicros = Math.floor(revenueMicros * (1 - floor));
+  return {
+    ok: estimateMicros <= maxCostMicros,
+    revenueMicros,
+    maxCostMicros,
+    estimateMicros,
+    margin: revenueMicros > 0 ? Math.round((1 - estimateMicros / revenueMicros) * 1000) / 1000 : null,
+    floor,
+  };
+}
+
 export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInput): Promise<Authorization> {
   // Idempotent: a retried request returns the same reservation (no second hold). Concurrent requests for the
   // same key (duplicate job delivery) serialize here, so the second sees the first's authorization instead of
@@ -105,9 +153,42 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     }
   }
 
-  // 2. Daily anomaly guard (plan 02 §4): 3x the plan's expected daily COGS.
+  // 1a. Pre-purchase exploration is cumulative per SKU for workspaces that have not paid (standard §5): every
+  //     storyboard, frame and extra concept batch for the product counts (active holds at their ceiling).
+  if (input.purpose === 'storyboard' && input.skuId && isFreeTier(ctx)) {
+    const [r] = await tx`select coalesce(sum(case when status = 'active' then max_cost_micros else spent_micros end), 0)::bigint as n
+                         from cost_authorizations
+                         where purpose = 'storyboard' and estimate->>'skuId' = ${input.skuId} and status in ('active','settled')`;
+    const prior = Number(r!.n);
+    if (prior + est.totalMicros > FREE_EXPLORATION.SKU_COGS_CAP) {
+      throw new DomainError('GATE_BLOCKED', 'You’ve explored this product as far as the free preview goes. Produce this one to keep exploring.', {
+        ceilingMicros: FREE_EXPLORATION.SKU_COGS_CAP,
+        estimateMicros: est.totalMicros,
+        priorMicros: prior,
+        purpose: input.purpose,
+        reason: 'free_exploration_cap',
+      });
+    }
+  }
+
   const [ws] = await tx`select plan_code from workspaces where id = ${ctx.workspaceId}`;
   const plan = (ws?.plan_code as PlanCode | null) ?? null;
+
+  // 1b. Markup floor (§33, §37): work paid for with an entitlement may not cost more than that entitlement's
+  //     revenue allows at the minimum variable margin. Premium and repair work have no standard ceiling, so they
+  //     are only ever authorized against an explicit, priced entitlement.
+  let margin: MarginDecision | null = null;
+  if ((input.purpose === 'premium' || input.purpose === 'repair') && !(input.entitlement && input.entitlement.amount > 0)) {
+    throw new DomainError('GATE_BLOCKED', 'Premium and repair work needs a priced entitlement', { purpose: input.purpose, reason: 'unpriced' });
+  }
+  if (input.entitlement && input.entitlement.amount > 0) {
+    margin = await marginDecision(tx, plan, input.entitlement.unit, input.entitlement.amount, input.projectId ?? null, est.totalMicros);
+    if (!margin.ok) {
+      throw new DomainError('GATE_BLOCKED', 'This plan costs more than the markup floor allows for its entitlement', { ...margin, purpose: input.purpose, reason: 'markup_floor' });
+    }
+  }
+
+  // 2. Daily anomaly guard (plan 02 §4): 3x the plan's expected daily COGS.
   const expectedDaily = plan
     ? (PLANS[plan].creativeTestsPerMonth * COST_LIMITS.CREATIVE_TEST_CEILING) / 30
     : COST_LIMITS.CREATIVE_TEST_CEILING;
@@ -139,7 +220,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     insert into cost_authorizations (workspace_id, project_id, purpose, token_hash, idempotency_key, rate_table_versions,
       estimate, max_cost_micros, entitlement_unit, entitlement_amount, expires_at)
     values (${ctx.workspaceId}, ${input.projectId ?? null}, ${input.purpose}, ${hashToken(token)}, ${input.idempotencyKey},
-      ${tx.json(est.rateVersions)}, ${tx.json({ ...(input.meta ?? {}), ...est, skuId: input.skuId ?? null } as never)}, ${est.totalMicros},
+      ${tx.json(est.rateVersions)}, ${tx.json({ ...(input.meta ?? {}), ...est, skuId: input.skuId ?? null, margin } as never)}, ${est.totalMicros},
       ${input.entitlement?.unit ?? null}, ${input.entitlement?.amount ?? 0}, now() + make_interval(mins => ${ttl}))
     on conflict (workspace_id, idempotency_key) do nothing
     returning id`;
@@ -292,9 +373,12 @@ export async function recordProviderCost(
  * (plan 05 §2.3).
  */
 export async function sweepExpiredAuthorizations(tx: Tx): Promise<number> {
+  // A reservation whose job still sends heartbeats is in use (§39): never released under a running production.
   const rows = await tx`select a.id, a.workspace_id from cost_authorizations a
                         where a.status = 'active' and a.expires_at < now()
                           and not exists (select 1 from workspaces w where w.id = a.workspace_id and w.state = 'SUSPENDED')
+                          and not exists (select 1 from projects p where p.workspace_id = a.workspace_id and p.id = a.project_id
+                                          and p.heartbeat_at > now() - make_interval(secs => ${HEARTBEAT_STALE_MS / 1000}))
                         limit 500`;
   let n = 0;
   for (const r of rows) {

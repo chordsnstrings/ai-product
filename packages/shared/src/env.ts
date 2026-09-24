@@ -75,6 +75,9 @@ const EnvSchema = z.object({
 
   /** 32-byte base64 key for encrypting OAuth tokens at rest (AES-256-GCM). */
   TOKEN_ENCRYPTION_KEY: z.string().default('ZGV2LWtleS1kZXYta2V5LWRldi1rZXktZGV2LWtleSE='),
+
+  /** Bearer token for GET /api/health/metrics (Prometheus text). Unset: the endpoint does not exist (404). */
+  METRICS_TOKEN: z.string().min(24).optional(),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

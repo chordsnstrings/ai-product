@@ -133,7 +133,7 @@ describe('renders kill switch (§44 "preserve reservation": prod-10)', () => {
     const [jobs] = await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`;
     expect(jobs!.n).toBe(0);
     // The gateway refuses renders too, whoever holds a token.
-    const other = await withTenant(r.t.workspaceId, (tx) => authorize(tx, r.ctx, { purpose: 'repair', lines: [{ kind: 'media', outputs: 1 }], idempotencyKey: 'kill-probe', reserveWhileRendersPaused: true }));
+    const other = await withTenant(r.t.workspaceId, (tx) => authorize(tx, r.ctx, { purpose: 'creative_test', lines: [{ kind: 'media', outputs: 1 }], idempotencyKey: 'kill-probe', reserveWhileRendersPaused: true }));
     await expect(generateVideo({ ctx: r.ctx, token: other.token, task: 'video.scene', prompt: 'x', references: [], seconds: 5, resolution: '720p', ratio: '9:16' })).rejects.toMatchObject({ code: 'UNAVAILABLE' });
 
     await ownerPool()`update feature_flags set enabled = false where key = 'kill.renders'`;

@@ -32,7 +32,7 @@ function recorder(name: string, fail: boolean): TtsProvider & { calls: TtsReques
 
 async function tokenFor(workspaceId: string, userId: string) {
   const ctx = ctxFor(workspaceId, userId);
-  const a = await withTenant(workspaceId, (tx) => authorize(tx, ctx, { purpose: 'repair', lines: [{ kind: 'tts', provider: 'minimax', model: 'speech-2.8-hd', chars: 5000 }], idempotencyKey: `tts:${Math.random()}` }));
+  const a = await withTenant(workspaceId, (tx) => authorize(tx, ctx, { purpose: 'creative_test', lines: [{ kind: 'tts', provider: 'minimax', model: 'speech-2.8-hd', chars: 5000 }], idempotencyKey: `tts:${Math.random()}` }));
   return { ctx, token: a.token };
 }
 

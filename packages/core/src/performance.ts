@@ -17,6 +17,7 @@ import { autoLinkByCode } from './experiments';
 import { enqueue, Queues } from './outbox';
 import { recordFacts } from './product-truth';
 import { nextCatalogueNo } from './workspaces';
+import { recordVariants } from './sku-variants';
 
 /**
  * PerformanceIngestionService (§33) + data freshness (§31) + integration edge cases (§47).
@@ -203,6 +204,18 @@ async function syncShopifyProducts(ctx: TenantContext, integrationId: string, sh
           { key: 'variants', valueJson: p.variants, sourceType: 'shopify', sourceId: p.id, state: 'OBSERVED' },
           { key: 'gtin', valueText: v0?.barcode ?? null, sourceType: 'shopify', sourceId: v0?.id, state: 'OBSERVED' },
         ]);
+        // §42: variant-specific price, availability and image.
+        await recordVariants(tx, ctx, sku!.id as string, 'shopify', p.variants.map((v) => ({
+          externalId: v.id,
+          title: v.title,
+          options: v.options,
+          priceMicros: v.price > 0 ? Math.round(v.price * 1_000_000) : undefined,
+          compareAtMicros: v.compareAtPrice ? Math.round(v.compareAtPrice * 1_000_000) : undefined,
+          sku: v.sku ?? undefined,
+          gtin: v.barcode ?? undefined,
+          available: v.available ?? undefined,
+          imageUrl: v.imageUrl ?? undefined,
+        })));
         if (p.status !== 'ACTIVE') await tx`update skus set status = 'archived' where id = ${sku!.id}`;
       });
     }

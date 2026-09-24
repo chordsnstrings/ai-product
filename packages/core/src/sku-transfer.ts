@@ -7,8 +7,8 @@ import { storage } from './storage';
 
 /**
  * "Transfer SKU to workspace" (plan 05 §2.3): merging workspaces isn't supported, so staff move SKUs one at a time
- * with the owner's written consent. One job copies the SKU's product truth — the SKU, its facts, claims and their
- * evidence, visual fingerprints and assets (stored objects included) — into the target workspace with new ids,
+ * with the owner's written consent. One job copies the SKU's product truth — the SKU, its facts, sizes/shades
+ * (sku_variants), claims and their evidence, visual fingerprints and assets (stored objects included) — into the target workspace with new ids,
  * rewriting every reference between them, then archives the source SKU. Experiments, productions and performance
  * stay with the workspace that ran them. Both workspaces get an event; the request and its outcome are audited.
  */
@@ -107,9 +107,11 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
       const evidence = await tx`select e.id, e.source_asset_id from claim_evidence e join claims c on c.id = e.claim_id and c.workspace_id = e.workspace_id
                                 where e.workspace_id = ${from} and c.sku_id = ${skuId}`;
       const fingerprints = await tx`select id, reference_asset_ids, cutout_asset_id from visual_fingerprints where workspace_id = ${from} and sku_id = ${skuId}`;
+      const skuVariants = await tx`select id, image_asset_ids from sku_variants where workspace_id = ${from} and sku_id = ${skuId}`;
       const referenced = new Set<string>([
         ...evidence.map((e) => e.source_asset_id as string | null),
         ...fingerprints.flatMap((f) => [...((f.reference_asset_ids as string[]) ?? []), f.cutout_asset_id as string | null]),
+        ...skuVariants.flatMap((sv) => (sv.image_asset_ids as string[]) ?? []),
       ].filter((x): x is string => !!x));
       const assets = await tx`select id, storage_key, mime from assets where workspace_id = ${from} and deleted_at is null
                               and (sku_id = ${skuId} or id = any(${[...referenced]}::uuid[]))`;
@@ -118,6 +120,7 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
       const claimMap = map(claims);
       const evidenceMap = map(evidence);
       const fpMap = map(fingerprints);
+      const skuVariantMap = map(skuVariants);
       const assetMap = map(assets);
       const keyMap: Record<string, string> = {};
       for (const a of assets) {
@@ -134,6 +137,7 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
         from, to, oldSku: skuId, newSku, no: Number(no!.no), brand: (brand?.id as string) ?? null,
         // Maps bind as JSON text cast in SQL (::text::jsonb), so they arrive intact with or without prepared statements.
         assets: JSON.stringify(assetMap), keys: JSON.stringify(keyMap), facts: JSON.stringify(factMap), claims: JSON.stringify(claimMap), evidence: JSON.stringify(evidenceMap), fps: JSON.stringify(fpMap),
+        skuVariants: JSON.stringify(skuVariantMap),
       };
       const remap = (map: string, col: string) => `({{${map}}}::text::jsonb ->> ${quote(col)}::text)::uuid`;
       counts.skus = await copyRows(tx, 'skus', `workspace_id = {{from}}::uuid and id = {{oldSku}}::uuid`, { id: '{{newSku}}::uuid', workspace_id: '{{to}}::uuid', catalogue_no: '{{no}}::int', brand_id: '{{brand}}::uuid', shopify_product_id: 'null' }, v);
@@ -142,6 +146,12 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
       }, v);
       counts.product_facts = await copyRows(tx, 'product_facts', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, {
         id: remap('facts', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid', supersedes_fact_id: remap('facts', 'supersedes_fact_id'),
+      }, v);
+      // Sizes/shades with their price, availability and images (standard §42), so creative in the target
+      // workspace can still name the right variant.
+      counts.sku_variants = await copyRows(tx, 'sku_variants', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, {
+        id: remap('skuVariants', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid',
+        image_asset_ids: `array(select ({{assets}}::text::jsonb ->> r::text)::uuid from unnest(image_asset_ids) r where {{assets}}::text::jsonb ? r::text)`,
       }, v);
       counts.visual_fingerprints = await copyRows(tx, 'visual_fingerprints', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, {
         id: remap('fps', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid', cutout_asset_id: remap('assets', 'cutout_asset_id'),

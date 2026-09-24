@@ -65,11 +65,32 @@ export const COST_LIMITS = {
   RETRY_RESERVE_FRACTION: 0.25,
   /** Daily anomaly guard = multiple of expected daily COGS (plan 02 §4). */
   DAILY_ANOMALY_MULTIPLE: 3,
+  /**
+   * Markup floor (standard §33/§37): minimum variable margin of entitlement-bearing work. The Creative Test
+   * ceiling keeps Scale (~$12.44 per test) just above it (standard §5: "above ~30% variable margin").
+   */
+  MIN_VARIABLE_MARGIN: 0.3,
 } as const;
 
 export const OFFER_RULES = {
   TASTE_WINDOW_MINUTES: 60,
   STRIPE_MIN_SESSION_MINUTES: 30,
+} as const;
+
+/**
+ * Pre-purchase exploration for signed-in workspaces that have not paid (standard §5 free preview: analysis,
+ * three concepts, a storyboard preview, "target preview COGS <= $0.20"). Signing up unlocks more exploration
+ * than a provisional workspace, but still bounded per SKU and per day, and by a cumulative per-SKU cost cap.
+ */
+export const FREE_EXPLORATION = {
+  /** New products a day. */
+  SKUS_PER_DAY: 3,
+  /** Concept batches per product, including the first three ideas. */
+  CONCEPT_BATCHES_PER_SKU: 4,
+  /** Storyboards drawn per product (each chosen concept draws one). */
+  STORYBOARDS_PER_SKU: 3,
+  /** Cumulative pre-purchase generation spend per product (storyboards, frames, extra concepts). */
+  SKU_COGS_CAP: usd(1.5),
 } as const;
 
 export const PROVISIONAL = {

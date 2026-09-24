@@ -5,12 +5,12 @@ import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { usd, type Role } from '@arkiv/shared';
 import { can } from './authz';
 import type { TenantContext } from './context';
-import { authorize, consumeAuthorization, estimateCost, settle, sweepExpiredAuthorizations } from './cost-governor';
+import { authorize, consumeAuthorization, estimateCost, marginDecision, revenuePerUnit, settle, sweepExpiredAuthorizations } from './cost-governor';
 import { idempotent } from './idempotency';
 import { append, available, balances, expirePeriod, periodUsage } from './ledger';
 import { llmJson } from './model-gateway';
 import { checkoutSessionExpiry, currentQuote, issueTasteOffer } from './offers';
-import { acceptInvite, changeRole, claimProvisional, createProvisionalWorkspace, inviteMember, removeMember, resolveProvisional } from './workspaces';
+import { acceptInvite, changeRole, claimProvisional, createProvisionalWorkspace, inviteMember, removeMember, resolveProvisional, transferOwnership } from './workspaces';
 
 beforeEach(truncateAll);
 afterAll(closeAll);
@@ -123,6 +123,42 @@ describe('ledger + cost governor', () => {
         }),
       ),
     ).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+  });
+
+  it('refuses entitlement work that costs more than the markup floor allows (§33, §37)', async () => {
+    const t = await makeTenant({ plan: 'SCALE', state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const video = (seconds: number) => [{ kind: 'video' as const, provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds, resolution: '720p' as const }];
+    await withTenant(t.workspaceId, (tx) => append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 5, idempotencyKey: 'g:floor' }));
+    // Scale: $199 / 16 = $12.4375 per Creative Test → at most $8.70 of variable cost at a 30% floor.
+    expect(await withTenant(t.workspaceId, (tx) => revenuePerUnit(tx, 'SCALE', 'creative_test', null))).toBe(12_437_500);
+    const long = await withTenant(t.workspaceId, (tx) => estimateCost(tx, video(40)));
+    expect(long.totalMicros).toBeGreaterThan(8_706_250);
+    // Premium work has no standard ceiling: the floor is what bounds it.
+    await expect(
+      withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'premium', lines: video(40), entitlement: { unit: 'creative_test', amount: 1 }, idempotencyKey: 'prem-1' })),
+    ).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { reason: 'markup_floor', revenueMicros: 12_437_500, maxCostMicros: 8_706_250 } });
+    // Two tests' worth of entitlement cover it; the decision is stored with the estimate.
+    const ok = await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'premium', lines: video(40), entitlement: { unit: 'creative_test', amount: 2 }, idempotencyKey: 'prem-2' }));
+    const [a] = await ownerPool()`select estimate->'margin' as margin from cost_authorizations where id = ${ok.authorizationId}`;
+    expect(a!.margin).toMatchObject({ ok: true, revenueMicros: 24_875_000, floor: 0.3 });
+    // Premium and repair work are never authorized without a priced entitlement.
+    for (const purpose of ['premium', 'repair'] as const) {
+      await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose, lines: video(5), idempotencyKey: `unpriced-${purpose}` }))).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { reason: 'unpriced' } });
+    }
+  });
+
+  it('values a Taste at what was paid, or at the live offer price for an unpaid credit', async () => {
+    const t = await makeTenant();
+    const [p] = await ownerPool()`insert into skus (workspace_id, catalogue_no, name) values (${t.workspaceId}, 1, 'S') returning id`;
+    const [proj] = await ownerPool()`insert into projects (workspace_id, sku_id, kind, state, created_by) values (${t.workspaceId}, ${p!.id}, 'preview', 'STORYBOARD_APPROVED', 'x') returning id`;
+    expect(await withTenant(t.workspaceId, (tx) => revenuePerUnit(tx, null, 'taste', proj!.id as string))).toBe(19_000_000);
+    await ownerPool()`insert into purchases (workspace_id, kind, project_id, amount_micros, stripe_checkout_session_id, created_by, status, paid_at)
+                      values (${t.workspaceId}, 'taste', ${proj!.id}, 5000000, 'cs_disc', 'user:x', 'paid', now())`;
+    const d = await withTenant(t.workspaceId, (tx) => marginDecision(tx, null, 'taste', 1, proj!.id as string, 4_000_000));
+    expect(d).toMatchObject({ ok: false, revenueMicros: 5_000_000, maxCostMicros: 3_500_000 });
+    // Without a plan, a Creative Test is valued at the cheapest per-test price of any plan.
+    expect(await withTenant(t.workspaceId, (tx) => revenuePerUnit(tx, null, 'creative_test', null))).toBe(12_437_500);
   });
 
   it('enforces the free preview cap per SKU', async () => {
@@ -270,5 +306,77 @@ describe('workspaces & members (plan 02 §2.1, §5)', () => {
     const owner = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
     await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'a@x.com', 'MEMBER'));
     await expect(withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'b@x.com', 'MEMBER'))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    // Re-inviting the same address replaces its invite instead of counting twice.
+    await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'a@x.com', 'ADMIN'));
+    const [n] = await ownerPool()`select count(*)::int as n from invites where workspace_id = ${t.workspaceId} and accepted_at is null and revoked_at is null`;
+    expect(n!.n).toBe(1);
+  });
+
+  it('concurrent invites at limit − 1 admit exactly one, and two invites to one address leave one live (x-races-09)', async () => {
+    const t = await makeTenant(); // free: 2 members, the owner is one
+    const owner = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
+    const results = await Promise.allSettled(['c1@x.com', 'c2@x.com', 'c3@x.com'].map((e) => withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, e, 'MEMBER'))));
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected').map((r) => (r as PromiseRejectedResult).reason.code)).toEqual(['PAYMENT_REQUIRED', 'PAYMENT_REQUIRED']);
+
+    const g = await makeTenant({ plan: 'GROWTH' });
+    const gOwner = ctxFor(g.workspaceId, g.userId);
+    await Promise.allSettled(Array.from({ length: 4 }, () => withTenant(g.workspaceId, (tx) => inviteMember(tx, gOwner, 'same@x.com', 'MEMBER'))));
+    const [live] = await ownerPool()`select count(*)::int as n from invites where workspace_id = ${g.workspaceId} and email = 'same@x.com' and accepted_at is null and revoked_at is null`;
+    expect(live!.n).toBe(1);
+  });
+
+  it('accepting an invite re-checks the member limit (e.g. after a downgrade) and leaves the invite open', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const owner = ctxFor(t.workspaceId, t.userId);
+    const { token } = await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'late@x.com', 'MEMBER'));
+    // Downgrade to free (2 members) and fill the second seat.
+    const [other] = await ownerPool()`insert into users (email) values ('other@x.com') returning id`;
+    await ownerPool()`update workspaces set plan_code = null where id = ${t.workspaceId}`;
+    await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${other!.id}, 'MEMBER')`;
+    const [late] = await ownerPool()`insert into users (email) values ('late@x.com') returning id`;
+    await expect(acceptInvite(token, { id: late!.id as string, email: 'late@x.com' })).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    const [inv] = await ownerPool()`select accepted_at from invites where email = 'late@x.com'`;
+    expect(inv!.accepted_at).toBeNull();
+    // After an upgrade the same invite works.
+    await ownerPool()`update workspaces set plan_code = 'GROWTH' where id = ${t.workspaceId}`;
+    expect(await acceptInvite(token, { id: late!.id as string, email: 'late@x.com' })).toBe(t.workspaceId);
+  });
+
+  it('two Owners demoting or removing each other concurrently never leave the workspace without an Owner (x-races-10)', async () => {
+    for (const op of ['demote', 'remove'] as const) {
+      const t = await makeTenant({ plan: 'GROWTH' });
+      const [b] = await ownerPool()`insert into users (email) values (${`b-${op}@x.com`}) returning id`;
+      await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${b!.id}, 'OWNER')`;
+      const a = ctxFor(t.workspaceId, t.userId);
+      const bc = ctxFor(t.workspaceId, b!.id as string);
+      const run = (actor: TenantContext, target: string) =>
+        withTenant(t.workspaceId, (tx) => (op === 'demote' ? changeRole(tx, actor, target, 'ADMIN') : removeMember(tx, actor, target)));
+      const results = await Promise.allSettled([run(a, b!.id as string), run(bc, t.userId)]);
+      expect(results.filter((r) => r.status === 'rejected').map((r) => (r as PromiseRejectedResult).reason.code)).toEqual(['CONFLICT']);
+      const [o] = await ownerPool()`select count(*)::int as n from memberships where workspace_id = ${t.workspaceId} and role = 'OWNER'`;
+      expect(o!.n).toBe(1);
+    }
+  });
+
+  it('a transfer to a member removed at the same moment fails without demoting the Owner (x-races-10)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const [adm] = await ownerPool()`insert into users (email) values ('admin@x.com') returning id`;
+    const [m] = await ownerPool()`insert into users (email) values ('member@x.com') returning id`;
+    await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${adm!.id}, 'ADMIN'), (${t.workspaceId}, ${m!.id}, 'MEMBER')`;
+    const owner = ctxFor(t.workspaceId, t.userId);
+    const admin = ctxFor(t.workspaceId, adm!.id as string, 'ADMIN');
+    await Promise.allSettled([
+      withTenant(t.workspaceId, (tx) => removeMember(tx, admin, m!.id as string)),
+      withTenant(t.workspaceId, (tx) => transferOwnership(tx, owner, m!.id as string)),
+    ]);
+    const owners = await ownerPool()`select user_id from memberships where workspace_id = ${t.workspaceId} and role = 'OWNER'`;
+    expect(owners.length).toBeGreaterThanOrEqual(1);
+    const [me] = await ownerPool()`select role from memberships where workspace_id = ${t.workspaceId} and user_id = ${t.userId}`;
+    const [still] = await ownerPool()`select role from memberships where workspace_id = ${t.workspaceId} and user_id = ${m!.id}`;
+    // Either the transfer won (member became Owner, then was an Owner the Admin may not remove) or the removal won
+    // (the transfer found no member and the original Owner kept the role).
+    if (still) expect([still.role, me!.role]).toEqual(['OWNER', 'ADMIN']);
+    else expect(me!.role).toBe('OWNER');
   });
 });

@@ -37,6 +37,34 @@ describe('product page parsing (fixtures)', () => {
     expect(p.description).toContain('Ignore previous instructions'); // preserved verbatim as untrusted data
   });
 
+  it('keeps every Shopify variant with its own options, price, availability and image (§42)', () => {
+    const p = parseShopifyProduct(JSON.stringify({ product: {
+      id: 7, title: 'Glow Serum', body_html: 'Serum', vendor: 'Lumen',
+      options: [{ name: 'Size', position: 1 }, { name: 'Shade', position: 2 }],
+      images: [{ id: 501, src: 'https://cdn/30.jpg' }, { id: 502, src: 'https://cdn/50.jpg' }],
+      variants: [
+        { id: 71, title: '30 ml / Light', price: '38.00', compare_at_price: null, sku: 'GS30L', barcode: '111', available: true, option1: '30 ml', option2: 'Light', image_id: 501 },
+        { id: 72, title: '50 ml / Light', price: '52.00', compare_at_price: '58.00', sku: 'GS50L', available: false, option1: '50 ml', option2: 'Light', image_id: 502 },
+      ],
+    } }));
+    expect(p?.priceMicros).toBe(38_000_000); // the product-level fact is still the first variant…
+    expect(p?.variants).toEqual([
+      { externalId: '71', title: '30 ml / Light', options: { Size: '30 ml', Shade: 'Light' }, priceMicros: 38_000_000, compareAtMicros: undefined, sku: 'GS30L', gtin: '111', available: true, imageUrl: 'https://cdn/30.jpg' },
+      { externalId: '72', title: '50 ml / Light', options: { Size: '50 ml', Shade: 'Light' }, priceMicros: 52_000_000, compareAtMicros: 58_000_000, sku: 'GS50L', gtin: undefined, available: false, imageUrl: 'https://cdn/50.jpg' },
+    ]); // …but each variant keeps its own, so creative can use the right one.
+  });
+
+  it('reads several JSON-LD offers as variants', () => {
+    const html = `<script type="application/ld+json">{"@type":"Product","name":"Cloud Cream","offers":[
+      {"@type":"Offer","sku":"CC30","name":"Cloud Cream 30 ml","price":"28.00","availability":"https://schema.org/InStock"},
+      {"@type":"Offer","sku":"CC50","name":"Cloud Cream 50 ml","price":"42.00","availability":"https://schema.org/OutOfStock"}]}</script>`;
+    const p = parseProductHtml(html, 'https://x.example/products/cc');
+    expect(p.variants?.map((v) => [v.externalId, v.title, v.priceMicros, v.available])).toEqual([
+      ['CC30', 'Cloud Cream 30 ml', 28_000_000, true],
+      ['CC50', 'Cloud Cream 50 ml', 42_000_000, false],
+    ]);
+  });
+
   it('parses Shopify product JSON', () => {
     const p = parseShopifyProduct(JSON.stringify({ product: { id: 99, title: 'Cloud Cream', body_html: '<b>Rich</b> cream', vendor: 'Nimbus', images: [{ src: 'https://cdn/x.jpg' }], variants: [{ title: '50 ml', price: '42.00', compare_at_price: '48.00', sku: 'CC50' }] } }));
     expect(p?.priceMicros).toBe(42_000_000);

@@ -3,6 +3,16 @@ import type { z } from 'zod';
 import { globalTx } from '@arkiv/db';
 import { isFlagOn } from '@arkiv/core';
 import { DomainError, env, httpStatusFor } from '@arkiv/shared';
+import { currentRequestId, logger, setLogService, withLogContext } from '@arkiv/shared/log';
+
+setLogService('web');
+const log = logger('api');
+
+/** A caller-supplied request id is kept only when it looks like one (it ends up in logs and responses). */
+export function requestIdFrom(req: Request): string {
+  const h = req.headers.get('x-request-id');
+  return h && /^[A-Za-z0-9._-]{8,64}$/.test(h) ? h : crypto.randomUUID();
+}
 
 /** Kill switch `kill.read_only` (plan 05 §20), cached for 5s so it costs ~nothing per request. */
 let roCache: { at: number; on: boolean } | null = null;
@@ -24,8 +34,9 @@ export function errorResponse(e: unknown) {
     if (e.code === 'RATE_LIMITED' && e.details?.retryAfter) res.headers.set('Retry-After', String(e.details.retryAfter));
     return res;
   }
-  const id = Math.random().toString(36).slice(2, 10);
-  console.error(`[api:${id}]`, e);
+  // The ref the customer sees is the request id every log line of this request (and its jobs) carries (§34).
+  const id = currentRequestId() ?? crypto.randomUUID();
+  log.error('request failed', { err: e });
   return json({ error: 'Something went wrong on our side. Please try again.', code: 'INTERNAL', ref: id }, 500);
 }
 
@@ -39,17 +50,32 @@ export function assertSameOrigin(req: Request) {
   }
 }
 
+/**
+ * API route wrapper: same-origin check, read-only kill switch, customer-safe errors, and a log context whose
+ * request id joins this request's log lines, the jobs it enqueues and their provider calls (§34). The id is
+ * returned in `x-request-id`.
+ */
 export function route<C = { params: Promise<Record<string, string>> }>(fn: (req: Request, ctx: C) => Promise<Response>) {
   return async (req: Request, ctx: C) => {
-    try {
-      assertSameOrigin(req);
-      if (req.method !== 'GET' && !new URL(req.url).pathname.startsWith('/api/auth/') && (await readOnly())) {
-        throw new DomainError('UNAVAILABLE', 'Arkiv is in read-only mode for maintenance. Nothing you’ve done is lost — try again shortly.');
+    const requestId = requestIdFrom(req);
+    return withLogContext({ requestId, method: req.method, path: new URL(req.url).pathname }, async () => {
+      let res: Response;
+      try {
+        assertSameOrigin(req);
+        if (req.method !== 'GET' && !new URL(req.url).pathname.startsWith('/api/auth/') && (await readOnly())) {
+          throw new DomainError('UNAVAILABLE', 'Arkiv is in read-only mode for maintenance. Nothing you’ve done is lost — try again shortly.');
+        }
+        res = await fn(req, ctx);
+      } catch (e) {
+        res = errorResponse(e);
       }
-      return await fn(req, ctx);
-    } catch (e) {
-      return errorResponse(e);
-    }
+      try {
+        res.headers.set('x-request-id', requestId);
+      } catch {
+        /* immutable response (e.g. a redirect); the id is still in the logs */
+      }
+      return res;
+    });
   };
 }
 

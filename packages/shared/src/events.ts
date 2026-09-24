@@ -109,7 +109,12 @@ export function actorRef(a: Actor): string {
   return a.kind === 'staff' && a.onBehalfOf ? `staff:${a.id}>${a.onBehalfOf}` : `${a.kind}:${a.id}`;
 }
 
-export const EVENT_SCHEMA_VERSION = 1;
+/**
+ * v2: every event carries `refs` (object IDs, subject included), one subject type per event type
+ * (EVENT_SUBJECT), VARIANT_GENERATED is emitted for experiment variants only (a finished one-off ad is
+ * COMPOSITION_COMPLETED) and PRODUCT_FACT_CHANGED carries the changed value.
+ */
+export const EVENT_SCHEMA_VERSION = 2;
 
 /**
  * Payload schemas for event types written from more than one code path (customer app, staff console, system),
@@ -131,4 +136,202 @@ export function assertEventPayload(type: EventType, payload: unknown): void {
   if (!schema) return;
   const r = schema.safeParse(payload);
   if (!r.success) throw new Error(`${type} payload does not match its schema: ${r.error.issues.map((i) => `${i.path.join('.') || '(root)'} ${i.message}`).join('; ')}`);
+}
+
+// ───────────── Subjects and object refs (§36 "events carry … object IDs") ─────────────
+
+/** Object IDs an event can relate to. Stored in events.refs so projections can be rebuilt without payload parsing. */
+export const EVENT_REF_KEYS = [
+  'skuId',
+  'projectId',
+  'experimentId',
+  'variantId',
+  'creativeId',
+  'sceneId',
+  'storyboardId',
+  'claimId',
+  'factId',
+  'learningId',
+  'recommendationId',
+  'integrationId',
+  'providerJobId',
+  'authorizationId',
+  'ledgerEntryId',
+  'purchaseId',
+  'offerId',
+  'subscriptionId',
+  'brandId',
+  'assetId',
+  'userId',
+] as const;
+export type EventRefKey = (typeof EVENT_REF_KEYS)[number];
+export type EventRefs = Partial<Record<EventRefKey, string | null | undefined>>;
+
+export type EventSubjectType =
+  | 'sku'
+  | 'brand'
+  | 'claim'
+  | 'creative'
+  | 'experiment'
+  | 'variant'
+  | 'learning'
+  | 'recommendation'
+  | 'project'
+  | 'scene'
+  | 'provider_job'
+  | 'workspace'
+  | 'user'
+  | 'offer'
+  | 'subscription'
+  | 'integration'
+  | 'asset';
+
+/** The ref key a subject's id is also stored under (subject { type: 'sku', id } ⇒ refs.skuId = id). */
+export const SUBJECT_REF: Partial<Record<EventSubjectType, EventRefKey>> = {
+  sku: 'skuId',
+  brand: 'brandId',
+  claim: 'claimId',
+  creative: 'creativeId',
+  experiment: 'experimentId',
+  variant: 'variantId',
+  learning: 'learningId',
+  recommendation: 'recommendationId',
+  project: 'projectId',
+  scene: 'sceneId',
+  provider_job: 'providerJobId',
+  user: 'userId',
+  offer: 'offerId',
+  subscription: 'subscriptionId',
+  integration: 'integrationId',
+  asset: 'assetId',
+};
+
+/**
+ * One subject type per event type (an event may also have no subject: workspace-level, e.g. a subscription grant
+ * with no project). Writers that disagree fail in tests (emit()).
+ */
+export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
+  PRODUCT_IMPORTED: 'sku',
+  PRODUCT_FACT_OBSERVED: 'sku',
+  PRODUCT_FACT_CHANGED: 'sku',
+  PRODUCT_CONFLICT_DETECTED: 'sku',
+  VISUAL_FINGERPRINT_VERSIONED: 'sku',
+  CUSTOMER_THEME_UPDATED: 'sku',
+  BRAND_BRAIN_VERSIONED: 'brand',
+  CLAIM_CREATED: 'claim',
+  CLAIM_EVIDENCE_ATTACHED: 'claim',
+  CLAIM_APPROVED: 'claim',
+  CLAIM_RESTRICTED: 'claim',
+  CLAIM_BLOCKED: 'claim',
+  CLAIM_UNBLOCKED: 'claim',
+  CREATIVE_IMPORTED: 'creative',
+  GENOME_EXTRACTED: 'creative',
+  CREATIVE_VERSIONED: 'creative',
+  EXPERIMENT_CREATED: 'experiment',
+  EXPERIMENT_APPROVED: 'experiment',
+  EXPERIMENT_STATE_CHANGED: 'experiment',
+  VARIANT_GENERATED: 'variant',
+  VARIANT_SKIPPED: 'variant',
+  VARIANT_EXPORTED: 'variant',
+  EXPERIMENT_CONFOUNDED: 'experiment',
+  PERFORMANCE_INGESTED: 'integration',
+  DATA_FRESHNESS_CHANGED: 'integration',
+  CONFIDENCE_CHANGED: 'experiment',
+  LEARNING_CREATED: 'learning',
+  LEARNING_WEAKENED: 'learning',
+  LEARNING_INVALIDATED: 'learning',
+  RECOMMENDATION_CREATED: 'recommendation',
+  RECOMMENDATION_ACCEPTED: 'recommendation',
+  RECOMMENDATION_DISMISSED: 'recommendation',
+  PROJECT_STATE_CHANGED: 'project',
+  PROVIDER_JOB_CREATED: 'provider_job',
+  PROVIDER_JOB_SUCCEEDED: 'provider_job',
+  PROVIDER_JOB_FAILED: 'provider_job',
+  QA_FAILED: 'scene',
+  QA_PASSED: 'scene',
+  COMPOSITION_COMPLETED: 'project',
+  CREDIT_RESERVED: 'project',
+  CREDIT_CONSUMED: 'project',
+  CREDIT_RELEASED: 'project',
+  CREDIT_REFUNDED: 'project',
+  CREDIT_GRANTED: 'project',
+  CREDIT_EXPIRED: 'project',
+  CREDIT_ADJUSTED: 'project',
+  FREE_QA_RETRY: 'project',
+  PROVIDER_COST_RECORDED: 'provider_job',
+  WORKSPACE_CREATED: 'workspace',
+  WORKSPACE_STATE_CHANGED: 'workspace',
+  WORKSPACE_PURGED: 'workspace',
+  MEMBER_ADDED: 'user',
+  MEMBER_REMOVED: 'user',
+  MEMBER_ROLE_CHANGED: 'user',
+  OFFER_ISSUED: 'offer',
+  OFFER_EXPIRED: 'offer',
+  OFFER_REDEEMED: 'offer',
+  SUBSCRIPTION_CHANGED: 'subscription',
+  INTEGRATION_CONNECTED: 'integration',
+  INTEGRATION_DEGRADED: 'integration',
+  INTEGRATION_DISCONNECTED: 'integration',
+  SKU_TRANSFERRED: 'sku',
+  LP_VIEWED: null,
+  UPLOAD_STARTED: null,
+  UPLOAD_COMPLETED: 'sku',
+  UPLOAD_FAILED: null,
+  URL_PARSE_FAILED: null,
+  SKU_VALIDATED: 'sku',
+  SKU_REJECTED: 'sku',
+  PRODUCT_ANALYZED: 'sku',
+  CONCEPTS_READY: 'project',
+  ACCOUNT_CLAIMED: 'workspace',
+  STORYBOARD_READY: 'project',
+  CHECKOUT_STARTED: 'project',
+  TASTE_PAID: 'project',
+  ASSET_WATCHED: 'asset',
+  ASSET_EXPORTED: 'asset',
+  SUBSCRIPTION_STARTED: 'subscription',
+};
+
+/**
+ * Object IDs every event of a type must carry (subject included), so downstream state (QA metrics, variant
+ * lineage, ledger reconciliation, product truth) can be rebuilt from events alone.
+ */
+export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey[]>> = {
+  PRODUCT_FACT_OBSERVED: ['skuId', 'factId'],
+  PRODUCT_FACT_CHANGED: ['skuId', 'factId'],
+  PRODUCT_CONFLICT_DETECTED: ['skuId', 'factId'],
+  QA_PASSED: ['sceneId', 'projectId', 'skuId', 'storyboardId', 'providerJobId'],
+  QA_FAILED: ['sceneId', 'projectId', 'skuId', 'storyboardId', 'providerJobId'],
+  VARIANT_GENERATED: ['variantId', 'experimentId', 'creativeId', 'skuId'],
+  VARIANT_SKIPPED: ['variantId', 'experimentId', 'skuId'],
+  COMPOSITION_COMPLETED: ['projectId', 'skuId', 'creativeId'],
+  CREDIT_RESERVED: ['ledgerEntryId', 'authorizationId'],
+  CREDIT_CONSUMED: ['ledgerEntryId', 'authorizationId'],
+  CREDIT_RELEASED: ['ledgerEntryId', 'authorizationId'],
+  CREDIT_GRANTED: ['ledgerEntryId'],
+  CREDIT_EXPIRED: ['ledgerEntryId'],
+  CREDIT_ADJUSTED: ['ledgerEntryId'],
+  FREE_QA_RETRY: ['ledgerEntryId', 'authorizationId', 'projectId'],
+  LEARNING_CREATED: ['learningId', 'experimentId', 'skuId'],
+  CONFIDENCE_CHANGED: ['experimentId', 'skuId'],
+  EXPERIMENT_CREATED: ['experimentId', 'skuId'],
+  RECOMMENDATION_CREATED: ['recommendationId', 'skuId'],
+  RECOMMENDATION_ACCEPTED: ['recommendationId', 'experimentId', 'skuId'],
+  GENOME_EXTRACTED: ['creativeId'],
+};
+
+/** Merge the subject into the refs and drop empty values. */
+export function eventRefs(subject: { type: string; id: string } | null, refs: EventRefs = {}): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(refs)) if (v) out[k] = v;
+  const key = subject ? SUBJECT_REF[subject.type as EventSubjectType] : undefined;
+  if (key && subject) out[key] = subject.id;
+  return out;
+}
+
+/** Throws when an event's subject type or required refs don't match its registered contract. */
+export function assertEventEnvelope(type: EventType, subject: { type: string; id: string } | null, refs: Record<string, string>): void {
+  const want = EVENT_SUBJECT[type];
+  if (subject && want && subject.type !== want) throw new Error(`${type} subject must be a ${want}, got ${subject.type}`);
+  const missing = (EVENT_REQUIRED_REFS[type] ?? []).filter((k) => !refs[k]);
+  if (missing.length) throw new Error(`${type} is missing refs: ${missing.join(', ')}`);
 }

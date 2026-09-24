@@ -19,7 +19,8 @@ import { isFlagOn } from './flags';
 import { append, type LedgerUnit } from './ledger';
 import { generateImage, generateVideo, lineFor, route, synthesizeVoice, type Route } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
-import { planSteps, step } from './progress';
+import { heartbeat as beat, planSteps, step } from './progress';
+import { referenceAssetIds } from './sku-variants';
 import { getProject, IN_PRODUCTION, isTerminal, PATH, transition } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
@@ -379,7 +380,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
   const unit = (p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'>) ?? 'taste';
   const purpose: Purpose = unit === 'creative_test' ? 'creative_test' : unit;
-  const heartbeat = () => renewLease(ctx, projectId, runId);
+  // The run's liveness: renews its lease (or stops, LeaseLost), records projects.heartbeat_at for the progress
+  // view and keeps its reservation from expiring under it (§39).
+  let authorizationId: string | null = (p.authorization_id as string | null) ?? null;
+  const heartbeat = async () => {
+    await renewLease(ctx, projectId, runId);
+    await withTenant(ws, (tx) => beat(tx, ws, projectId, authorizationId));
+  };
   const voice: LogicalVoice = brand?.brain.voice ?? DEFAULT_VOICE;
   const names = [sku.name as string, brand?.name ?? null];
   const reusable = reusableRenders(scenes, versions);
@@ -438,8 +445,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await tx`update projects set authorization_id = ${a.authorizationId} where id = ${projectId}`;
       }
       await step(tx, ws, projectId, 'prepare', 'done', `${scenes.length} scenes planned`);
+      await beat(tx, ws, projectId, a.authorizationId);
       return { auth: a, routes, plan };
     }));
+    authorizationId = auth.authorizationId;
   } catch (e) {
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     if (e instanceof DomainError && (e.code === 'PAYMENT_REQUIRED' || e.code === 'GATE_BLOCKED')) {
@@ -474,7 +483,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await advance(tx, ctx, projectId, 'RENDERING');
       await step(tx, ws, projectId, 'scenes', 'active');
     });
-    const refs = await withTenant(ws, async (tx) => Promise.all(((fp?.reference_asset_ids as string[]) ?? []).slice(0, 2).map((id) => assetBytes(tx, id))));
+    // Fidelity QA compares against the advertised variant's own image first (§42), then the fingerprint's photos.
+    const refs = await withTenant(ws, async (tx) => Promise.all((await referenceAssetIds(tx, sku.id as string, projectId)).map((id) => assetBytes(tx, id))));
     const fingerprint = { labelText: (fp?.label_text as string) ?? null, closure: (fp?.closure as string) ?? null, paletteDistanceMax: 70 };
     if (imagery.cutout && !imagery.cutout.keyed) checks.push({ check: 'product_fidelity', pass: true, hard: false, detail: `Your product photo couldn’t be cut out cleanly, so product shots use the photo itself. ${CLEAN_PHOTO_TIP}` });
 
@@ -595,7 +605,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                                              ${tx.json(res as never)}, ${ok ? 'accepted' : 'qa_failed'}, ${hashes.get(s.id)!},
                                              ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null } as never)})
                                      returning id`;
-              await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) });
+              await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) }, {
+                projectId, skuId: sku.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null,
+                providerJobId: vid.jobId, authorizationId: auth.authorizationId, assetId: a.id,
+              });
               return { assetId: a.id, versionId: row!.id as string };
             });
             checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: ${c.detail}` })));
@@ -813,8 +826,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');
         await settle(tx, ctx, auth.authorizationId, 'consumed');
-        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets });
-        await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, {});
+        const refs = { projectId, skuId: sku.id as string, creativeId: cr!.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null, authorizationId: auth.authorizationId };
+        // An experiment's master is its control variant; a one-off ad has no variant (COMPOSITION_COMPLETED only).
+        if (p.variant_id) await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: p.variant_id as string }, { creativeId: cr!.id, exports: exportAssets, master: true }, refs);
+        await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets }, refs);
         await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
         if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
       });

@@ -15,6 +15,8 @@ export interface ProductContext {
   approvedClaims: string[];
   themes: { label: string; signalType: string }[];
   testedAngles: string[];
+  /** Ids of the context-packet items the mock cites as rationale (themes, claims, facts, learnings). */
+  rationaleIds?: { themes: string[]; claims: string[]; facts: string[]; learnings: string[] };
 }
 
 const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
@@ -122,6 +124,13 @@ export function mockConcepts(ctx: ProductContext, batch = 1): ConceptSet {
       estimatedGenerationClass: 'remix',
     },
   ];
+  // Cite what each idea rests on, as a real Creative Director does: the review themes, approved claims and facts.
+  const r = ctx.rationaleIds;
+  if (r) {
+    base[0]!.rationaleIds = [...r.themes.slice(0, 1), ...r.claims.slice(0, 1), ...r.facts.slice(0, 1), ...r.learnings.slice(0, 1)];
+    base[1]!.rationaleIds = [...r.themes.slice(0, 2), ...r.claims.slice(0, 1)];
+    base[2]!.rationaleIds = r.facts.slice(0, 2);
+  }
   const offset = (batch - 1) % 3;
   const concepts = [...base.slice(offset), ...base.slice(0, offset)] as [Proposal, Proposal, Proposal];
   if (batch > 1) concepts.forEach((c, i) => (c.hookOptions = [c.hookOptions[(i + batch) % 3]!, ...c.hookOptions.filter((_, j) => j !== (i + batch) % 3)]));

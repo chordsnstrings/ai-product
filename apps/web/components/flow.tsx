@@ -43,9 +43,82 @@ function Loading() {
 const FACT_LABELS: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at', category: 'Category', texture: 'Texture', ingredients: 'Key ingredients', sku_code: 'SKU', gtin: 'GTIN' };
 const EDITABLE = new Set(['name', 'brand', 'size', 'price', 'category', 'texture', 'ingredients']);
 
+/** Inline inputs for facts we could not find (plan 03 P3 "ask for the missing field"; §42 ingredient source). */
+function MissingFacts({ projectId, fields, onSaved }: { projectId: string; fields: { key: string; label: string; hint?: string }[]; onSaved: () => void }) {
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  if (!fields.length) return null;
+  async function save(key: string) {
+    setErr(null);
+    setBusy(key);
+    try {
+      await api(`/api/projects/${projectId}/fact`, { key, value: values[key] ?? '' });
+      setValues((v) => ({ ...v, [key]: '' }));
+      onSaved();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(null);
+  }
+  return (
+    <div className="ak-stack">
+      {fields.map((f) => (
+        <form key={f.key} className="ak-stack" style={{ gap: 4 }} onSubmit={(e) => { e.preventDefault(); void save(f.key); }}>
+          <label className="ak-label" htmlFor={`missing-${f.key}`}>{f.label}</label>
+          {f.hint ? <span className="ak-small ak-muted">{f.hint}</span> : null}
+          <div className="ak-row">
+            {f.key === 'ingredients' ? (
+              <textarea id={`missing-${f.key}`} className="ak-input" rows={3} maxLength={400} value={values[f.key] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))} />
+            ) : (
+              <input id={`missing-${f.key}`} className="ak-input" maxLength={400} value={values[f.key] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))} />
+            )}
+            <Button size="sm" type="submit" disabled={!values[f.key]?.trim() || busy === f.key}>Save</Button>
+          </div>
+        </form>
+      ))}
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * §42 "Variants / sizes": which size or shade this ad is for, so it never shows the wrong one. Chosen before an
+ * idea is picked (the storyboard is drawn for it); until then no size or price that differs between them is used.
+ */
+function VariantPicker({ projectId, v, onSaved }: { projectId: string; v: View; onSaved: () => void }) {
+  const [err, setErr] = useState<string | null>(null);
+  const locked = !['PRODUCT_UPLOADED', 'PRODUCT_ANALYZED', 'BRIEF_READY', 'CONCEPTS_READY', 'NEEDS_USER_ACTION'].includes(v.project.state);
+  const chosen = v.sku.variants.find((x) => x.id === v.project.variantId) ?? null;
+  async function choose(variantId: string) {
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/variant`, { variantId: variantId || null });
+      onSaved();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  }
+  return (
+    <div className="ak-panel ak-stack">
+      <label className="ak-label" htmlFor="variant">Which one is this ad for?</label>
+      <select id="variant" className="ak-input" value={v.project.variantId ?? ''} disabled={locked} onChange={(e) => void choose(e.target.value)}>
+        <option value="">Not chosen — we won’t mention a size, shade or price that differs</option>
+        {v.sku.variants.map((x) => (
+          <option key={x.id} value={x.id}>
+            {x.title}{x.priceMicros != null ? ` · ${usd(x.priceMicros)}` : ''}{x.available === false ? ' · out of stock' : ''}
+          </option>
+        ))}
+      </select>
+      {chosen?.available === false ? <Banner tone="warn">{chosen.title} is out of stock on your store. You can still make the ad, but check it before you run it.</Banner> : null}
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
 export function AnalysisFlow({ projectId }: { projectId: string }) {
   const active = useCallback((v: View | null) => !v || v.sku.status === 'analyzing' || (v.sku.status === 'active' && v.concepts.length === 0 && v.project.state !== 'NEEDS_USER_ACTION'), []);
-  const { data: v, error, refresh } = useProject(projectId, active);
+  const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [err, setErr] = useState<string | null>(null);
@@ -61,7 +134,19 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
   }
 
   const analyzing = v.sku.status === 'analyzing';
+  // The analysis ended without finishing (plan 03 P3): show what we have, ask for what's missing, offer a retry.
+  const failed = v.sku.status === 'needs_input';
   const ready = v.concepts.length > 0;
+  async function retryAnalysis() {
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/retry-analysis`, {});
+      resume();
+      refresh();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  }
   async function save(key: string) {
     setErr(null);
     try {
@@ -77,8 +162,8 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
   return (
     <Shell
       step={1}
-      title={analyzing ? 'Cataloguing your product' : v.sku.name}
-      sub={analyzing ? 'This is real work, happening now — usually under a minute. You can leave this tab; we’ll keep going.' : `No. ${String(v.sku.catalogueNo).padStart(3, '0')} · Check the details below. Anything you correct is used exactly as you write it.`}
+      title={analyzing ? 'Cataloguing your product' : failed ? 'We couldn’t finish reading this product' : v.sku.name}
+      sub={analyzing ? 'This is real work, happening now — usually under a minute. You can leave this tab; we’ll keep going.' : failed ? 'Here’s what we found. Add anything that’s missing and try again — nothing has been charged.' : `No. ${String(v.sku.catalogueNo).padStart(3, '0')} · Check the details below. Anything you correct is used exactly as you write it.`}
     >
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
         <div className="ak-specimen" data-ready={!!v.sku.cutoutUrl}>
@@ -114,6 +199,26 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   }))}
               />
               {err ? <p className="ak-error" role="alert">{err}</p> : null}
+              {failed ? (
+                <div className="ak-stack">
+                  <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
+                  <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
+                  <div><Button onClick={() => void retryAnalysis()}>Try again</Button></div>
+                </div>
+              ) : !v.sku.ingredientsVerified ? (
+                <div className="ak-panel ak-stack">
+                  <h2 className="ak-label">Add your ingredient list to unlock ingredient tests</h2>
+                  <p className="ak-small ak-muted" style={{ margin: 0 }}>We didn’t find an ingredient list on your page or label, so we won’t suggest ingredient-led ads or guess ingredients from the category.</p>
+                  <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Key ingredients', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
+                </div>
+              ) : null}
+              {!failed && v.sku.variants.length > 1 ? <VariantPicker projectId={projectId} v={v} onSaved={refresh} /> : null}
+              {!failed && v.sku.missingEvidence.length ? (
+                <div>
+                  <h2 className="ak-label">What would make these ads stronger</h2>
+                  <ul className="ak-small" style={{ margin: 0 }}>{v.sku.missingEvidence.map((m) => <li key={m}>{m}</li>)}</ul>
+                </div>
+              ) : null}
               {v.claims.length ? (
                 <div>
                   <h2 className="ak-label">Claims we found</h2>
@@ -128,7 +233,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <p className="ak-small ak-muted">Blocked claims never appear in your ads. Cosmetic products can’t claim to treat or change the skin’s structure (FDA).</p>
                 </div>
               ) : null}
-              {ready ? (
+              {failed ? null : ready ? (
                 <LinkButton href={`/concepts/${projectId}`} block id="cta">Looks right — show me 3 ad ideas</LinkButton>
               ) : v.project.state === 'NEEDS_USER_ACTION' ? (
                 <Banner tone="warn">{v.project.failureReason ?? 'We need a clearer photo of the product. Add one to continue.'}</Banner>
@@ -468,10 +573,25 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
           {err ? <p className="ak-error">{err}</p> : null}
         </div>
       ) : (
-        <Ledger steps={v.productionSteps} />
+        <>
+          <Ledger steps={v.productionSteps} />
+          <Liveness live={v.project.liveness} />
+        </>
       )}
     </Shell>
   );
+}
+
+/** "Still working" vs "stalled", from the production run's heartbeat (standard §39). */
+export function Liveness({ live }: { live: View['project']['liveness'] }) {
+  if (live.state === 'stalled') {
+    return <Banner tone="warn">This is taking longer than it should. We’re checking on it — nothing is lost, and you won’t be charged twice.</Banner>;
+  }
+  if (live.state === 'working' && live.heartbeatAgeMs != null) {
+    const s = Math.round(live.heartbeatAgeMs / 1000);
+    return <p className="ak-small ak-muted" aria-live="off">Still working · last update {s < 5 ? 'just now' : `${s}s ago`}</p>;
+  }
+  return null;
 }
 
 /* ───────────── P10 · Delivery ───────────── */

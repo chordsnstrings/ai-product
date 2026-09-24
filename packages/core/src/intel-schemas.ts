@@ -43,6 +43,11 @@ export const Proposal = z.object({
   ifTestFails: z.string().max(220),
   riskProfile: z.enum(['lower_risk', 'adjacent', 'exploratory']),
   estimatedGenerationClass: z.enum(['remix', 'hybrid_short', 'generative_short', 'premium']),
+  /**
+   * The context-packet items this idea rests on, by their `id` (customer themes, learnings, approved claims,
+   * product facts) — the rationale we show instead of chain-of-thought (§38). Unknown ids are dropped by the gate.
+   */
+  rationaleIds: z.array(z.string().max(64)).max(8).optional().describe('ids of context-packet items (themes, learnings, claims, facts) this idea is grounded in'),
 });
 export type Proposal = z.infer<typeof Proposal>;
 

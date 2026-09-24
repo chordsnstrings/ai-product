@@ -86,6 +86,57 @@ describe('Taste checkout (P7/P8, plan 02 B1–B5)', () => {
   }, 60_000);
 });
 
+describe('exactly-once Stripe processing (plan 02 B1/B2, x-races-03)', () => {
+  it('the webhook route, the poller and an admin replay racing on one event apply its side effects once', async () => {
+    const { t, ctx, projectId } = await storyboardReady();
+    const co = await withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }));
+    const [w] = await ownerPool()`select stripe_customer_id from workspaces where id = ${t.workspaceId}`;
+    const evt = { id: 'evt_race', type: 'checkout.session.completed', data: { object: { id: co.sessionId, mode: 'payment', payment_status: 'paid', customer: w!.stripe_customer_id, metadata: { workspace_id: t.workspaceId }, payment_intent: 'pi_race' } } };
+    await receiveStripeWebhook(JSON.stringify(evt), null);
+    const outcomes = await Promise.all(Array.from({ length: 6 }, () => processStripeEvent('evt_race')));
+    expect(outcomes).toContain('processed');
+    expect(outcomes.every((o) => o === 'processed' || o === 'in_progress')).toBe(true);
+    // Replays after the fact are no-ops too.
+    expect(await processStripeEvent('evt_race')).toBe('processed');
+    const count = async (q: Promise<{ n: number }[]>) => (await q)[0]!.n;
+    expect(await count(ownerPool()`select count(*)::int as n from events where workspace_id = ${t.workspaceId} and type = 'TASTE_PAID'`)).toBe(1);
+    expect(await count(ownerPool()`select count(*)::int as n from funnel_events where workspace_id = ${t.workspaceId} and type = 'TASTE_PAID'`)).toBe(1);
+    expect(await count(ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and queue = 'send-email' and payload->>'template' = 'receipt'`)).toBe(1);
+    expect(await count(ownerPool()`select count(*)::int as n from ledger_entries where workspace_id = ${t.workspaceId} and type = 'CREDIT_GRANTED'`)).toBe(1);
+    const [row] = await ownerPool()`select status, workspace_id, claim_token, attempts from stripe_events where id = 'evt_race'`;
+    expect(row).toMatchObject({ status: 'processed', workspace_id: t.workspaceId, claim_token: null });
+  }, 60_000);
+
+  it('takes over a claim abandoned by a crashed process; the old holder can no longer complete it', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    await ownerPool()`insert into stripe_customers (customer_id, workspace_id) values ('cus_stale', ${t.workspaceId})`;
+    await receiveStripeWebhook(JSON.stringify({ id: 'evt_stale', type: 'invoice.payment_failed', data: { object: { id: 'in_s', customer: 'cus_stale', subscription: 'sub_s' } } }), null);
+    const dead = '00000000-0000-4000-8000-000000000001';
+    // A live claim is left alone…
+    await ownerPool()`update stripe_events set status = 'processing', claimed_at = now(), claim_token = ${dead} where id = 'evt_stale'`;
+    expect(await processStripeEvent('evt_stale')).toBe('in_progress');
+    // …a stale one is taken over and applied once.
+    await ownerPool()`update stripe_events set claimed_at = now() - interval '6 minutes' where id = 'evt_stale'`;
+    expect(await processStripeEvent('evt_stale')).toBe('processed');
+    const [done] = await withTenant(t.workspaceId, (tx) => tx`select stripe_event_complete('evt_stale', ${dead}) as ok`);
+    expect(done!.ok).toBe(false);
+    const mails = await ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and payload->>'template' = 'payment_failed'`;
+    expect(mails[0]!.n).toBe(1);
+    const [w] = await ownerPool()`select state from workspaces where id = ${t.workspaceId}`;
+    expect(w!.state).toBe('PAST_DUE');
+  });
+
+  it('an event that arrives before our row commits goes back to received for a later retry', async () => {
+    const t = await makeTenant();
+    await ownerPool()`insert into stripe_customers (customer_id, workspace_id) values ('cus_early', ${t.workspaceId})`;
+    await receiveStripeWebhook(JSON.stringify({ id: 'evt_early', type: 'checkout.session.completed', data: { object: { id: 'cs_not_yet', mode: 'payment', payment_status: 'paid', customer: 'cus_early', metadata: {} } } }), null);
+    expect(await processStripeEvent('evt_early')).toBe('retry');
+    const [row] = await ownerPool()`select status, claim_token, attempts, error from stripe_events where id = 'evt_early'`;
+    expect(row).toMatchObject({ status: 'received', claim_token: null, attempts: 1 });
+    expect(row!.error).toMatch(/not committed/);
+  });
+});
+
 describe('kill switches (plan 05 §20)', () => {
   it('kill.checkout pauses checkout without losing the storyboard', async () => {
     const { t, ctx, projectId } = await storyboardReady();

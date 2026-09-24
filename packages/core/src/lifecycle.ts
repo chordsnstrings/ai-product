@@ -17,10 +17,21 @@ import { transitionWorkspace } from './workspaces';
 
 export async function requestExport(tx: Tx, ctx: TenantContext) {
   assertCan(ctx, 'workspace.export');
-  await enqueue(tx, ctx.workspaceId, Queues.exportWorkspace, { requestedBy: ctx.actor }, { singletonKey: `export:${ctx.workspaceId}` });
+  await enqueue(tx, ctx.workspaceId, Queues.exportWorkspace, { requestedBy: ctx.actor, requestedAt: new Date().toISOString() }, { singletonKey: `export:${ctx.workspaceId}` });
 }
 
-const EXPORT_TABLES = ['brand_brain_versions', 'skus', 'product_facts', 'claims', 'claim_evidence', 'customer_signals', 'customer_themes', 'experiments', 'variants', 'learnings', 'recommendations', 'creatives', 'performance_observations', 'confounders', 'events'];
+/**
+ * Has an export finished since this request was made? Then the request is already answered (a second click
+ * after the first job was dispatched) and the job stands down instead of building and emailing it twice.
+ */
+export async function exportSatisfied(tx: Tx, workspaceId: string, requestedAt: string | null | undefined): Promise<boolean> {
+  if (!requestedAt) return false;
+  const [a] = await tx`select 1 from assets where workspace_id = ${workspaceId} and kind = 'evidence_doc' and lineage->>'export' = 'true'
+                       and created_at >= ${new Date(requestedAt)} and deleted_at is null limit 1`;
+  return !!a;
+}
+
+const EXPORT_TABLES = ['brand_brain_versions', 'skus', 'sku_variants', 'product_facts', 'claims', 'claim_evidence', 'customer_signals', 'customer_themes', 'experiments', 'variants', 'learnings', 'recommendations', 'creatives', 'performance_observations', 'confounders', 'events'];
 
 export async function buildExport(ctx: TenantContext): Promise<{ assetId: string; url: string }> {
   const ws = ctx.workspaceId;
@@ -87,7 +98,7 @@ export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
   return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
-const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes'];
+const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'sku_variants', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes'];
 
 /**
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,

@@ -2,6 +2,8 @@ import { withSystem, withTenant } from '@arkiv/db';
 import { sendEmail } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import {
+  ANALYSIS_STATES,
+  failAnalysis,
   OUTAGE_MAX_HOURS,
   RECOVERY_EMAIL_CAP,
   STUCK_DEADLINE_MINUTES,
@@ -23,14 +25,19 @@ import {
   weekOf,
 } from '@arkiv/core';
 
+// Scheduled maintenance (§39: reservations must never be stranded; plan 02 lifecycle; plan 04 L20 recovery).
+// Each sweep runs as the system role and fans out tenant work through the outbox.
+
 /**
- * Scheduled maintenance (§39: reservations must never be stranded; plan 02 lifecycle; plan 04 L20 recovery).
- * Each sweep runs as the system role and fans out tenant work through the outbox.
+ * Fan-out enqueue, once per singleton key ever (a reminder is never sent twice, even after its job ran). Atomic:
+ * a concurrent run's pending row wins through the `outbox_singleton_pending` index; this workspace's own rows
+ * are checked explicitly (system_rw sees every tenant).
  */
 async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], workspaceId: string, queue: string, payload: Record<string, unknown>, singletonKey: string, priority = 0) {
-  const [dup] = await tx`select 1 from outbox where queue = ${queue} and singleton_key = ${singletonKey} limit 1`;
-  if (dup) return;
-  await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority})`;
+  await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority)
+           select ${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority}
+           where not exists (select 1 from outbox where workspace_id = ${workspaceId} and queue = ${queue} and singleton_key = ${singletonKey})
+           on conflict (workspace_id, queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing`;
 }
 
 const sysCtx = (workspaceId: string, id: string): TenantContext => ({ ...systemContext(workspaceId, id), actor: { kind: 'system', id } });
@@ -124,6 +131,28 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
         else await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:stuck:${Math.floor(Date.now() / 300_000)}`, 20));
       }
       return rows.length;
+    },
+  },
+  // Plan 03 P3: an analysis with no progress for 10 minutes (worker lost, job expired) is failed honestly: the
+  // SKU waits for the merchant with what was found, instead of "analyzing" forever. System role: every
+  // predicate is tied to the SKU's own workspace.
+  'sweep-stuck-analysis': {
+    cron: '*/5 * * * *',
+    run: async () => {
+      const rows = await withSystem((tx) => tx`
+        select s.id as sku_id, p.id as project_id, s.workspace_id from skus s
+        join projects p on p.sku_id = s.id and p.workspace_id = s.workspace_id
+        where s.status in ('analyzing', 'active') and p.state in ${tx([...ANALYSIS_STATES])}
+          and p.updated_at < now() - interval '10 minutes' and s.created_at < now() - interval '10 minutes'
+          and not exists (select 1 from progress_steps ps where ps.workspace_id = s.workspace_id and ps.subject_id = s.id
+                          and greatest(ps.started_at, ps.completed_at) > now() - interval '10 minutes')
+          and not exists (select 1 from outbox o where o.workspace_id = s.workspace_id and o.queue in ('analyze-product', 'analyze-product-free')
+                          and o.dispatched_at is null and o.payload->>'skuId' = s.id::text)
+          and not exists (select 1 from workspaces w where w.id = s.workspace_id and w.state = any(${[...JOB_HOLD_STATES]}))
+        limit 100`);
+      let n = 0;
+      for (const r of rows) if (await failAnalysis(sysCtx(r.workspace_id as string, 'analysis-sweep'), r.sku_id as string, r.project_id as string, 'analysis stalled (no progress for 10 minutes)')) n++;
+      return n;
     },
   },
   'sweep-provisional': { cron: '*/15 * * * *', run: () => withSystem((tx) => sweepProvisional(tx)) },

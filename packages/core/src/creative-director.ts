@@ -10,13 +10,42 @@ import { ConceptSet, StoryboardPlan, type Proposal } from './intel-schemas';
 import { mockConcepts, mockStoryboard, type ProductContext } from './mock-intel';
 import { llmJson } from './model-gateway';
 import { currentFacts, factText } from './product-truth';
+import { listVariants, projectVariant, variantTruth } from './sku-variants';
 import { CONCEPTS_SYSTEM, STORYBOARD_SYSTEM } from './prompts';
+
+/** Sources that observe a real ingredient list (the page, structured data, the store, the label itself). */
+const INGREDIENT_SOURCES: ReadonlySet<string> = new Set(['product_page', 'json_ld', 'shopify', 'photo_ocr']);
+
+/**
+ * Ingredients creative may use (§42 "Missing ingredient list: do not infer ingredient claims from category;
+ * request source if ingredient creative is desired"): only an ingredient list observed at a real source, or one
+ * the merchant decided. Ingredients inferred from photos or category are never passed on.
+ */
+export function verifiedIngredients(facts: Awaited<ReturnType<typeof currentFacts>>): { list: string[]; verified: boolean } {
+  const usable = (key: string) => {
+    const f = facts[key];
+    if (!f || f.disputed) return null;
+    const v = f.value;
+    const ok = (v.state === 'OBSERVED' && INGREDIENT_SOURCES.has(v.sourceType)) || (v.state === 'DECIDED' && (v.sourceType === 'merchant' || v.sourceType === 'staff'));
+    return ok ? factText(facts, key) : null;
+  };
+  const split = (t: string, max: number) => t.split(/[,;\n]/).map((s) => s.trim()).filter((s) => s && s.length <= 60).slice(0, max);
+  const key = usable('key_ingredients');
+  if (key) return { list: split(key, 8), verified: true };
+  const full = usable('ingredients');
+  if (full) return { list: split(full, 6), verified: true };
+  return { list: [], verified: false };
+}
+
+/** Ingredient-led creative (education, explanation) needs a sourced ingredient list (§42). */
+export const isIngredientLed = (p: Pick<Proposal, 'angle' | 'proofMechanism'>) => p.angle === 'INGREDIENT_EDUCATION' || p.proofMechanism === 'INGREDIENT_EXPLANATION';
+export const UNVERIFIED_INGREDIENTS_REASON = 'ingredient creative needs your ingredient list (add it to unlock ingredient tests)';
 
 /**
  * ContextBuilder (§22, §33): a curated, bounded Context Packet — never raw DB access. Everything comes through
  * tenant-scoped reads, so a packet can only contain this workspace's rows (plan 02 §3 layer 6).
  */
-export async function buildContext(tx: Tx, skuId: string) {
+export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: string | null } = {}) {
   const [sku] = await tx`select * from skus where id = ${skuId}`;
   if (!sku) throw new DomainError('NOT_FOUND', 'Product not found');
   const facts = await currentFacts(tx, skuId);
@@ -24,43 +53,60 @@ export async function buildContext(tx: Tx, skuId: string) {
   // Only claims usable wherever this ad will be published (every export platform, the brand's market) are
   // offered as APPROVED; anything narrower would pass here and then fail claims QA after render spend.
   const usable = new Set((await renderableClaims(tx, skuId, { platforms: AD_PLATFORMS })).map((c) => c.id));
-  const themes = await tx`select label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
+  const themes = await tx`select id, label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
                           order by prevalence * relevance desc limit 6`;
   const snippets = await tx`select text from customer_signals where sku_id = ${skuId} order by observed_at desc nulls last limit 8`;
   const coverage = await tx`select genes->>'angle' as angle, state, count(*)::int as n from experiments where sku_id = ${skuId}
                             group by 1, 2`;
-  const learnings = await tx`select statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
+  const learnings = await tx`select id, statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
                              and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') and not confounded order by confidence desc limit 6`;
-  const ingredients = (factText(facts, 'key_ingredients') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const { list: ingredients, verified: ingredientsVerified } = verifiedIngredients(facts);
   const brand = await brandBrainFor(tx, skuId);
+  const approvedRows = claims.filter((c) => usable.has(c.id));
+  // Stable ids for every packet item, so a proposal can cite what it rests on (rationale ids, §38).
+  const FACT_KEYS = ['category', 'size', 'price', 'texture', 'format', 'key_ingredients', 'ingredients'];
+  const factIds = Object.fromEntries(FACT_KEYS.filter((k) => facts[k]).map((k) => [k, facts[k]!.value.id]));
+  // §42 variants: the advertised variant's size, shade and price — never another variant's (e.g. variants[0]).
+  const variants = await listVariants(tx, skuId);
+  const chosen = opts.projectId ? await projectVariant(tx, opts.projectId) : null;
+  const factPrice = facts.price?.value.valueNumber;
+  const truth = variantTruth(variants, chosen, { size: factText(facts, 'size'), priceMicros: factPrice != null ? Math.round(factPrice * 1_000_000) : null });
   const productContext: ProductContext = {
     name: sku.name as string,
     category: (factText(facts, 'category') ?? sku.category ?? 'skincare') as string,
-    sizeText: factText(facts, 'size'),
+    sizeText: truth.size,
     texture: factText(facts, 'texture'),
     ingredients,
-    approvedClaims: claims.filter((c) => usable.has(c.id)).map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
+    approvedClaims: approvedRows.map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
     themes: themes.map((t) => ({ label: t.label as string, signalType: t.signal_type as string })),
     testedAngles: coverage.map((c) => c.angle as string).filter(Boolean),
+    rationaleIds: { themes: themes.map((t) => t.id as string), claims: approvedRows.map((c) => c.id), facts: Object.values(factIds), learnings: learnings.map((l) => l.id as string) },
   };
   const packet = {
     product: {
       name: productContext.name,
       category: productContext.category,
       size: productContext.sizeText,
-      price: factText(facts, 'price'),
+      price: truth.priceMicros != null ? (truth.priceMicros / 1_000_000).toFixed(2) : null,
+      shade: truth.shade,
+      variant: truth.variantTitle,
+      // Sold in several sizes/shades and none chosen: state no size, shade or price that differs between them.
+      variantNote: truth.ambiguous ? `Sold in ${variants.length} variants (${variants.map((v) => v.title).slice(0, 6).join(', ')}); no variant chosen — do not state a size, shade or price that is not listed here.` : null,
       texture: productContext.texture,
       format: factText(facts, 'format'),
       keyIngredients: ingredients,
+      // No sourced ingredient list: no ingredient-led concepts, and never ingredients guessed from the category.
+      ingredientsUnverified: !ingredientsVerified,
+      factIds,
     },
     claims: {
-      APPROVED: productContext.approvedClaims,
+      APPROVED: approvedRows.map((c, i) => ({ id: c.id, wording: productContext.approvedClaims[i]! })),
       NEEDS_REVIEW_DO_NOT_USE: claims.filter((c) => c.status === 'MERCHANT_REVIEW_REQUIRED' || ((c.status === 'VERIFIED' || c.status === 'VERIFIED_WITH_QUALIFIER') && !usable.has(c.id))).map((c) => c.preferredWording),
       BLOCKED_NEVER_USE: claims.filter((c) => c.status === 'BLOCKED' || c.status === 'RESTRICTED').map((c) => c.preferredWording),
     },
-    customerThemes: themes.map((t) => ({ label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
+    customerThemes: themes.map((t) => ({ id: t.id, label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
     coverage: coverage.map((c) => ({ angle: c.angle, state: c.state, count: c.n })),
-    learnings: learnings.map((l) => ({ statement: l.statement, state: l.state, platform: l.scope_platform })),
+    learnings: learnings.map((l) => ({ id: l.id, statement: l.statement, state: l.state, platform: l.scope_platform })),
     // The merchant's own Brand Brain (versioned): shapes voice and visuals, never overrides claim rules.
     brand: brand
       ? { name: brand.name, tone: brand.brain.tone, neverShowOrSay: brand.brain.prohibited, requiredDisclosures: brand.brain.disclosures, preferredCta: brand.brain.cta, colors: brand.brain.colors, market: brand.brain.market }
@@ -70,12 +116,30 @@ export async function buildContext(tx: Tx, skuId: string) {
   };
   // Product and brand names are names, not claims ("Glow Serum" makes no glow claim).
   const names = [sku.name as string, brand?.name ?? null];
-  return { sku, facts, productContext, packet, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
+  const r = productContext.rationaleIds!;
+  const packetIds = new Set([...r.themes, ...r.claims, ...r.facts, ...r.learnings]);
+  return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
 }
 
-/** Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). */
-export function gateProposal(p: Proposal, approved: string[], names: (string | null | undefined)[] = []): { ok: boolean; reasons: string[]; cleaned: Proposal } {
+/**
+ * Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). Rationale ids are
+ * kept only when they name an item of the packet the proposal was drafted from (`packetIds`).
+ */
+export function gateProposal(
+  p: Proposal,
+  approved: string[],
+  names: (string | null | undefined)[] = [],
+  opts: { packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean } = {},
+): { ok: boolean; reasons: string[]; cleaned: Proposal } {
   const reasons: string[] = [];
+  const { packetIds } = opts;
+  const ingredientBlocked = opts.ingredientsVerified === false && isIngredientLed(p);
+  if (ingredientBlocked) reasons.push(UNVERIFIED_INGREDIENTS_REASON);
+  const rationaleIds = [...new Set(p.rationaleIds ?? [])].filter((id) => {
+    const known = !packetIds || packetIds.has(id);
+    if (!known) reasons.push(`unknown rationale id dropped: ${id.slice(0, 40)}`);
+    return known;
+  });
   const vault = approved.map((w, i) => ({ id: String(i), wording: w }));
   // Only customer-facing copy is claims-scanned; hypothesis/body are internal strategy notes. A hook that makes a
   // product claim no approved claim covers would be refused by claims QA after render spend, so it goes now.
@@ -93,7 +157,7 @@ export function gateProposal(p: Proposal, approved: string[], names: (string | n
     return ok;
   });
   while (cleanHooks.length < 3) cleanHooks.push(['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'][cleanHooks.length]!);
-  return { ok: !blockedStrategy, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims } };
+  return { ok: !blockedStrategy && !ingredientBlocked, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds } };
 }
 
 /** Three concepts must differ in hypothesis (angle or primary variable), not just copy (§13). */
@@ -115,7 +179,7 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -137,7 +201,7 @@ export async function generateConcepts(run: ConceptRun) {
       effort: 'high',
       maxTokens: CONCEPTS_MAX_TOKENS,
     });
-    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names));
+    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified }));
     const valid = gated.filter((g) => g.ok);
     if (valid.length === 3 && conceptsAreDistinct(valid.map((v) => v.cleaned))) break;
     content.push({ type: 'text', text: `Previous attempt was rejected by compliance/diversity gates: ${gated.flatMap((g) => g.reasons).join('; ') || 'concepts too similar'}. Fix and return three distinct compliant concepts.` });
@@ -209,7 +273,7 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (
 
 export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string; brandBrainVersionId: string | null }> {
   const { productContext, packet, concept, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, async (tx) => {
-    const c = await buildContext(tx, run.skuId);
+    const c = await buildContext(tx, run.skuId, { projectId: run.projectId });
     const [row] = await tx`select proposal from concepts where id = ${run.conceptId}`;
     if (!row) throw new DomainError('NOT_FOUND', 'Concept not found');
     return { ...c, concept: row.proposal as Proposal };

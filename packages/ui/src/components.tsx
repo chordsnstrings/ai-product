@@ -93,7 +93,7 @@ export function Rail({ step }: { step: 1 | 2 | 3 | 4 }) {
   );
 }
 
-export function Ledger({ steps }: { steps: { key: string; label: string; status: string; detail?: string | null; at?: string | null }[] }) {
+export function Ledger({ steps }: { steps: { key: string; label: string; status: string; detail?: string | null; at?: string | null; note?: string | null }[] }) {
   return (
     <ol className="ak-ledger" aria-live="polite">
       {steps.map((s) => (
@@ -102,6 +102,7 @@ export function Ledger({ steps }: { steps: { key: string; label: string; status:
           <span>
             {s.label}
             {s.detail ? <span className="ak-small ak-muted" style={{ display: 'block' }}>{s.detail}</span> : null}
+            {s.note && s.status === 'active' ? <span className="ak-small" style={{ display: 'block' }}>{s.note}</span> : null}
           </span>
           <span className="ak-index">{s.at ? new Date(s.at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''}</span>
         </li>

@@ -20,6 +20,7 @@ import {
   transitionWorkspace,
   type TenantContext,
 } from '@arkiv/core';
+import { randomUUID } from 'node:crypto';
 import type Stripe from 'stripe';
 import { billingGateway, priceIdFor, type MockStripe } from './gateway';
 import { applySucceededRefund, recordChargeRefund } from './refunds';
@@ -306,97 +307,134 @@ const sysCtx = (workspaceId: string, state = 'ACTIVE_PAID'): TenantContext => ({
   requestId: 'stripe',
 });
 
+/** A claim older than this is presumed dead (crashed worker) and may be taken over. */
+export const STRIPE_CLAIM_STALE_MINUTES = 5;
+
+/** The claim was taken over (stale) while this run was still going: roll back, the new holder finishes. */
+class ClaimLost extends Error {}
+
 const INVOICE_EVENTS = ['invoice.created', 'invoice.finalized', 'invoice.updated', 'invoice.paid', 'invoice.payment_failed', 'invoice.voided', 'invoice.marked_uncollectible'];
 const DISPUTE_EVENTS = ['charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed', 'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated'];
+const HANDLED_TYPES = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'charge.refunded', ...INVOICE_EVENTS, ...DISPUTE_EVENTS];
 
-/** Process one stored event (system job). Idempotent: every side effect is keyed on Stripe ids. */
-export async function processStripeEvent(eventId: string): Promise<'processed' | 'unmatched' | 'ignored' | 'retry'> {
-  const [row] = await withSystem((tx) => tx`select * from stripe_events where id = ${eventId}`);
-  if (!row || row.status === 'processed' || row.status === 'ignored') return 'processed';
+export type StripeOutcome = 'processed' | 'unmatched' | 'ignored' | 'retry' | 'in_progress';
+
+/**
+ * Process one stored event (system job). Exactly once, whichever of the webhook route, the worker poller or an
+ * admin replay gets there first (plan 02 B1/B2, standard §35):
+ *  1. claim atomically (received/unmatched/failed → processing, or a stale processing claim); a caller that
+ *     loses the race returns at once;
+ *  2. apply the event in one tenant transaction whose last statement marks it processed (under the same
+ *     claim), so its side effects (ledger, events, funnel, emails) commit together with the mark — a crash
+ *     before the commit re-runs everything, a crash after it re-runs nothing.
+ */
+export async function processStripeEvent(eventId: string): Promise<StripeOutcome> {
+  const claim = randomUUID();
+  const [row] = await withSystem((tx) => tx`
+    update stripe_events set status = 'processing', claimed_at = now(), claim_token = ${claim}, attempts = attempts + 1
+    where id = ${eventId}
+      and (status in ('received', 'unmatched', 'failed')
+           or (status = 'processing' and claimed_at < now() - make_interval(mins => ${STRIPE_CLAIM_STALE_MINUTES})))
+    returning *`);
+  if (!row) {
+    const [cur] = await withSystem((tx) => tx`select status from stripe_events where id = ${eventId}`);
+    return cur?.status === 'processing' ? 'in_progress' : 'processed';
+  }
+  // Every later write is conditional on still holding the claim.
+  const release = (status: 'received' | 'unmatched' | 'ignored' | 'failed', error: string | null = null) =>
+    withSystem((tx) => tx`update stripe_events set status = ${status}, claim_token = null, error = ${error},
+                           processed_at = ${status === 'ignored' ? new Date() : null}
+                          where id = ${eventId} and claim_token = ${claim}`);
   const event = row.payload as Stripe.Event;
   const obj = event.data.object as unknown as Record<string, unknown>;
   const customerId = (obj.customer as string) ?? null;
   const meta = (obj.metadata as Record<string, string>) ?? {};
   const paymentIntent = typeof obj.payment_intent === 'string' ? obj.payment_intent : ((obj.payment_intent as { id?: string } | null)?.id ?? null);
   const workspaceId = await withSystem((tx) => resolveWorkspace(tx, customerId, meta.workspace_id ?? null, paymentIntent));
-  const handled = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'charge.refunded', ...INVOICE_EVENTS, ...DISPUTE_EVENTS];
-  if (!handled.includes(event.type)) {
-    await withSystem((tx) => tx`update stripe_events set status = 'ignored', processed_at = now() where id = ${eventId}`);
+  if (!HANDLED_TYPES.includes(event.type)) {
+    await release('ignored');
     return 'ignored';
   }
   if (!workspaceId) {
-    await withSystem((tx) => tx`update stripe_events set status = 'unmatched', attempts = attempts + 1 where id = ${eventId}`);
+    await release('unmatched');
     return 'unmatched';
   }
   try {
-    const outcome = await withTenant(workspaceId, async (tx) => {
-      const [ws] = await tx`select state, name from workspaces where id = ${workspaceId}`;
-      const ctx = sysCtx(workspaceId, ws!.state as string);
-      // Mirror first (plan 05 §7): the invoice/dispute row reflects Stripe even when the side effects below no-op.
-      if (INVOICE_EVENTS.includes(event.type)) await mirrorInvoice(tx, workspaceId, event, obj as unknown as InvoiceLike);
-      if (DISPUTE_EVENTS.includes(event.type)) await mirrorDispute(tx, workspaceId, event, obj as unknown as DisputeLike);
-      switch (event.type) {
-        case 'checkout.session.completed': {
-          const cs = obj as unknown as Stripe.Checkout.Session;
-          if (cs.mode === 'payment') return onPaymentCompleted(tx, ctx, cs);
-          if (cs.mode === 'subscription') return onSubscriptionCheckout(tx, ctx, cs);
-          return 'processed';
-        }
-        case 'checkout.session.expired':
-          await tx`update purchases set status = 'expired' where stripe_checkout_session_id = ${obj.id as string} and status = 'pending'`;
-          return 'processed';
-        case 'customer.subscription.created':
-        case 'customer.subscription.updated':
-          return upsertSubscription(tx, ctx, obj as unknown as Stripe.Subscription);
-        case 'customer.subscription.deleted': {
-          const sub = obj as unknown as Stripe.Subscription;
-          await tx`update subscriptions set status = 'canceled' where stripe_subscription_id = ${sub.id}`;
-          await tx`update workspaces set plan_code = null where id = ${workspaceId}`;
-          if (['ACTIVE_PAID', 'PAST_DUE'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'CANCELLED', 'subscription ended');
-          await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'cancellation_confirmed', subscriptionId: sub.id });
-          return 'processed';
-        }
-        case 'invoice.paid':
-          return onInvoicePaid(tx, ctx, obj as unknown as Stripe.Invoice);
-        case 'invoice.payment_failed': {
-          if (ws!.state === 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'PAST_DUE', 'invoice payment failed');
-          await tx`update subscriptions set status = 'past_due' where stripe_subscription_id = ${subscriptionIdOf(obj as never)}`;
-          await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'payment_failed' });
-          return 'processed';
-        }
-        case 'charge.refunded': {
-          // Refunds made from the console are already on file; anything else (Stripe dashboard) is recorded
-          // here with the same bookkeeping: mirror row, partial amounts, CREDIT_REFUNDED (B9 credit withdrawal).
-          const ch = obj as unknown as Stripe.Charge;
-          await recordChargeRefund(tx, ctx, { id: ch.id, payment_intent: (ch.payment_intent as string) ?? null, amount_refunded: ch.amount_refunded ?? null, refunded: ch.refunded ?? null });
-          return 'processed';
-        }
-        case 'charge.dispute.created':
-          // Lock a live workspace; one already on hold or being purged keeps that state (and the event still processes).
-          if (['ACTIVE_FREE', 'ACTIVE_PAID', 'PAST_DUE', 'CANCELLED'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'LOCKED', 'chargeback opened');
-          return 'processed';
-        case 'charge.dispute.closed': {
-          const d = obj as unknown as Stripe.Dispute;
-          if (d.status === 'won' && ws!.state === 'LOCKED') {
-            const [w] = await tx`select state_before_hold from workspaces where id = ${workspaceId}`;
-            if (w?.state_before_hold) await transitionWorkspace(tx, ctx, w.state_before_hold as never, 'dispute won');
-          }
-          return 'processed';
-        }
-      }
-      return 'processed';
+    return await withTenant(workspaceId, async (tx) => {
+      const outcome = await applyStripeEvent(tx, workspaceId, event, obj);
+      const [done] = await tx`select stripe_event_complete(${eventId}, ${claim}) as ok`;
+      if (!done?.ok) throw new ClaimLost();
+      return outcome;
     });
-    await withSystem((tx) => tx`update stripe_events set status = 'processed', processed_at = now(), workspace_id = ${workspaceId}, attempts = attempts + 1 where id = ${eventId}`);
-    return outcome as 'processed';
   } catch (e) {
+    if (e instanceof ClaimLost) return 'in_progress';
     if (e instanceof DomainError && e.code === 'NOT_FOUND') {
-      // B1: webhook before our row committed — retry later (the job re-runs; admin queue after 10 min).
-      await withSystem((tx) => tx`update stripe_events set attempts = attempts + 1, error = ${e.message} where id = ${eventId}`);
+      // B1: webhook before our row committed — back to received; the poller retries (admin queue after 10 min).
+      await release('received', e.message);
       return 'retry';
     }
-    await withSystem((tx) => tx`update stripe_events set status = 'failed', attempts = attempts + 1, error = ${(e as Error).message.slice(0, 500)} where id = ${eventId}`);
+    await release('failed', (e as Error).message.slice(0, 500));
     throw e;
   }
+}
+
+/** Apply one event inside the tenant transaction. Every enqueue carries a key derived from Stripe ids. */
+async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event, obj: Record<string, unknown>): Promise<'processed'> {
+  const [ws] = await tx`select state, name from workspaces where id = ${workspaceId}`;
+  const ctx = sysCtx(workspaceId, ws!.state as string);
+  // Mirror first (plan 05 §7): the invoice/dispute row reflects Stripe even when the side effects below no-op.
+  if (INVOICE_EVENTS.includes(event.type)) await mirrorInvoice(tx, workspaceId, event, obj as unknown as InvoiceLike);
+  if (DISPUTE_EVENTS.includes(event.type)) await mirrorDispute(tx, workspaceId, event, obj as unknown as DisputeLike);
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const cs = obj as unknown as Stripe.Checkout.Session;
+      if (cs.mode === 'payment') return onPaymentCompleted(tx, ctx, cs);
+      if (cs.mode === 'subscription') return onSubscriptionCheckout(tx, ctx, cs);
+      return 'processed';
+    }
+    case 'checkout.session.expired':
+      await tx`update purchases set status = 'expired' where stripe_checkout_session_id = ${obj.id as string} and status = 'pending'`;
+      return 'processed';
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+      return upsertSubscription(tx, ctx, obj as unknown as Stripe.Subscription);
+    case 'customer.subscription.deleted': {
+      const sub = obj as unknown as Stripe.Subscription;
+      await tx`update subscriptions set status = 'canceled' where stripe_subscription_id = ${sub.id}`;
+      await tx`update workspaces set plan_code = null where id = ${workspaceId}`;
+      if (['ACTIVE_PAID', 'PAST_DUE'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'CANCELLED', 'subscription ended');
+      await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'cancellation_confirmed', subscriptionId: sub.id }, { singletonKey: `cancelled:${sub.id}` });
+      return 'processed';
+    }
+    case 'invoice.paid':
+      return onInvoicePaid(tx, ctx, obj as unknown as Stripe.Invoice);
+    case 'invoice.payment_failed': {
+      if (ws!.state === 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'PAST_DUE', 'invoice payment failed');
+      await tx`update subscriptions set status = 'past_due' where stripe_subscription_id = ${subscriptionIdOf(obj as never)}`;
+      await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'payment_failed' }, { singletonKey: `payfail:${event.id}` });
+      return 'processed';
+    }
+    case 'charge.refunded': {
+      // Refunds made from the console are already on file; anything else (Stripe dashboard) is recorded
+      // here with the same bookkeeping: mirror row, partial amounts, CREDIT_REFUNDED (B9 credit withdrawal).
+      const ch = obj as unknown as Stripe.Charge;
+      await recordChargeRefund(tx, ctx, { id: ch.id, payment_intent: (ch.payment_intent as string) ?? null, amount_refunded: ch.amount_refunded ?? null, refunded: ch.refunded ?? null });
+      return 'processed';
+    }
+    case 'charge.dispute.created':
+      // Lock a live workspace; one already on hold or being purged keeps that state (and the event still processes).
+      if (['ACTIVE_FREE', 'ACTIVE_PAID', 'PAST_DUE', 'CANCELLED'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'LOCKED', 'chargeback opened');
+      return 'processed';
+    case 'charge.dispute.closed': {
+      const d = obj as unknown as Stripe.Dispute;
+      if (d.status === 'won' && ws!.state === 'LOCKED') {
+        const [w] = await tx`select state_before_hold from workspaces where id = ${workspaceId}`;
+        if (w?.state_before_hold) await transitionWorkspace(tx, ctx, w.state_before_hold as never, 'dispute won');
+      }
+      return 'processed';
+    }
+  }
+  return 'processed';
 }
 
 function subscriptionIdOf(inv: { subscription?: string | { id: string } | null; parent?: { subscription_details?: { subscription?: string } } }) {
@@ -405,11 +443,13 @@ function subscriptionIdOf(inv: { subscription?: string | { id: string } | null; 
   return inv.parent?.subscription_details?.subscription ?? null;
 }
 
-async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkout.Session) {
-  const [pu] = await tx`select * from purchases where stripe_checkout_session_id = ${cs.id}`;
+async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkout.Session): Promise<'processed'> {
+  const [pu] = await tx`select * from purchases where stripe_checkout_session_id = ${cs.id} for update`;
   if (!pu) throw new DomainError('NOT_FOUND', 'purchase row not committed yet');
   if (pu.status === 'paid') return 'processed';
   if (cs.payment_status !== 'paid') return 'processed';
+  // Two sessions for one project completing at once (B4) are serialized on the project: exactly one grants.
+  await tx`select 1 from projects where id = ${pu.project_id} for update`;
   const [otherPaid] = await tx`select id from purchases where project_id = ${pu.project_id} and status = 'paid' and id <> ${pu.id}`;
   await tx`update purchases set status = 'paid', paid_at = now(), stripe_payment_intent_id = ${(cs.payment_intent as string) ?? null} where id = ${pu.id}`;
   if (otherPaid) {
@@ -430,11 +470,11 @@ async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkou
   await approveForProduction(tx, { ...ctx, workspaceState: 'ACTIVE_PAID' }, pu.project_id as string, unit);
   await emit(tx, ctx, 'TASTE_PAID', { type: 'project', id: pu.project_id as string }, { kind: unit, amountMicros: Number(pu.amount_micros) });
   await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, pu.project_id as string), props: { kind: unit } }, tx);
-  await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'receipt', purchaseId: pu.id });
+  await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'receipt', purchaseId: pu.id }, { singletonKey: `receipt:${pu.id}` });
   return 'processed';
 }
 
-async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Checkout.Session) {
+async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Checkout.Session): Promise<'processed'> {
   const plan = (cs.metadata?.plan as PlanCode) ?? null;
   const consentId = cs.metadata?.consent_record_id ?? null;
   const subId = typeof cs.subscription === 'string' ? cs.subscription : (cs.subscription?.id ?? null);
@@ -447,11 +487,11 @@ async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Che
   if (ctx.workspaceState !== 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'subscription started');
   await emit(tx, ctx, 'SUBSCRIPTION_STARTED', { type: 'subscription', id: subRow!.id as string }, { plan, stripeSubscriptionId: subId });
   await recordFunnel('SUBSCRIPTION_STARTED', { workspaceId: ctx.workspaceId, visitorId: await workspaceVisitor(tx, ctx.workspaceId), props: { plan } }, tx);
-  await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'subscription_started', plan });
+  await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'subscription_started', plan }, { singletonKey: `sub-started:${subId}` });
   return 'processed';
 }
 
-async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscription) {
+async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscription): Promise<'processed'> {
   const item = sub.items?.data?.[0];
   const planFromPrice = (Object.keys(PLANS) as PlanCode[]).find((p) => priceIdFor(p) && priceIdFor(p) === item?.price?.id) ?? ((sub.metadata?.plan as PlanCode) || null);
   const periodStart = (item as unknown as { current_period_start?: number })?.current_period_start ?? (sub as unknown as { current_period_start?: number }).current_period_start;
@@ -468,7 +508,7 @@ async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscr
 }
 
 /** New billing period → grant this period's Creative Tests, expire the previous period's leftovers. */
-async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice) {
+async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice): Promise<'processed'> {
   const subId = subscriptionIdOf(inv as never);
   if (!subId) return 'processed';
   const [s] = await tx`select * from subscriptions where stripe_subscription_id = ${subId}`;

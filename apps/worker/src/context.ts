@@ -12,7 +12,8 @@ export async function jobContext(payload: { workspaceId?: string; actor?: Actor 
     workspaceState: w.state as WorkspaceState,
     role: 'OWNER',
     actor: payload.actor ?? { kind: 'system', id: jobId },
-    requestId: jobId,
+    // The request that enqueued the job (propagated through the outbox), else the job itself.
+    requestId: (payload as { requestId?: string }).requestId ?? jobId,
     planCode: w.plan_code as string | null,
   };
 }

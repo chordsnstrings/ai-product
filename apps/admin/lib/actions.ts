@@ -227,7 +227,7 @@ export const ACTIONS = {
     schema: z.object({ workspaceId: uuid, reason }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        await enqueue(tx, i.workspaceId, Queues.exportWorkspace, { requestedBy: { kind: 'staff', id: s.staffId } }, { singletonKey: `export:${i.workspaceId}` });
+        await enqueue(tx, i.workspaceId, Queues.exportWorkspace, { requestedBy: { kind: 'staff', id: s.staffId }, requestedAt: new Date().toISOString() }, { singletonKey: `export:${i.workspaceId}` });
         await audit(tx, s, 'tenant.export', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason });
         return { message: 'Export queued; the link is emailed to workspace owners.' };
       }),

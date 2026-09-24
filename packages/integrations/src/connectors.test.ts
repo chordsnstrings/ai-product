@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { decryptToken, encryptToken, signState, verifyState } from './crypto';
 import { hmacHex } from './crypto';
-import { normalizeMetaInsight, normalizeTikTokRow, verifyShopifyQuery } from './connectors';
+import { normalizeMetaInsight, normalizeShopifyProduct, normalizeTikTokRow, verifyShopifyQuery } from './connectors';
 
 /** Replaces the character at `i` with a different one, so the string always changes. */
 const flipChar = (s: string, i: number) => s.slice(0, i) + (s[i] === 'A' ? 'B' : 'A') + s.slice(i + 1);
@@ -55,5 +55,24 @@ describe('TikTok normalization', () => {
     const row = { dimensions: { ad_id: '1', stat_time_day: '2026-09-20 00:00:00' }, metrics: { spend: '10', impressions: '5000', clicks: '40', complete_payment: '3' } };
     expect(normalizeTikTokRow(row, 'adv', 'USD', 'GMV_MAX').measurementContext).toBe('TIKTOK_GMV_MAX_TOTAL');
     expect(normalizeTikTokRow(row, 'adv', 'USD', null).measurementContext).toBe('TIKTOK_PAID_ATTRIBUTED');
+  });
+});
+
+describe('Shopify product normalization (§42 variants)', () => {
+  it('keeps each variant’s options, availability and image; drops the "Default Title" placeholder', () => {
+    const p = normalizeShopifyProduct({
+      id: 'gid://shopify/Product/1', title: 'Glow Serum', description: 'x', status: 'ACTIVE', vendor: 'Lumen', updatedAt: '2026-09-01',
+      media: { nodes: [{ image: { url: 'https://cdn/p.jpg' } }] },
+      variants: { nodes: [
+        { id: 'gid://shopify/ProductVariant/11', title: '30 ml', price: '38.00', compareAtPrice: null, sku: 'GS30', barcode: null, availableForSale: true, selectedOptions: [{ name: 'Size', value: '30 ml' }], image: { url: 'https://cdn/30.jpg' } },
+        { id: 'gid://shopify/ProductVariant/12', title: '50 ml', price: '52.00', compareAtPrice: '58.00', sku: 'GS50', barcode: '0123', availableForSale: false, selectedOptions: [{ name: 'Size', value: '50 ml' }], image: null },
+      ] },
+    });
+    expect(p.variants).toEqual([
+      { id: 'gid://shopify/ProductVariant/11', title: '30 ml', price: 38, compareAtPrice: null, sku: 'GS30', barcode: null, options: { Size: '30 ml' }, available: true, imageUrl: 'https://cdn/30.jpg' },
+      { id: 'gid://shopify/ProductVariant/12', title: '50 ml', price: 52, compareAtPrice: 58, sku: 'GS50', barcode: '0123', options: { Size: '50 ml' }, available: false, imageUrl: null },
+    ]);
+    const single = normalizeShopifyProduct({ id: '2', title: 'Balm', status: 'ACTIVE', variants: { nodes: [{ id: '21', title: 'Default Title', price: '20', selectedOptions: [{ name: 'Title', value: 'Default Title' }] }] } });
+    expect(single.variants[0]!.options).toEqual({});
   });
 });

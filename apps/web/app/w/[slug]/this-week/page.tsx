@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
-import { balances, weekOf } from '@arkiv/core';
+import { balances, resolveRationale, weekOf, type RationaleItem } from '@arkiv/core';
 import { Banner, Empty, LinkButton, SignalChip } from '@arkiv/ui';
 import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
@@ -23,6 +23,30 @@ const EVENT_TEXT: Record<string, string> = {
   CLAIM_BLOCKED: 'A claim was blocked',
   CLAIM_APPROVED: 'A claim was approved',
 };
+
+const KIND: Record<RationaleItem['kind'], string> = { customer_theme: 'Customers say', learning: 'Learning', claim: 'Approved claim', fact: 'Product fact' };
+
+/** Evidence, in words, for a stored confidence (§38): never a promise that the test will win. */
+function confidenceLabel(c: number) {
+  return `${c >= 0.6 ? 'Stronger evidence' : c >= 0.4 ? 'Some evidence' : 'Early evidence'} (${Math.round(c * 100)}%)`;
+}
+
+/** What a recommendation rests on (rationale ids resolved to themes, learnings, claims and facts). */
+function Rationale({ items }: { items: RationaleItem[] }) {
+  if (!items.length) return null;
+  return (
+    <details className="ak-small">
+      <summary>Why we suggest this</summary>
+      <ul style={{ paddingLeft: 18, margin: '6px 0 0' }}>
+        {items.map((i) => (
+          <li key={i.id}>
+            <span className="ak-muted">{KIND[i.kind]}:</span> {i.label}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
 
 function weekLine(d = new Date()) {
   const start = new Date(weekOf(d));
@@ -48,7 +72,8 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
     const dismissedStreak = await tx`select count(*)::int as n from recommendations where status = 'dismissed' and created_at > now() - interval '21 days'`;
     const acceptedRecent = await tx`select count(*)::int as n from recommendations where status = 'accepted' and created_at > now() - interval '21 days'`;
     const [sub] = await tx`select plan_code from subscriptions where status in ('active','trialing','past_due') limit 1`;
-    return { skus, recs, jobs, changes, bal: await balances(tx), ignored: dismissedStreak[0]!.n >= 6 && acceptedRecent[0]!.n === 0, sub };
+    const rationale = await resolveRationale(tx, recs.flatMap((r) => (r.rationale_ids as string[]) ?? []));
+    return { skus, recs, jobs, changes, rationale, bal: await balances(tx), ignored: dismissedStreak[0]!.n >= 6 && acceptedRecent[0]!.n === 0, sub };
   });
   const canCreate = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
 
@@ -93,7 +118,11 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
                   <dt>Tests</dt><dd>{p.primaryVariable}</dd>
                   <dt>Cost</dt><dd>1 Creative Test</dd>
                 </dl>
-                <p className="ak-small ak-muted">{BASIS[r.basis as string]}</p>
+                <p className="ak-small ak-muted">
+                  {BASIS[r.basis as string]}
+                  {r.confidence != null ? <> · {confidenceLabel(Number(r.confidence))}</> : null}
+                </p>
+                <Rationale items={((r.rationale_ids as string[]) ?? []).map((id) => data.rationale.get(id)).filter((x): x is RationaleItem => !!x)} />
                 {canCreate ? (
                   <div className="ak-row">
                     <ActionButton slug={slug} action="rec-accept" body={{ id: r.id }} variant="primary">Approve</ActionButton>

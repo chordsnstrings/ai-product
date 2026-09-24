@@ -10,9 +10,9 @@ import { purgeWorkspace, scheduleDeletion } from './lifecycle';
 import { mockConcepts } from './mock-intel';
 import { ingestObservations, parsePerformanceCsv } from './performance';
 import { approveForProduction, produceProject } from './production';
-import { generateRecommendations, refreshMaturity } from './recommendations';
+import { generateRecommendations, recommendationsForSku, refreshMaturity } from './recommendations';
 import { generateStoryboard } from './storyboard';
-import { ctxFor, productPhoto } from './testing';
+import { ctxFor, eventContractProblems, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
 import { produceHookVariants } from './variants';
 import { diffCompositions, type CompositionManifest } from './composition';
@@ -85,8 +85,12 @@ describe('learning loop (Phases 4–5)', () => {
       expect(hook!.startMs).toBe(masterHook!.startMs);
       expect(diffCompositions(master, m)).toEqual(['hook']);
     }
-    const generated = await ownerPool()`select payload from events where workspace_id = ${t.workspaceId} and type = 'VARIANT_GENERATED' and subject_type = 'variant'`;
+    const generated = await ownerPool()`select payload from events where workspace_id = ${t.workspaceId} and type = 'VARIANT_GENERATED' and subject_type = 'variant' and payload->>'master' is null`;
     expect(generated.map((e) => (e.payload as { changed: string[] }).changed)).toEqual([['hook'], ['hook']]);
+    // The master is the experiment's first variant; every variant event carries its experiment, SKU and creative.
+    const lineage = await ownerPool()`select subject_id, refs from events where workspace_id = ${t.workspaceId} and type = 'VARIANT_GENERATED' order by seq`;
+    expect(lineage).toHaveLength(3);
+    expect(lineage.every((e) => (e.refs as Record<string, string>).experimentId === experimentId && (e.refs as Record<string, string>).skuId === skuId && !!(e.refs as Record<string, string>).creativeId)).toBe(true);
     const [exp0] = await ownerPool()`select state, mode from experiments where id = ${experimentId}`;
     expect(exp0!.state).toBe('READY_TO_RUN');
     expect(exp0!.mode).toBe('CONTROLLED');
@@ -123,7 +127,18 @@ describe('learning loop (Phases 4–5)', () => {
     const recs = await ownerPool()`select slot, basis, score from recommendations where week_of = '2026-09-21'`;
     expect(recs.length).toBeGreaterThan(0);
     expect(recs.every((r) => Number(r.score) > 0)).toBe(true);
+    // §38: every recommendation carries rationale ids (resolvable to packet items) and a confidence.
+    const listed = await withTenant(t.workspaceId, (tx) => recommendationsForSku(tx, skuId, { sinceWeek: '2026-09-21' }));
+    expect(listed.length).toBe(recs.length);
+    for (const r of listed) {
+      expect(r.confidence).toBeGreaterThan(0);
+      expect(r.rationaleIds.length).toBeGreaterThan(0);
+      expect(r.rationale.length).toBe(r.rationaleIds.length);
+    }
+    expect(listed.flatMap((r) => r.rationale.map((i) => i.kind))).toContain('fact');
     expect(await generateRecommendations(ctx, skuId, '2026-09-21')).toBe(0); // idempotent per week
+    // Every event of the whole loop carries its subject type and required object refs (§36).
+    expect(await eventContractProblems(t.workspaceId)).toEqual([]);
   }, 240_000);
 
   it('parses a manual performance CSV into its own measurement context', () => {

@@ -34,6 +34,9 @@ const norm = (s: string | null | undefined) => (s ?? '').toLowerCase().replace(/
  * (§25 check 6) compares the two manifests, so a variant that changed anything it promised to hold constant is
  * never shipped (§20 CONTROLLED).
  */
+/** Object refs shared by a hook variant's events (the master project's experiment and SKU). */
+const variantRefs = (p: Record<string, unknown>) => ({ experimentId: p.experiment_id as string, skuId: p.sku_id as string, projectId: p.id as string, storyboardId: p.storyboard_id as string | null });
+
 export async function produceHookVariants(ctx: TenantContext, projectId: string): Promise<number> {
   const ws = ctx.workspaceId;
   const data = await withTenant(ws, async (tx) => {
@@ -68,7 +71,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
     const hook = (v.label as string).trim();
     // Never ship a hook that makes a claim the vault doesn't cover on every platform it's exported to.
     if (!scanPasses(scanCreativeText([hook], data.allowed, { names: data.names }))) {
-      await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'hook failed claims check' }));
+      await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'hook failed claims check' }, variantRefs(p)));
       continue;
     }
     const ok = await withTempDir(async (dir) => {
@@ -82,7 +85,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
         const room = hookRoomEnd - hookSeg.startMs;
         const tempo = ms > room ? ms / Math.max(1, room) : 1;
         if (tempo > HOOK_MAX_TEMPO) {
-          await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'spoken hook too long to keep the rest of the voice-over unchanged' }));
+          await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'spoken hook too long to keep the rest of the voice-over unchanged' }, variantRefs(p)));
           return false;
         }
         newSeg = { sceneId: hookSeg.sceneId, text: hook, clipAssetId: clip.id, startMs: hookSeg.startMs, endMs: Math.round(hookSeg.startMs + ms / tempo), tempo: Math.round(tempo * 10_000) / 10_000 };
@@ -98,7 +101,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
       const changed = diffCompositions(manifest, variantManifest);
       const integrity = qaExperimentIntegrity({ changed: (v.changed_variables as string[]) ?? ['hook'], heldConstant: (v.held_constant as string[]) ?? [] }, { changed });
       if (!integrity.pass) {
-        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: integrity.detail }));
+        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: integrity.detail }, variantRefs(p)));
         return false;
       }
       // 3. Compose from the master's exact assets.
@@ -127,7 +130,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
       const checks: CheckResult[] = [integrity];
       for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, variantManifest.durationMs)));
       if (checks.some((c) => !c.pass && c.hard)) {
-        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) }));
+        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) }, variantRefs(p)));
         return false;
       }
       await withTenant(ws, async (tx) => {
@@ -141,7 +144,7 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
                                       ${tx.json(variantManifest as never)})
                               returning id`;
         await tx`update variants set creative_id = ${cr!.id} where id = ${v.id}`;
-        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed, creativeId: cr!.id, integrity: integrity.detail });
+        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed, creativeId: cr!.id, integrity: integrity.detail }, { ...variantRefs(p), creativeId: cr!.id as string });
       });
       return true;
     });

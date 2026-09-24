@@ -204,14 +204,18 @@ export async function inviteMember(tx: Tx, ctx: TenantContext, email: string, ro
   assertCan(ctx, 'member.invite');
   const normalized = email.trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized)) throw invalid('Enter a valid email address');
-  const [w] = await tx`select plan_code from workspaces where id = ${ctx.workspaceId}`;
+  // The workspace row lock serializes invites, accepts and member changes per workspace: two concurrent invites
+  // at limit−1 cannot both pass the count below (x-races-09).
+  const [w] = await tx`select plan_code from workspaces where id = ${ctx.workspaceId} for update`;
   const lim = await planQuota(tx, w?.plan_code as PlanCode | null);
+  // A re-invite replaces the address's live invite, so it does not count against the limit twice.
   const [c] = await tx`select (select count(*) from memberships) + (select count(*) from invites where accepted_at is null
-                         and revoked_at is null and expires_at > now()) as n`;
+                         and revoked_at is null and expires_at > now() and email <> ${normalized}) as n`;
   if (Number(c!.n) >= lim.members) throw new DomainError('PAYMENT_REQUIRED', `Your plan includes ${lim.members} members. Upgrade to invite more.`);
   const [existing] = await tx`select 1 from memberships m join users u on u.id = m.user_id where u.email = ${normalized}`;
   if (existing) throw conflict('That person is already a member');
   const token = randomToken();
+  // One live invite per address (unique index invites_one_live): the new one replaces any earlier one.
   await tx`update invites set revoked_at = now() where email = ${normalized} and accepted_at is null and revoked_at is null`;
   const [inv] = await tx`
     insert into invites (workspace_id, email, role, token_hash, invited_by, expires_at)
@@ -256,6 +260,14 @@ export async function acceptInvite(token: string, user: { id: string; email: str
   if (inv.email.toLowerCase() !== user.email.toLowerCase())
     throw new DomainError('FORBIDDEN', `This invite is for ${inv.email}. Switch account to accept it.`, { mismatch: true, inviteEmail: inv.email });
   return withTenant(inv.workspaceId, async (tx) => {
+    // Re-check the member limit at acceptance (the plan may have been downgraded since the invite was sent);
+    // a full workspace leaves the invite open so it can be accepted after an upgrade.
+    const [w] = await tx`select plan_code from workspaces where id = ${inv.workspaceId} for update`;
+    const lim = await planQuota(tx, (w?.plan_code as PlanCode | null) ?? null);
+    const [already] = await tx`select 1 from memberships where user_id = ${user.id}`;
+    const [c] = await tx`select count(*)::int as n from memberships`;
+    if (!already && c!.n >= lim.members)
+      throw new DomainError('PAYMENT_REQUIRED', `This workspace’s plan includes ${lim.members} members and it is full. Ask an Owner to upgrade, then accept again.`);
     const upd = await tx`update invites set accepted_at = now(), accepted_by = ${user.id}
                          where id = ${inv.inviteId} and accepted_at is null and revoked_at is null returning id`;
     if (!upd.length) throw conflict('This invite was already used');
@@ -271,7 +283,17 @@ async function ownerCount(tx: Tx) {
   return r!.n as number;
 }
 
+/**
+ * Owner-affecting changes (role change, removal, transfer) lock the workspace row first, so they run one at a
+ * time per workspace and the last-Owner check (M1) sees committed state: two Owners demoting or removing each
+ * other concurrently cannot both pass it (x-races-10).
+ */
+async function lockMembership(tx: Tx, ctx: TenantContext) {
+  await tx`select 1 from workspaces where id = ${ctx.workspaceId} for update`;
+}
+
 export async function changeRole(tx: Tx, ctx: TenantContext, userId: string, role: Role) {
+  await lockMembership(tx, ctx);
   const [target] = await tx`select role from memberships where user_id = ${userId} for update`;
   if (!target) throw notFound('Member not found');
   const from = target.role as Role;
@@ -286,6 +308,7 @@ export async function changeRole(tx: Tx, ctx: TenantContext, userId: string, rol
 }
 
 export async function removeMember(tx: Tx, ctx: TenantContext, userId: string) {
+  await lockMembership(tx, ctx);
   const [target] = await tx`select role from memberships where user_id = ${userId} for update`;
   if (!target) throw notFound('Member not found');
   const self = ctx.actor.kind === 'user' && ctx.actor.id === userId;
@@ -301,9 +324,12 @@ export async function removeMember(tx: Tx, ctx: TenantContext, userId: string) {
 
 export async function transferOwnership(tx: Tx, ctx: TenantContext, toUserId: string) {
   assertCan(ctx, 'workspace.transfer');
-  const [t] = await tx`select role from memberships where user_id = ${toUserId}`;
+  await lockMembership(tx, ctx);
+  const [t] = await tx`select role from memberships where user_id = ${toUserId} for update`;
   if (!t) throw notFound('New owner must already be a member');
-  await tx`update memberships set role = 'OWNER' where user_id = ${toUserId}`;
+  // The new Owner must exist when the outgoing one steps down, or the workspace would be left without one.
+  const promoted = await tx`update memberships set role = 'OWNER' where user_id = ${toUserId} returning user_id`;
+  if (!promoted.length) throw notFound('New owner must already be a member');
   // The outgoing owner steps down to Admin (not when they name themselves).
   let stepDown: { userId: string; from: Role } | null = null;
   if (ctx.actor.kind === 'user' && ctx.actor.id !== toUserId) {
@@ -326,6 +352,8 @@ export async function transferOwnership(tx: Tx, ctx: TenantContext, toUserId: st
  */
 export async function swapOwnership(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, toUserId: string, extra: { byStaff?: true; reason?: string } = {}) {
   const ws = ctx.workspaceId;
+  // Same per-workspace serialization as the other owner-affecting changes (lockMembership, x-races-10).
+  await tx`select 1 from workspaces where id = ${ws} for update`;
   const [m] = await tx`select role from memberships where workspace_id = ${ws} and user_id = ${toUserId} for update`;
   if (!m) throw notFound('The new owner must still be a member of this workspace.');
   if (m.role === 'OWNER') throw conflict('That member already owns this workspace.');

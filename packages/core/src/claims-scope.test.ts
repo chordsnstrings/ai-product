@@ -37,7 +37,8 @@ describe('approved claims become renderable (regression: lowercase scope never m
       expect(approved.allowedMarkets).toEqual(['US']);
       for (const p of AD_PLATFORMS) expect((await renderableClaims(tx, skuId, { platforms: [p] })).map((x) => x.id), p).toEqual([c.id]);
       expect((await allowedClaimTexts(tx, skuId)).map((x) => x.wording)).toEqual(['Non-comedogenic']);
-      expect((await buildContext(tx, skuId)).packet.claims.APPROVED).toEqual(['Non-comedogenic']);
+      // Packet items carry their id, so proposals can cite the claim as rationale (§38).
+      expect((await buildContext(tx, skuId)).packet.claims.APPROVED).toEqual([{ id: c.id, wording: 'Non-comedogenic' }]);
     });
   });
 

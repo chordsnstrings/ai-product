@@ -1,5 +1,24 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { assetUrl, currentFacts, currentQuote, customerQaSummary, DELIVERY_HOLD_STATES, listClaims, listSteps, storyboardView, type Proposal, type QaReport } from '@arkiv/core';
+import {
+  ANALYSIS_KEY_FACTS,
+  assetUrl,
+  currentFacts,
+  currentQuote,
+  customerQaSummary,
+  DELIVERY_HOLD_STATES,
+  IN_PRODUCTION,
+  listClaims,
+  listSteps,
+  listVariants,
+  liveness,
+  SLOW_STEP_MS,
+  stepEta,
+  storyboardView,
+  verifiedIngredients,
+  type Proposal,
+  type QaReport,
+} from '@arkiv/core';
+import type { ProjectState } from '@arkiv/shared';
 import type { WorkspaceState } from '@arkiv/shared';
 
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
@@ -10,6 +29,7 @@ export async function projectView(workspaceId: string, projectId: string) {
     if (!p) return null;
     const skuSteps = await listSteps(tx, p.sku_id as string);
     const facts = await currentFacts(tx, p.sku_id as string);
+    const variants = await listVariants(tx, p.sku_id as string);
     const claims = await listClaims(tx, p.sku_id as string);
     const [fp] = await tx`select cutout_asset_id, label_text, package_type, closure from visual_fingerprints where sku_id = ${p.sku_id} and active`;
     const [maxBatch] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
@@ -59,9 +79,13 @@ export async function projectView(workspaceId: string, projectId: string) {
         failureReason: (p.failure_reason as string) ?? null,
         /** Paused by a provider outage: resumes automatically with the reservation held (§44). */
         paused: p.state === 'NEEDS_USER_ACTION' && !!p.outage,
+        /** Is the production run alive? From its heartbeat, never from elapsed time alone (§39). */
+        liveness: liveness(IN_PRODUCTION.includes(p.state as ProjectState), (p.heartbeat_at as string | null) ?? null),
         /** What we checked, in customer words (plan 03 P10), derived from the stored QA report. */
         qa: customerQaSummary(p.qa_report as QaReport | null),
         storyboardId: (p.storyboard_id as string) ?? null,
+        /** The size/shade this ad is for (§42). */
+        variantId: (p.sku_variant_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
         deliveryHeld,
       },
@@ -74,6 +98,14 @@ export async function projectView(workspaceId: string, projectId: string) {
         analysis: p.analysis ?? {},
         cutoutUrl: fp?.cutout_asset_id ? await assetUrl(tx, fp.cutout_asset_id as string) : null,
         packaging: fp ? { type: fp.package_type, closure: fp.closure, label: fp.label_text } : null,
+        /** What a good ad would still need (§42), from the analysis. */
+        missingEvidence: ((p.analysis as { missingEvidence?: string[] } | null)?.missingEvidence ?? []).slice(0, 6),
+        /** Ingredient-led tests need a sourced ingredient list (§42 "request source"). */
+        ingredientsVerified: verifiedIngredients(facts).verified,
+        /** Sizes/shades with their own price and availability (§42); the project records which one it advertises. */
+        variants: variants.map((x) => ({ id: x.id, title: x.title, size: x.size, shade: x.shade, priceMicros: x.priceMicros, available: x.available })),
+        /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
+        missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
       },
       steps: skuSteps.map(stepJson),
       facts: factRows,
@@ -90,7 +122,25 @@ export async function projectView(workspaceId: string, projectId: string) {
   });
 }
 
-const stepJson = (s: Record<string, unknown>) => ({ key: s.step_key as string, label: s.label as string, status: s.status as string, detail: (s.detail as string) ?? null, at: (s.completed_at ?? s.started_at ?? null) as string | null });
+/** Honest "still working" copy for a slow step, from the estimate recorded when it started (plan 03 P3). */
+function slowNote(key: string, eta: ReturnType<typeof stepEta>): string | null {
+  if (!eta || eta.elapsedMs < SLOW_STEP_MS) return null;
+  if (eta.remainingMs == null || eta.remainingMs < 5_000) return 'Taking longer than usual — still working. Nothing is lost if you leave this page.';
+  const sec = Math.ceil(eta.remainingMs / 5_000) * 5;
+  return `${key === 'read_page' || key === 'identify' ? 'Your page is detailed' : 'This one is detailed'} — about ${sec} more seconds.`;
+}
+
+const stepJson = (s: Record<string, unknown>) => {
+  const eta = stepEta(s as { status: string; started_at?: string | null; expected_ms?: number | null });
+  return {
+    key: s.step_key as string,
+    label: s.label as string,
+    status: s.status as string,
+    detail: (s.detail as string) ?? null,
+    at: (s.completed_at ?? s.started_at ?? null) as string | null,
+    note: slowNote(s.step_key as string, eta),
+  };
+};
 
 async function storyboardBlock(tx: Tx, storyboardId: string) {
   const v = await storyboardView(tx, storyboardId);
