@@ -12,3 +12,11 @@ alter table performance_observations add constraint performance_observations_mea
   check (measurement_context in ('META_PAID_ATTRIBUTED', 'TIKTOK_PAID_ATTRIBUTED', 'TIKTOK_GMV_MAX_TOTAL', 'SHOPIFY_BLENDED_ORDER',
                                  'MERCHANT_IMPORTED_META', 'MERCHANT_IMPORTED_TIKTOK',
                                  'META_ORGANIC', 'TIKTOK_ORGANIC', 'META_AFFILIATE', 'TIKTOK_AFFILIATE'));
+
+-- Provider version drift goes through the regression policy (standard §48 "route changed versions through
+-- regression/canary policy before becoming default"): the gateway queues the route's golden-set eval as the system
+-- (no staff requester), and a route whose drift policy is 'hold' stops dispatching until staff re-pin it.
+alter table model_routes add column drift_policy text not null default 'alert' check (drift_policy in ('alert', 'hold'));
+alter table eval_runs alter column created_by drop not null;
+alter table ops_commands alter column requested_by drop not null;
+grant insert on eval_runs, ops_commands to system_rw;

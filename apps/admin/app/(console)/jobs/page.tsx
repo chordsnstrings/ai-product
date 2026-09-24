@@ -46,7 +46,7 @@ export default async function Jobs({ searchParams }: { searchParams: Promise<{ s
     const outbox = await tx`select queue, count(*)::int as n, min(created_at) as oldest from outbox where dispatched_at is null group by queue`;
     const stuck = await tx`select p.id, p.workspace_id, p.state, p.updated_at, w.name from projects p join workspaces w on w.id = p.workspace_id
                            where p.state in ${tx(Object.keys(EXPECTED_MIN))} and p.updated_at < now() - interval '5 minutes' ${notTest(tx, prefs, 'p.workspace_id')} order by p.updated_at limit 100`;
-    const commands = await tx`select c.*, s.name from ops_commands c join staff_users s on s.id = c.requested_by order by c.created_at desc limit 30`;
+    const commands = await tx`select c.*, coalesce(s.name, 'System') as name from ops_commands c left join staff_users s on s.id = c.requested_by order by c.created_at desc limit 30`;
     const wsIds = [...new Set(concurrency.map((c) => c.ws as string).filter((x) => /^[0-9a-f-]{36}$/i.test(x)))];
     // Renders in flight against each plan's render concurrency (plan 02 §4 quotas).
     const workspaces = wsIds.length

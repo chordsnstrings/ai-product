@@ -359,18 +359,49 @@ export function versionDrift(pinned: string | null | undefined, returned: string
   return returned !== pinned && returned !== `${pinned}-mock`;
 }
 
-/** One open Pulse alert per route (a repeat is a no-op until staff resolve it); raised as the system. */
+/**
+ * One open Pulse alert per route (a repeat is a no-op until staff resolve it); raised as the system. A new drift
+ * also goes through the regression policy before the changed version is trusted (§48 "route changed versions
+ * through regression/canary policy"): the route's golden-set eval is queued for the model it now serves, and a
+ * route whose drift policy is 'hold' stops dispatching (its circuit opens, manually closed by staff) until then.
+ */
 async function raiseVersionDrift(r: Pick<Route, 'task' | 'provider' | 'pinnedVersion'>, returned: string, jobId: string) {
   gatewayLog.warn('provider version drift', { task: r.task, pinned: r.pinnedVersion, returned, providerJobId: jobId });
-  await withSystem((tx) =>
-    raiseAlert(tx, {
+  await withSystem(async (tx) => {
+    const alertId = await raiseAlert(tx, {
       kind: 'version_drift',
       severity: 'risk',
       subject: { type: 'route', id: r.task },
       message: `${r.provider} answered ${r.task} with ${returned}, not the pinned ${r.pinnedVersion}. Check output quality, then re-pin or roll back.`,
       details: { provider: r.provider, pinned: r.pinnedVersion, returned, providerJobId: jobId },
-    }),
-  );
+    });
+    if (alertId) await driftFollowUp(tx, r.task, returned);
+  });
+}
+
+/** The regression step for a newly drifted route: queue its golden-set eval, and hold dispatch when policy says so. */
+export async function driftFollowUp(tx: Tx, task: string, returned: string): Promise<{ evalRunId: string | null; held: boolean }> {
+  const [route] = await tx`select model, prompt_version, drift_policy from model_routes where task = ${task}`;
+  if (!route) return { evalRunId: null, held: false };
+  // Loaded lazily: the eval runner calls back into this gateway.
+  const { evalDatasetFor } = await import('./evals');
+  const dataset = evalDatasetFor(task);
+  let evalRunId: string | null = null;
+  if (dataset) {
+    const [run] = await tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by)
+                           values (${task}, ${route.prompt_version as string}, ${route.model as string}, ${dataset}, 'queued', null) returning id`;
+    evalRunId = run!.id as string;
+    await tx`insert into ops_commands (kind, payload, requested_by, reason)
+             values ('eval.run', ${tx.json({ dataset, evalRunId, task, model: route.model, promptVersion: route.prompt_version, trigger: 'version_drift', returned } as never)}, null,
+                     ${`automatic: provider answered with ${returned}`.slice(0, 300)})`;
+  }
+  const held = route.drift_policy === 'hold';
+  if (held) {
+    await tx`update model_routes set circuit_open = true, circuit_auto = false, circuit_until = null,
+               circuit_reason = ${`version drift: provider answered with ${returned}; held until staff re-pin and close`.slice(0, 300)}, circuit_changed_at = now(), updated_at = now()
+             where task = ${task}`;
+  }
+  return { evalRunId, held };
 }
 
 async function closeJob(

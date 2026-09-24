@@ -22,7 +22,7 @@ export default async function Prompts({ searchParams }: { searchParams: Promise<
   const ids = [sp.run, sp.a, sp.b].filter((x): x is string => !!x && UUID.test(x));
   const d0 = await withAdmin(async (tx) => ({
     routes: await tx`select task, provider, model, prompt_version, rollout_pct, canary from model_routes order by task`,
-    runs: await tx`select r.*, s.name from eval_runs r join staff_users s on s.id = r.created_by order by r.created_at desc limit 30`,
+    runs: await tx`select r.*, coalesce(s.name, 'System') as name from eval_runs r left join staff_users s on s.id = r.created_by order by r.created_at desc limit 30`,
     picked: ids.length ? await tx`select * from eval_runs where id = any(${ids}::uuid[])` : [],
     added: await tx`select g.id, g.dataset, g.input, g.expected, g.note, g.source, g.consent_ref, g.created_at, s.name from golden_cases g join staff_users s on s.id = g.created_by
                     where g.retired_at is null order by g.created_at desc limit 200`,
