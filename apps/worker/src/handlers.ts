@@ -19,6 +19,7 @@ import {
   regenerateFrame,
   Queues,
   syncIntegration,
+  transferSku,
   weekOf,
   enqueue,
   holdDecision,
@@ -105,6 +106,7 @@ export const handlers: Record<string, Handler> = {
   [Queues.purgeWorkspace]: (_ctx, d) => purgeWorkspace(d.workspaceId as string),
   [Queues.extractGenome]: (ctx, d) => extractGenome(ctx, d.creativeId as string),
   [Queues.customerThemes]: (ctx, d) => clusterThemes(ctx, d.skuId as string),
+  [Queues.transferSku]: (_ctx, d) => transferSku(d.transferId as string),
 };
 
 /** Run one job with tenant context. Domain errors are final (no retry); others bubble up for pg-boss retry. */

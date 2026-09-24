@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
-import { env, formatUsd, PLANS, PRICES, type PlanCode } from '@arkiv/shared';
+import { env, formatUsd, PLANS, PRICES, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import { assetUrl, recoveryEmailKey, recoveryStatus, recoveryUrl, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
+import { assetUrl, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -119,6 +119,21 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       const lines = await withTenant(ws, (tx) => tx`select statement, state from learnings where last_revalidated_at > now() - interval '7 days' order by confidence desc limit 4`);
       const out = lines.map((l) => `${l.state === 'ACTIONABLE' ? 'Actionable' : l.state === 'DIRECTIONAL' ? 'Directional' : 'Weakening'}: ${l.statement}`);
       if (out.length) await send('friday_summary', { workspaceName: w!.name, lines: out, url: `${base}/results` });
+      return;
+    }
+    case 'ownership_transferred': {
+      // A staff-requested transfer the Owner confirmed (plan 05 §2.2): both the new and previous owners are told.
+      const ids = ((data.userIds as string[]) ?? []).filter(Boolean);
+      if (!ids.length) return;
+      const to = await withTenant(ws, (tx) => tx`select u.email from memberships m join users u on u.id = m.user_id where m.user_id in ${tx(ids)} and u.deleted_at is null`);
+      await send('security_alert', { event: `Ownership of ${w!.name as string} was transferred`, when: new Date().toUTCString(), url: `${base}/settings/profile` }, to.map((r) => r.email as string));
+      return;
+    }
+    case 'intervention': {
+      // Retention playbook email (plan 05 §17), to owners and admins; never a discount.
+      const pb = RISK_PLAYBOOKS[data.indicator as RiskIndicator];
+      if (!pb?.email) return;
+      await send('intervention', { label: 'From the Arkiv team', headline: pb.email.headline, body: pb.email.body, cta: pb.email.cta, url: `${base}${pb.email.path}` });
       return;
     }
     case 'staff_break_glass':

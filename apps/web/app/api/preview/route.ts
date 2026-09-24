@@ -1,5 +1,5 @@
 import { withTenant, globalTx } from '@arkiv/db';
-import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, resolveProvisional, startPreview, type TenantContext } from '@arkiv/core';
+import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, resolveProvisional, startPreview, uploadFailureCategory, type TenantContext } from '@arkiv/core';
 import { DomainError, env } from '@arkiv/shared';
 import { clientIp, json, route } from '@/lib/http';
 import { currentUser, provisionalToken, setProvisionalCookie, visitorId } from '@/lib/session';
@@ -14,9 +14,23 @@ export const POST = route(async (req) => {
   const url = (form.get('url') as string | null)?.trim() || null;
   const photos = form.getAll('photos').filter((f): f is File => f instanceof File && f.size > 0).slice(0, 6);
   if (!url && !photos.length) throw new DomainError('INVALID', 'Paste your product link or add a photo.');
-  const ip = clientIp(req);
   const vid = await visitorId();
-  await recordFunnel('UPLOAD_STARTED', { visitorId: vid, page: (form.get('page') as string) ?? null, variant: (form.get('variant') as string) ?? null, props: { method: url ? 'url' : 'photos' } });
+  const page = (form.get('page') as string) ?? null;
+  const variant = (form.get('variant') as string) ?? null;
+  const method = url ? 'url' : 'photos';
+  await recordFunnel('UPLOAD_STARTED', { visitorId: vid, page, variant, props: { method } });
+  try {
+    return await startUpload(req, form, { url, photos, vid });
+  } catch (e) {
+    // Drop-off drilldown (plan 05 §4): why this attempt never became a preview (file too big, unsupported page…).
+    await recordFunnel('UPLOAD_FAILED', { visitorId: vid, page, variant, props: { method, category: uploadFailureCategory(e), reason: e instanceof DomainError ? e.message.slice(0, 120) : 'error' } }).catch(() => {});
+    throw e;
+  }
+});
+
+async function startUpload(req: Request, form: FormData, input: { url: string | null; photos: File[]; vid: string }) {
+  const { url, photos, vid } = input;
+  const ip = clientIp(req);
 
   if (env().TURNSTILE_SECRET) {
     // Bots: invisible challenge on submit only (plan 03 P1 edge cases). The form sends the token (UploadModule).
@@ -49,4 +63,4 @@ export const POST = route(async (req) => {
   }
   const r = await withTenant(ctx.workspaceId, (tx) => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip }));
   return json({ projectId: r.projectId, skuId: r.skuId, catalogueNo: r.catalogueNo });
-});
+}

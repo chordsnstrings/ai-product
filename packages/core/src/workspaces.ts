@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import { globalTx, withSystem, withTenant, type Tx } from '@arkiv/db';
 import {
   DomainError,
@@ -18,6 +19,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { JOB_HOLD_STATES, releaseHeldJobs } from './holds';
+import { enqueue, Queues } from './outbox';
 import { planQuota } from './settings';
 import { storage } from './storage';
 
@@ -218,6 +220,22 @@ export async function inviteMember(tx: Tx, ctx: TenantContext, email: string, ro
   return { inviteId: inv!.id as string, token };
 }
 
+/**
+ * Resend a pending invite (plan 05 §2.2 Members "Resend invite"): a new token (the old link stops working) and a
+ * fresh 7-day expiry. Runs under any role; the explicit workspace filter keeps it tenant-scoped for staff.
+ */
+export async function rotateInviteToken(tx: Tx, workspaceId: string, inviteId: string) {
+  const [inv] = await tx`select i.email, i.role, i.accepted_at, i.revoked_at, coalesce(u.name, u.email::text) as inviter, w.name as workspace_name
+                         from invites i join workspaces w on w.id = i.workspace_id left join users u on u.id = i.invited_by
+                         where i.id = ${inviteId} and i.workspace_id = ${workspaceId} for update of i`;
+  if (!inv) throw notFound('Invite not found');
+  if (inv.accepted_at) throw conflict('That invite was already accepted.');
+  if (inv.revoked_at) throw conflict('That invite was revoked. Invite the person again instead.');
+  const token = randomToken();
+  await tx`update invites set token_hash = ${sha256(token)}, expires_at = now() + interval '7 days' where id = ${inviteId} and workspace_id = ${workspaceId}`;
+  return { token, email: inv.email as string, role: inv.role as Role, inviterName: (inv.inviter as string) ?? (inv.workspace_name as string), workspaceName: inv.workspace_name as string };
+}
+
 export type InviteLookup =
   | { status: 'ok'; workspaceId: string; workspaceName: string; email: string; role: Role; inviteId: string }
   | { status: 'expired' | 'revoked' | 'accepted' | 'not_found'; workspaceName?: string };
@@ -299,6 +317,71 @@ export async function transferOwnership(tx: Tx, ctx: TenantContext, toUserId: st
   // One MEMBER_ROLE_CHANGED per member whose role changed, in the shared payload shape (EVENT_PAYLOADS).
   if (t.role !== 'OWNER') await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: toUserId }, { from: t.role as Role, to: 'OWNER', transfer: true });
   if (stepDown) await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: stepDown.userId }, { from: stepDown.from, to: 'ADMIN', transfer: true });
+}
+
+/**
+ * Make `toUserId` the Owner and step every current Owner down to Admin, in one transaction. Shared by the staff
+ * ownership transfer (completed when the current Owner confirms). Explicit workspace filters: callers may run as
+ * the tenant (RLS) or as staff/system, whose policies see every tenant.
+ */
+export async function swapOwnership(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, toUserId: string, extra: { byStaff?: true; reason?: string } = {}) {
+  const ws = ctx.workspaceId;
+  const [m] = await tx`select role from memberships where workspace_id = ${ws} and user_id = ${toUserId} for update`;
+  if (!m) throw notFound('The new owner must still be a member of this workspace.');
+  if (m.role === 'OWNER') throw conflict('That member already owns this workspace.');
+  const prev = await tx`update memberships set role = 'ADMIN' where workspace_id = ${ws} and role = 'OWNER' returning user_id`;
+  await tx`update memberships set role = 'OWNER' where workspace_id = ${ws} and user_id = ${toUserId}`;
+  await tx`update workspaces set membership_version = membership_version + 1 where id = ${ws}`;
+  // One MEMBER_ROLE_CHANGED per member whose role changed, in the shared payload shape (EVENT_PAYLOADS).
+  await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: toUserId }, { from: m.role as Role, to: 'OWNER', transfer: true, ...extra });
+  for (const p of prev) await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: p.user_id as string }, { from: 'OWNER', to: 'ADMIN', transfer: true, ...extra });
+  return { from: m.role as Role, previousOwners: prev.map((p) => p.user_id as string) };
+}
+
+export type OwnershipTransferLookup =
+  | { status: 'pending'; workspaceId: string; workspaceName: string; workspaceSlug: string; toEmail: string; toName: string | null; staffName: string; reason: string; expiresAt: string }
+  | { status: 'confirmed' | 'declined' | 'cancelled' | 'expired' | 'not_found'; workspaceName?: string };
+
+/** The confirmation page (GET): inspect a staff-requested ownership transfer without deciding it. */
+export async function lookupOwnershipTransfer(token: string): Promise<OwnershipTransferLookup> {
+  const [t] = await globalTx((tx) => tx`select * from find_ownership_transfer(${sha256(token)})`);
+  if (!t) return { status: 'not_found' };
+  if (t.status !== 'pending') return { status: t.status as 'confirmed' | 'declined' | 'cancelled', workspaceName: t.workspace_name as string };
+  if (new Date(t.expires_at as string) <= new Date()) return { status: 'expired', workspaceName: t.workspace_name as string };
+  return {
+    status: 'pending',
+    workspaceId: t.workspace_id as string,
+    workspaceName: t.workspace_name as string,
+    workspaceSlug: t.workspace_slug as string,
+    toEmail: t.to_email as string,
+    toName: (t.to_name as string) ?? null,
+    staffName: t.staff_name as string,
+    reason: t.reason as string,
+    expiresAt: t.expires_at as string,
+  };
+}
+
+/**
+ * The current Owner confirms (or declines) a transfer Arkiv support requested (plan 05 §2.2 "🔐 transfer ownership
+ * (with written reason + customer email confirmation)"). They must be signed in as an Owner of that workspace and
+ * hold the emailed link. The decision is recorded on the request and in the staff audit log, and a confirmation
+ * swaps the roles in the same transaction; both owners are told by email through the outbox.
+ */
+export async function decideOwnershipTransfer(token: string, user: { id: string }, confirm: boolean, meta: { ip?: string | null; userAgent?: string | null } = {}) {
+  const t = await lookupOwnershipTransfer(token);
+  if (t.status !== 'pending') throw new DomainError('CONFLICT', `This request is ${t.status.replace('_', ' ')}.`, { status: t.status });
+  return withTenant(t.workspaceId, async (tx) => {
+    const [me] = await tx`select role from memberships where workspace_id = ${t.workspaceId} and user_id = ${user.id}`;
+    if (me?.role !== 'OWNER') throw new DomainError('FORBIDDEN', `Only an owner of ${t.workspaceName} can answer this request.`);
+    const ip = meta.ip && isIP(meta.ip) ? meta.ip : null;
+    const [d] = await tx`select * from ownership_transfer_decide(${sha256(token)}, ${user.id}, ${confirm}, ${ip}, ${meta.userAgent ?? null})`;
+    if (!d) throw conflict('This request is no longer pending.');
+    if (!confirm) return { workspaceId: t.workspaceId, slug: t.workspaceSlug, confirmed: false };
+    const ctx = { workspaceId: t.workspaceId, actor: { kind: 'user' as const, id: user.id } };
+    const r = await swapOwnership(tx, ctx, d.to_user_id as string, { byStaff: true, reason: d.reason as string });
+    await enqueue(tx, t.workspaceId, Queues.sendEmail, { template: 'ownership_transferred', userIds: [d.to_user_id as string, ...r.previousOwners] }, { singletonKey: `owner-transferred:${d.id as string}` });
+    return { workspaceId: t.workspaceId, slug: t.workspaceSlug, confirmed: true };
+  });
 }
 
 /** Next catalogue number: `No. 001` stamp for each SKU (design M4). */

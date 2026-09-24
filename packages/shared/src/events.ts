@@ -76,10 +76,14 @@ export const EventType = [
   'INTEGRATION_CONNECTED',
   'INTEGRATION_DEGRADED',
   'INTEGRATION_DISCONNECTED',
+  // Platform event: staff moved a SKU between workspaces with the owner's consent (plan 05 §2.3); one per side.
+  'SKU_TRANSFERRED',
   // Funnel (plan 04 §1) — server-side source of truth
   'LP_VIEWED',
   'UPLOAD_STARTED',
   'UPLOAD_COMPLETED',
+  // An upload attempt refused before a preview started (plan 05 §4 drop-off drilldown: file too big, unsupported page…).
+  'UPLOAD_FAILED',
   'URL_PARSE_FAILED',
   'SKU_VALIDATED',
   'SKU_REJECTED',

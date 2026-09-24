@@ -10,6 +10,7 @@ import {
   createExperiment,
   decideFact,
   disconnectIntegration,
+  dismissNotice,
   dismissRecommendation,
   enqueue,
   importHistoricalCreative,
@@ -205,6 +206,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'transfer': {
       const { userId } = await body(req, z.object({ userId: uuid }));
       await t((tx) => transferOwnership(tx, ctx, userId));
+      return json({ ok: true });
+    }
+    /* ── In-app notices from Arkiv (plan 05 §17 playbooks) ── */
+    case 'notice-dismiss': {
+      const { id } = await body(req, z.object({ id: uuid }));
+      await t((tx) => dismissNotice(tx, ctx, id));
       return json({ ok: true });
     }
     /* ── Billing (plan 04 §3: honest, two-click cancel) ── */

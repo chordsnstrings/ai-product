@@ -87,7 +87,7 @@ export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
   return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
-const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integrations', 'invites', 'memberships', 'offers', 'refunds', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'break_glass_sessions', 'tenant_notes'];
+const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes'];
 
 /**
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,
@@ -148,22 +148,95 @@ export interface RiskSignal {
   evidence: Record<string, unknown>;
 }
 
+/** A customer-facing message of a playbook; `path` is inside the workspace (e.g. /this-week). */
+export interface PlaybookMessage {
+  headline: string;
+  body: string;
+  cta: string;
+  path: string;
+}
+
+export interface RiskPlaybook {
+  label: string;
+  /** What staff do (shown on the board). */
+  intervention: string;
+  /** Email to the workspace's owners and admins when the playbook starts. */
+  email?: PlaybookMessage;
+  /** In-app notice in the workspace until dismissed (14 days). */
+  notice?: PlaybookMessage;
+}
+
 /**
- * Value interventions per indicator (plan 05 §17, standard §10). Never automatic discounting. The Record type
- * makes adding an indicator without a playbook a compile error.
+ * Value interventions per indicator (plan 05 §17, standard §10): "each indicator maps to a value intervention
+ * (e.g. paid-no-export → email + in-app …)". Never automatic discounting. The Record type makes adding an
+ * indicator without a playbook a compile error. Negative support sentiment is a personal follow-up, so it has no
+ * templated message.
  */
-export const RISK_PLAYBOOKS: Record<RiskIndicator, { label: string; intervention: string }> = {
-  idle_7d: { label: '7 days idle', intervention: 'Email the week’s top recommendation with a one-click approve link.' },
-  paid_no_export: { label: 'Paid, no export', intervention: '“Your ad is ready — here’s how to upload it to Meta in 2 minutes.” (email + in-app)' },
-  repeated_qa_rejects: { label: 'Repeated QA rejects', intervention: 'OPS reviews the SKU’s fingerprint and reference photos; offer a better-photo guide.' },
-  ignored_recommendations: { label: '3 ignored recommendation cycles', intervention: 'Ask one question: “Are these the wrong kind of tests?”' },
-  ad_account_disconnected: { label: 'Ad account disconnected', intervention: 'Reconnect prompt with the exact scope explanation.' },
-  stockout: { label: 'Stockout', intervention: 'Pause tests on the out-of-stock SKU, mark the period as confounded, and suggest an in-stock SKU for this week’s test.' },
-  low_utilisation: { label: 'Utilisation < 25% (2 periods)', intervention: 'Suggest the plan that fits usage (downgrade is fine) and offer a 15-minute planning call.' },
-  high_utilisation_friction: { label: 'Utilisation > 95% with friction', intervention: 'Show the next plan’s allowance and unblock the waiting production; no discount.' },
-  no_performance_linked_test: { label: 'No performance-linked test in 30 days', intervention: 'Walk through variant codes in ad names / CSV upload.' },
+export const RISK_PLAYBOOKS: Record<RiskIndicator, RiskPlaybook> = {
+  idle_7d: {
+    label: '7 days idle',
+    intervention: 'Email the week’s top recommendation with a one-click approve link.',
+    email: { headline: 'This week’s test is ready for you', body: 'We picked the most promising test for your catalogue this week. Approving it takes one click.', cta: 'See this week’s test', path: '/this-week' },
+    notice: { headline: 'This week’s test is waiting', body: 'One click approves the test we recommend for this week.', cta: 'See it', path: '/this-week' },
+  },
+  paid_no_export: {
+    label: 'Paid, no export',
+    intervention: '“Your ad is ready — here’s how to upload it to Meta in 2 minutes.” (email + in-app)',
+    email: { headline: 'Your ad is ready — here’s how to upload it to Meta in 2 minutes', body: 'Download the 9:16 and 4:5 exports, create an ad in Ads Manager and upload both sizes. Keep the variant code in the ad name so its results flow back to Arkiv automatically.', cta: 'Get your ad', path: '/results' },
+    notice: { headline: 'Your ad is ready to upload', body: 'It takes about 2 minutes in Ads Manager: upload the 9:16 and 4:5 exports and keep the variant code in the ad name.', cta: 'Get your ad', path: '/results' },
+  },
+  repeated_qa_rejects: {
+    label: 'Repeated QA rejects',
+    intervention: 'OPS reviews the SKU’s fingerprint and reference photos; offer a better-photo guide.',
+    email: { headline: 'Clearer product photos make better ads', body: 'Some renders didn’t pass our product-accuracy checks. Front-facing photos on a plain background, with the label readable and the cap on, help most.', cta: 'Update product photos', path: '/products' },
+    notice: { headline: 'Better photos, fewer retries', body: 'A front-facing photo on a plain background with a readable label helps our accuracy checks pass first time.', cta: 'Update photos', path: '/products' },
+  },
+  ignored_recommendations: {
+    label: '3 ignored recommendation cycles',
+    intervention: 'Ask one question: “Are these the wrong kind of tests?”',
+    email: { headline: 'Are these the wrong kind of tests?', body: 'You haven’t picked any of the last few weeks’ recommendations. Tell us what would be more useful and we’ll adjust what we suggest.', cta: 'Tell us', path: '/this-week' },
+    notice: { headline: 'Are these the wrong kind of tests?', body: 'Pick or dismiss a recommendation and we’ll learn what you want to test.', cta: 'Review tests', path: '/this-week' },
+  },
+  ad_account_disconnected: {
+    label: 'Ad account disconnected',
+    intervention: 'Reconnect prompt with the exact scope explanation.',
+    email: { headline: 'Reconnect your ad account', body: 'Your ad account is disconnected, so results can’t flow back. Reconnecting asks for read-only access to ad performance — we never change budgets, bids or campaigns.', cta: 'Reconnect', path: '/settings/integrations' },
+    notice: { headline: 'Your ad account is disconnected', body: 'Reconnect with read-only access so test results keep flowing in.', cta: 'Reconnect', path: '/settings/integrations' },
+  },
+  stockout: {
+    label: 'Stockout',
+    intervention: 'Pause tests on the out-of-stock SKU, mark the period as confounded, and suggest an in-stock SKU for this week’s test.',
+    email: { headline: 'A product is out of stock', body: 'We’ve paused tests on out-of-stock products so their results aren’t skewed. Pick an in-stock product for this week’s test.', cta: 'Choose a product', path: '/products' },
+    notice: { headline: 'Tests paused on an out-of-stock product', body: 'Pick an in-stock product for this week’s test.', cta: 'Choose a product', path: '/products' },
+  },
+  low_utilisation: {
+    label: 'Utilisation < 25% (2 periods)',
+    intervention: 'Suggest the plan that fits usage (downgrade is fine) and offer a 15-minute planning call.',
+    email: { headline: 'Is your plan the right size?', body: 'You’ve used less than a quarter of your Creative Tests for two periods. If a smaller plan fits better, you can switch anytime in Settings → Billing, or reply to book a 15-minute planning call.', cta: 'Review your plan', path: '/settings/billing' },
+  },
+  high_utilisation_friction: {
+    label: 'Utilisation > 95% with friction',
+    intervention: 'Show the next plan’s allowance and unblock the waiting production; no discount.',
+    email: { headline: 'You’re using almost all of your tests', body: 'You’ve used over 95% of this period’s Creative Tests. See what the next plan includes; your waiting production continues either way.', cta: 'Compare plans', path: '/settings/billing' },
+  },
+  no_performance_linked_test: {
+    label: 'No performance-linked test in 30 days',
+    intervention: 'Walk through variant codes in ad names / CSV upload.',
+    email: { headline: 'Link your ads to see what works', body: 'Put the variant code in your ad names, or upload a CSV from Ads Manager, and we’ll match results to each test.', cta: 'See how', path: '/results' },
+    notice: { headline: 'Link your ads to your tests', body: 'Variant codes in ad names (or a CSV upload) let us match results to each test.', cta: 'See how', path: '/results' },
+  },
   negative_support_sentiment: { label: 'Negative support sentiment', intervention: 'Founder or senior support follow-up within one business day; fix the underlying issue first.' },
 };
+
+/** A member hides an in-app notice for the whole workspace (the app may only mark notices dismissed). */
+export async function dismissNotice(tx: Tx, ctx: TenantContext, noticeId: string) {
+  if (ctx.actor.kind !== 'user') throw new DomainError('FORBIDDEN', 'Only a signed-in member can dismiss notices.');
+  // Any member may acknowledge a notice, including while the workspace is held (that is when notices matter).
+  assertCan(ctx, 'workspace.view');
+  const r = await tx`update workspace_notices set dismissed_at = now(), dismissed_by = ${ctx.actor.id}
+                     where id = ${noticeId} and workspace_id = ${ctx.workspaceId} and dismissed_at is null returning id`;
+  return r.length > 0;
+}
 
 const DAY = 86400_000;
 

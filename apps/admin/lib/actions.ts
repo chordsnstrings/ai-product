@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
-import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
+import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
   actOnBehalf,
   addTenantNote,
@@ -20,9 +21,14 @@ import {
   decideFact,
   editScene,
   endBreakGlass,
+  emit,
   enqueue,
+  staffCtx,
+  staffTenantCtx,
   evalDatasetFor,
   GOLDEN,
+  importAdSpend,
+  parseAdSpendCsv,
   normalizeAllowKey,
   QA_VERDICT_KEY,
   Queues,
@@ -35,15 +41,20 @@ import {
   SETTING_DEFAULTS,
   setTenantFlags,
   setTenantHold,
-  staffTransferOwnership,
+  requestOwnershipTransfer,
+  requestSkuTransfer,
+  cancelOwnershipTransfer,
+  OWNERSHIP_TRANSFER_HOURS,
+  rotateInviteToken,
+  startIntervention,
   startBreakGlass,
   suppressRiskFlag,
   validateEligibility,
   type Permission,
   type SettingKey,
 } from '@arkiv/core';
-import { billingGateway, processStripeEvent, refundPayment } from '@arkiv/billing';
-import { sendEmail } from '@arkiv/email';
+import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan } from '@arkiv/billing';
+import { canResendTemplate, sendEmail, type TemplateName } from '@arkiv/email';
 import { DataRequestKind, DomainError, env, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
@@ -121,6 +132,16 @@ async function ownerEmails(workspaceId: string) {
   return withAdmin((tx) => tx`select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${workspaceId} and m.role in ('OWNER','ADMIN')`).then((r) => r.map((x) => x.email as string));
 }
 
+async function sendUserLoginLink(s: StaffUser, userId: string, why: string, verification: boolean) {
+  const [u] = await withAdmin((tx) => tx`select email, email_verified_at, locked_at, deleted_at from users where id = ${userId}`);
+  if (!u || u.deleted_at) throw new DomainError('NOT_FOUND', 'User not found');
+  if (u.locked_at) throw new DomainError('CONFLICT', 'This account is locked. Unlock it first.');
+  if (verification && u.email_verified_at) throw new DomainError('CONFLICT', 'This address is already verified. Send a sign-in link instead.');
+  await requestMagicLink({ email: u.email as string, purpose: 'login' });
+  await withAdmin((tx) => audit(tx, s, verification ? 'user.resend_verification' : 'user.send_login_link', { type: 'user', id: userId }, { reason: why }));
+  return { message: verification ? 'Verification link sent; opening it confirms the address.' : 'Sign-in link sent to the user’s inbox (valid 15 minutes).' };
+}
+
 /** Customer-app link inside the workspace (plan 02 M11): email buttons land on the page they name. */
 export const appUrl = (slug: string, path: string) => `${env().APP_URL}/w/${slug}${path}`;
 async function workspaceSlug(workspaceId: string) {
@@ -182,6 +203,17 @@ export const ACTIONS = {
         return { message: 'Scene updated on the customer’s behalf (claims-checked like their own edits).' };
       }),
   }),
+  /* §2.3 "Transfer SKU to workspace": with the owner's written consent, one job copies the SKU's product truth
+     and assets into the target workspace with new ids (break-glass write on the source, audited on both sides). */
+  'tenant.sku_transfer': a({
+    perm: 'breakglass.write',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, skuId: uuid, toWorkspaceId: uuid, consentRef: z.string().trim().min(4, 'Reference the owner’s written consent (ticket or email)').max(200), reason }),
+    run: async (s, i) => {
+      const r = await requestSkuTransfer(s, { fromWorkspaceId: i.workspaceId, skuId: i.skuId, toWorkspaceId: i.toWorkspaceId, consentRef: i.consentRef, reason: i.reason });
+      return { transferId: r.transferId, message: 'Transfer queued. The SKU, its facts, claims, evidence, fingerprint and files are copied with new ids; the original is archived.' };
+    },
+  }),
   'tenant.purge_now': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'workspace.purge_now', { workspaceId: i.workspaceId }, i.reason) }),
   'tenant.schedule_purge': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => scheduleTenantPurge(s, i.workspaceId, i.reason) }),
   'tenant.cancel_purge': a({
@@ -206,20 +238,69 @@ export const ACTIONS = {
     schema: z.object({ workspaceId: uuid, unit: z.enum(['creative_test', 'taste', 'standalone']), amount: z.number().int().refine((n) => n !== 0, 'Amount cannot be 0'), reason }),
     run: (s, i) => requestOrExecute(s, 'ledger.adjust', { workspaceId: i.workspaceId, unit: i.unit, amount: i.amount, nonce: newId() }, i.reason),
   }),
+  /* §2.2 Members: 🔐 transfer ownership "with written reason + customer email confirmation". Staff file the
+     request; the current owner confirms from the emailed link (signed in), and only then do the roles change. */
   'tenant.transfer_owner': a({
     perm: 'tenant.state',
     reauth: true,
     schema: z.object({ workspaceId: uuid, userId: uuid, reason }),
     run: async (s, i) => {
-      const r = await staffTransferOwnership(s, i.workspaceId, i.userId, i.reason);
-      // "Review sessions" lands on the member's profile, where sessions can be revoked.
-      for (const to of r.notify) await sendEmail('security_alert', to, { event: 'Workspace ownership was transferred by Arkiv support', when: new Date().toUTCString(), url: appUrl(r.slug, '/settings/profile') }, { idempotencyKey: `owner:${i.workspaceId}:${i.userId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
-      return { message: 'Ownership transferred; the new and previous owners were emailed.' };
+      const r = await requestOwnershipTransfer(s, i.workspaceId, i.userId, i.reason);
+      const url = `${env().APP_URL}/ownership/${r.token}`;
+      const newOwner = r.newOwner.name ? `${r.newOwner.name} (${r.newOwner.email})` : r.newOwner.email;
+      let sent = 0;
+      for (const to of r.notify) {
+        const res = await sendEmail('ownership_transfer_confirm', to, { workspaceName: r.workspaceName, newOwner, reason: i.reason, url, expiresIn: `${OWNERSHIP_TRANSFER_HOURS} hours` }, { idempotencyKey: `owner-transfer:${r.transferId}:${to}`, workspaceId: i.workspaceId }).catch(() => null);
+        if (res && res.status !== 'suppressed') sent++;
+      }
+      if (!sent) throw new DomainError('UNAVAILABLE', 'The confirmation email could not be sent to any owner. The request stays pending; withdraw it or try again.');
+      return { transferId: r.transferId, message: `Confirmation emailed to ${sent} owner${sent === 1 ? '' : 's'}. Nothing changes until an owner confirms (link valid ${OWNERSHIP_TRANSFER_HOURS} hours).` };
+    },
+  }),
+  'tenant.transfer_owner_cancel': a({ perm: 'tenant.state', schema: z.object({ workspaceId: uuid, transferId: uuid, reason }), run: (s, i) => cancelOwnershipTransfer(s, i.workspaceId, i.transferId, i.reason).then(() => ({ message: 'Request withdrawn; the emailed link no longer works.' })) }),
+  /* §2.2 Members: resend a pending invite with a fresh link (the previous link stops working). */
+  'tenant.invite_resend': a({
+    perm: 'tenant.flags',
+    schema: z.object({ workspaceId: uuid, inviteId: uuid }),
+    run: async (s, i) => {
+      const r = await withAdmin(async (tx) => {
+        const inv = await rotateInviteToken(tx, i.workspaceId, i.inviteId);
+        await audit(tx, s, 'tenant.invite_resend', { type: 'invite', id: i.inviteId }, { workspaceId: i.workspaceId, after: { role: inv.role, expires: '7 days' } });
+        return inv;
+      });
+      const res = await sendEmail('invite', r.email, { url: `${env().APP_URL}/invite/${r.token}`, workspaceName: r.workspaceName, inviterName: r.inviterName, role: r.role }, { idempotencyKey: `invite:${i.inviteId}:${createHash('sha256').update(r.token).digest('hex').slice(0, 16)}`, workspaceId: i.workspaceId });
+      return { message: res.status === 'suppressed' ? 'New link issued, but the address is suppressed (bounce/complaint); unsuppress it first.' : 'Invite resent with a new link; it expires in 7 days.' };
     },
   }),
   'tenant.invite_revoke': a({ perm: 'tenant.flags', schema: z.object({ workspaceId: uuid, inviteId: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select email, role, expires_at, revoked_at, accepted_at from invites where id = ${i.inviteId} and workspace_id = ${i.workspaceId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Invite not found'); await tx`update invites set revoked_at = now() where id = ${i.inviteId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'tenant.invite_revoke', { type: 'invite', id: i.inviteId }, { workspaceId: i.workspaceId, before: { revoked_at: b.revoked_at, accepted_at: b.accepted_at }, after: { revoked_at: 'now' } }); }) }),
   'tenant.integration_sync': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid }), run: (s, i) => withAdmin(async (tx) => { await enqueue(tx, i.workspaceId, Queues.syncIntegration, { integrationId: i.integrationId, full: true }, { singletonKey: `sync:${i.integrationId}` }); await audit(tx, s, 'integration.resync', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId }); }) }),
-  'tenant.integration_status': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid, status: z.enum(['active', 'paused', 'degraded']), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status from integrations where id = ${i.integrationId} and workspace_id = ${i.workspaceId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Integration not found'); await tx`update integrations set status = ${i.status} where id = ${i.integrationId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'integration.status', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId, reason: i.reason, before: { status: b.status }, after: { status: i.status } }); }) }),
+  // §2.2 Integrations: pause/resume sync, or mark a connection degraded (the customer sees it needs attention and
+  // freshness reflects it, like a connector-detected degradation).
+  'tenant.integration_status': a({
+    perm: 'integrations.manage',
+    schema: z.object({ workspaceId: uuid, integrationId: uuid, status: z.enum(['active', 'paused', 'degraded']), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select status, provider from integrations where id = ${i.integrationId} and workspace_id = ${i.workspaceId} for update`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Integration not found');
+        if (b.status === 'disconnected' || b.status === 'revoked') throw new DomainError('CONFLICT', `This connection is ${b.status as string}; only the customer can reconnect it.`);
+        if (b.status === i.status) return { message: `Already ${i.status}.` };
+        await tx`update integrations set status = ${i.status} where id = ${i.integrationId} and workspace_id = ${i.workspaceId}`;
+        if (i.status === 'degraded') {
+          const ctx = staffCtx(s, i.workspaceId);
+          await emit(tx, ctx, 'INTEGRATION_DEGRADED', { type: 'integration', id: i.integrationId }, { kind: 'staff', reason: i.reason });
+          await emit(tx, ctx, 'DATA_FRESHNESS_CHANGED', { type: 'integration', id: i.integrationId }, { status: 'degraded' });
+        }
+        await audit(tx, s, 'integration.status', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId, reason: i.reason, before: { status: b.status }, after: { status: i.status } });
+        return { message: `${b.provider as string} connection ${i.status === 'degraded' ? 'marked degraded' : i.status === 'paused' ? 'paused' : 'resumed'}.` };
+      }),
+  }),
+  /* §2.2 Risk / §17: start the flag's intervention playbook (email + in-app notice; never a discount). */
+  'intervention.start': a({
+    perm: 'tenant.flags',
+    schema: z.object({ workspaceId: uuid, flagId: uuid, email: z.boolean().optional(), notice: z.boolean().optional(), note: z.string().max(500).optional() }),
+    run: (s, i) => startIntervention(s, i.workspaceId, i.flagId, { email: i.email, notice: i.notice, note: i.note ?? null }),
+  }),
   'tenant.risk_suppress': a({
     perm: 'tenant.flags',
     schema: z.object({ workspaceId: uuid, flagId: uuid, reason, days: z.number().int().min(1).max(180).default(30) }),
@@ -266,6 +347,11 @@ export const ACTIONS = {
   /* ── Users ── */
   'user.lock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select locked_at, locked_reason from users where id = ${i.userId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'User not found'); await tx`update users set locked_at = now(), locked_reason = ${i.reason} where id = ${i.userId}`; const ended = await tx`update sessions set revoked_at = now() where user_id = ${i.userId} and revoked_at is null returning id`; await audit(tx, s, 'user.lock', { type: 'user', id: i.userId }, { reason: i.reason, before: b, after: { locked: true, sessionsRevoked: ended.length } }); }) }),
   'user.unlock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select locked_at, locked_reason from users where id = ${i.userId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'User not found'); await tx`update users set locked_at = null, locked_reason = null where id = ${i.userId}`; await audit(tx, s, 'user.unlock', { type: 'user', id: i.userId }, { reason: i.reason, before: b, after: { locked_at: null, locked_reason: null } }); }) }),
+  /* §3 Users "resend verification, trigger password reset email": sign-in is passwordless, so both send the user a
+     fresh single-use sign-in link (opening it verifies the address). Staff never see or set a credential; the link
+     goes only to the user's own inbox, under the normal per-address rate limit. */
+  'user.resend_verification': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: (s, i) => sendUserLoginLink(s, i.userId, i.reason, true) }),
+  'user.send_login_link': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: (s, i) => sendUserLoginLink(s, i.userId, i.reason, false) }),
   'user.force_logout': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: async (s, i) => { await revokeAllSessions(i.userId); await withAdmin((tx) => audit(tx, s, 'user.force_logout', { type: 'user', id: i.userId }, { reason: i.reason })); } }),
 
   /* ── Billing ── */
@@ -287,6 +373,33 @@ export const ACTIONS = {
       .refine((x) => !!x.purchaseId !== !!x.invoiceEventId, 'Choose exactly one payment to refund'),
     // The nonce keys the Stripe refund and its mirror row, so a replay (retried click, re-run approval) never refunds twice.
     run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId ?? null, invoiceEventId: i.invoiceEventId ?? null, amountMicros: Math.round(i.amount * 1e6), reasonCode: i.reasonCode, customerNote: i.customerNote ?? null, nonce: i.requestId ?? newId() }, i.reason),
+  }),
+  /* §2.2 Billing "apply coupon": FINANCE applies a Stripe coupon to the tenant's subscription (a deliberate,
+     reasoned discount — retention playbooks never discount). */
+  'billing.apply_coupon': a({
+    perm: 'billing.manage',
+    schema: z.object({ workspaceId: uuid, coupon: z.string().trim().regex(/^[A-Za-z0-9_-]{2,64}$/, 'Coupon ids are letters, digits, - and _'), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const ctx = await staffTenantCtx(tx, s, i.workspaceId);
+        const r = await applySubscriptionCoupon(tx, ctx, i.coupon);
+        await audit(tx, s, 'billing.apply_coupon', { type: 'subscription', id: r.subscriptionId }, { workspaceId: i.workspaceId, reason: i.reason, before: { coupon: r.previous }, after: { coupon: i.coupon } });
+        return { message: `Coupon ${i.coupon} applied in Stripe; it shows on the next invoice.` };
+      }),
+  }),
+  /* §2.2 Billing "change plan (customer consent recorded)": the customer asked support to change plan; the consent
+     record names where they agreed, and the usual upgrade-now / downgrade-at-renewal rules apply. */
+  'billing.change_plan': a({
+    perm: 'billing.manage',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, plan: z.enum(['LAUNCH', 'GROWTH', 'SCALE']), consentRef: z.string().trim().min(4, 'Where did the customer agree? (ticket or email reference)').max(200), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const ctx = await staffTenantCtx(tx, s, i.workspaceId);
+        const r = await staffChangePlan(tx, ctx, i.plan, { reference: i.consentRef, staffId: s.staffId });
+        await audit(tx, s, 'billing.change_plan', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { plan: i.plan, effective: r.effective, consentRecordId: r.consentRecordId, consentRef: i.consentRef } });
+        return { message: r.effective === 'now' ? `Upgraded to ${i.plan.toLowerCase()} now (prorated${r.extraTests ? `, +${r.extraTests} tests this period` : ''}).` : r.effective === 'period_end' ? `Moves to ${i.plan.toLowerCase()} at the end of the current period.` : 'No change.' };
+      }),
   }),
   'billing.stripe_assign': a({ perm: 'billing.unmatched', reauth: true, schema: z.object({ eventId: z.string(), workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'stripe.assign', { eventId: i.eventId, workspaceId: i.workspaceId }, i.reason) }),
   'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched' returning id`; if (!b) throw new DomainError('CONFLICT', 'Event is not unmatched'); await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason, before: { status: 'unmatched' }, after: { status: 'ignored' } }); }) }),
@@ -495,6 +608,22 @@ export const ACTIONS = {
   }),
   'lp.status': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), status: z.enum(['draft', 'live', 'paused']) }), run: (s, i) => withAdmin(async (tx) => { if (i.slug === 'default' && i.status !== 'live') throw new DomainError('CONFLICT', 'The default page must stay live (paused pages redirect to it).'); const [b] = await tx`select status from landing_pages where slug = ${i.slug} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Page not found'); await tx`update landing_pages set status = ${i.status}, published_at = case when ${i.status} = 'live' then now() else published_at end where slug = ${i.slug}`; await audit(tx, s, 'lp.status', { type: 'landing_page', id: i.slug }, { before: { status: b.status }, after: { status: i.status } }); }) }),
   'lp.rollback': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), version: z.number().int() }), run: (s, i) => withAdmin(async (tx) => { const [p] = await tx`select history, content, version from landing_pages where slug = ${i.slug} for update`; const h = (p?.history as { version: number; content: unknown; variants: unknown }[]) ?? []; const v = h.find((x) => x.version === i.version); if (!v) throw new DomainError('NOT_FOUND', 'Version not found'); await tx`update landing_pages set content = ${tx.json(v.content as never)}, variants = ${tx.json(v.variants as never)}, version = version + 1, history = history || ${tx.json([{ version: p!.version, content: p!.content, at: new Date().toISOString(), by: s.email }] as never)} where slug = ${i.slug}`; await audit(tx, s, 'lp.rollback', { type: 'landing_page', id: i.slug }, { after: { toVersion: i.version } }); }) }),
+  /* §4 CAC: ad spend imported as CSV in V1 (date, source, campaign, ad id, spend in USD). */
+  'adspend.import': a({
+    perm: 'adspend.manage',
+    schema: z.object({ csv: z.string().min(10).max(2_000_000), source: z.string().trim().max(40).optional(), reason: z.string().max(200).optional() }),
+    run: async (s, i) => {
+      const rows = parseAdSpendCsv(i.csv, i.source || null);
+      const batchId = newId();
+      return withAdmin(async (tx) => {
+        const n = await importAdSpend(tx, rows, { staffId: s.staffId, batchId });
+        const total = rows.reduce((t, r) => t + r.spendMicros, 0);
+        const dates = rows.map((r) => r.date).sort();
+        await audit(tx, s, 'adspend.import', { type: 'ad_spend_batch', id: batchId }, { reason: i.reason ?? null, after: { rows: rows.length, stored: n, totalMicros: total, from: dates[0], to: dates.at(-1) } });
+        return { message: `Imported ${rows.length} rows (${dates[0]} → ${dates.at(-1)}), $${(total / 1e6).toLocaleString('en-US', { maximumFractionDigits: 2 })} in total.` };
+      });
+    },
+  }),
   'offer.create': a({
     perm: 'offers.manage',
     schema: z.object({
@@ -554,6 +683,23 @@ export const ACTIONS = {
         if (!before) throw new DomainError('NOT_FOUND', 'That address isn’t suppressed.');
         await audit(tx, s, 'email.unsuppress', { type: 'email', id: before.email as string }, { reason: i.reason, before });
       }),
+  }),
+  /* §2.2 Emails "Resend" (§0.2 SUPPORT "resend emails"): the same template and data to the same address, under a
+     new idempotency key minted when the button renders (a double click sends once). Credential links (sign-in,
+     invite, download, ownership) are never stored, so those are reissued by their own actions instead. */
+  'email.resend': a({
+    perm: 'email.manage',
+    schema: z.object({ logId: uuid, requestId: uuid, reason }),
+    run: async (s, i) => {
+      const [row] = await withAdmin((tx) => tx`select id, workspace_id, to_email, template, status, data from email_log where id = ${i.logId}`);
+      if (!row) throw new DomainError('NOT_FOUND', 'Email not found');
+      if (!canResendTemplate(row.template as string)) throw new DomainError('CONFLICT', 'This email carried a single-use link. Use “Resend invite” or “Send login link” to issue a fresh one.');
+      if (!row.data) throw new DomainError('CONFLICT', 'This email was sent before its content was recorded, so it can’t be resent.');
+      const res = await sendEmail(row.template as TemplateName, row.to_email as string, row.data as never, { idempotencyKey: `resend:${i.logId}:${i.requestId}`, workspaceId: (row.workspace_id as string) ?? null });
+      await withAdmin((tx) => audit(tx, s, 'email.resend', { type: 'email_log', id: i.logId }, { workspaceId: (row.workspace_id as string) ?? null, reason: i.reason, before: { template: row.template, status: row.status }, after: { outcome: res.status } }));
+      const said = { sent: 'Resent.', logged: 'Resent (logged; no provider configured here).', duplicate: 'Already resent.', suppressed: 'Not sent: the address is suppressed. Unsuppress it first.', capped: 'Not sent: marketing frequency cap reached for this address.' }[res.status];
+      return { status: res.status, message: said };
+    },
   }),
   'email.test': a({ perm: 'email.read', schema: z.object({ template: z.enum(['magic_link', 'receipt', 'asset_ready', 'weekly_brief', 'cancellation_confirmed']) }), run: async (s, i) => { const samples = { magic_link: { url: `${env().APP_URL}/auth/magic/test`, purpose: 'login' as const }, receipt: { productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: env().APP_URL }, asset_ready: { productName: 'Dew Serum', url: env().APP_URL, catalogueNo: '014' }, weekly_brief: { workspaceName: 'Sample Brand', week: 'Week 39', recommendations: [{ hypothesis: 'Texture close-ups beat talking heads for serums', slot: 'EXPLOIT' }], url: env().APP_URL }, cancellation_confirmed: { planName: 'Growth', endsOn: 'October 23', exportUrl: env().APP_URL } }; await sendEmail(i.template, s.email, samples[i.template] as never, { idempotencyKey: `test:${i.template}:${newId()}` }); return { message: `Sent to ${s.email}` }; } }),
 

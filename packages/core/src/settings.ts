@@ -39,6 +39,9 @@ export const SETTING_DEFAULTS = {
   'retention.purge_grace_days': RETENTION.PURGE_GRACE_DAYS,
   'free_preview.cogs_cap_micros': COST_LIMITS.FREE_PREVIEW_CAP,
   'quota.plan_defaults': {} as Record<string, Partial<PlanQuota>>,
+  // Payment fee allocation for Taste contribution / effective CAC (Appendix C): standard card rate.
+  'finance.payment_fee_bps': 290,
+  'finance.payment_fee_fixed_micros': 300_000,
 } as const;
 export type SettingKey = keyof typeof SETTING_DEFAULTS;
 

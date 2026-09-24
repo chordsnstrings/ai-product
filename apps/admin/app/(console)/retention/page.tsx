@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
 import { auditView, RISK_PLAYBOOKS, staffCan } from '@arkiv/core';
 import type { RiskIndicator } from '@arkiv/shared';
-import { ActForm } from '@/components/act';
+import { ActButton, ActForm } from '@/components/act';
 import { ago, d, Mono, Page, Section, Table } from '@/components/ui';
 import { consolePrefs } from '@/lib/prefs';
 import { notTest } from '@/lib/sql';
@@ -18,7 +18,7 @@ export default async function Retention({ searchParams }: { searchParams: Promis
   const prefs = await consolePrefs();
   const d0 = await withAdmin(async (tx) => ({
     audited: await auditView(tx, s, 'retention', { since: today ? 'today' : null, includeTest: prefs.includeTest }),
-    flags: await tx`select r.id, r.workspace_id, r.indicator, r.evidence, r.raised_at, w.name, w.plan_code from risk_flags r join workspaces w on w.id = r.workspace_id
+    flags: await tx`select r.id, r.workspace_id, r.indicator, r.evidence, r.raised_at, r.interventions, w.name, w.plan_code from risk_flags r join workspaces w on w.id = r.workspace_id
                     where r.resolved_at is null ${notTest(tx, prefs, 'r.workspace_id')} and (${!today} or r.raised_at >= date_trunc('day', now(), ${prefs.tz})) order by r.raised_at desc limit 300`,
     suppressed: await tx`select r.workspace_id, r.indicator, r.suppressed_reason, r.suppressed_until, w.name from risk_flags r join workspaces w on w.id = r.workspace_id
                          where r.suppressed_until > now() ${notTest(tx, prefs, 'r.workspace_id')} order by r.suppressed_until limit 100`,
@@ -29,12 +29,20 @@ export default async function Retention({ searchParams }: { searchParams: Promis
                       from subscriptions where created_at > now() - interval '120 days' ${notTest(tx, prefs)} group by 1 order by 1 desc`,
   }));
   const pb = (i: unknown) => RISK_PLAYBOOKS[i as RiskIndicator];
+  const started = (f: Record<string, unknown>) => ((f.interventions as { at: string }[]) ?? []).map((x) => x.at).sort().at(-1) ?? null;
   return (
     <Page title="Retention & customer success" sub={today ? <>Indicators raised today ({prefs.tz}). <Link href="/retention">Show all open indicators</Link></> : 'Churn-risk board: indicators with evidence and a mapped value intervention.'}>
       <Table head={['Workspace', 'Plan', 'Indicator', 'Evidence', 'Since', 'Playbook', '']} rows={d0.flags.map((f) => [
         <Link key="w" href={`/tenants/${f.workspace_id}?tab=risk`}>{f.name as string}</Link>, (f.plan_code as string)?.toLowerCase() ?? '—', pb(f.indicator)?.label ?? (f.indicator as string),
         <Mono key="e">{JSON.stringify(f.evidence).slice(0, 100)}</Mono>, ago(f.raised_at), <span key="p" className="ak-small">{pb(f.indicator)?.intervention ?? '—'}</span>,
-        canSuppress ? <ActForm key="s" inline action="tenant.risk_suppress" extra={{ workspaceId: f.workspace_id, flagId: f.id }} submit="Suppress" fields={[{ name: 'days', label: 'Days', type: 'number', defaultValue: 30, required: true }, { name: 'reason', label: 'Reason', required: true }]} /> : null,
+        canSuppress ? (
+          <span key="s" className="ak-stack" style={{ ['--stack' as string]: '6px' }}>
+            <ActButton small action="intervention.start" payload={{ workspaceId: f.workspace_id, flagId: f.id }} confirm={pb(f.indicator)?.email || pb(f.indicator)?.notice ? `Start the playbook? ${[pb(f.indicator)?.email ? 'Emails the owners and admins' : null, pb(f.indicator)?.notice ? 'posts an in-app notice' : null].filter(Boolean).join(' and ')}.` : 'Record that you started the personal follow-up?'}>
+              Start playbook{started(f) ? ` (last ${ago(started(f))})` : ''}
+            </ActButton>
+            <ActForm inline action="tenant.risk_suppress" extra={{ workspaceId: f.workspace_id, flagId: f.id }} submit="Suppress" fields={[{ name: 'days', label: 'Days', type: 'number', defaultValue: 30, required: true }, { name: 'reason', label: 'Reason', required: true }]} />
+          </span>
+        ) : null,
       ])} empty="No open churn-risk indicators." />
       <Section title="Suppressed indicators">
         <Table head={['Workspace', 'Indicator', 'Reason', 'Suppressed until']} rows={d0.suppressed.map((x) => [<Link key="w" href={`/tenants/${x.workspace_id}?tab=risk`}>{x.name as string}</Link>, pb(x.indicator)?.label ?? (x.indicator as string), x.suppressed_reason as string, d(x.suppressed_until)])} empty="No active suppressions." />

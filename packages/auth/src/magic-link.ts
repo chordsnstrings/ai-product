@@ -3,6 +3,7 @@ import { globalTx } from '@arkiv/db';
 import { DomainError, env } from '@arkiv/shared';
 import { hit } from '@arkiv/core';
 import { sendEmail } from '@arkiv/email';
+import { recordLoginFailure, type LoginMeta } from './login-attempts';
 import { createSession, findOrCreateUser } from './sessions';
 
 /**
@@ -64,8 +65,21 @@ export async function previewMagicLink(token: string): Promise<MagicLinkPreview>
   return { status: 'ok', email: m.email, purpose: m.purpose };
 }
 
-/** POST handler: consume once, create/verify user, create session. */
-export async function consumeMagicLink(token: string, meta: { ip?: string | null; userAgent?: string | null }) {
+/** POST handler: consume once, create/verify user, create session. A refused link is recorded as a failed sign-in. */
+export async function consumeMagicLink(token: string, meta: LoginMeta) {
+  let email: string | null = null;
+  try {
+    return await consume(token, meta, (e) => (email = e));
+  } catch (e) {
+    if (e instanceof DomainError) {
+      const p = email ? null : await previewMagicLink(token).catch(() => null);
+      await recordLoginFailure('magic_link', { email: email ?? p?.email ?? null }, e.message, meta, /locked/i.test(e.message) ? 'locked' : 'failed');
+    }
+    throw e;
+  }
+}
+
+async function consume(token: string, meta: LoginMeta, seen: (email: string) => void) {
   return globalTx(async (tx) => {
     const [m] = await tx`update magic_links set consumed_at = now()
                          where token_hash = ${hash(token)} and consumed_at is null and expires_at > now()
@@ -74,6 +88,7 @@ export async function consumeMagicLink(token: string, meta: { ip?: string | null
       const p = await previewMagicLink(token);
       throw new DomainError('CONFLICT', p.status === 'used' ? 'This link was already used.' : 'This link has expired.', { status: p.status, email: p.email });
     }
+    seen(m.email as string);
     const user = await findOrCreateUser(tx, m.email as string, { verified: true });
     await tx`insert into user_identities (user_id, provider, provider_subject, email) values (${user.userId}, 'email', ${m.email}, ${m.email})
              on conflict (provider, provider_subject) do nothing`;
