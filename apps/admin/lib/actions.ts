@@ -1,19 +1,24 @@
 import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
-import { assertFreshReauth, createStaff, deprovisionStaff, revokeAllSessions } from '@arkiv/auth';
+import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
+  actOnBehalf,
   addTenantNote,
   approveClaim,
   assertBreakGlass,
   assertStaff,
   audit,
   blockClaim,
+  BREAK_GLASS_REASON_KINDS,
+  BREAK_GLASS_REASON_LABEL,
   cancelProjectBeforeDispatch,
   cancelTenantPurge,
   claimMarket,
   classifyClaim,
   clearSettingsCache,
   decideApproval,
+  decideFact,
+  editScene,
   endBreakGlass,
   enqueue,
   evalDatasetFor,
@@ -30,6 +35,7 @@ import {
   SETTING_DEFAULTS,
   setTenantFlags,
   setTenantHold,
+  staffTransferOwnership,
   startBreakGlass,
   suppressRiskFlag,
   validateEligibility,
@@ -40,6 +46,7 @@ import { billingGateway, processStripeEvent, refundPayment } from '@arkiv/billin
 import { sendEmail } from '@arkiv/email';
 import { DataRequestKind, DomainError, env, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
+import { tenantFilters } from './tenants-query';
 
 /**
  * Every console mutation goes through this registry: permission check, optional 🔐 fresh second factor,
@@ -114,6 +121,14 @@ async function ownerEmails(workspaceId: string) {
   return withAdmin((tx) => tx`select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${workspaceId} and m.role in ('OWNER','ADMIN')`).then((r) => r.map((x) => x.email as string));
 }
 
+/** Customer-app link inside the workspace (plan 02 M11): email buttons land on the page they name. */
+export const appUrl = (slug: string, path: string) => `${env().APP_URL}/w/${slug}${path}`;
+async function workspaceSlug(workspaceId: string) {
+  const [w] = await withAdmin((tx) => tx`select slug from workspaces where id = ${workspaceId}`);
+  if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
+  return w.slug as string;
+}
+
 export const ACTIONS = {
   /* ── Approvals ── */
   'approval.decide': a({ perm: 'approvals.read', reauth: true, schema: z.object({ id: uuid, approve: z.boolean(), note: z.string().max(500).optional() }), run: (s, i) => decideApproval(s, i.id, i.approve, i.note) }),
@@ -124,17 +139,49 @@ export const ACTIONS = {
   'tenant.note': a({ perm: 'tenant.note', schema: z.object({ workspaceId: uuid, body: z.string().min(1).max(4000), sentiment: z.enum(['positive', 'neutral', 'negative']).optional() }), run: (s, i) => addTenantNote(s, i.workspaceId, i.body, i.sentiment ?? null) }),
   'tenant.breakglass': a({
     perm: 'breakglass.read',
-    schema: z.object({ workspaceId: uuid, reason: z.string().min(8), ticket: z.string().max(40).optional(), write: z.boolean().optional(), writeReason: z.string().optional() }),
+    schema: z.object({ workspaceId: uuid, reasonKind: z.enum(BREAK_GLASS_REASON_KINDS), reason: z.string().min(8), ticket: z.string().max(40).optional(), write: z.boolean().optional(), writeReason: z.string().optional() }),
     run: async (s, i) => {
       if (i.write) assertFreshReauth(s);
       const r = await startBreakGlass(s, i.workspaceId, i);
+      const url = appUrl(await workspaceSlug(i.workspaceId), '/settings/access-log');
       for (const to of await ownerEmails(i.workspaceId)) {
-        await sendEmail('staff_break_glass', to, { staffName: s.name, reason: i.reason, when: new Date().toUTCString(), url: `${env().APP_URL}/app` }, { idempotencyKey: `bg:${r.id}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+        await sendEmail('staff_break_glass', to, { staffName: s.name, reason: `${BREAK_GLASS_REASON_LABEL[i.reasonKind]}${i.ticket ? ` #${i.ticket}` : ''}: ${i.reason}`, when: new Date().toUTCString(), url }, { idempotencyKey: `bg:${r.id}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
       }
-      return { ...r, message: `Access until ${new Date(r.expiresAt).toLocaleTimeString()}; the customer can see this in their access log.` };
+      return { ...r, message: `Access until ${new Date(r.expiresAt).toISOString().slice(11, 16)} UTC; the customer can see this in their access log.` };
     },
   }),
   'tenant.breakglass_end': a({ perm: 'breakglass.read', schema: z.object({ workspaceId: uuid }), run: (s, i) => endBreakGlass(s, i.workspaceId) }),
+  /* Act on behalf (break-glass write, §0.3): each write runs the customer's own domain function with
+     actor=staff:<id>, on_behalf_of=workspace:<id>, after a content.write audit row. */
+  'tenant.fact_decide': a({
+    perm: 'breakglass.write',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, skuId: uuid, key: z.string().regex(/^[a-z][a-z0-9_]{1,40}$/, 'Fact keys look like size_ml'), value: z.string().trim().min(1).max(500), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const ctx = await actOnBehalf(tx, s, i.workspaceId, `correct product fact ${i.key} on SKU ${i.skuId}`);
+        const [sku] = await tx`select 1 from skus where id = ${i.skuId} and workspace_id = ${i.workspaceId}`;
+        if (!sku) throw new DomainError('NOT_FOUND', 'SKU not found in this workspace');
+        const before = await tx`select value_text, value_number, source_type, state from product_facts where workspace_id = ${i.workspaceId} and sku_id = ${i.skuId} and normalized_key = ${i.key} and status <> 'SUPERSEDED'`;
+        const factId = await decideFact(tx, ctx, i.skuId, i.key, { text: i.value });
+        await audit(tx, s, 'tenant.fact_decide', { type: 'sku', id: i.skuId }, { workspaceId: i.workspaceId, reason: i.reason, before: { [i.key]: before }, after: { [i.key]: i.value, factId } });
+        return { message: `Saved on the customer’s behalf; the change shows as Arkiv support in their history.` };
+      }),
+  }),
+  'tenant.scene_edit': a({
+    perm: 'breakglass.write',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, sceneId: uuid, spokenLine: z.string().max(300).optional(), overlayText: z.string().max(120).optional(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const ctx = await actOnBehalf(tx, s, i.workspaceId, `edit storyboard scene ${i.sceneId}`);
+        const [before] = await tx`select spoken_line, overlay_text from scenes where id = ${i.sceneId} and workspace_id = ${i.workspaceId}`;
+        if (!before) throw new DomainError('NOT_FOUND', 'Scene not found in this workspace');
+        await editScene(tx, ctx, i.sceneId, { spokenLine: i.spokenLine, overlayText: i.overlayText }); // reads and writes by the verified scene id
+        await audit(tx, s, 'tenant.scene_edit', { type: 'scene', id: i.sceneId }, { workspaceId: i.workspaceId, reason: i.reason, before, after: { spoken_line: i.spokenLine ?? before.spoken_line, overlay_text: i.overlayText ?? before.overlay_text } });
+        return { message: 'Scene updated on the customer’s behalf (claims-checked like their own edits).' };
+      }),
+  }),
   'tenant.purge_now': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'workspace.purge_now', { workspaceId: i.workspaceId }, i.reason) }),
   'tenant.schedule_purge': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => scheduleTenantPurge(s, i.workspaceId, i.reason) }),
   'tenant.cancel_purge': a({
@@ -163,22 +210,16 @@ export const ACTIONS = {
     perm: 'tenant.state',
     reauth: true,
     schema: z.object({ workspaceId: uuid, userId: uuid, reason }),
-    run: (s, i) =>
-      withAdmin(async (tx) => {
-        const [m] = await tx`select role from memberships where workspace_id = ${i.workspaceId} and user_id = ${i.userId}`;
-        if (!m) throw new DomainError('NOT_FOUND', 'That user is not a member');
-        const prev = await tx`update memberships set role = 'ADMIN' where workspace_id = ${i.workspaceId} and role = 'OWNER' returning user_id`;
-        await tx`update memberships set role = 'OWNER' where workspace_id = ${i.workspaceId} and user_id = ${i.userId}`;
-        await tx`update workspaces set membership_version = membership_version + 1 where id = ${i.workspaceId}`;
-        await tx`insert into events (workspace_id, type, actor, subject_type, subject_id, payload) values (${i.workspaceId}, 'MEMBER_ROLE_CHANGED', ${`staff:${s.staffId}`}, 'user', ${i.userId}, ${tx.json({ to: 'OWNER', from: prev.map((p) => p.user_id as string), reason: i.reason })})`;
-        await audit(tx, s, 'tenant.transfer_owner', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, before: prev, after: { owner: i.userId } });
-        const emails = await tx`select email from users where id in ${tx([i.userId, ...prev.map((p) => p.user_id as string)])}`;
-        for (const e of emails) await sendEmail('security_alert', e.email as string, { event: 'Workspace ownership was transferred by Arkiv support', when: new Date().toUTCString(), url: `${env().APP_URL}/app` }, { idempotencyKey: `owner:${i.workspaceId}:${i.userId}:${e.email}` }).catch(() => {});
-      }),
+    run: async (s, i) => {
+      const r = await staffTransferOwnership(s, i.workspaceId, i.userId, i.reason);
+      // "Review sessions" lands on the member's profile, where sessions can be revoked.
+      for (const to of r.notify) await sendEmail('security_alert', to, { event: 'Workspace ownership was transferred by Arkiv support', when: new Date().toUTCString(), url: appUrl(r.slug, '/settings/profile') }, { idempotencyKey: `owner:${i.workspaceId}:${i.userId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      return { message: 'Ownership transferred; the new and previous owners were emailed.' };
+    },
   }),
-  'tenant.invite_revoke': a({ perm: 'tenant.flags', schema: z.object({ workspaceId: uuid, inviteId: uuid }), run: (s, i) => withAdmin(async (tx) => { await tx`update invites set revoked_at = now() where id = ${i.inviteId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'tenant.invite_revoke', { type: 'invite', id: i.inviteId }, { workspaceId: i.workspaceId }); }) }),
+  'tenant.invite_revoke': a({ perm: 'tenant.flags', schema: z.object({ workspaceId: uuid, inviteId: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select email, role, expires_at, revoked_at, accepted_at from invites where id = ${i.inviteId} and workspace_id = ${i.workspaceId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Invite not found'); await tx`update invites set revoked_at = now() where id = ${i.inviteId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'tenant.invite_revoke', { type: 'invite', id: i.inviteId }, { workspaceId: i.workspaceId, before: { revoked_at: b.revoked_at, accepted_at: b.accepted_at }, after: { revoked_at: 'now' } }); }) }),
   'tenant.integration_sync': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid }), run: (s, i) => withAdmin(async (tx) => { await enqueue(tx, i.workspaceId, Queues.syncIntegration, { integrationId: i.integrationId, full: true }, { singletonKey: `sync:${i.integrationId}` }); await audit(tx, s, 'integration.resync', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId }); }) }),
-  'tenant.integration_status': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid, status: z.enum(['active', 'paused', 'degraded']), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update integrations set status = ${i.status} where id = ${i.integrationId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'integration.status', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId, reason: i.reason, after: { status: i.status } }); }) }),
+  'tenant.integration_status': a({ perm: 'integrations.manage', schema: z.object({ workspaceId: uuid, integrationId: uuid, status: z.enum(['active', 'paused', 'degraded']), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status from integrations where id = ${i.integrationId} and workspace_id = ${i.workspaceId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Integration not found'); await tx`update integrations set status = ${i.status} where id = ${i.integrationId} and workspace_id = ${i.workspaceId}`; await audit(tx, s, 'integration.status', { type: 'integration', id: i.integrationId }, { workspaceId: i.workspaceId, reason: i.reason, before: { status: b.status }, after: { status: i.status } }); }) }),
   'tenant.risk_suppress': a({
     perm: 'tenant.flags',
     schema: z.object({ workspaceId: uuid, flagId: uuid, reason, days: z.number().int().min(1).max(180).default(30) }),
@@ -187,13 +228,44 @@ export const ACTIONS = {
       return { message: `Suppressed until ${new Date(r.suppressedUntil).toDateString()}.` };
     },
   }),
+  /* Tenant list (§2.1): saved views per staff member; bulk tag, audited per workspace. */
+  'view.save': a({
+    perm: 'tenant.read',
+    schema: z.object({ module: z.literal('tenants'), name: z.string().trim().min(1).max(60), query: z.record(z.string(), z.string().max(200)) }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const query = tenantFilters(i.query);
+        const [v] = await tx`insert into staff_saved_views (staff_id, module, name, query) values (${s.staffId}, ${i.module}, ${i.name}, ${tx.json(query)})
+                             on conflict (staff_id, module, name) do update set query = excluded.query returning id`;
+        return { id: v!.id, message: `Saved “${i.name}”.` };
+      }),
+  }),
+  'view.delete': a({ perm: 'tenant.read', schema: z.object({ id: uuid }), run: (s, i) => withAdmin(async (tx) => { const del = await tx`delete from staff_saved_views where id = ${i.id} and staff_id = ${s.staffId} returning id`; if (!del.length) throw new DomainError('NOT_FOUND', 'Saved view not found'); }) }),
+  'tenant.bulk_tag': a({
+    perm: 'tenant.flags',
+    schema: z.object({ workspaceIds: z.array(uuid).min(1).max(200), tag: z.string().trim().toLowerCase().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/, 'Tags are lowercase letters, digits, - and _'), mode: z.enum(['add', 'remove']).default('add') }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const rows = await tx`select id, tags from workspaces where id in ${tx([...new Set(i.workspaceIds)])} for update`;
+        let changed = 0;
+        for (const w of rows) {
+          const before = (w.tags as string[]) ?? [];
+          const after = i.mode === 'add' ? [...new Set([...before, i.tag])] : before.filter((t) => t !== i.tag);
+          if (after.length === before.length && after.every((t, n) => t === before[n])) continue;
+          await tx`update workspaces set tags = ${after} where id = ${w.id}`;
+          await audit(tx, s, 'tenant.bulk_tag', { type: 'workspace', id: w.id as string }, { workspaceId: w.id as string, before: { tags: before }, after: { tags: after } });
+          changed++;
+        }
+        return { message: `${i.mode === 'add' ? 'Tagged' : 'Untagged'} ${changed} of ${rows.length} tenant${rows.length === 1 ? '' : 's'} “${i.tag}”.` };
+      }),
+  }),
   /* Experiments & jobs tab (§2.2): retry a failed production within entitlement; cancel before dispatch. */
   'tenant.project_retry': a({ perm: 'jobs.manage', schema: z.object({ workspaceId: uuid, projectId: uuid, reason }), run: (s, i) => retryProjectProduction(s, i.workspaceId, i.projectId, i.reason) }),
   'tenant.project_cancel': a({ perm: 'jobs.manage', schema: z.object({ workspaceId: uuid, projectId: uuid, reason }), run: (s, i) => cancelProjectBeforeDispatch(s, i.workspaceId, i.projectId, i.reason) }),
 
   /* ── Users ── */
-  'user.lock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update users set locked_at = now(), locked_reason = ${i.reason} where id = ${i.userId}`; await tx`update sessions set revoked_at = now() where user_id = ${i.userId} and revoked_at is null`; await audit(tx, s, 'user.lock', { type: 'user', id: i.userId }, { reason: i.reason }); }) }),
-  'user.unlock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update users set locked_at = null, locked_reason = null where id = ${i.userId}`; await audit(tx, s, 'user.unlock', { type: 'user', id: i.userId }, { reason: i.reason }); }) }),
+  'user.lock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select locked_at, locked_reason from users where id = ${i.userId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'User not found'); await tx`update users set locked_at = now(), locked_reason = ${i.reason} where id = ${i.userId}`; const ended = await tx`update sessions set revoked_at = now() where user_id = ${i.userId} and revoked_at is null returning id`; await audit(tx, s, 'user.lock', { type: 'user', id: i.userId }, { reason: i.reason, before: b, after: { locked: true, sessionsRevoked: ended.length } }); }) }),
+  'user.unlock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select locked_at, locked_reason from users where id = ${i.userId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'User not found'); await tx`update users set locked_at = null, locked_reason = null where id = ${i.userId}`; await audit(tx, s, 'user.unlock', { type: 'user', id: i.userId }, { reason: i.reason, before: b, after: { locked_at: null, locked_reason: null } }); }) }),
   'user.force_logout': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: async (s, i) => { await revokeAllSessions(i.userId); await withAdmin((tx) => audit(tx, s, 'user.force_logout', { type: 'user', id: i.userId }, { reason: i.reason })); } }),
 
   /* ── Billing ── */
@@ -217,7 +289,7 @@ export const ACTIONS = {
     run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId ?? null, invoiceEventId: i.invoiceEventId ?? null, amountMicros: Math.round(i.amount * 1e6), reasonCode: i.reasonCode, customerNote: i.customerNote ?? null, nonce: i.requestId ?? newId() }, i.reason),
   }),
   'billing.stripe_assign': a({ perm: 'billing.unmatched', reauth: true, schema: z.object({ eventId: z.string(), workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'stripe.assign', { eventId: i.eventId, workspaceId: i.workspaceId }, i.reason) }),
-  'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched'`; await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason }); }) }),
+  'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched' returning id`; if (!b) throw new DomainError('CONFLICT', 'Event is not unmatched'); await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason, before: { status: 'unmatched' }, after: { status: 'ignored' } }); }) }),
   'billing.portal': a({ perm: 'billing.read', schema: z.object({ workspaceId: uuid }), run: async (s, i) => { const [c] = await withAdmin((tx) => tx`select customer_id from stripe_customers where workspace_id = ${i.workspaceId}`); if (!c) throw new DomainError('NOT_FOUND', 'No Stripe customer'); await withAdmin((tx) => audit(tx, s, 'billing.open_stripe', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId })); return { url: billingGateway().live ? `https://dashboard.stripe.com/customers/${c.customer_id}` : `${env().ADMIN_URL}/billing?customer=${c.customer_id}` }; } }),
 
   /* ── Rates ── */
@@ -361,8 +433,10 @@ export const ACTIONS = {
           await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording });
         }
         await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier } });
-        const [c] = await tx`select preferred_wording from claims where id = ${i.claimId}`;
-        for (const to of await ownerEmails(i.workspaceId)) await sendEmail('claim_review_result', to, { claim: c?.preferred_wording as string, outcome: i.decision === 'block' ? `Blocked: ${i.reason}` : 'Approved for use', url: `${env().APP_URL}/app` }, { idempotencyKey: `claimrev:${i.claimId}:${i.decision}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+        const [c] = await tx`select c.preferred_wording, c.sku_id, w.slug from claims c join workspaces w on w.id = c.workspace_id where c.id = ${i.claimId} and c.workspace_id = ${i.workspaceId}`;
+        // "Open Claims Vault" lands on this SKU's claims page.
+        const url = c ? appUrl(c.slug as string, `/products/${c.sku_id as string}/claims`) : `${env().APP_URL}/app`;
+        for (const to of await ownerEmails(i.workspaceId)) await sendEmail('claim_review_result', to, { claim: c?.preferred_wording as string, outcome: i.decision === 'block' ? `Blocked: ${i.reason}` : 'Approved for use', url }, { idempotencyKey: `claimrev:${i.claimId}:${i.decision}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
       });
     },
   }),
@@ -376,22 +450,25 @@ export const ACTIONS = {
     run: (s, i) =>
       withAdmin(async (tx) => {
         const key = normalizeAllowKey(i.key);
+        const [b] = await tx`select reason, until from abuse_allowlist where key = ${key}`;
         await tx`insert into abuse_allowlist (key, reason, until, created_by) values (${key}, ${i.reason}, now() + make_interval(days => ${i.days}), ${s.staffId}) on conflict (key) do update set reason = excluded.reason, until = excluded.until, created_by = excluded.created_by`;
-        await audit(tx, s, 'abuse.allowlist', { type: 'key', id: key }, { reason: i.reason, after: { days: i.days } });
+        await audit(tx, s, 'abuse.allowlist', { type: 'key', id: key }, { reason: i.reason, before: b ?? null, after: { days: i.days } });
         return { message: `Allowlisted ${key} for ${i.days} days.` };
       }),
   }),
-  'abuse.allowlist_remove': a({ perm: 'abuse.manage', schema: z.object({ key: z.string().min(3), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`delete from abuse_allowlist where key = ${i.key}`; await audit(tx, s, 'abuse.allowlist_remove', { type: 'key', id: i.key }, { reason: i.reason }); }) }),
+  'abuse.allowlist_remove': a({ perm: 'abuse.manage', schema: z.object({ key: z.string().min(3), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`delete from abuse_allowlist where key = ${i.key} returning reason, until, created_by`; await audit(tx, s, 'abuse.allowlist_remove', { type: 'key', id: i.key }, { reason: i.reason, before: b ?? null, after: null }); }) }),
   'rights.create': a({ perm: 'abuse.manage', schema: z.object({ complainant: z.string().min(2), detail: z.string().min(5), workspaceId: uuid.optional(), assetId: uuid.optional() }), run: (s, i) => withAdmin(async (tx) => { const [c] = await tx`insert into rights_cases (complainant, detail, workspace_id, asset_id, created_by) values (${i.complainant}, ${i.detail}, ${i.workspaceId ?? null}, ${i.assetId ?? null}, ${s.staffId}) returning id`; await audit(tx, s, 'rights.create', { type: 'rights_case', id: c!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
   'rights.update': a({
     perm: 'abuse.manage',
     schema: z.object({ id: uuid, status: z.enum(['frozen', 'resolved_kept', 'resolved_removed']), resolution: z.string().max(1000).optional() }),
     run: (s, i) =>
       withAdmin(async (tx) => {
+        const [b] = await tx`select status, resolution from rights_cases where id = ${i.id} for update`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Case not found');
         const [c] = await tx`update rights_cases set status = ${i.status}, resolution = ${i.resolution ?? null}, resolved_at = case when ${i.status} like 'resolved%' then now() end where id = ${i.id} returning asset_id, workspace_id`;
         // Freezing marks the asset's rights expired so it can't be used in new production.
         if (c?.asset_id && i.status !== 'resolved_kept') await tx`update assets set rights_expires_at = now() where id = ${c.asset_id}`;
-        await audit(tx, s, `rights.${i.status}`, { type: 'rights_case', id: i.id }, { workspaceId: (c?.workspace_id as string) ?? null, reason: i.resolution ?? null });
+        await audit(tx, s, `rights.${i.status}`, { type: 'rights_case', id: i.id }, { workspaceId: (c?.workspace_id as string) ?? null, reason: i.resolution ?? null, before: b, after: { status: i.status, resolution: i.resolution ?? null } });
       }),
   }),
 
@@ -416,7 +493,7 @@ export const ACTIONS = {
         return { message: before ? `Saved v${Number(before.version) + 1}` : 'Draft created' };
       }),
   }),
-  'lp.status': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), status: z.enum(['draft', 'live', 'paused']) }), run: (s, i) => withAdmin(async (tx) => { if (i.slug === 'default' && i.status !== 'live') throw new DomainError('CONFLICT', 'The default page must stay live (paused pages redirect to it).'); await tx`update landing_pages set status = ${i.status}, published_at = case when ${i.status} = 'live' then now() else published_at end where slug = ${i.slug}`; await audit(tx, s, 'lp.status', { type: 'landing_page', id: i.slug }, { after: { status: i.status } }); }) }),
+  'lp.status': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), status: z.enum(['draft', 'live', 'paused']) }), run: (s, i) => withAdmin(async (tx) => { if (i.slug === 'default' && i.status !== 'live') throw new DomainError('CONFLICT', 'The default page must stay live (paused pages redirect to it).'); const [b] = await tx`select status from landing_pages where slug = ${i.slug} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Page not found'); await tx`update landing_pages set status = ${i.status}, published_at = case when ${i.status} = 'live' then now() else published_at end where slug = ${i.slug}`; await audit(tx, s, 'lp.status', { type: 'landing_page', id: i.slug }, { before: { status: b.status }, after: { status: i.status } }); }) }),
   'lp.rollback': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), version: z.number().int() }), run: (s, i) => withAdmin(async (tx) => { const [p] = await tx`select history, content, version from landing_pages where slug = ${i.slug} for update`; const h = (p?.history as { version: number; content: unknown; variants: unknown }[]) ?? []; const v = h.find((x) => x.version === i.version); if (!v) throw new DomainError('NOT_FOUND', 'Version not found'); await tx`update landing_pages set content = ${tx.json(v.content as never)}, variants = ${tx.json(v.variants as never)}, version = version + 1, history = history || ${tx.json([{ version: p!.version, content: p!.content, at: new Date().toISOString(), by: s.email }] as never)} where slug = ${i.slug}`; await audit(tx, s, 'lp.rollback', { type: 'landing_page', id: i.slug }, { after: { toVersion: i.version } }); }) }),
   'offer.create': a({
     perm: 'offers.manage',
@@ -460,12 +537,24 @@ export const ACTIONS = {
         return { message: `Created ${i.code} as ${i.type.toLowerCase()} v${v!.v}. New customers get it once it’s the latest active eligible version.` };
       }),
   }),
-  'offer.active': a({ perm: 'offers.manage', schema: z.object({ code: z.string(), active: z.boolean() }), run: (s, i) => withAdmin(async (tx) => { if (!i.active) { const refs = await tx`select code from offer_definitions where reference_code = ${i.code} and active`; if (refs.length) throw new DomainError('CONFLICT', `Active offers anchor to this price: ${refs.map((r) => r.code).join(', ')}. Pause them first.`); } await tx`update offer_definitions set active = ${i.active}, updated_at = now() where code = ${i.code}`; await audit(tx, s, 'offer.active', { type: 'offer', id: i.code }, { after: { active: i.active } }); }) }),
+  'offer.active': a({ perm: 'offers.manage', schema: z.object({ code: z.string(), active: z.boolean() }), run: (s, i) => withAdmin(async (tx) => { if (!i.active) { const refs = await tx`select code from offer_definitions where reference_code = ${i.code} and active`; if (refs.length) throw new DomainError('CONFLICT', `Active offers anchor to this price: ${refs.map((r) => r.code).join(', ')}. Pause them first.`); } const [b] = await tx`select active from offer_definitions where code = ${i.code} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Offer not found'); await tx`update offer_definitions set active = ${i.active}, updated_at = now() where code = ${i.code}`; await audit(tx, s, 'offer.active', { type: 'offer', id: i.code }, { before: { active: b.active }, after: { active: i.active } }); }) }),
   'testimonial.create': a({ perm: 'growth.manage', schema: z.object({ quote: z.string().min(10).max(400), personName: z.string().min(2), brandName: z.string().optional(), consentDocument: z.string().min(5), consentGivenAt: z.string() }), run: (s, i) => withAdmin(async (tx) => { const [t] = await tx`insert into testimonials (quote, person_name, brand_name, consent_document, consent_given_at) values (${i.quote}, ${i.personName}, ${i.brandName ?? null}, ${i.consentDocument}, ${i.consentGivenAt}) returning id`; await audit(tx, s, 'testimonial.create', { type: 'testimonial', id: t!.id as string }, { after: i }); }) }),
-  'testimonial.revoke': a({ perm: 'growth.manage', schema: z.object({ id: uuid }), run: (s, i) => withAdmin(async (tx) => { await tx`update testimonials set revoked_at = now() where id = ${i.id}`; await audit(tx, s, 'testimonial.revoke', { type: 'testimonial', id: i.id }); }) }),
+  'testimonial.revoke': a({ perm: 'growth.manage', schema: z.object({ id: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select revoked_at from testimonials where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Testimonial not found'); await tx`update testimonials set revoked_at = now() where id = ${i.id}`; await audit(tx, s, 'testimonial.revoke', { type: 'testimonial', id: i.id }, { before: b, after: { revoked_at: 'now' } }); }) }),
 
   /* ── Email ── */
-  'email.unsuppress': a({ perm: 'email.manage', schema: z.object({ email: z.string().email(), reason }), run: (s, i) => withAdmin(async (tx) => { await tx`delete from email_suppressions where email = ${i.email.toLowerCase()}`; await audit(tx, s, 'email.unsuppress', { type: 'email', id: i.email }, { reason: i.reason }); }) }),
+  // Pages send an opaque emailKey (sha256 of the address) so masked views never carry the address itself.
+  'email.unsuppress': a({
+    perm: 'email.manage',
+    schema: z.object({ email: z.string().email().optional(), emailKey: z.string().regex(/^[0-9a-f]{64}$/).optional(), reason }).refine((x) => !!x.email !== !!x.emailKey, 'Give the address or its key'),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [before] = await tx`delete from email_suppressions
+                                  where ${i.email ? tx`email = ${i.email.toLowerCase()}` : tx`encode(sha256(convert_to(lower(email::text), 'UTF8')), 'hex') = ${i.emailKey!}`}
+                                  returning email, reason, stream, created_at`;
+        if (!before) throw new DomainError('NOT_FOUND', 'That address isn’t suppressed.');
+        await audit(tx, s, 'email.unsuppress', { type: 'email', id: before.email as string }, { reason: i.reason, before });
+      }),
+  }),
   'email.test': a({ perm: 'email.read', schema: z.object({ template: z.enum(['magic_link', 'receipt', 'asset_ready', 'weekly_brief', 'cancellation_confirmed']) }), run: async (s, i) => { const samples = { magic_link: { url: `${env().APP_URL}/auth/magic/test`, purpose: 'login' as const }, receipt: { productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: env().APP_URL }, asset_ready: { productName: 'Dew Serum', url: env().APP_URL, catalogueNo: '014' }, weekly_brief: { workspaceName: 'Sample Brand', week: 'Week 39', recommendations: [{ hypothesis: 'Texture close-ups beat talking heads for serums', slot: 'EXPLOIT' }], url: env().APP_URL }, cancellation_confirmed: { planName: 'Growth', endsOn: 'October 23', exportUrl: env().APP_URL } }; await sendEmail(i.template, s.email, samples[i.template] as never, { idempotencyKey: `test:${i.template}:${newId()}` }); return { message: `Sent to ${s.email}` }; } }),
 
   /* ── Flags, settings, banner ── */
@@ -507,7 +596,7 @@ export const ACTIONS = {
 
   /* ── Privacy ── */
   'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(DataRequestKind), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
-  'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { after: i }); }) }),
+  'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status, notes, workspace_id from data_requests where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Request not found'); await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, before: { status: b.status, notes: b.notes }, after: { status: i.status, notes: i.notes ?? b.notes } }); }) }),
   'privacy.erase_reviews': a({
     perm: 'privacy.manage',
     reauth: true,
@@ -542,8 +631,58 @@ export const ACTIONS = {
     },
   }),
   'staff.roles': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, roles: z.string(), reason }), run: (s, i) => requestOrExecute(s, 'staff.roles', { staffId: i.staffId, roles: parseRoles(i.roles) }, i.reason) }),
-  'staff.deprovision': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'You can’t deprovision yourself.'); await deprovisionStaff(tx, i.staffId); await audit(tx, s, 'staff.deprovision', { type: 'staff', id: i.staffId }, { reason: i.reason }); }) }),
-  'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }); }) }),
+  'staff.deprovision': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'You can’t deprovision yourself.'); const [b] = await tx`select email, roles, active from staff_users where id = ${i.staffId}`; if (!b) throw new DomainError('NOT_FOUND', 'Staff member not found'); await deprovisionStaff(tx, i.staffId); await audit(tx, s, 'staff.deprovision', { type: 'staff', id: i.staffId }, { reason: i.reason, before: b, after: { active: false } }); }) }),
+  'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select roles, roles_confirmed_at from staff_users where id = ${i.staffId}`; await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }, { before: b ?? null, after: { roles_confirmed_at: 'now' } }); }) }),
+  // §23 "require passkey": the staff member must already have one, or they'd be locked out.
+  'staff.require_passkey': a({
+    perm: 'staff.manage',
+    reauth: true,
+    schema: z.object({ staffId: uuid, required: z.boolean(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [u] = await tx`select require_passkey, (select count(*)::int from staff_passkeys where staff_id = ${i.staffId}) as passkeys from staff_users where id = ${i.staffId} for update`;
+        if (!u) throw new DomainError('NOT_FOUND', 'Staff member not found');
+        if (i.required && Number(u.passkeys) === 0) throw new DomainError('CONFLICT', 'They have no passkey yet. Ask them to add one under Passkeys first.');
+        await tx`update staff_users set require_passkey = ${i.required} where id = ${i.staffId}`;
+        await audit(tx, s, 'staff.require_passkey', { type: 'staff', id: i.staffId }, { reason: i.reason, before: { require_passkey: u.require_passkey }, after: { require_passkey: i.required } });
+        return { message: i.required ? 'Passkey required: authenticator codes no longer work for this account.' : 'Passkey no longer required.' };
+      }),
+  }),
+  // §0.1 IP allowlist per staff role. Refuses a change that would lock the acting staff member out.
+  'staff.ip_policy': a({
+    perm: 'staff.manage',
+    reauth: true,
+    schema: z.object({ role: z.enum(StaffRole), enabled: z.boolean(), cidrs: z.string().max(2000).default(''), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const cidrs = [...new Set(i.cidrs.split(/[\s,]+/).map((c) => c.trim()).filter(Boolean))];
+        for (const c of cidrs) {
+          const ok = await tx.savepoint((sp) => sp`select ${c}::cidr`).then(() => true, () => false);
+          if (!ok) throw new DomainError('INVALID', `“${c}” isn’t a network. Use CIDR notation, e.g. 203.0.113.0/24.`);
+        }
+        const [before] = await tx`select enabled, cidrs::text[] as cidrs from staff_role_ip_policies where role = ${i.role} for update`;
+        await tx`insert into staff_role_ip_policies (role, enabled, cidrs, updated_by, updated_at) values (${i.role}, ${i.enabled}, ${cidrs}::cidr[], ${s.staffId}, now())
+                 on conflict (role) do update set enabled = excluded.enabled, cidrs = excluded.cidrs, updated_by = excluded.updated_by, updated_at = now()`;
+        if (!(await staffNetworkAllowed(tx, { id: s.staffId, roles: s.roles }, s.ip))) {
+          throw new DomainError('CONFLICT', `This would lock you out: your current address (${s.ip ?? 'unknown'}) isn’t in the networks your roles allow.`);
+        }
+        await audit(tx, s, 'staff.ip_policy', { type: 'staff_role', id: i.role }, { reason: i.reason, before: before ?? null, after: { enabled: i.enabled, cidrs } });
+        return { message: i.enabled && cidrs.length ? `${i.role}: sign-in and every request limited to ${cidrs.length} network${cidrs.length === 1 ? '' : 's'}.` : `${i.role}: ${i.enabled ? 'on, but not enforced until a network is listed' : 'off'}.` };
+      }),
+  }),
+
+  /* ── Your own account ── */
+  'account.passkey_remove': a({
+    perm: 'account.self',
+    reauth: true,
+    schema: z.object({ passkeyId: uuid }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const name = await removeStaffPasskey(tx, s.staffId, i.passkeyId);
+        await audit(tx, s, 'staff.passkey_removed', { type: 'staff', id: s.staffId }, { before: { passkeyId: i.passkeyId, name } });
+        return { message: `Removed “${name}”.` };
+      }),
+  }),
 } as const;
 
 export type ActionName = keyof typeof ACTIONS;

@@ -1,4 +1,5 @@
 import { withAdmin } from '@arkiv/db';
+import { auditView } from '@arkiv/core';
 import { ActButton, ActForm } from '@/components/act';
 import { d, dt, money, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -7,8 +8,9 @@ export const metadata = { title: 'Offers' };
 
 /** Offer Engine (plan 05 §6): deterministic, versioned, honest anchors only. */
 export default async function Offers() {
-  await requireStaff('offers.manage');
+  const s = await requireStaff('offers.manage');
   const d0 = await withAdmin(async (tx) => ({
+    audited: await auditView(tx, s, 'offers'),
     defs: await tx`select * from offer_definitions order by type, code`,
     issued: await tx`select o.type, o.status, count(*)::int as n from offers o join workspaces w on w.id = o.workspace_id where not w.is_test and o.created_at > now() - interval '30 days' group by 1, 2`,
     recent: await tx`select o.*, w.name from offers o join workspaces w on w.id = o.workspace_id order by o.created_at desc limit 50`,

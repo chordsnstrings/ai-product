@@ -2,8 +2,9 @@
 
 import { useRouter } from 'next/navigation';
 import { useState, type ReactNode } from 'react';
+import { startAuthentication } from '@simplewebauthn/browser';
 
-async function post(url: string, body: unknown) {
+export async function post(url: string, body: unknown) {
   const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
@@ -14,15 +15,32 @@ async function post(url: string, body: unknown) {
   return j as Record<string, unknown>;
 }
 
-/** Runs an admin action; if the server asks for a fresh second factor (🔐), prompts for a TOTP code and retries once. */
+/**
+ * 🔐 fresh second factor (plan 05 §0.1): a passkey tap when the staff member has one, otherwise (or if they
+ * cancel the tap and their account allows it) an authenticator code.
+ */
+export async function reauthenticate(): Promise<void> {
+  const { options } = await post('/api/reauth', { step: 'options' });
+  if (options) {
+    // A cancelled or unavailable authenticator falls back to a code; a refused assertion is final.
+    const response = await startAuthentication({ optionsJSON: options as Parameters<typeof startAuthentication>[0]['optionsJSON'] }).catch(() => null);
+    if (response) {
+      await post('/api/reauth', { response });
+      return;
+    }
+  }
+  const code = window.prompt('Confirm with your authenticator code');
+  if (!code) throw new Error('Cancelled');
+  await post('/api/reauth', { code });
+}
+
+/** Runs an admin action; if the server asks for a fresh second factor (🔐), re-authenticates and retries once. */
 export async function act(action: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   try {
     return await post(`/api/act/${action}`, payload);
   } catch (e) {
     if ((e as { details?: { reauth?: boolean } }).details?.reauth) {
-      const code = window.prompt('Confirm with your authenticator code');
-      if (!code) throw new Error('Cancelled');
-      await post('/api/reauth', { code });
+      await reauthenticate();
       return post(`/api/act/${action}`, payload);
     }
     throw e;

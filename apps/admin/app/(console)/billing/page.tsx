@@ -1,27 +1,36 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
+import { auditView, mrrMovement } from '@arkiv/core';
 import { PLANS, type PlanCode } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
 import { dt, Grid, Kpi, money, Mono, Page, Section, Table, Tabs } from '@/components/ui';
+import { consolePrefs, daysFrom } from '@/lib/prefs';
+import { notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Billing' };
 
 /** Plan 05 §7: Stripe mirror, reconciliation exceptions, unmatched events, dunning, revenue. */
-export default async function Billing({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
-  await requireStaff('billing.read');
-  const tab = (await searchParams).tab ?? 'revenue';
+export default async function Billing({ searchParams }: { searchParams: Promise<{ tab?: string; days?: string }> }) {
+  const s = await requireStaff('billing.read');
+  const sp = await searchParams;
+  const tab = sp.tab ?? 'revenue';
+  const prefs = await consolePrefs();
+  const days = daysFrom(sp.days, prefs);
+  const tz = prefs.tz;
   const d0 = await withAdmin(async (tx) => {
-    const test = tx`(select id from workspaces where is_test)`;
+    await auditView(tx, s, 'billing', { tab, includeTest: prefs.includeTest });
+    const t = (col = 'workspace_id') => notTest(tx, prefs, col);
     return {
-      subs: await tx`select plan_code, status, count(*)::int as n from subscriptions where workspace_id not in ${test} group by 1, 2`,
-      movements: await tx`select to_char(date_trunc('month', at), 'YYYY-MM') as month,
+      subs: await tx`select plan_code, status, count(*)::int as n from subscriptions where true ${t()} group by 1, 2`,
+      mrrMove: await mrrMovement(tx, days, { includeTest: prefs.includeTest }),
+      movements: await tx`select to_char(date_trunc('month', at, ${tz}) at time zone ${tz}, 'YYYY-MM') as month,
                                  count(*) filter (where type = 'SUBSCRIPTION_STARTED')::int as new,
                                  count(*) filter (where type = 'SUBSCRIPTION_CHANGED' and payload->>'effective' = 'now')::int as expansion,
                                  count(*) filter (where type = 'SUBSCRIPTION_CHANGED' and payload->>'effective' = 'period_end')::int as contraction,
                                  count(*) filter (where type = 'SUBSCRIPTION_CHANGED' and payload->>'cancelAtPeriodEnd' = 'true')::int as cancels
-                          from events where type in ('SUBSCRIPTION_STARTED','SUBSCRIPTION_CHANGED') and at > now() - interval '12 months' and workspace_id not in ${test} group by 1 order by 1 desc`,
-      oneTime: await tx`select to_char(date_trunc('month', paid_at), 'YYYY-MM') as month, kind, count(*)::int as n, sum(amount_micros)::bigint as amt from purchases where status in ('paid','refunded') and workspace_id not in ${test} group by 1, 2 order by 1 desc`,
+                          from events where type in ('SUBSCRIPTION_STARTED','SUBSCRIPTION_CHANGED') and at > now() - interval '12 months' ${t()} group by 1 order by 1 desc`,
+      oneTime: await tx`select to_char(date_trunc('month', paid_at, ${tz}) at time zone ${tz}, 'YYYY-MM') as month, kind, count(*)::int as n, sum(amount_micros)::bigint as amt from purchases where status in ('paid','refunded') ${t()} group by 1, 2 order by 1 desc`,
       unmatched: await tx`select id, type, received_at, attempts, payload->'data'->'object'->>'customer' as customer, payload->'data'->'object'->'metadata'->>'workspace_id' as meta_ws from stripe_events where status = 'unmatched' order by received_at`,
       recon: await tx`
         select 'Paid purchase without project progress' as issue, p.workspace_id, p.id::text as ref, p.paid_at as at from purchases p join projects pr on pr.id = p.project_id
@@ -35,21 +44,22 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
         union all
         select 'Stripe event failed processing', e.workspace_id, e.id, e.received_at from stripe_events e where e.status = 'failed'`,
       dunning: await tx`select w.id, w.name, s.plan_code, s.current_period_end, (select count(*) from email_log l where l.workspace_id = w.id and l.template = 'payment_failed')::int as emails
-                        from workspaces w join subscriptions s on s.workspace_id = w.id and s.status = 'past_due' order by s.current_period_end`,
-      disputes: await tx`select e.id, e.type, e.received_at, e.workspace_id, w.name from stripe_events e left join workspaces w on w.id = e.workspace_id where e.type like 'charge.dispute%' order by e.received_at desc limit 50`,
+                        from workspaces w join subscriptions s on s.workspace_id = w.id and s.status = 'past_due' where (${prefs.includeTest} or not w.is_test) order by s.current_period_end`,
+      disputes: await tx`select e.id, e.type, e.received_at, e.workspace_id, w.name from stripe_events e left join workspaces w on w.id = e.workspace_id where e.type like 'charge.dispute%' ${t('e.workspace_id')} order by e.received_at desc limit 50`,
     };
   });
   const active = d0.subs.filter((s) => ['active', 'trialing', 'past_due'].includes(s.status as string));
   const mrr = active.reduce((a, s) => a + PLANS[s.plan_code as PlanCode].priceMicros * Number(s.n), 0);
   return (
-    <Page title="Billing & revenue">
+    <Page title="Billing & revenue" sub={`Test accounts ${prefs.includeTest ? 'included' : 'excluded'} · months in ${tz}`}>
       <Grid>
         <Kpi label="MRR" value={money(mrr, 0)} sub={`ARR ${money(mrr * 12, 0)}`} />
+        <Kpi label={`Net new MRR (${days}d)`} value={money(d0.mrrMove.net, 0)} sub={`new ${money(d0.mrrMove.new, 0)} · expansion ${money(d0.mrrMove.expansion, 0)} · contraction ${money(d0.mrrMove.contraction, 0)} · churned ${money(d0.mrrMove.churned, 0)}`} alert={d0.mrrMove.net < 0} alertText="Shrinking" />
         <Kpi label="Active subscriptions" value={active.reduce((a, s) => a + Number(s.n), 0)} sub={active.map((s) => `${s.plan_code} ${s.n}`).join(' · ')} />
         <Kpi label="Unmatched Stripe events" value={d0.unmatched.length} alert={d0.unmatched.length > 0} />
         <Kpi label="Reconciliation exceptions" value={d0.recon.length} alert={d0.recon.length > 0} />
       </Grid>
-      <Tabs base="/billing" current={tab} tabs={[['revenue', 'Revenue'], ['unmatched', 'Unmatched events'], ['recon', 'Reconciliation'], ['dunning', 'Dunning'], ['disputes', 'Disputes']]} />
+      <Tabs label="Billing sections" base="/billing" current={tab} tabs={[['revenue', 'Revenue'], ['unmatched', 'Unmatched events'], ['recon', 'Reconciliation'], ['dunning', 'Dunning'], ['disputes', 'Disputes']]} />
       {tab === 'revenue' ? (
         <>
           <Table head={['Month', 'New subs', 'Upgrades', 'Downgrades', 'Cancels (logo churn)']} rows={d0.movements.map((m) => [m.month as string, m.new as number, m.expansion as number, m.contraction as number, m.cancels as number])} empty="No subscription movement yet." />

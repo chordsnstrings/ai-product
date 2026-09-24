@@ -1,9 +1,12 @@
 import Link from 'next/link';
 import type { ReactNode } from 'react';
+import { requestTz } from '@/lib/prefs';
 
 export const money = (micros: number | string | null | undefined, d = 2) => `$${(Number(micros ?? 0) / 1e6).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
-export const dt = (v: unknown) => (v ? new Date(v as string).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—');
-export const d = (v: unknown) => (v ? new Date(v as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—');
+/** Dates are stored in UTC and shown in the console timezone (plan 05 §1), or an explicit one. */
+export const dt = (v: unknown, tz = requestTz().tz) => (v ? new Date(v as string).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: tz }) : '—');
+export const d = (v: unknown, tz = requestTz().tz) => (v ? new Date(v as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: tz }) : '—');
+export const tm = (v: unknown, tz = requestTz().tz) => (v ? new Date(v as string).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: tz, timeZoneName: 'short' }) : '—');
 export const ago = (v: unknown) => {
   if (!v) return '—';
   const s = (Date.now() - new Date(v as string).getTime()) / 1000;
@@ -47,10 +50,14 @@ export function Table({ head, rows, empty = 'Nothing here.' }: { head: ReactNode
   );
 }
 
-export function Kpi({ label, value, sub, alert, href }: { label: string; value: ReactNode; sub?: ReactNode; alert?: boolean; href?: string }) {
+/** A metric tile. An alert is spelled out (chip + text), never shown by colour alone (WCAG 1.4.1). */
+export function Kpi({ label, value, sub, alert, alertText = 'Alert', href }: { label: string; value: ReactNode; sub?: ReactNode; alert?: boolean; alertText?: string; href?: string }) {
   const inner = (
     <div className="ak-panel ak-kpi" style={{ padding: 14, borderColor: alert ? 'var(--risk)' : undefined }}>
-      <span className="ak-label" style={{ margin: 0 }}>{label}</span>
+      <span className="ak-between" style={{ alignItems: 'start' }}>
+        <span className="ak-label" style={{ margin: 0 }}>{label}</span>
+        {alert ? <span className="ak-chip ak-chip--risk"><span aria-hidden="true">⚠</span> {alertText}</span> : null}
+      </span>
       <strong style={{ color: alert ? 'var(--risk)' : undefined }}>{value}</strong>
       {sub ? <span className="ak-small ak-muted">{sub}</span> : null}
     </div>
@@ -62,13 +69,31 @@ export function Grid({ children, min = 200 }: { children: ReactNode; min?: numbe
   return <div style={{ display: 'grid', gap: 12, gridTemplateColumns: `repeat(auto-fill, minmax(${min}px, 1fr))` }}>{children}</div>;
 }
 
-export function Tabs({ base, tabs, current }: { base: string; tabs: [string, string][]; current: string }) {
+/** Section tabs: the current tab carries aria-current, not just an underline (WCAG 1.3.1 / 4.1.2). */
+export function Tabs({ base, tabs, current, label = 'Sections', params }: { base: string; tabs: [string, string][]; current: string; label?: string; params?: Record<string, string | undefined> }) {
+  const href = (k: string) => {
+    const q = new URLSearchParams(Object.entries(params ?? {}).filter((e): e is [string, string] => !!e[1]));
+    q.set('tab', k);
+    return `${base}?${q}`;
+  };
   return (
-    <nav className="ak-row ak-scroll-x" style={{ borderBottom: '1px solid var(--rule)', flexWrap: 'nowrap', margin: '12px 0 16px' }}>
+    <nav aria-label={label} className="ak-row ak-scroll-x" style={{ borderBottom: '1px solid var(--rule)', flexWrap: 'nowrap', margin: '12px 0 16px' }}>
       {tabs.map(([k, l]) => (
-        <Link key={k} href={`${base}?tab=${k}`} className="ak-textbtn" style={{ paddingBottom: 6, whiteSpace: 'nowrap', borderBottom: k === current ? '1px solid var(--ink)' : '1px solid transparent' }}>{l}</Link>
+        <Link key={k} href={href(k)} aria-current={k === current ? 'page' : undefined} className="ak-textbtn" style={{ paddingBottom: 6, whiteSpace: 'nowrap', fontWeight: k === current ? 600 : undefined, borderBottom: k === current ? '2px solid var(--ink)' : '2px solid transparent' }}>{l}</Link>
       ))}
     </nav>
+  );
+}
+
+/**
+ * A filter toggle rendered as a link: its state is exposed (aria-current) and shown with a ✓, not by fill
+ * colour alone (WCAG 1.4.1, 4.1.2).
+ */
+export function FilterChip({ href, on, children }: { href: string; on: boolean; children: ReactNode }) {
+  return (
+    <Link href={href} className={`ak-chip${on ? ' ak-chip--dec' : ''}`} aria-current={on ? 'true' : undefined}>
+      {on ? <span aria-hidden="true">✓ </span> : null}{children}
+    </Link>
   );
 }
 

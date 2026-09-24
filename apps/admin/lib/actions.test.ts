@@ -3,6 +3,7 @@ import { closeAll, ownerPool } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { assertStaff, decideApproval, startBreakGlass } from '@arkiv/core';
 import { MockStripe, setBillingGateway } from '@arkiv/billing';
+import { devOutbox } from '@arkiv/email';
 import { DataRequestKind, newId, type StaffRole } from '@arkiv/shared';
 import { ACTIONS, type ActionName } from './actions';
 import type { StaffUser } from './staff';
@@ -55,7 +56,7 @@ describe('qa.review (plan 05 §13)', () => {
     ] };
     await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by, qa_report) values (${pid}, ${t.workspaceId}, ${sku}, 'taste', 'COMPLETE', 'test', ${ownerPool().json(report)})`;
     const ops = await staff(['OPS']);
-    await startBreakGlass(ops, t.workspaceId, { reason: 'QA calibration sample review' });
+    await startBreakGlass(ops, t.workspaceId, { reasonKind: 'compliance_review', reason: 'QA calibration sample review' });
     await expect(act(ops, 'qa.review', { workspaceId: t.workspaceId, projectId: pid, verdicts: { undefined: 'agree' } })).rejects.toThrow(/1:product_fidelity/);
     await expect(act(ops, 'qa.review', { workspaceId: t.workspaceId, projectId: pid, verdicts: { '4:claims': 'agree' } })).rejects.toThrow(/No such check/);
     await act(ops, 'qa.review', { workspaceId: t.workspaceId, projectId: pid, verdicts: { '1:product_fidelity': 'agree', '2:product_fidelity': 'disagree', '3:claims': 'agree' }, failureLabel: 'false_positive' });
@@ -169,11 +170,139 @@ describe('danger zone and jobs actions', () => {
     await expect(act(sup, 'tenant.project_retry', { workspaceId: t.workspaceId, projectId: newId(), reason: 'retry' })).rejects.toThrow(/role/);
   });
 
+  it('transfer ownership emits one MEMBER_ROLE_CHANGED per member in the shared payload shape, and links to the profile page', async () => {
+    const t = await makeTenant();
+    const [admin] = await ownerPool()`insert into users (email, email_verified_at) values ('next-owner@example.com', now()) returning id`;
+    await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${admin!.id}, 'ADMIN')`;
+    const o = await staff(['OPS']);
+    devOutbox.length = 0;
+    await act(o, 'tenant.transfer_owner', { workspaceId: t.workspaceId, userId: admin!.id, reason: 'Ticket #88: owner left the company, confirmed by email' });
+    const roles = await ownerPool()`select user_id, role from memberships where workspace_id = ${t.workspaceId} order by role desc`;
+    expect(Object.fromEntries(roles.map((r) => [r.user_id, r.role]))).toEqual({ [admin!.id as string]: 'OWNER', [t.userId]: 'ADMIN' });
+    const ev = await ownerPool()`select subject_id, actor, payload, schema_version from events where workspace_id = ${t.workspaceId} and type = 'MEMBER_ROLE_CHANGED' order by payload->>'to' desc`;
+    expect(ev.map((e) => [e.subject_id, e.payload])).toEqual([
+      [admin!.id, { from: 'ADMIN', to: 'OWNER', transfer: true, byStaff: true, reason: 'Ticket #88: owner left the company, confirmed by email' }],
+      [t.userId, { from: 'OWNER', to: 'ADMIN', transfer: true, byStaff: true, reason: 'Ticket #88: owner left the company, confirmed by email' }],
+    ]);
+    expect(ev.every((e) => e.actor === `staff:${o.staffId}` && e.schema_version === 1)).toBe(true);
+    const mails = devOutbox.filter((m) => m.template === 'security_alert');
+    expect(mails.map((m) => m.to).sort()).toEqual([t.email, 'next-owner@example.com'].sort());
+    expect(mails.every((m) => (m.data as { url: string }).url.endsWith(`/w/${t.slug}/settings/profile`))).toBe(true);
+    await expect(act(o, 'tenant.transfer_owner', { workspaceId: t.workspaceId, userId: admin!.id, reason: 'again please' })).rejects.toThrow(/already owns/);
+  });
+
+  it('break-glass and claim review emails land on the access log and the SKU claims page', async () => {
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const [cl] = await ownerPool()`insert into claims (workspace_id, sku_id, canonical_meaning, preferred_wording, claim_category, risk_level, status, origin)
+                                   values (${t.workspaceId}, ${sku}, 'hydrates', 'Hydrates for 24 hours', 'cosmetic', 'medium', 'RESTRICTED', 'merchant') returning id`;
+    const sup = await staff(['SUPPORT']);
+    devOutbox.length = 0;
+    await act(sup, 'tenant.breakglass', { workspaceId: t.workspaceId, reasonKind: 'ticket', ticket: '812', reason: 'Customer reports the wrong cap colour in the storyboard' });
+    const bg = devOutbox.find((m) => m.template === 'staff_break_glass');
+    expect((bg!.data as { url: string }).url).toMatch(new RegExp(`/w/${t.slug}/settings/access-log$`));
+    const comp = await staff(['COMPLIANCE']);
+    await act(comp, 'claim.decide', { workspaceId: t.workspaceId, claimId: cl!.id, decision: 'block', reason: 'Needs a clinical study' });
+    const cr = devOutbox.find((m) => m.template === 'claim_review_result');
+    expect((cr!.data as { url: string }).url).toMatch(new RegExp(`/w/${t.slug}/products/${sku}/claims$`));
+  });
+
+  it('unblocking a claim (four-eyes) emits CLAIM_UNBLOCKED, not a restriction', async () => {
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const [cl] = await ownerPool()`insert into claims (workspace_id, sku_id, canonical_meaning, preferred_wording, claim_category, risk_level, status, origin, block_reason)
+                                   values (${t.workspaceId}, ${sku}, 'repairs barrier', 'Repairs your skin barrier', 'cosmetic', 'high', 'BLOCKED', 'merchant', 'unsupported') returning id`;
+    const c1 = await staff(['COMPLIANCE']);
+    const c2 = await staff(['COMPLIANCE']);
+    const r = await act(c1, 'claim.decide', { workspaceId: t.workspaceId, claimId: cl!.id, decision: 'unblock', reason: 'Evidence pack received' });
+    expect(r.status).toBe('pending');
+    await decideApproval(c2, r.approvalId as string, true);
+    const [c] = await ownerPool()`select status, block_reason from claims where id = ${cl!.id}`;
+    expect(c).toMatchObject({ status: 'MERCHANT_REVIEW_REQUIRED', block_reason: null });
+    const ev = await ownerPool()`select type, actor, payload from events where subject_id = ${cl!.id}`;
+    expect(ev).toEqual([{ type: 'CLAIM_UNBLOCKED', actor: `staff:${c2.staffId}`, payload: { from: 'BLOCKED', to: 'MERCHANT_REVIEW_REQUIRED', reason: 'Evidence pack received' } }]);
+  });
+
   it('allowlist keys are normalised so the heuristics recognise them', async () => {
     const c = await staff(['COMPLIANCE']);
     await act(c, 'abuse.allowlist', { key: '203.0.113.77', reason: 'agency evaluating 12 SKUs', days: 30 });
     await act(c, 'abuse.allowlist', { key: 'buyer@Agency.com', reason: 'agency evaluating 12 SKUs', days: 7 });
     const keys = await ownerPool()`select key from abuse_allowlist order by key`;
     expect(keys.map((k) => k.key)).toEqual(['domain:agency.com', 'ip:203.0.113']);
+  });
+});
+
+describe('staff sign-in policies (plan 05 §0.1, §23)', () => {
+  it('require passkey needs a registered passkey first and is audited', async () => {
+    const sa = await staff(['SUPER_ADMIN']);
+    const fin = await staff(['FINANCE']);
+    await expect(act(sa, 'staff.require_passkey', { staffId: fin.staffId, required: true, reason: 'finance access' })).rejects.toThrow(/no passkey yet/);
+    await ownerPool()`insert into staff_passkeys (staff_id, credential_id, public_key) values (${fin.staffId}, 'cred-1', '\\x00')`;
+    await act(sa, 'staff.require_passkey', { staffId: fin.staffId, required: true, reason: 'finance access' });
+    const [u] = await ownerPool()`select require_passkey from staff_users where id = ${fin.staffId}`;
+    expect(u!.require_passkey).toBe(true);
+    const [a] = await ownerPool()`select before, after from admin_audit_log where action = 'staff.require_passkey'`;
+    expect(a).toEqual({ before: { require_passkey: false }, after: { require_passkey: true } });
+    // Their own last passkey can't be removed while it's required.
+    const [pk] = await ownerPool()`select id from staff_passkeys where staff_id = ${fin.staffId}`;
+    await expect(act(fin, 'account.passkey_remove', { passkeyId: pk!.id })).rejects.toThrow(/requires a passkey/);
+    // …and nobody removes someone else's passkey through their own account.
+    await expect(act(sa, 'account.passkey_remove', { passkeyId: pk!.id })).rejects.toThrow(/not found/);
+  });
+
+  it('role network policies validate CIDRs and refuse a change that locks the actor out', async () => {
+    const sa = { ...(await staff(['SUPER_ADMIN'])), ip: '198.51.100.7' };
+    await expect(act(sa, 'staff.ip_policy', { role: 'FINANCE', enabled: true, cidrs: '10.0.0.0/33', reason: 'office only' })).rejects.toThrow(/isn’t a network/);
+    const r = await act(sa, 'staff.ip_policy', { role: 'FINANCE', enabled: true, cidrs: '203.0.113.0/24, 2001:db8::/32', reason: 'office + VPN' });
+    expect(r.message).toMatch(/limited to 2 networks/);
+    const [p] = await ownerPool()`select enabled, cidrs::text[] as cidrs, updated_by from staff_role_ip_policies where role = 'FINANCE'`;
+    expect(p).toEqual({ enabled: true, cidrs: ['203.0.113.0/24', '2001:db8::/32'], updated_by: sa.staffId });
+    // SUPER_ADMIN at 198.51.100.7 can't restrict their own role to networks that exclude them.
+    await expect(act(sa, 'staff.ip_policy', { role: 'SUPER_ADMIN', enabled: true, cidrs: '203.0.113.0/24', reason: 'office only' })).rejects.toThrow(/lock you out/);
+    const [still] = await ownerPool()`select count(*)::int as n from staff_role_ip_policies where role = 'SUPER_ADMIN' and enabled`;
+    expect(still!.n).toBe(0);
+    await act(sa, 'staff.ip_policy', { role: 'SUPER_ADMIN', enabled: true, cidrs: '198.51.100.0/24', reason: 'founders office' });
+  });
+});
+
+describe('act on behalf (plan 05 §0.3)', () => {
+  it('needs SUPER_ADMIN/OPS with a write session, and every write carries actor=staff, on_behalf_of=workspace', async () => {
+    const t = await makeTenant();
+    const other = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const otherSku = await makeSku(other.workspaceId);
+    const ops = await staff(['OPS']);
+    const sup = await staff(['SUPPORT']);
+    const fix = { workspaceId: t.workspaceId, skuId: sku, key: 'size_ml', value: '30', reason: 'Ticket #9: label says 30 ml' };
+    expect(ACTIONS['tenant.fact_decide'].perm).toBe('breakglass.write');
+    await expect(act(sup, 'tenant.fact_decide', fix)).rejects.toThrow(/role/);
+    await expect(act(ops, 'tenant.fact_decide', fix)).rejects.toThrow(/break-glass/);
+    await startBreakGlass(ops, t.workspaceId, { reasonKind: 'ticket', ticket: '9', reason: 'Customer asked us to fix the size' });
+    await expect(act(ops, 'tenant.fact_decide', fix)).rejects.toThrow(/write access/);
+    await startBreakGlass(ops, t.workspaceId, { reasonKind: 'ticket', ticket: '9', reason: 'Customer asked us to fix the size', write: true, writeReason: 'They can’t edit from their phone' });
+    // A write session on one tenant never reaches another tenant's SKU.
+    await expect(act(ops, 'tenant.fact_decide', { ...fix, skuId: otherSku })).rejects.toThrow(/not found/i);
+    await act(ops, 'tenant.fact_decide', fix);
+    const onBehalf = `staff:${ops.staffId}>workspace:${t.workspaceId}`;
+    const [f] = await ownerPool()`select value_text, created_by, state from product_facts where sku_id = ${sku} and normalized_key = 'size_ml' and status <> 'SUPERSEDED'`;
+    expect(f).toEqual({ value_text: '30', created_by: onBehalf, state: 'DECIDED' });
+    const [ev] = await ownerPool()`select actor from events where workspace_id = ${t.workspaceId} and type = 'PRODUCT_FACT_CHANGED'`;
+    expect(ev!.actor).toBe(onBehalf);
+    const audits = await ownerPool()`select action from admin_audit_log where staff_id = ${ops.staffId} and action in ('content.write', 'tenant.fact_decide') order by id`;
+    // Refused attempts roll back with their transaction; the successful write leaves both rows.
+    expect(audits.map((a) => a.action)).toEqual(['content.write', 'tenant.fact_decide']);
+
+    // Storyboard lines edited on the customer's behalf go through the same claims check as their own edits.
+    const pid = newId();
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by) values (${pid}, ${t.workspaceId}, ${sku}, 'taste', 'STORYBOARD_READY', 'test')`;
+    const [sb] = await ownerPool()`insert into storyboards (workspace_id, project_id, concept_id, status) values (${t.workspaceId}, ${pid}, ${newId()}, 'ready') returning id`;
+    const [sc] = await ownerPool()`insert into scenes (workspace_id, storyboard_id, position, purpose, duration_ms, visual_plan, spoken_line, production_mode)
+                                   values (${t.workspaceId}, ${sb!.id}, 1, 'hook', 3000, 'close-up', 'Meet your new serum', 'STRICT_COMPOSITE') returning id`;
+    await expect(act(ops, 'tenant.scene_edit', { workspaceId: t.workspaceId, sceneId: sc!.id, spokenLine: 'Cures acne overnight', reason: 'Ticket #9' })).rejects.toThrow(/can’t be used/);
+    await act(ops, 'tenant.scene_edit', { workspaceId: t.workspaceId, sceneId: sc!.id, spokenLine: 'Meet your new favourite serum', reason: 'Ticket #9: typo' });
+    const [line] = await ownerPool()`select spoken_line from scenes where id = ${sc!.id}`;
+    expect(line!.spoken_line).toBe('Meet your new favourite serum');
+    const [sa] = await ownerPool()`select before, after from admin_audit_log where action = 'tenant.scene_edit'`;
+    expect(sa).toMatchObject({ before: { spoken_line: 'Meet your new serum' }, after: { spoken_line: 'Meet your new favourite serum' } });
   });
 });
