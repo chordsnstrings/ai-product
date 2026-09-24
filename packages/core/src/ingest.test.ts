@@ -209,6 +209,13 @@ describe('product page parsing (fixtures)', () => {
     ]); // …but each variant keeps its own, so creative can use the right one.
   });
 
+  it('reads a Shopify product as out of stock only when no variant can be bought (§42)', () => {
+    const product = (variants: Record<string, unknown>[]) => parseShopifyProduct(JSON.stringify({ product: { id: 8, title: 'Cloud Cream', variants } }));
+    expect(product([{ id: 1, title: 'A', price: '10.00', available: false }, { id: 2, title: 'B', price: '12.00', available: false }])?.inStock).toBe(false);
+    expect(product([{ id: 1, title: 'A', price: '10.00', available: false }, { id: 2, title: 'B', price: '12.00', available: true }])?.inStock).toBe(true);
+    expect(product([{ id: 1, title: 'A', price: '10.00' }])?.inStock).toBeUndefined(); // not stated: unknown, never "out"
+  });
+
   it('reads several JSON-LD offers as variants', () => {
     const html = `<script type="application/ld+json">{"@type":"Product","name":"Cloud Cream","offers":[
       {"@type":"Offer","sku":"CC30","name":"Cloud Cream 30 ml","price":"28.00","availability":"https://schema.org/InStock"},

@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withAdmin, withSystem, withTenant } from '@arkiv/d
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId, usd, type StaffRole } from '@arkiv/shared';
 import type { Staff } from './admin';
-import { guardrailBreach, offerExperimentResults, setOfferExperiment, sweepOfferGuardrails } from './offer-experiments';
+import { guardrailBreach, offerExperimentReadout, offerExperimentResults, setOfferExperiment, sweepOfferGuardrails, type OfferVariantResult } from './offer-experiments';
 import { issueTasteOffer } from './offers';
 import { ctxFor } from './testing';
 
@@ -70,7 +70,7 @@ describe('offer experiments (plan 05 §6)', () => {
   });
 
   it('judges guardrails only past the minimum sample', () => {
-    const row = (v: string, paid: number, refunded: number, issued = paid, support = 0) => ({ variant: v, issued, redeemed: paid, expired: 0, paid, refunded, disputed: 0, support, conversion: 1, refundRate: paid ? refunded / paid : null, disputeRate: 0, supportRate: issued ? support / issued : null });
+    const row = (v: string, paid: number, refunded: number, issued = paid, support = 0) => ({ variant: v, issued, redeemed: paid, expired: 0, checkoutStarted: paid, paid, refunded, disputed: 0, support, conversion: 1, checkoutRate: 1, paidConversion: 1, refundRate: paid ? refunded / paid : null, disputeRate: 0, supportRate: issued ? support / issued : null });
     const g = { maxRefundRate: 0.1, maxSupportRate: 0.2, minSample: 20 };
     expect(guardrailBreach([row('a', 10, 5)], g)).toBeNull(); // 50% refunds, but only 10 paid
     expect(guardrailBreach([row('a', 40, 2), row('b', 40, 8)], g)).toMatch(/refund rate 20% on variant b/);
@@ -107,5 +107,43 @@ describe('offer experiments (plan 05 §6)', () => {
     const q = await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctxFor(t.workspaceId, t.userId), newId()));
     expect(q.priceMicros).toBe(usd(19));
     expect(await withSystem((tx) => sweepOfferGuardrails(tx))).toEqual([]);
+  });
+});
+
+describe('offer experiment readout (plan 04 L22: pre-registered metric, minimum sample)', () => {
+  const r = (variant: string, issued: number, checkoutStarted: number, paid: number): OfferVariantResult => ({
+    variant, issued, redeemed: paid, expired: 0, checkoutStarted, paid, refunded: 0, disputed: 0, support: 0,
+    conversion: paid / issued, checkoutRate: checkoutStarted / issued, paidConversion: paid / issued, refundRate: 0, disputeRate: 0, supportRate: 0,
+  });
+  const exp = { primaryMetric: 'paid_conversion' as const, minSamplePerVariant: 200, variants: [{ key: 'p19', weight: 1 }, { key: 'p24', weight: 1 }] };
+
+  it('calls nothing before every variant has its sample', () => {
+    const out = offerExperimentReadout([r('p19', 250, 100, 60), r('p24', 150, 40, 10)], exp);
+    expect(out).toMatchObject({ ready: false, leader: null });
+    expect(out.note).toMatch(/p24 150\/200/);
+  });
+
+  it('names a leader only when the 95% interval excludes no difference, on the registered metric', () => {
+    expect(offerExperimentReadout([r('p19', 400, 120, 80), r('p24', 400, 118, 78)], exp)).toMatchObject({ ready: true, leader: null });
+    const clear = offerExperimentReadout([r('p19', 400, 120, 40), r('p24', 400, 160, 90)], exp);
+    expect(clear.leader).toBe('p24');
+    expect(clear.variants[1]!.low).toBeGreaterThan(0);
+    // The same data read on checkout rate, as pre-registered for another experiment.
+    expect(offerExperimentReadout([r('p19', 400, 160, 40), r('p24', 400, 100, 90)], { ...exp, primaryMetric: 'checkout_rate' }).leader).toBe('p19');
+  });
+
+  it('counts opened checkouts per variant from the purchases of each offer', async () => {
+    const s = await staff();
+    await withAdmin((tx) => setOfferExperiment(tx, s, 'TASTE_19', priceTest, 'price test'));
+    const t = await makeTenant();
+    await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctxFor(t.workspaceId, t.userId), newId()));
+    const [o] = await ownerPool()`select id, variant from offers where workspace_id = ${t.workspaceId}`;
+    await ownerPool()`insert into purchases (workspace_id, kind, offer_id, amount_micros, stripe_checkout_session_id, created_by) values (${t.workspaceId}, 'taste', ${o!.id}, 19000000, 'cs_ro_1', 'user:x')`;
+    await ownerPool()`insert into purchases (workspace_id, kind, offer_id, amount_micros, stripe_checkout_session_id, created_by) values (${t.workspaceId}, 'taste', ${o!.id}, 19000000, 'cs_ro_2', 'user:x')`;
+    const results = await withAdmin((tx) => offerExperimentResults(tx, 'TASTE_19', 'taste-price-q4'));
+    expect(results.find((x) => x.variant === o!.variant)).toMatchObject({ issued: 1, checkoutStarted: 1, paid: 0, checkoutRate: 1 });
+    // The stored experiment carries its pre-registered metric (defaulted).
+    const [d] = await ownerPool()`select experiment from offer_definitions where code = 'TASTE_19'`;
+    expect(d!.experiment).toMatchObject({ primaryMetric: 'paid_conversion', minSamplePerVariant: 100 });
   });
 });

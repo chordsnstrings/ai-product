@@ -4,6 +4,7 @@ import { saveAsset } from './assets';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { fetchImage, findSize, type ExtractedVariant } from './ingest';
+import { refreshStock } from './stock';
 import { usableAssetIds } from './vision';
 
 /**
@@ -82,6 +83,8 @@ export async function recordVariants(tx: Tx, ctx: Pick<TenantContext, 'workspace
     await tx`update sku_variants set available = false
              where sku_id = ${skuId} and source = ${source} and external_id <> all(${seen}::text[]) and available is distinct from false`;
   }
+  // §42 "Out of stock": the SKU is out when none of the variants the store sells is available.
+  await refreshStock(tx, ctx, skuId);
   return n;
 }
 

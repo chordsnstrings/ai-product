@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
-import { analyzeProduct, available, generateStoryboard, ingestBytes, periodUsage, scheduleDeletion, selectConcept, startPreview } from '@arkiv/core';
+import { analyzeProduct, available, generateStoryboard, ingestBytes, periodUsage, scheduleDeletion, selectConcept, setStockIntent, startPreview } from '@arkiv/core';
 import { ctxFor, productPhoto } from '@arkiv/core/testing';
 import {
   autoRenewText,
@@ -321,6 +321,29 @@ describe('one-off payments (plan 02 B4/B9, M9)', () => {
     await generateStoryboard(ctx, projectId, next.storyboardId, concepts[1]!);
     const [p2] = await ownerPool()`select state, storyboard_id from projects where id = ${projectId}`;
     expect(p2).toEqual({ state: 'STORYBOARD_APPROVED', storyboard_id: storyboardId });
+  }, 90_000);
+
+  it('an out-of-stock product is flagged before the offer and checkout; stating a waitlist starts both (§42)', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const asset = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctx, await productPhoto(), 'product_photo', null));
+    const { skuId, projectId } = await withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [asset.id] }));
+    await analyzeProduct(ctx, skuId, projectId);
+    await ownerPool()`update skus set in_stock = false where id = ${skuId}`;
+    const concepts = await ownerPool()`select id from concepts where project_id = ${projectId} order by idx`;
+    const { storyboardId } = await withTenant(t.workspaceId, (tx) => selectConcept(tx, ctx, projectId, concepts[0]!.id as string));
+    await generateStoryboard(ctx, projectId, storyboardId, concepts[0]!.id as string);
+    // The storyboard is ready, but the intro window hasn't started and nothing can be bought.
+    expect(await ownerPool()`select 1 from offers where workspace_id = ${t.workspaceId}`).toHaveLength(0);
+    await expect(withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }))).rejects.toMatchObject({ code: 'CONFLICT', details: { outOfStock: true } });
+    await withTenant(t.workspaceId, (tx) => setStockIntent(tx, ctx, skuId, 'waitlist'));
+    const [offer] = await ownerPool()`select type, project_id, expires_at from offers where workspace_id = ${t.workspaceId}`;
+    expect(offer).toMatchObject({ type: 'TASTE', project_id: projectId });
+    const co = await withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }));
+    expect(co.quote.kind).toBe('taste');
+    // The funnel names the offer (and its experiment variant, none here) for per-variant readouts (plan 04 L22).
+    const [f] = await ownerPool()`select props from funnel_events where workspace_id = ${t.workspaceId} and type = 'CHECKOUT_STARTED'`;
+    expect(f!.props).toMatchObject({ kind: 'taste', offer: 'TASTE_19', offerVariant: null });
   }, 90_000);
 
   it('a refund booked as fraudulent flags the purchase (its downloads are refused)', async () => {

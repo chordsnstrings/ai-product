@@ -3,6 +3,8 @@ import {
   ANALYSIS_KEY_FACTS,
   assetUrl,
   blockedLines,
+  bonusHookDue,
+  bonusHooks,
   cancelDecision,
   currentFacts,
   customerReason,
@@ -71,6 +73,22 @@ export async function projectView(workspaceId: string, projectId: string) {
       );
       exports.sort((a, b) => ['9x16', '4x5', '1x1'].indexOf(a.aspect) - ['9x16', '4x5', '1x1'].indexOf(b.aspect));
     }
+    // The offer's bonus alternate hook (§8), delivered as a version of the ad once it is made.
+    let bonusExports: typeof exports = [];
+    if (p.bonus_hook_creative_id && !deliveryHeld) {
+      const [bc] = await tx`select final_asset_ids from creatives where id = ${p.bonus_hook_creative_id}`;
+      const assets = await tx`select id, lineage from assets where id in ${tx((bc?.final_asset_ids as string[]) ?? ['00000000-0000-0000-0000-000000000000'])}`;
+      bonusExports = await Promise.all(
+        assets.map(async (a) => {
+          const aspect = (a.lineage as { aspect: string }).aspect;
+          const name = `${String(p.sku_name).replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-alt-hook-${aspect}.mp4`;
+          return { aspect, assetId: a.id as string, url: await assetUrl(tx, a.id as string, 3600), download: `/api/assets/${a.id}/download?name=${encodeURIComponent(name)}&project=${projectId}` };
+        }),
+      );
+      bonusExports.sort((a, b) => ['9x16', '4x5', '1x1'].indexOf(a.aspect) - ['9x16', '4x5', '1x1'].indexOf(b.aspect));
+    }
+    // A bonus still being made: the offer promised one and the ad is done.
+    const bonusPending = p.state === 'COMPLETE' && !p.bonus_hook_creative_id && (await bonusHookDue(tx, projectId));
     // Why production stopped, in customer words (plan 03 P9, standard §8): a paused production's queue status
     // (partner + ETA), otherwise the copy mapped from the stored reason code — never an internal error.
     const queue = p.outage ? await outageStatus(tx, workspaceId, projectId) : null;
@@ -180,6 +198,8 @@ export async function projectView(workspaceId: string, projectId: string) {
       quote,
       purchase: purchase ? { status: purchase.status as string, kind: purchase.kind as string, amountMicros: Number(purchase.amount_micros) } : null,
       exports,
+      // An offer bonus is shown only when the offer carries it (what is shown is what is delivered, §8).
+      bonus: { offered: quote.kind === 'taste' && bonusHooks(quote.bonus) > 0, exports: bonusExports, pending: bonusPending, failed: !!p.bonus_hook_failed_at },
       disclosure,
     };
   });

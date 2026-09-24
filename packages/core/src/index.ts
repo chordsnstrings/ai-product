@@ -37,6 +37,7 @@ export * from './claims';
 export * from './product-truth';
 export * from './ingest';
 export * from './sku-variants';
+export * from './stock';
 export * from './intel-schemas';
 export * from './creative-director';
 export * from './analysis';

@@ -69,6 +69,40 @@ export async function transitionWorkspace(
   return to;
 }
 
+/** States a workspace sits in "on top of" another one it returns to: a staff hold or a scheduled deletion. */
+const HOLD_STATES: ReadonlySet<WorkspaceState> = new Set(['SUSPENDED', 'LOCKED']);
+
+/**
+ * A billing-driven lifecycle change (a payment failed, a plan ended, a payment recovered, a plan started), applied
+ * only from the states in `from` (plan 02 §2). A staff hold (SUSPENDED/LOCKED) is never lifted by billing: the
+ * hold stays, and the state the workspace returns to when it is lifted follows billing instead, so lifting a hold
+ * never restores a paid state whose plan has ended (x-sublife-13). A scheduled deletion likewise keeps its purge
+ * and records the state a cancelled deletion returns to — unless `from` lists PURGE_SCHEDULED itself (a new plan
+ * starting takes the workspace out of a scheduled deletion). Evented either way. Returns the resulting state.
+ */
+export async function billingStateChange(
+  tx: Tx,
+  ctx: Pick<TenantContext, 'workspaceId' | 'actor'>,
+  to: WorkspaceState,
+  from: readonly WorkspaceState[],
+  reason: string,
+): Promise<WorkspaceState> {
+  const [w] = await tx`select state, state_before_hold, state_before_purge from workspaces where id = ${ctx.workspaceId} for update`;
+  if (!w) throw notFound('Workspace not found');
+  const cur = w.state as WorkspaceState;
+  const underneath = HOLD_STATES.has(cur) ? 'state_before_hold' : cur === 'PURGE_SCHEDULED' && !from.includes(cur) ? 'state_before_purge' : null;
+  if (underneath) {
+    const prev = w[underneath] as WorkspaceState | null;
+    if (!prev || prev === to || !from.includes(prev)) return cur;
+    if (underneath === 'state_before_hold') await tx`update workspaces set state_before_hold = ${to} where id = ${ctx.workspaceId}`;
+    else await tx`update workspaces set state_before_purge = ${to} where id = ${ctx.workspaceId}`;
+    await emit(tx, ctx, 'WORKSPACE_STATE_CHANGED', { type: 'workspace', id: ctx.workspaceId }, { from: cur, to: cur, reason, underlying: { from: prev, to } });
+    return cur;
+  }
+  if (!from.includes(cur)) return cur;
+  return transitionWorkspace(tx, ctx, to, reason);
+}
+
 function slugify(s: string) {
   return (
     s

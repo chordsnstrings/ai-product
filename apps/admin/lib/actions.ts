@@ -76,6 +76,7 @@ import {
   startBreakGlass,
   suppressRiskFlag,
   validateEligibility,
+  validateOfferBonus,
   type Permission,
   type SettingKey,
   RATE_PROVIDERS,
@@ -1036,6 +1037,7 @@ export const ACTIONS = {
       withAdmin(async (tx) => {
         const priceMicros = Math.round(i.price * 1e6);
         validateEligibility(i.eligibility);
+        validateOfferBonus(i.bonus, i.type);
         if (i.referenceCode) {
           // Honest anchoring: the reference must be the price we actually charge for its type today (its latest
           // active version), and above this price.

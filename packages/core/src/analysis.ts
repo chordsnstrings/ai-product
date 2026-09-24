@@ -16,6 +16,8 @@ import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
+import { WEEKLY_RECOMMENDATION_SKUS, weekOf } from './recommendations';
+import { refreshStock } from './stock';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
 import { recordVariants } from './sku-variants';
@@ -208,6 +210,8 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
                      where p.id = ${projectId} and v.sku_id = ${skuId} and v.external_id = ${extracted!.selectedVariantId} and v.workspace_id = p.workspace_id`;
           }
         }
+        // §42: availability as the page states it when it lists no variants (theirs decided above).
+        await refreshStock(tx, ctx, skuId, extracted!.inStock ?? null);
         await step(tx, ws, skuId, 'read_page', 'done', extracted!.name ? `Found “${extracted!.name}”` : 'Page read');
         // One SKU per store product (§42 "Duplicate import"): a product already in the catalogue keeps its SKU as
         // the match; this import stays unlinked rather than competing for it.
@@ -392,6 +396,17 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed, technique: cut.technique });
       await step(tx, ws, skuId, 'fingerprint', 'done', `${x.packaging.type.replace('_', ' ')}${x.packaging.closure ? ` · ${x.packaging.closure}` : ''}`);
       await tx`update skus set status = 'active' where id = ${skuId}`;
+      // A subscriber's new SKU gets its first recommended experiments now (standard §9 "Day 1-2"), not on the
+      // next Monday's weekly run.
+      // Only a SKU the weekly run covers (its first WEEKLY_RECOMMENDATION_SKUS active products): a store import of
+      // hundreds of products doesn't start hundreds of paid recommendation runs.
+      const [sub] = await tx`select 1 from workspaces w where w.id = ${ws} and w.state = 'ACTIVE_PAID' and w.plan_code is not null
+                               and (select count(*) from skus o where o.workspace_id = w.id and o.status = 'active' and o.id <> ${skuId}
+                                      and o.catalogue_no < (select catalogue_no from skus where id = ${skuId})) < ${WEEKLY_RECOMMENDATION_SKUS}`;
+      if (sub) {
+        const week = weekOf();
+        await enqueue(tx, ws, Queues.weeklyRecommendations, { week, skuId }, { singletonKey: `recs:${ws}:${skuId}:${week}` });
+      }
       await transition(tx, ctx, projectId, 'PRODUCT_ANALYZED');
       await transition(tx, ctx, projectId, 'BRIEF_READY');
       await emit(tx, ctx, 'PRODUCT_IMPORTED', { type: 'sku', id: skuId }, { source: extracted?.source ?? 'photos' });

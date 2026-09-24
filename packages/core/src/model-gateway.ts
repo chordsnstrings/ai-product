@@ -30,7 +30,7 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
 import { findPrompt } from './prompts';
-import { actualCost, loadRates, priceLine, type CostLine } from './rates';
+import { actualCost, loadRates, priceLine, promoSplit, type CostLine } from './rates';
 
 /**
  * Model Gateway (§33): provider-agnostic, and the ONLY path to a billable provider. Every call must present a
@@ -90,7 +90,7 @@ export async function route(tx: Tx, task: string, workspaceId?: string | null): 
 export type TaskUnits =
   | { kind: 'llm'; inputTokens: number; outputTokens: number; cachedTokens?: number }
   | { kind: 'image'; images: number }
-  | { kind: 'video'; seconds: number; resolution: '720p' | '1080p'; retryReserve?: boolean }
+  | { kind: 'video'; seconds: number; resolution: '720p' | '1080p'; retryReserve?: boolean; videoInputSeconds?: number }
   | { kind: 'tts'; chars: number };
 
 /** A cost line for units served by a route: priced with the model the route resolved to, never a fixed one. */
@@ -385,12 +385,16 @@ async function closeJob(
     // real spend: recorded as provider cost even though the call failed and the customer is not charged (§37).
     const billed = started.line ? (started.billed ?? []).map((u) => billedLine(started.line!, u)).filter((l): l is CostLine => !!l) : [];
     const billedMicros = billed.reduce((s, l) => s + actualCost(rates, l), 0);
-    const actual = (outcome.actualMicros ?? (line ? actualCost(rates, line) : 0)) + billedMicros;
+    const list = (outcome.actualMicros ?? (line ? actualCost(rates, line) : 0)) + billedMicros;
+    // A promotional package lowers what the call really cost; the difference is kept as savings (§6). A cost the
+    // provider reported itself is already what was paid.
+    const priced = outcome.actualMicros === undefined ? line ?? started.line ?? null : null;
+    const { realizedMicros: actual, savingsMicros } = priced && 'provider' in priced ? promoSplit(rates, priced.provider, priced.model, list) : { realizedMicros: list, savingsMicros: 0 };
     // The failure class is kept on the job: the circuit breaker counts outage-class failures per route (plan 05 §10).
     const extra = { ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}), ...(outcome.ok ? {} : { errorKind: outcome.errorKind }), ...(billed.length ? { billedOnFailure: billed.map(unitsOf) } : {}) };
     const raw = outcome.rawMeta || Object.keys(extra).length ? { ...(outcome.rawMeta ?? {}), ...extra } : null;
     const [closed] = await tx`
-      update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual},
+      update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual}, savings_micros = ${savingsMicros},
         latency_ms = ${outcome.latencyMs}, completed_at = now(),
         model_version_returned = ${outcome.ok ? (outcome.modelVersion ?? null) : null},
         provider_request_id = coalesce(provider_request_id, ${outcome.providerRequestId ?? null}),
@@ -631,6 +635,8 @@ async function cutoutOnce(call: CutoutCall, p: ProviderSet, adapter: Segmentatio
 export interface VideoCall extends CallMeta {
   prompt: string;
   references: string[];
+  /** Seconds of reference video the request carries (priced at the provider's video-input rate, §6). */
+  videoInputSeconds?: number;
   seconds: number;
   resolution: '720p' | '1080p';
   ratio: '9:16' | '4:5' | '1:1';
@@ -653,7 +659,7 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
 }
 
 async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider = p.video): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
-  const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
+  const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false, ...(call.videoInputSeconds ? { videoInputSeconds: call.videoInputSeconds } : {}) }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
   const line = started.line;
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.

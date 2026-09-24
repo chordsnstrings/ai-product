@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, offerExperimentResults, type OfferExperiment, type OfferVariantResult } from '@arkiv/core';
+import { auditView, offerExperimentReadout, offerExperimentResults, type OfferExperiment, type OfferVariantResult } from '@arkiv/core';
 import { ActButton, ActForm } from '@/components/act';
 import { d, dt, money, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -12,6 +12,8 @@ type Ended = OfferExperiment & { endedAt: string; endedBy: string; reason: strin
 const EXPERIMENT_TEMPLATE = JSON.stringify(
   {
     key: 'taste-price-2026q4',
+    primaryMetric: 'paid_conversion',
+    minSamplePerVariant: 100,
     variants: [
       { key: 'p19', weight: 1, priceMicros: 19_000_000 },
       { key: 'p24', weight: 1, priceMicros: 24_000_000 },
@@ -22,11 +24,21 @@ const EXPERIMENT_TEMPLATE = JSON.stringify(
   2,
 );
 
-function Results({ rows }: { rows: OfferVariantResult[] }) {
+/** Per-variant funnel (issued → checkout → paid) and guardrails, read on the experiment's pre-registered metric. */
+function Results({ rows, exp }: { rows: OfferVariantResult[]; exp: OfferExperiment }) {
+  const readout = offerExperimentReadout(rows, exp);
+  const byVariant = new Map(readout.variants.map((v) => [v.variant, v]));
+  const vs = (k: string) => {
+    const v = byVariant.get(k);
+    return v?.diff == null ? '—' : `${v.diff > 0 ? '+' : ''}${pct(v.diff)} (${pct(v.low!)} to ${pct(v.high!)})`;
+  };
   return (
-    <Table head={['Variant', 'Issued', 'Redeemed', 'Conversion', 'Expired', 'Paid', 'Refund rate', 'Dispute rate', 'Support tickets']} rows={rows.map((r) => [
-      r.variant, r.issued, r.redeemed, pct(r.conversion ?? NaN), r.expired, r.paid, pct(r.refundRate ?? NaN), pct(r.disputeRate ?? NaN), `${r.support} (${pct(r.supportRate ?? NaN)})`,
-    ])} empty="No offers issued under this experiment yet." />
+    <>
+      <p className="ak-small">Primary metric (pre-registered): <strong>{readout.metric.replace('_', ' ')}</strong>, read once every variant has {readout.minSamplePerVariant} offers. {readout.note}</p>
+      <Table head={['Variant', 'Issued', 'Checkout opened', 'Paid', 'Paid conversion', `vs ${exp.variants[0]?.key ?? 'first'} (95%)`, 'Expired', 'Refund rate', 'Dispute rate', 'Support tickets']} rows={rows.map((r) => [
+        r.variant, r.issued, `${r.checkoutStarted} (${pct(r.checkoutRate ?? NaN)})`, r.paid, pct(r.paidConversion ?? NaN), vs(r.variant), r.expired, pct(r.refundRate ?? NaN), pct(r.disputeRate ?? NaN), `${r.support} (${pct(r.supportRate ?? NaN)})`,
+      ])} empty="No offers issued under this experiment yet." />
+    </>
   );
 }
 
@@ -88,13 +100,13 @@ export default async function Offers() {
               {exp ? (
                 <>
                   <p className="ak-small">Running <strong>{exp.key}</strong> since {dt(exp.startedAt)}: {exp.variants.map((v) => `${v.key} (weight ${v.weight}${v.priceMicros ? `, ${money(v.priceMicros)}` : ''}${v.windowMinutes ? `, ${v.windowMinutes} min` : ''})`).join(' · ')}. Guardrails: {[exp.guardrails.maxRefundRate !== undefined ? `refunds ≤ ${pct(exp.guardrails.maxRefundRate)}` : null, exp.guardrails.maxDisputeRate !== undefined ? `disputes ≤ ${pct(exp.guardrails.maxDisputeRate)}` : null, exp.guardrails.maxSupportRate !== undefined ? `support ≤ ${pct(exp.guardrails.maxSupportRate)}` : null].filter(Boolean).join(', ')} (n ≥ {exp.guardrails.minSample ?? 30}).</p>
-                  <Results rows={d0.results.get(`${o.code}:${exp.key}`) ?? []} />
+                  <Results rows={d0.results.get(`${o.code}:${exp.key}`) ?? []} exp={exp} />
                   <ActButton action="offer.experiment" payload={{ code: o.code, experiment: null }} reason="Why stop it?" confirm="Stop the experiment? New offers go back to the base price and window.">Stop experiment</ActButton>
                 </>
               ) : (
                 <div style={{ maxWidth: 560 }}>
                   <ActForm action="offer.experiment" extra={{ code: o.code }} submit="Start experiment" fields={[
-                    { name: 'experiment', label: 'Experiment (variants: key, weight, priceMicros, windowMinutes 30–1440; guardrails: maxRefundRate, maxDisputeRate, maxSupportRate, minSample)', type: 'json', defaultValue: EXPERIMENT_TEMPLATE },
+                    { name: 'experiment', label: 'Experiment (pre-register primaryMetric paid_conversion | checkout_rate and minSamplePerVariant; variants: key, weight, priceMicros, windowMinutes 30–1440; guardrails: maxRefundRate, maxDisputeRate, maxSupportRate, minSample)', type: 'json', defaultValue: EXPERIMENT_TEMPLATE },
                     { name: 'reason', label: 'Hypothesis / reason', required: true },
                   ]} />
                 </div>
@@ -105,7 +117,7 @@ export default async function Offers() {
                   {history.map((h) => (
                     <div key={h.key} style={{ marginTop: 8 }}>
                       <p className="ak-small"><strong>{h.key}</strong> · {dt(h.startedAt)} → {dt(h.endedAt)} · ended by {h.endedBy}: {h.reason}</p>
-                      <Results rows={d0.results.get(`${o.code}:${h.key}`) ?? []} />
+                      <Results rows={d0.results.get(`${o.code}:${h.key}`) ?? []} exp={h} />
                     </div>
                   ))}
                 </details>

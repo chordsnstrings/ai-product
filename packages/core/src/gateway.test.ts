@@ -104,6 +104,30 @@ describe('partial provider billing (plan 06 Phase 3 tests; standard §37 all spe
   });
 });
 
+describe('promotional packages (standard §6: recorded as savings)', () => {
+  it('realized cost is the discounted amount, the list-price difference is kept as savings, estimates stay at list', async () => {
+    const t = await makeTenant();
+    try {
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        select provider, model, 2, unit, rates || '{"promo_paid_ppm": 555556}'::jsonb, now() - interval '1 minute', 'published'
+                        from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 1`;
+      const { ctx, token, authorizationId } = await tokenFor(t.workspaceId, t.userId, 'video.scene', 'video');
+      await generateVideo({ ctx, token, task: 'video.scene', subject: null, prompt: 'hands', references: [], seconds: 5, resolution: '720p', ratio: '9:16' });
+      const [job] = await ownerPool()`select actual_micros, savings_micros from provider_jobs where workspace_id = ${t.workspaceId}`;
+      const list = 5 * 231333;
+      expect(Number(job!.actual_micros)).toBe(Math.ceil((list * 555556) / 1_000_000));
+      expect(Number(job!.savings_micros)).toBe(list - Number(job!.actual_micros));
+      const [cost] = await ownerPool()`select amount from ledger_entries where workspace_id = ${t.workspaceId} and type = 'PROVIDER_COST_RECORDED' and authorization_id = ${authorizationId}`;
+      expect(Number(cost!.amount)).toBe(Number(job!.actual_micros));
+      // The authorization was planned at list price (a promotion is never needed for retail viability).
+      const [a] = await ownerPool()`select max_cost_micros from cost_authorizations where id = ${authorizationId}`;
+      expect(Number(a!.max_cost_micros)).toBe(Math.ceil(10 * 231333 * 1.25));
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 2`;
+    }
+  });
+});
+
 describe('pinned provider versions (standard §48; arch-35)', () => {
   it('sends the pinned version on the stable arm, and never pins a canary on another model', async () => {
     const llm = new RecordingLlm();

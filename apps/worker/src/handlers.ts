@@ -23,6 +23,7 @@ import {
   syncShopifyProduct,
   transferSku,
   weekOf,
+  WEEKLY_RECOMMENDATION_SKUS,
   enqueue,
   failAnalysis,
   holdDecision,
@@ -121,7 +122,10 @@ export const handlers: Record<string, Handler> = {
   },
   [Queues.weeklyRecommendations]: async (ctx, d) => {
     const week = (d.week as string) ?? weekOf();
-    const skus = await withTenant(ctx.workspaceId, (tx) => tx`select id from skus where status = 'active' order by catalogue_no limit 30`);
+    // One SKU (just analysed for a subscriber) or the whole catalogue (the weekly run, a new subscription).
+    const skus = d.skuId
+      ? await withTenant(ctx.workspaceId, (tx) => tx`select id from skus where id = ${d.skuId as string} and status = 'active'`)
+      : await withTenant(ctx.workspaceId, (tx) => tx`select id from skus where status = 'active' order by catalogue_no limit ${WEEKLY_RECOMMENDATION_SKUS}`);
     let n = 0;
     for (const s of skus) n += await generateRecommendations(ctx, s.id as string, week).catch((e) => (e instanceof DomainError ? 0 : Promise.reject(e)));
     if (n) await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week }, { singletonKey: `brief:${ctx.workspaceId}:${week}` }));

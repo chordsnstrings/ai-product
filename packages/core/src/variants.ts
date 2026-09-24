@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { platformAssets, platformsFor } from '@arkiv/shared';
+import { DomainError, platformAssets, platformsFor } from '@arkiv/shared';
 import { captionCues, composeAd, layoutVoice, probe, withTempDir, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { raiseAlert } from './alerts';
 import { assetBytes, saveAsset } from './assets';
 import { brandBrainFor } from './brand';
 import { scanCreativeText, scanPasses } from './compliance';
@@ -16,6 +17,7 @@ import { emit } from './events';
 import { setExperimentState } from './experiments';
 import { LEASE_BUSY, renewJobLease, withJobLease } from './leases';
 import { synthesizeVoice } from './model-gateway';
+import { bonusHookDue } from './offers';
 import { enqueue, Queues } from './outbox';
 import { ASPECTS, productionRoutes, voiceLine } from './production';
 import { qaExperimentIntegrity, qaExport, type CheckResult } from './qa';
@@ -61,13 +63,117 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
   return 0;
 }
 
+/** A hook version built from a master's manifest, ready to be saved (or why it can't be made). */
+type HookBuild =
+  | { ok: true; outs: { aspect: string; file: string; srt?: string }[]; manifest: CompositionManifest; changed: string[]; integrity: CheckResult }
+  | { ok: false; reason: string };
+
+/** What a hook version is built from: the master's composition and what the new hook must pass. */
+interface HookSource {
+  projectId: string;
+  skuId: string;
+  manifest: CompositionManifest;
+  /** The storyboard's hook text (the opening line when the hook is spoken). */
+  hookText: string | null;
+  names: (string | null)[];
+  allowed: Awaited<ReturnType<typeof allowedClaimTexts>>;
+}
+
+/**
+ * Build one economical hook version (§5 Creative Test definition) in `dir`: the master's footage, voice-over after
+ * the hook and end card, every export — only the opening hook changes. A spoken hook is re-voiced (one short TTS
+ * line) and fitted into the master's hook slot; a visual-only hook reuses the master voice-over untouched.
+ * Experiment integrity (§25 check 6) compares the two manifests, and every export passes export QA; anything else
+ * is refused with the reason, never shipped.
+ */
+async function buildHookVersion(
+  ctx: TenantContext,
+  dir: string,
+  src: HookSource,
+  hook: string,
+  voiceRef: { variantId?: string; bonusFor?: string },
+  intended: { changed: string[]; heldConstant: string[] },
+): Promise<HookBuild> {
+  const ws = ctx.workspaceId;
+  const { manifest } = src;
+  // Never ship a hook that makes a claim the vault doesn't cover on every platform it's exported to.
+  if (!scanPasses(scanCreativeText([hook], src.allowed, { names: src.names }))) return { ok: false, reason: 'hook failed claims check' };
+  const hookScene = manifest.scenes[0]!;
+  const segments = manifest.voiceover?.segments ?? [];
+  const hookSeg = segments.find((s) => s.sceneId === hookScene.sceneId) ?? null;
+  // The hook is spoken when the opening scene's line *is* the storyboard hook; otherwise it is visual-only.
+  const spokenHook = !!hookSeg && !!src.hookText && norm(hookSeg.text) === norm(src.hookText);
+  const nextStart = segments.filter((s) => s !== hookSeg && s.startMs >= (hookSeg?.startMs ?? 0)).reduce((m, s) => Math.min(m, s.startMs), Infinity);
+  const hookRoomEnd = Math.min(hookSeg ? hookSeg.startMs + hookScene.durationMs : 0, nextStart - HOOK_GAP_MS);
+  // 1. The new spoken hook (if the hook is spoken), fitted into the master's hook slot.
+  let newSeg: VoiceSegment | null = null;
+  if (spokenHook && hookSeg) {
+    let clip: { id: string; bytes: Buffer };
+    try {
+      clip = await hookClip(ctx, voiceRef, hook, manifest.voiceover!.voice, src.skuId, src.projectId);
+    } catch (e) {
+      // The Cost Governor refused it: this voice-over would take the test past its cost ceiling (§5). Skipped,
+      // never produced over budget.
+      if (e instanceof DomainError && e.code === 'GATE_BLOCKED') return { ok: false, reason: 'the test’s cost ceiling is reached' };
+      throw e;
+    }
+    const file = path.join(dir, 'hook.mp3');
+    await writeFile(file, clip.bytes);
+    const ms = (await probe(file)).durationMs;
+    const room = hookRoomEnd - hookSeg.startMs;
+    const tempo = ms > room ? ms / Math.max(1, room) : 1;
+    if (tempo > HOOK_MAX_TEMPO) return { ok: false, reason: 'spoken hook too long to keep the rest of the voice-over unchanged' };
+    newSeg = { sceneId: hookSeg.sceneId, text: hook, clipAssetId: clip.id, startMs: hookSeg.startMs, endMs: Math.round(hookSeg.startMs + ms / tempo), tempo: Math.round(tempo * 10_000) / 10_000 };
+  }
+  // 2. The version's manifest: the master's, with only the hook changed.
+  const versionManifest: CompositionManifest = {
+    ...manifest,
+    scenes: [{ ...hookScene, overlayText: hook.slice(0, 60), spokenText: newSeg ? hook : hookScene.spokenText }, ...manifest.scenes.slice(1)],
+    voiceover: manifest.voiceover && newSeg ? { ...manifest.voiceover, segments: segments.map((s) => (s === hookSeg ? newSeg! : s)) } : manifest.voiceover,
+    captions: newSeg ? [...captionCues(hook, newSeg.startMs, newSeg.endMs), ...manifest.captions.filter((c) => !(c.startMs >= hookSeg!.startMs && c.endMs <= hookSeg!.endMs))].sort((a, b) => a.startMs - b.startMs) : manifest.captions,
+    aspects: VARIANT_ASPECTS,
+  };
+  const changed = diffCompositions(manifest, versionManifest);
+  const integrity = qaExperimentIntegrity(intended, { changed });
+  if (!integrity.pass) return { ok: false, reason: integrity.detail };
+  // 3. Compose from the master's exact assets.
+  const inputs: SceneInput[] = [];
+  for (const [i, s] of versionManifest.scenes.entries()) {
+    if (!s.assetId) return { ok: false, reason: 'a master scene has no stored asset' };
+    const f = path.join(dir, `s${i}.${s.kind === 'video' ? 'mp4' : 'png'}`);
+    await writeFile(f, await withTenant(ws, (tx) => assetBytes(tx, s.assetId!)));
+    inputs.push({ kind: s.kind, file: f, durationMs: s.durationMs, overlayText: s.overlayText, motion: 'push' });
+  }
+  let voPath: string | null = null;
+  const segs = versionManifest.voiceover?.segments ?? [];
+  if (segs.length) {
+    const clips: VoiceClip[] = [];
+    for (const [i, s] of segs.entries()) {
+      const f = path.join(dir, `vo-${i}.mp3`);
+      await writeFile(f, await withTenant(ws, (tx) => assetBytes(tx, s.clipAssetId)));
+      clips.push({ file: f, startMs: s.startMs, tempo: s.tempo });
+    }
+    voPath = path.join(dir, 'vo.wav');
+    await layoutVoice(clips, versionManifest.durationMs, voPath);
+  }
+  const e = versionManifest.endCard;
+  const endCard = { productName: e.productName, cta: e.cta, index: e.index, durationMs: e.durationMs, accent: e.accent ?? null, note: e.note ?? null };
+  // The version is the master's footage with a re-voiced hook: it carries the master's AI-content disclosure (§40).
+  const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: versionManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(versionManifest.disclosure) }, dir);
+  const checks: CheckResult[] = [integrity];
+  for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, versionManifest.durationMs)));
+  if (checks.some((c) => !c.pass && c.hard)) return { ok: false, reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) };
+  return { ok: true, outs, manifest: versionManifest, changed, integrity };
+}
+
 async function runHookVariants(ctx: TenantContext, projectId: string, holder: string): Promise<number> {
   const ws = ctx.workspaceId;
   const data = await withTenant(ws, async (tx) => {
     const [p] = await tx`select * from projects where id = ${projectId}`;
-    if (!p?.experiment_id || p.state !== 'COMPLETE') return null;
-    const hookVariants = await tx`select * from variants where experiment_id = ${p.experiment_id} and role = 'variant'
-                                  and project_id is null and creative_id is null order by code`;
+    if (!p || p.state !== 'COMPLETE') return null;
+    const hookVariants = p.experiment_id
+      ? await tx`select * from variants where experiment_id = ${p.experiment_id} and role = 'variant' and project_id is null and creative_id is null order by code`
+      : [];
     const [master] = p.final_creative_id ? await tx`select composition from creatives where id = ${p.final_creative_id}` : [];
     const [sb] = await tx`select hook_text from storyboards where id = ${p.storyboard_id}`;
     const [sku] = await tx`select name from skus where id = ${p.sku_id}`;
@@ -75,20 +181,17 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
     const allowed = await allowedClaimTexts(tx, p.sku_id as string, { platforms: platformsFor(VARIANT_ASPECTS) });
     return { p, hookVariants, manifest: (master?.composition ?? null) as CompositionManifest | null, hookText: (sb?.hook_text as string | null) ?? null, names: [sku?.name as string, brand?.name ?? null], allowed };
   });
-  if (!data || !data.hookVariants.length) return 0;
+  if (!data) return 0;
   const { p, manifest } = data;
+  // A one-off ad: its offer's bonus alternate hook, if it has one due (standard §7/§8).
+  if (!p.experiment_id) return manifest?.scenes.length ? runBonusHook(ctx, projectId, holder, { projectId, skuId: p.sku_id as string, manifest, hookText: data.hookText, names: data.names, allowed: data.allowed }) : 0;
+  if (!data.hookVariants.length) return 0;
   if (!manifest?.scenes.length) {
     // Without the master's composition nothing can be held constant: no variant rather than a confounded one.
     await withTenant(ws, (tx) => settleExperiment(tx, ctx, p.experiment_id as string, 'hook variants unavailable: master has no composition record'));
     return 0;
   }
-  const hookScene = manifest.scenes[0]!;
-  const segments = manifest.voiceover?.segments ?? [];
-  const hookSeg = segments.find((s) => s.sceneId === hookScene.sceneId) ?? null;
-  // The hook is spoken when the opening scene's line *is* the storyboard hook; otherwise it is visual-only.
-  const spokenHook = !!hookSeg && !!data.hookText && norm(hookSeg.text) === norm(data.hookText);
-  const nextStart = segments.filter((s) => s !== hookSeg && s.startMs >= (hookSeg?.startMs ?? 0)).reduce((m, s) => Math.min(m, s.startMs), Infinity);
-  const hookRoomEnd = Math.min(hookSeg ? hookSeg.startMs + hookScene.durationMs : 0, nextStart - HOOK_GAP_MS);
+  const src: HookSource = { projectId, skuId: p.sku_id as string, manifest, hookText: data.hookText, names: data.names, allowed: data.allowed };
 
   let made = 0;
   for (const v of data.hookVariants) {
@@ -97,97 +200,32 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
     const [still] = await withTenant(ws, (tx) => tx`select creative_id from variants where id = ${v.id}`);
     if (!still || still.creative_id) continue; // made by an earlier run since we listed it
     const hook = (v.label as string).trim();
-    // Never ship a hook that makes a claim the vault doesn't cover on every platform it's exported to.
-    if (!scanPasses(scanCreativeText([hook], data.allowed, { names: data.names }))) {
-      await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'hook failed claims check' }, variantRefs(p)));
-      continue;
-    }
     const ok = await withTempDir(async (dir) => {
-      // 1. The new spoken hook (if the hook is spoken), fitted into the master's hook slot.
-      let newSeg: VoiceSegment | null = null;
-      if (spokenHook && hookSeg) {
-        const clip = await hookClip(ctx, v.id as string, hook, manifest.voiceover!.voice, p.sku_id as string, projectId);
-        const file = path.join(dir, 'hook.mp3');
-        await writeFile(file, clip.bytes);
-        const ms = (await probe(file)).durationMs;
-        const room = hookRoomEnd - hookSeg.startMs;
-        const tempo = ms > room ? ms / Math.max(1, room) : 1;
-        if (tempo > HOOK_MAX_TEMPO) {
-          await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: 'spoken hook too long to keep the rest of the voice-over unchanged' }, variantRefs(p)));
-          return false;
-        }
-        newSeg = { sceneId: hookSeg.sceneId, text: hook, clipAssetId: clip.id, startMs: hookSeg.startMs, endMs: Math.round(hookSeg.startMs + ms / tempo), tempo: Math.round(tempo * 10_000) / 10_000 };
-      }
-      // 2. The variant's manifest: the master's, with only the hook changed.
-      const variantManifest: CompositionManifest = {
-        ...manifest,
-        scenes: [{ ...hookScene, overlayText: hook.slice(0, 60), spokenText: newSeg ? hook : hookScene.spokenText }, ...manifest.scenes.slice(1)],
-        voiceover: manifest.voiceover && newSeg ? { ...manifest.voiceover, segments: segments.map((s) => (s === hookSeg ? newSeg! : s)) } : manifest.voiceover,
-        captions: newSeg ? [...captionCues(hook, newSeg.startMs, newSeg.endMs), ...manifest.captions.filter((c) => !(c.startMs >= hookSeg!.startMs && c.endMs <= hookSeg!.endMs))].sort((a, b) => a.startMs - b.startMs) : manifest.captions,
-        aspects: VARIANT_ASPECTS,
-      };
-      const changed = diffCompositions(manifest, variantManifest);
-      const integrity = qaExperimentIntegrity({ changed: (v.changed_variables as string[]) ?? ['hook'], heldConstant: (v.held_constant as string[]) ?? [] }, { changed });
-      if (!integrity.pass) {
-        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: integrity.detail }, variantRefs(p)));
-        return false;
-      }
-      // 3. Compose from the master's exact assets.
-      const inputs: SceneInput[] = [];
-      for (const [i, s] of variantManifest.scenes.entries()) {
-        if (!s.assetId) return false;
-        const f = path.join(dir, `s${i}.${s.kind === 'video' ? 'mp4' : 'png'}`);
-        await writeFile(f, await withTenant(ws, (tx) => assetBytes(tx, s.assetId!)));
-        inputs.push({ kind: s.kind, file: f, durationMs: s.durationMs, overlayText: s.overlayText, motion: 'push' });
-      }
-      let voPath: string | null = null;
-      const segs = variantManifest.voiceover?.segments ?? [];
-      if (segs.length) {
-        const clips: VoiceClip[] = [];
-        for (const [i, s] of segs.entries()) {
-          const f = path.join(dir, `vo-${i}.mp3`);
-          await writeFile(f, await withTenant(ws, (tx) => assetBytes(tx, s.clipAssetId)));
-          clips.push({ file: f, startMs: s.startMs, tempo: s.tempo });
-        }
-        voPath = path.join(dir, 'vo.wav');
-        await layoutVoice(clips, variantManifest.durationMs, voPath);
-      }
-      const e = variantManifest.endCard;
-      const endCard = { productName: e.productName, cta: e.cta, index: e.index, durationMs: e.durationMs, accent: e.accent ?? null, note: e.note ?? null };
-      // The variant is the master's footage with a re-voiced hook: it carries the master's AI-content disclosure (§40).
-      const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: variantManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(variantManifest.disclosure) }, dir);
-      const checks: CheckResult[] = [integrity];
-      for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, variantManifest.durationMs)));
-      if (checks.some((c) => !c.pass && c.hard)) {
-        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) }, variantRefs(p)));
+      const built = await buildHookVersion(ctx, dir, src, hook, { variantId: v.id as string }, { changed: (v.changed_variables as string[]) ?? ['hook'], heldConstant: (v.held_constant as string[]) ?? [] });
+      if (!built.ok) {
+        await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: built.reason }, variantRefs(p)));
         return false;
       }
       return withTenant(ws, async (tx) => {
         // Claim the variant first: an overlapping run that got here before us wins, and we write nothing.
         const [cur] = await tx`select creative_id from variants where id = ${v.id} for update`;
         if (!cur || cur.creative_id) return false;
-        const ids: string[] = [];
-        const exported: { aspect: string; assetId: string }[] = [];
-        for (const o of outs) {
-          const a = await saveAsset(tx, ws, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId, variantId: v.id, aspect: o.aspect, srt: o.srt, changed } });
-          ids.push(a.id);
-          exported.push({ aspect: o.aspect, assetId: a.id });
-        }
+        const { ids, exported } = await saveHookExports(tx, ctx, p, built, { variantId: v.id as string });
         const creativeId = await versionCreative(tx, ctx, {
           skuId: p.sku_id as string,
           parentCreativeId: p.final_creative_id as string,
           projectId,
           genome: { ...(v.genes as object), hookText: hook },
           finalAssetIds: ids,
-          composition: variantManifest,
-          changedVariables: changed.length ? changed : ['hook'],
+          composition: built.manifest,
+          changedVariables: built.changed.length ? built.changed : ['hook'],
           experimentId: p.experiment_id as string,
           variantId: v.id as string,
           storyboardId: (p.storyboard_id as string | null) ?? null,
         });
         const [claimed] = await tx`update variants set creative_id = ${creativeId}, platform_assets = ${tx.json(platformAssets(exported) as never)} where id = ${v.id} and creative_id is null returning id`;
         if (!claimed) throw new Error(`variant ${v.id as string} was claimed concurrently`); // rolls back the creative and its assets
-        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed, creativeId, integrity: integrity.detail }, { ...variantRefs(p), creativeId });
+        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed: built.changed, creativeId, integrity: built.integrity.detail }, { ...variantRefs(p), creativeId });
         return true;
       });
     });
@@ -196,6 +234,83 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
   await withTenant(ws, (tx) => settleExperiment(tx, ctx, p.experiment_id as string, 'variants ready'));
   return made;
 }
+
+/** Store a built hook version's exports (one final_export asset per aspect). */
+async function saveHookExports(tx: Tx, ctx: TenantContext, p: Record<string, unknown>, built: Extract<HookBuild, { ok: true }>, lineage: { variantId?: string; bonusFor?: string }) {
+  const ids: string[] = [];
+  const exported: { aspect: string; assetId: string }[] = [];
+  for (const o of built.outs) {
+    const a = await saveAsset(tx, ctx.workspaceId, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId: p.id, ...lineage, aspect: o.aspect, srt: o.srt, changed: built.changed } });
+    ids.push(a.id);
+    exported.push({ aspect: o.aspect, assetId: a.id });
+  }
+  return { ids, exported };
+}
+
+// ───────────── Offer bonus: an alternate opening hook (standard §7 bonus entitlements, §8) ─────────────
+
+/**
+ * The alternate opening hook an offer promised (§8 "any low-COGS bonus such as an alternate opening hook"): the
+ * chosen concept's next hook option, built exactly like an experiment's hook variant (same footage, one re-voiced
+ * line, integrity and export QA) and delivered with the ad as a version of it. Its voice-over counts toward the
+ * same Creative Test cost ceiling. When it can't be made, staff are alerted to make good on the promise.
+ */
+async function runBonusHook(ctx: TenantContext, projectId: string, holder: string, src: HookSource): Promise<number> {
+  const ws = ctx.workspaceId;
+  const plan = await withTenant(ws, async (tx) => {
+    if (!(await bonusHookDue(tx, projectId))) return null;
+    const [c] = await tx`select c.proposal from projects p join concepts c on c.id = p.selected_concept_id and c.workspace_id = p.workspace_id where p.id = ${projectId}`;
+    const options = ((c?.proposal as { hookOptions?: string[] } | undefined)?.hookOptions ?? []).map((h) => h.trim()).filter(Boolean);
+    return { hook: options.find((h) => norm(h) !== norm(src.hookText)) ?? null };
+  });
+  if (!plan) return 0;
+  if (!(await renewJobLease(ws, variantsLease(projectId), holder, VARIANTS_LEASE_SECONDS))) return 0;
+  const notDelivered = (why: string) =>
+    withTenant(ws, async (tx) => {
+      await tx`update projects set bonus_hook_failed_at = now() where id = ${projectId} and workspace_id = ${ws} and bonus_hook_creative_id is null`;
+      await raiseAlert(tx, {
+        kind: 'offer.bonus_not_delivered',
+        severity: 'risk',
+        subject: { type: 'project', id: projectId },
+        message: `The alternate opening hook this ad’s offer promised couldn’t be made: ${why}. Make it by hand or make good with the customer.`,
+        details: { workspaceId: ws, projectId, why },
+      });
+    });
+  if (!plan.hook) {
+    await notDelivered('the concept has no other hook option');
+    return 0;
+  }
+  const hook = plan.hook;
+  const made = await withTempDir(async (dir) => {
+    const built = await buildHookVersion(ctx, dir, src, hook, { bonusFor: projectId }, { changed: ['hook'], heldConstant: [...BONUS_HELD] });
+    if (!built.ok) {
+      await notDelivered(built.reason);
+      return false;
+    }
+    return withTenant(ws, async (tx) => {
+      const [p] = await tx`select * from projects where id = ${projectId} for update`;
+      if (!p || p.bonus_hook_creative_id) return false; // delivered by an overlapping run
+      const { ids } = await saveHookExports(tx, ctx, p, built, { bonusFor: projectId });
+      const creativeId = await versionCreative(tx, ctx, {
+        skuId: p.sku_id as string,
+        parentCreativeId: p.final_creative_id as string,
+        projectId,
+        genome: { hookText: hook, bonus: 'alternate_hook' },
+        finalAssetIds: ids,
+        composition: built.manifest,
+        changedVariables: built.changed.length ? built.changed : ['hook'],
+        storyboardId: (p.storyboard_id as string | null) ?? null,
+      });
+      // Delivered with the ad: the delivery page lists it beside the master's exports.
+      await tx`update projects set bonus_hook_creative_id = ${creativeId} where id = ${projectId} and workspace_id = ${ws}`;
+      return true;
+    });
+  });
+  return made ? 1 : 0;
+}
+
+/** What a bonus hook holds constant (everything but the opening line). */
+const BONUS_HELD = ['body', 'offer', 'cta', 'product', 'duration', 'scenes_2_plus', 'voiceover'] as const;
 
 /**
  * Production is over: the test is READY_TO_RUN when at least two of its variants (master, hook variants, control)
@@ -211,25 +326,29 @@ async function settleExperiment(tx: Tx, ctx: TenantContext, experimentId: string
 }
 
 /**
- * The spoken hook for one variant: reused if already voiced, else one short TTS call under its own Cost Governor
- * authorization (no Creative Test is consumed: hook variants are part of the test, §5).
+ * The spoken hook for one variant (or an offer's bonus hook): reused if already voiced, else one short TTS call
+ * under its own Cost Governor authorization (no Creative Test is consumed: hook variants are part of the test, §5).
  */
-async function hookClip(ctx: TenantContext, variantId: string, text: string, voice: string, skuId: string, projectId: string): Promise<{ id: string; bytes: Buffer }> {
+async function hookClip(ctx: TenantContext, ref: { variantId?: string; bonusFor?: string }, text: string, voice: string, skuId: string, projectId: string): Promise<{ id: string; bytes: Buffer }> {
   const ws = ctx.workspaceId;
   const textHash = createHash('sha256').update(`${voice}\n${text}`).digest('hex');
+  const lineageKey = ref.variantId ? 'variantId' : 'bonusFor';
+  const refId = (ref.variantId ?? ref.bonusFor)!;
   const existing = await withTenant(ws, async (tx) => {
-    const [a] = await tx`select id from assets where kind = 'voiceover' and lineage->>'variantId' = ${variantId} and lineage->>'textHash' = ${textHash}
+    const [a] = await tx`select id from assets where kind = 'voiceover' and lineage->>${lineageKey} = ${refId} and lineage->>'textHash' = ${textHash}
                          order by created_at desc limit 1`;
     return a ? { id: a.id as string, bytes: await assetBytes(tx, a.id as string) } : null;
   });
   if (existing) return existing;
+  const idem = ref.variantId ? `hook-vo:${ref.variantId}:${textHash.slice(0, 16)}` : `bonus-hook-vo:${refId}:${textHash.slice(0, 16)}`;
   const auth = await withTenant(ws, async (tx) =>
-    authorizeOrTakeOver(tx, ctx, { purpose: 'creative_test', projectId, lines: [voiceLine(await productionRoutes(tx, ws), await loadRates(tx), text.length)], idempotencyKey: `hook-vo:${variantId}:${textHash.slice(0, 16)}` }, 15),
+    authorizeOrTakeOver(tx, ctx, { purpose: 'creative_test', projectId, lines: [voiceLine(await productionRoutes(tx, ws), await loadRates(tx), text.length)], idempotencyKey: idem }, 15),
   );
   try {
-    const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'variant', id: variantId }, text, voice: voice as never });
+    const subject = ref.variantId ? { type: 'variant', id: ref.variantId } : { type: 'project', id: refId };
+    const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject, text, voice: voice as never });
     return await withTenant(ws, async (tx) => {
-      const a = await saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, variantId, textHash } });
+      const a = await saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, [lineageKey]: refId, textHash } });
       await settle(tx, ctx, auth.authorizationId, 'consumed');
       return { id: a.id, bytes: vo.bytes };
     });

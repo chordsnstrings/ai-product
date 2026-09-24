@@ -14,6 +14,7 @@ import { approveForProduction } from './production';
 import { planSteps } from './progress';
 import { transition } from './projects';
 import { STORYBOARD_STEPS } from './storyboard';
+import { assertStockCleared } from './stock';
 import {
   baselineFrom,
   compareVariants,
@@ -139,6 +140,8 @@ export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId
   const projectId = v.project_id as string;
   if (e.approved_at) return { changed: false, projectId };
   if (!['DRAFT', 'RECOMMENDED', 'APPROVED'].includes(e.state as string)) throw new DomainError('CONFLICT', 'This test has already moved past approval.');
+  // §42: an out-of-stock product is flagged before production; it goes ahead once the merchant says what for.
+  await assertStockCleared(tx, e.sku_id as string);
   // With a render quote (the customer app always sends one, §38): the Cost Governor authorization is made now, in
   // this transaction, against the storyboard and rates the merchant was shown; a refusal rolls the approval back.
   if (opts.quoteId) await authorizeFromQuote(tx, ctx, experimentId, opts.quoteId);

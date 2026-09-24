@@ -106,4 +106,19 @@ describe('recovery emails (plan 04 L20)', () => {
     const sent = devOutbox.find((m) => m.template === 'new_concept');
     expect(new URL((sent!.data as { url: string }).url).pathname).toBe(`/concepts/${a.projectId}`);
   }, 60_000);
+
+  it('states the price that applies after the offer from the live offer versions, not a constant (biz-16)', async () => {
+    try {
+      await ownerPool()`insert into offer_definitions (code, type, price_micros, eligibility, version) values ('STANDALONE_35', 'STANDALONE', 35000000, '{}', 5)`;
+      const a = await abandoned();
+      await sendQueuedEmail(a.ctx, payloadFor(a, 'offer_ending'), 'job-price-1');
+      await sendQueuedEmail(a.ctx, payloadFor(a, 'storyboard_saved'), 'job-price-2');
+      const ending = devOutbox.find((m) => m.template === 'offer_ending');
+      const saved = devOutbox.find((m) => m.template === 'storyboard_saved');
+      expect(ending!.data).toMatchObject({ price: '$19', regular: '$35' });
+      expect(saved!.data).toMatchObject({ standalonePrice: '$35' });
+    } finally {
+      await ownerPool()`delete from offer_definitions where code = 'STANDALONE_35'`;
+    }
+  });
 });

@@ -209,6 +209,8 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
       images: (product.images ?? []).map((i) => i.src),
       sku: v0?.sku || undefined,
       gtin: v0?.barcode || undefined,
+      // In stock when any variant can be bought; unknown when the storefront doesn't say.
+      inStock: (product.variants ?? []).some((v) => typeof v.available === 'boolean') ? (product.variants ?? []).some((v) => v.available === true) : undefined,
       variants: (product.variants ?? []).map((v) => {
         const values = [v.option1, v.option2, v.option3];
         const options = Object.fromEntries(optionNames.map((n, i) => [n, values[i]]).filter(([n, val]) => n && val && !(n === 'Title' && val === 'Default Title'))) as Record<string, string>;

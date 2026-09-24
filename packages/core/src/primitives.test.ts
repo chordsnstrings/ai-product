@@ -101,6 +101,31 @@ describe('ledger + cost governor', () => {
     await expect(second).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
+  it('applies the Creative Test ceiling to the whole test, not each authorization (§5, biz-30)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH', state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const projectId = '00000000-0000-4000-8000-0000000b1030';
+    // ≈ $4.34 each (15 s of 720p video with its QA retry reserve): two of them exceed $8.50.
+    const video = [{ kind: 'video' as const, provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 15, resolution: '720p' as const }];
+    const run = await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'creative_test', projectId, lines: video, idempotencyKey: `produce:${projectId}` }));
+    await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'creative_test', projectId, lines: video, idempotencyKey: 'hook-extra' }))).rejects.toMatchObject({
+      code: 'GATE_BLOCKED',
+      details: expect.objectContaining({ priorMicros: expect.any(Number) }),
+    });
+    // Another test (another project) has its own ceiling.
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'creative_test', projectId: '00000000-0000-4000-8000-0000000b1031', lines: video, idempotencyKey: 'other-test' }));
+    // Settled work counts at what it actually cost.
+    await withTenant(t.workspaceId, async (tx) => {
+      await settle(tx, ctx, run.authorizationId, 'consumed');
+      await tx`update cost_authorizations set spent_micros = 1000000 where id = ${run.authorizationId}`;
+    });
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'creative_test', projectId, lines: video, idempotencyKey: 'hook-after-settle' }));
+    // A failed attempt a retry replaced (its key retired) is not part of the plan being checked.
+    await ownerPool()`update cost_authorizations set spent_micros = 8000000, idempotency_key = ${`produce:${projectId}:retired:1`} where id = ${run.authorizationId}`;
+    await ownerPool()`update cost_authorizations set status = 'released', spent_micros = 0 where idempotency_key = 'hook-after-settle'`;
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'creative_test', projectId, lines: video, idempotencyKey: `produce:${projectId}` }));
+  });
+
   it('blocks spend without entitlement and above the Creative Test ceiling', async () => {
     const t = await makeTenant();
     const ctx = ctxFor(t.workspaceId, t.userId);

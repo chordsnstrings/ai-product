@@ -74,4 +74,16 @@ describe('render estimate and quoted approval (standard §38 Production)', () =>
     expect(await reservations(x.t.workspaceId)).toBe(1);
     await expect(withTenant(x.t.workspaceId, (tx) => renderQuote(tx, x.ctx, x.experimentId))).rejects.toMatchObject({ code: 'CONFLICT' });
   }, 120_000);
+
+  it('an out-of-stock product is flagged in the estimate and approval waits for the merchant’s intent (§42)', async () => {
+    const x = await readyExperiment(1);
+    await ownerPool()`update skus set in_stock = false where workspace_id = ${x.t.workspaceId}`;
+    const q = await withTenant(x.t.workspaceId, (tx) => renderQuote(tx, x.ctx, x.experimentId));
+    expect(q.blockedReason).toMatch(/out of stock/);
+    await expect(withTenant(x.t.workspaceId, (tx) => approveExperiment(tx, x.ctx, x.experimentId, { quoteId: q.quoteId }))).rejects.toMatchObject({ code: 'CONFLICT', details: { outOfStock: true } });
+    await ownerPool()`update skus set stock_intent = 'launch' where workspace_id = ${x.t.workspaceId}`;
+    const q2 = await withTenant(x.t.workspaceId, (tx) => renderQuote(tx, x.ctx, x.experimentId));
+    expect(q2.blockedReason).toBeNull();
+    expect((await withTenant(x.t.workspaceId, (tx) => approveExperiment(tx, x.ctx, x.experimentId, { quoteId: q2.quoteId }))).changed).toBe(true);
+  }, 240_000);
 });

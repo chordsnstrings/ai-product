@@ -357,6 +357,7 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   CREDIT_GRANTED: ['ledgerEntryId'],
   CREDIT_EXPIRED: ['ledgerEntryId'],
   CREDIT_ADJUSTED: ['ledgerEntryId'],
+  PROVIDER_COST_RECORDED: ['ledgerEntryId', 'providerJobId'],
   FREE_QA_RETRY: ['ledgerEntryId', 'authorizationId', 'projectId'],
   LEARNING_CREATED: ['learningId', 'experimentId', 'skuId'],
   CONFIDENCE_CHANGED: ['experimentId', 'skuId'],

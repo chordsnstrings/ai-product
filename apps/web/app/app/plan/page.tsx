@@ -5,6 +5,7 @@ import { autoRenewText } from '@arkiv/billing';
 import { PLANS, formatUsd, type PlanCode } from '@arkiv/shared';
 import { requireUser } from '@/lib/session';
 import { userWorkspaces } from '@/lib/tenant';
+import { Banner } from '@arkiv/ui';
 import { ThemeScope } from '@arkiv/ui/client';
 import { PlanPicker } from '@/components/plan-picker';
 
@@ -27,7 +28,13 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ p
         <p className="ak-label">{w.name as string}</p>
         <h1 className="ak-h1">Choose your plan</h1>
         <p className="ak-muted">Creative Tests reset monthly. Upgrade, downgrade or cancel online anytime.</p>
-        <PlanPicker slug={w.slug as string} plans={plans} initial={initial} canBuy={['OWNER', 'ADMIN'].includes(w.role as string)} />
+        {w.state === 'PURGE_SCHEDULED' ? (
+          <Banner tone="warn">This workspace is scheduled for deletion. Cancel the deletion first (Settings → Data), then choose a plan.</Banner>
+        ) : w.state === 'SUSPENDED' || w.state === 'LOCKED' ? (
+          <Banner tone="warn">This workspace is on hold, so a plan can’t be started right now. Contact support to resolve the hold first.</Banner>
+        ) : (
+          <PlanPicker slug={w.slug as string} plans={plans} initial={initial} canBuy={['OWNER', 'ADMIN'].includes(w.role as string)} />
+        )}
       </div>
     </ThemeScope>
   );

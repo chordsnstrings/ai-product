@@ -27,7 +27,7 @@ export default async function Ledger({ searchParams }: { searchParams: Promise<S
   const d0 = await withAdmin(async (tx) => {
     await auditView(tx, s, 'ledger', { tab, days, ws: sp.ws, type: sp.type, exp: sp.exp, job: sp.job, includeTest: prefs.includeTest });
     return {
-      byModel: tab === 'cogs' ? await tx`select j.provider, j.model, j.task, count(*)::int as calls, coalesce(sum(j.actual_micros), 0)::bigint as spend, avg(j.latency_ms)::int as latency,
+      byModel: tab === 'cogs' ? await tx`select j.provider, j.model, j.task, count(*)::int as calls, coalesce(sum(j.actual_micros), 0)::bigint as spend, coalesce(sum(j.savings_micros), 0)::bigint as savings, avg(j.latency_ms)::int as latency,
                                               count(*) filter (where j.status = 'failed')::int as failed
                                        from provider_jobs j where j.created_at > now() - make_interval(days => ${days}) ${notTest(tx, prefs, 'j.workspace_id')} group by 1, 2, 3 order by spend desc` : [],
       trend: tab === 'cogs' ? await tx`
@@ -80,7 +80,7 @@ export default async function Ledger({ searchParams }: { searchParams: Promise<S
             </Section>
           </div>
           <Section title={`By provider / model / task (${days}d)`}>
-            <Table head={['Provider', 'Model', 'Task', 'Calls', 'Failed', 'Spend', 'Avg latency']} rows={d0.byModel.map((m) => [m.provider as string, <Mono key="m">{m.model as string}</Mono>, m.task as string, m.calls as number, m.failed as number, money(m.spend), m.latency ? `${m.latency}ms` : '—'])} />
+            <Table head={['Provider', 'Model', 'Task', 'Calls', 'Failed', 'Spend', 'Promo savings', 'Avg latency']} rows={d0.byModel.map((m) => [m.provider as string, <Mono key="m">{m.model as string}</Mono>, m.task as string, m.calls as number, m.failed as number, money(m.spend), Number(m.savings) ? money(m.savings) : '—', m.latency ? `${m.latency}ms` : '—'])} />
           </Section>
         </>
       ) : null}

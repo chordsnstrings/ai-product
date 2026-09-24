@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { closeAll, ownerPool, withSystem, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { usd } from '@arkiv/shared';
-import { currentQuote, evalEligibility, issueTasteOffer, validateEligibility } from './offers';
+import { currentQuote, evalEligibility, expireOffers, issueTasteOffer, publicOneOffPrices, quoteAfterOffer, validateEligibility } from './offers';
 import { ctxFor } from './testing';
 
 /** Offer definitions are reference data (not truncated between tests): every test restores the seed. */
@@ -84,5 +84,42 @@ describe('offer engine uses versioned definitions (plan 05 §6)', () => {
     expect((await withTenant(t.workspaceId, (tx) => currentQuote(tx))).kind).toBe('taste');
     await ownerPool()`update offers set expires_at = now() - interval '1 minute' where workspace_id = ${t.workspaceId}`;
     expect(await withTenant(t.workspaceId, (tx) => currentQuote(tx))).toMatchObject({ kind: 'standalone', priceMicros: usd(25), definitionCode: 'STANDALONE_25_WINBACK' });
+  });
+});
+
+describe('offer expiry (standard §7, §36)', () => {
+  it('an expired offer is marked expired once, with an OFFER_EXPIRED event for its own workspace', async () => {
+    const a = await makeTenant();
+    const b = await makeTenant();
+    for (const t of [a, b]) await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctxFor(t.workspaceId, t.userId), t.workspaceId));
+    await ownerPool()`update offers set expires_at = now() - interval '1 minute' where workspace_id = ${a.workspaceId}`;
+    expect(await withSystem((tx) => expireOffers(tx))).toBe(1);
+    expect(await withSystem((tx) => expireOffers(tx))).toBe(0);
+    const evs = await ownerPool()`select workspace_id, subject_id, payload, actor from events where type = 'OFFER_EXPIRED'`;
+    const [o] = await ownerPool()`select id from offers where workspace_id = ${a.workspaceId}`;
+    expect(evs).toHaveLength(1);
+    expect(evs[0]).toMatchObject({ workspace_id: a.workspaceId, subject_id: o!.id, payload: { code: 'TASTE_19' } });
+    // Expired offers remain expired: issuing again returns the same, expired offer.
+    const q = await withTenant(a.workspaceId, (tx) => issueTasteOffer(tx, ctxFor(a.workspaceId, a.userId), a.workspaceId));
+    expect(q).toMatchObject({ offerId: o!.id, status: 'expired' });
+  });
+});
+
+describe('stated prices come from the live offer versions (plan 04 L9, biz-16)', () => {
+  it('the public one-off prices follow a new standalone version and a paused Taste offer', async () => {
+    expect(await withSystem((tx) => publicOneOffPrices(tx))).toEqual({ standaloneMicros: usd(29), tasteMicros: usd(19), tasteWindowMinutes: 60 });
+    await define('STANDALONE_35', 'STANDALONE', 35, 9);
+    await ownerPool()`update offer_definitions set active = false where code = 'TASTE_19'`;
+    expect(await withSystem((tx) => publicOneOffPrices(tx))).toEqual({ standaloneMicros: usd(35), tasteMicros: null, tasteWindowMinutes: null });
+  });
+
+  it('the price after the offer is the next-offer version or the live standalone, even while the offer runs', async () => {
+    const t = await makeTenant();
+    await withTenant(t.workspaceId, (tx) => issueTasteOffer(tx, ctxFor(t.workspaceId, t.userId), t.workspaceId));
+    await define('STANDALONE_35', 'STANDALONE', 35, 9);
+    await withTenant(t.workspaceId, async (tx) => {
+      expect((await currentQuote(tx)).priceMicros).toBe(usd(19));
+      expect((await quoteAfterOffer(tx)).priceMicros).toBe(usd(35));
+    });
   });
 });

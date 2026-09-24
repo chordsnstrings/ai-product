@@ -7,6 +7,8 @@ import {
   append,
   approveForProduction,
   assertCan,
+  assertStockCleared,
+  billingStateChange,
   checkoutSessionExpiry,
   currentQuote,
   emit,
@@ -21,6 +23,7 @@ import {
   redeemOffer,
   transition,
   transitionWorkspace,
+  weekOf,
   type TenantContext,
 } from '@arkiv/core';
 import { randomUUID } from 'node:crypto';
@@ -66,9 +69,11 @@ async function ensureCustomer(tx: Tx, ctx: TenantContext, email: string): Promis
 export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projectId: string, user: { id: string; email: string }) {
   assertCan(ctx, 'storyboard.approve');
   if (await isFlagOn(tx, 'kill.checkout')) throw new DomainError('UNAVAILABLE', 'Checkout is paused for a few minutes for maintenance. Your storyboard is saved.');
-  const [p] = await tx`select p.state, p.storyboard_id, s.name from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
+  const [p] = await tx`select p.state, p.storyboard_id, p.sku_id, s.name from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
   if (p.state !== 'STORYBOARD_READY') throw new DomainError('CONFLICT', p.state === 'COMPLETE' || String(p.state).startsWith('REN') ? 'This ad is already in production.' : 'The storyboard isn’t ready yet.');
+  // §42: nobody pays to produce an ad for a product they can't sell until they say it's for a waitlist or launch.
+  await assertStockCleared(tx, p.sku_id as string);
   const [paid] = await tx`select id from purchases where project_id = ${projectId} and status = 'paid'`;
   if (paid) throw new DomainError('CONFLICT', 'Already paid — production is starting.');
   const quote = await currentQuote(tx);
@@ -97,8 +102,16 @@ export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projec
              on conflict (stripe_checkout_session_id) do nothing`;
   }
   await emit(tx, ctx, 'CHECKOUT_STARTED', { type: 'project', id: projectId }, { kind, priceMicros: quote.priceMicros });
-  await recordFunnel('CHECKOUT_STARTED', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind } }, tx);
+  // The offer and its experiment variant (plan 04 L22): the funnel reads each variant's checkout and paid rates.
+  await recordFunnel('CHECKOUT_STARTED', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind, ...(await offerProps(tx, ctx.workspaceId, quote.offerId, quote.definitionCode ?? null)) } }, tx);
   return { sessionId: session.id, clientSecret: session.clientSecret, url: session.url, quote };
+}
+
+/** Funnel props naming the offer (definition code) and its experiment variant, when there is an offer. */
+async function offerProps(tx: Tx, workspaceId: string, offerId: string | null, fallbackCode: string | null): Promise<Record<string, string | null>> {
+  if (!offerId) return fallbackCode ? { offer: fallbackCode } : {};
+  const [o] = await tx`select definition_code, variant, experiment_key from offers where id = ${offerId} and workspace_id = ${workspaceId}`;
+  return o ? { offer: o.definition_code as string, offerVariant: (o.variant as string | null) ?? null, offerExperiment: (o.experiment_key as string | null) ?? null } : {};
 }
 
 /**
@@ -120,6 +133,17 @@ function assertNotPendingDeletion(ctx: TenantContext) {
   if (ctx.workspaceState === 'PURGE_SCHEDULED') throw new DomainError('CONFLICT', 'This workspace is scheduled for deletion. Cancel the deletion first (Settings → Data), then choose a plan.');
 }
 
+/**
+ * A new subscription needs a workspace that can use it: not one pending deletion, and not one on a staff hold
+ * (SUSPENDED: billing paused; LOCKED: a dispute is open). Starting one there would charge monthly for a workspace
+ * that can't produce anything, and only staff lift a hold (plan 02 §2, x-sublife-12).
+ */
+function assertCanSubscribe(ctx: TenantContext) {
+  assertNotPendingDeletion(ctx);
+  if (ctx.workspaceState === 'SUSPENDED' || ctx.workspaceState === 'LOCKED')
+    throw new DomainError('CONFLICT', 'This workspace is on hold, so a plan can’t be started right now. Contact support to resolve the hold first.');
+}
+
 export async function recordAutoRenewConsent(
   tx: Tx,
   ctx: TenantContext,
@@ -127,7 +151,7 @@ export async function recordAutoRenewConsent(
 ) {
   // Consent records are append-only; never write one for someone who cannot start the subscription.
   assertCan(ctx, 'billing.manage');
-  assertNotPendingDeletion(ctx);
+  assertCanSubscribe(ctx);
   if (!input.agreed) throw new DomainError('INVALID', 'Please tick the box to agree to the recurring charge.');
   const text = autoRenewText(input.plan);
   const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)
@@ -140,7 +164,7 @@ export async function recordAutoRenewConsent(
 /** P11: subscription checkout; requires a consent record created in the same flow (plan 04 §3). */
 export async function startSubscriptionCheckout(tx: Tx, ctx: TenantContext, plan: PlanCode, consentId: string, user: { id: string; email: string }) {
   assertCan(ctx, 'billing.manage');
-  assertNotPendingDeletion(ctx);
+  assertCanSubscribe(ctx);
   if (await isFlagOn(tx, 'kill.checkout')) throw new DomainError('UNAVAILABLE', 'Checkout is paused for a few minutes for maintenance.');
   const [consent] = await tx`select id, context from consent_records where id = ${consentId} and kind = 'auto_renew' and created_at > now() - interval '30 minutes'`;
   if (!consent || (consent.context as { plan: string }).plan !== plan) throw new DomainError('INVALID', 'Please confirm the recurring charge again.');
@@ -188,14 +212,14 @@ export async function setCancellation(tx: Tx, ctx: TenantContext, cancel: boolea
     if (!other) await tx`update workspaces set plan_code = null where id = ${ctx.workspaceId}`;
     const period = periodKeyOf(s.current_period_start);
     if (period) await expirePeriod(tx, ctx, period);
-    const [w] = await tx`select state from workspaces where id = ${ctx.workspaceId}`;
-    if (['ACTIVE_PAID', 'PAST_DUE'].includes(w?.state as string)) await transitionWorkspace(tx, ctx, 'CANCELLED', 'cancelled while past due');
+    await billingStateChange(tx, ctx, 'CANCELLED', ['ACTIVE_PAID', 'PAST_DUE'], 'cancelled while past due');
     await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { immediate: true, ...why });
     await emit(tx, ctx, 'SUBSCRIPTION_ENDED', { type: 'subscription', id: s.id as string }, { plan: s.plan_code as string, stripeSubscriptionId: s.stripe_subscription_id as string, reason: 'cancelled_past_due' });
     return { endsAt: new Date().toISOString(), immediate: true };
   }
   await billingGateway().setCancelAtPeriodEnd(s.stripe_subscription_id as string, cancel);
-  await tx`update subscriptions set cancel_at_period_end = ${cancel} where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
+  // What Stripe holds as of now: a subscription event created before this change is older and never undoes it.
+  await tx`update subscriptions set cancel_at_period_end = ${cancel}, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, cancel ? { cancelAtPeriodEnd: true, ...why } : { cancelAtPeriodEnd: false });
   return { endsAt: s.current_period_end as string, immediate: false };
 }
@@ -221,7 +245,7 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   if (from === to) {
     if (!pending) return { effective: 'none' as const };
     await billingGateway().changeSubscriptionPrice(subId, priceIdFor(from) ?? `price_${from}`, false);
-    await tx`update subscriptions set pending_plan_code = null where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
+    await tx`update subscriptions set pending_plan_code = null, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
     await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from, to: from, effective: 'kept', withdrawn: pending });
     return { effective: 'kept' as const };
   }
@@ -231,7 +255,7 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
     // difference from what the customer actually pays.
     if (pending) await billingGateway().changeSubscriptionPrice(subId, priceIdFor(from) ?? `price_${from}`, false);
     await billingGateway().changeSubscriptionPrice(subId, priceIdFor(to) ?? `price_${to}`, true);
-    await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
+    await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
     await tx`update workspaces set plan_code = ${to} where id = ${ctx.workspaceId}`;
     // Pro-rata extra Creative Tests for the rest of this period (rounded up).
     const start = new Date(s.current_period_start as string).getTime();
@@ -248,7 +272,7 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   }
   if (pending === to) return { effective: 'period_end' as const, on: s.current_period_end as string };
   await billingGateway().changeSubscriptionPrice(subId, priceIdFor(to) ?? `price_${to}`, false);
-  await tx`update subscriptions set pending_plan_code = ${to} where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
+  await tx`update subscriptions set pending_plan_code = ${to}, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from, to, effective: 'period_end' });
   return { effective: 'period_end' as const, on: s.current_period_end as string };
 }
@@ -516,6 +540,8 @@ export async function processStripeEvent(eventId: string): Promise<StripeOutcome
 async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event, obj: Record<string, unknown>, staffAssigned = false): Promise<'processed'> {
   const [ws] = await tx`select state, name from workspaces where id = ${workspaceId}`;
   const ctx = sysCtx(workspaceId, ws!.state as string);
+  // Stripe's event time orders what an event may overwrite (events arrive out of order, §39).
+  const at = unix(event.created) ?? new Date();
   // Mirror first (plan 05 §7): the invoice/dispute row reflects Stripe even when the side effects below no-op.
   if (INVOICE_EVENTS.includes(event.type)) await mirrorInvoice(tx, workspaceId, event, obj as unknown as InvoiceLike);
   if (DISPUTE_EVENTS.includes(event.type)) await mirrorDispute(tx, workspaceId, event, obj as unknown as DisputeLike);
@@ -531,7 +557,7 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
       return 'processed';
     case 'customer.subscription.created':
     case 'customer.subscription.updated':
-      return upsertSubscription(tx, ctx, obj as unknown as Stripe.Subscription, staffAssigned);
+      return upsertSubscription(tx, ctx, obj as unknown as Stripe.Subscription, staffAssigned, at);
     case 'customer.subscription.deleted': {
       const sub = obj as unknown as Stripe.Subscription;
       const [before] = await tx`select id, status, cancel_at_period_end, current_period_start from subscriptions
@@ -548,7 +574,7 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
       if (period) await expirePeriod(tx, ctx, period);
       const [other] = await tx`select 1 from subscriptions where workspace_id = ${workspaceId} and id <> ${ended.id} and status in ('active','trialing','past_due')`;
       if (!other) await tx`update workspaces set plan_code = null where id = ${workspaceId}`;
-      if (!other && ['ACTIVE_PAID', 'PAST_DUE'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'CANCELLED', 'subscription ended');
+      if (!other) await billingStateChange(tx, ctx, 'CANCELLED', ['ACTIVE_PAID', 'PAST_DUE'], 'subscription ended');
       // A cancel the customer asked for was confirmed when they asked (the cancel flow's email); a plan that ended
       // because payment failed gets its own notice; one ended in Stripe by staff gets the cancellation email.
       if (before?.status === 'past_due' || endReason === 'payment_failed') {
@@ -559,17 +585,26 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
       return 'processed';
     }
     case 'invoice.paid':
-      return onInvoicePaid(tx, ctx, obj as unknown as Stripe.Invoice);
+      return onInvoicePaid(tx, ctx, obj as unknown as Stripe.Invoice, at);
     case 'invoice.payment_failed': {
-      if (ws!.state === 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'PAST_DUE', 'invoice payment failed');
+      const inv = obj as { id: string; attempt_count?: number | null; next_payment_attempt?: number | null };
+      // A late failure event changes nothing once the invoice is paid (the mirror above kept it paid), nor once a
+      // newer event set the plan's status (a recovered payment), nor for a plan that already ended (§39).
+      const [mirrored] = await tx`select status from stripe_invoices where id = ${inv.id} and workspace_id = ${workspaceId}`;
+      if (mirrored?.status === 'paid') return 'processed';
+      const subId = subscriptionIdOf(obj as never);
+      const [s] = subId ? await tx`select id, status, status_event_at from subscriptions where stripe_subscription_id = ${subId} and workspace_id = ${workspaceId} for update` : [];
+      if (s && (s.status === 'canceled' || (s.status_event_at && at < new Date(s.status_event_at as string)))) return 'processed';
+      await billingStateChange(tx, ctx, 'PAST_DUE', ['ACTIVE_PAID'], 'invoice payment failed');
       // Dunning view (plan 05 §7 "retry schedule"): Stripe's attempt count and next retry (null = no more retries).
       // A late, older event (lower attempt count) never overwrites a newer schedule.
-      const inv = obj as { attempt_count?: number | null; next_payment_attempt?: number | null };
       const attempt = Math.max(1, Number(inv.attempt_count ?? 1));
-      await tx`update subscriptions set status = 'past_due',
-                 next_payment_attempt = case when ${attempt} >= payment_attempt_count then ${unix(inv.next_payment_attempt)} else next_payment_attempt end,
-                 payment_attempt_count = greatest(payment_attempt_count, ${attempt})
-               where stripe_subscription_id = ${subscriptionIdOf(obj as never)} and workspace_id = ${workspaceId}`;
+      if (s) {
+        await tx`update subscriptions set status = 'past_due', status_event_at = ${at},
+                   next_payment_attempt = case when ${attempt} >= payment_attempt_count then ${unix(inv.next_payment_attempt)} else next_payment_attempt end,
+                   payment_attempt_count = greatest(payment_attempt_count, ${attempt})
+                 where id = ${s.id} and workspace_id = ${workspaceId}`;
+      }
       await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'payment_failed' }, { singletonKey: `payfail:${event.id}` });
       return 'processed';
     }
@@ -663,7 +698,7 @@ async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkou
   const projectId = pu.project_id as string;
   await append(tx, ctx, { type: 'CREDIT_GRANTED', unit, amount: 1, projectId, reference: cs.id, idempotencyKey: `pay:${cs.id}` });
   if (pu.offer_id) await redeemOffer(tx, ctx, pu.offer_id as string);
-  if (ctx.workspaceState === 'ACTIVE_FREE') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'one-off purchase');
+  await billingStateChange(tx, ctx, 'ACTIVE_PAID', ['ACTIVE_FREE'], 'one-off purchase');
   const paidCtx = { ...ctx, workspaceState: 'ACTIVE_PAID' as const };
   // Production starts on the storyboard this payment was for (plan 02 M9). A paid order is never left failed:
   // if that storyboard can no longer be produced, the credit stays with the project and staff are alerted.
@@ -679,7 +714,7 @@ async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkou
     });
   }
   await emit(tx, ctx, 'TASTE_PAID', { type: 'project', id: projectId }, { kind: unit, amountMicros: Number(pu.amount_micros) });
-  await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind: unit } }, tx);
+  await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind: unit, ...(await offerProps(tx, ctx.workspaceId, (pu.offer_id as string | null) ?? null, null)) } }, tx);
   await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'receipt', purchaseId: pu.id }, { singletonKey: `receipt:${pu.id}` });
   return 'processed';
 }
@@ -722,22 +757,28 @@ async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Che
            on conflict (stripe_subscription_id) do update set plan_code = excluded.plan_code, consent_record_id = excluded.consent_record_id
            returning id`;
   await tx`update workspaces set plan_code = ${plan} where id = ${ctx.workspaceId}`;
-  if (ctx.workspaceState !== 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'subscription started');
+  // A workspace on a staff hold keeps it (the plan applies once staff lift it); one pending deletion leaves it.
+  await billingStateChange(tx, ctx, 'ACTIVE_PAID', ['ACTIVE_FREE', 'CANCELLED', 'PAST_DUE', 'PURGE_SCHEDULED'], 'subscription started');
   await emit(tx, ctx, 'SUBSCRIPTION_STARTED', { type: 'subscription', id: subRow!.id as string }, { plan, stripeSubscriptionId: subId });
   await recordFunnel('SUBSCRIPTION_STARTED', { workspaceId: ctx.workspaceId, visitorId: await workspaceVisitor(tx, ctx.workspaceId), props: { plan } }, tx);
   await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'subscription_started', plan }, { singletonKey: `sub-started:${subId}` });
+  // The first recommended experiments arrive now (standard §9 "Day 1-2"), not on the next Monday; the key is the
+  // weekly run's, so a Monday subscriber gets one run for the week.
+  const week = weekOf();
+  await enqueue(tx, ctx.workspaceId, Queues.weeklyRecommendations, { week }, { singletonKey: `recs:${ctx.workspaceId}:${week}` });
   return 'processed';
 }
 
 const LIVE_SUB_STATUSES = ['active', 'trialing', 'past_due'];
 
-async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscription, staffAssigned: boolean): Promise<'processed'> {
+async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscription, staffAssigned: boolean, at: Date): Promise<'processed'> {
   const item = sub.items?.data?.[0];
   // The Price identifies the plan.
   const pricedPlan = (Object.keys(PLANS) as PlanCode[]).find((p) => priceIdFor(p) && priceIdFor(p) === item?.price?.id) ?? null;
   const periodStart = (item as unknown as { current_period_start?: number })?.current_period_start ?? (sub as unknown as { current_period_start?: number }).current_period_start;
   const periodEnd = (item as unknown as { current_period_end?: number })?.current_period_end ?? (sub as unknown as { current_period_end?: number }).current_period_end;
-  const [existing] = await tx`select id, plan_code, pending_plan_code from subscriptions where stripe_subscription_id = ${sub.id} and workspace_id = ${ctx.workspaceId} for update`;
+  const [existing] = await tx`select id, status, plan_code, pending_plan_code, stripe_event_at, status_event_at from subscriptions
+                              where stripe_subscription_id = ${sub.id} and workspace_id = ${ctx.workspaceId} for update`;
   if (!existing) {
     // Created by our checkout: the checkout handler creates the row with its consent record.
     if (sub.metadata?.consent_record_id) return 'processed';
@@ -745,23 +786,33 @@ async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscr
     // unmatched queue). Its plan comes from the Price (checkout-less metadata as a fallback).
     const plan = pricedPlan ?? (PLANS[sub.metadata?.plan as PlanCode] ? (sub.metadata!.plan as PlanCode) : null);
     if (!plan || !LIVE_SUB_STATUSES.includes(sub.status) || (sub.metadata?.workspace_id !== ctx.workspaceId && !staffAssigned)) return 'processed';
-    const [row] = await tx`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id, source, cancel_at_period_end, current_period_start, current_period_end)
+    const [row] = await tx`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id, source, cancel_at_period_end, current_period_start, current_period_end,
+                                                      stripe_event_at, status_event_at)
                            values (${ctx.workspaceId}, ${sub.id}, ${plan}, ${sub.status}, null, 'stripe', ${!!sub.cancel_at_period_end},
-                                   coalesce(to_timestamp(${periodStart ?? null}), now()), coalesce(to_timestamp(${periodEnd ?? null}), now() + interval '1 month'))
+                                   coalesce(to_timestamp(${periodStart ?? null}), now()), coalesce(to_timestamp(${periodEnd ?? null}), now() + interval '1 month'), ${at}, ${at})
                            on conflict (stripe_subscription_id) do nothing returning id`;
     if (!row) return 'processed';
     await tx`update workspaces set plan_code = ${plan} where id = ${ctx.workspaceId}`;
-    if (sub.status !== 'past_due' && ['ACTIVE_FREE', 'CANCELLED', 'PURGE_SCHEDULED'].includes(ctx.workspaceState)) await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'subscription created in Stripe');
+    if (sub.status !== 'past_due') await billingStateChange(tx, ctx, 'ACTIVE_PAID', ['ACTIVE_FREE', 'CANCELLED', 'PURGE_SCHEDULED'], 'subscription created in Stripe');
     await emit(tx, ctx, 'SUBSCRIPTION_STARTED', { type: 'subscription', id: row.id as string }, { plan, stripeSubscriptionId: sub.id, source: 'stripe' });
     return 'processed';
   }
+  // Ordering (§35, §39): an event older than the one (or the change made here) that last set this row is stale —
+  // e.g. a cancel delivered after the un-cancel that followed it — and changes nothing.
+  if (existing.stripe_event_at && at < new Date(existing.stripe_event_at as string)) return 'processed';
+  // The status a newer invoice event set stands (a renewal's "active" delivered after its payment failed doesn't
+  // recover the plan), and an ended subscription never comes back: Stripe never revives a canceled one.
+  const statusStale = existing.status === 'canceled' || (!!existing.status_event_at && at < new Date(existing.status_event_at as string));
+  const status = statusStale ? (existing.status as string) : sub.status;
   // Our own scheduled downgrade already switched the Stripe price; the plan changes when that period starts.
   const applied = pricedPlan && pricedPlan !== existing.plan_code && pricedPlan !== existing.pending_plan_code ? pricedPlan : null;
-  await tx`update subscriptions set status = ${sub.status}, cancel_at_period_end = ${sub.cancel_at_period_end},
+  await tx`update subscriptions set status = ${status}, cancel_at_period_end = ${sub.cancel_at_period_end},
              plan_code = coalesce(${applied}, plan_code),
              pending_plan_code = case when ${applied}::text is null then pending_plan_code else null end,
              current_period_start = coalesce(to_timestamp(${periodStart ?? null}), current_period_start),
-             current_period_end = coalesce(to_timestamp(${periodEnd ?? null}), current_period_end)
+             current_period_end = coalesce(to_timestamp(${periodEnd ?? null}), current_period_end),
+             stripe_event_at = ${at},
+             status_event_at = case when ${statusStale} then status_event_at else ${at}::timestamptz end
            where id = ${existing.id}`;
   if (applied) {
     // A plan change made in Stripe itself (dashboard, portal) is an MRR movement like one made here, and every
@@ -769,7 +820,7 @@ async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscr
     await tx`update workspaces set plan_code = ${applied} where id = ${ctx.workspaceId} and plan_code is distinct from ${applied}`;
     await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: existing.id as string }, { from: existing.plan_code as string, to: applied, effective: 'now', source: 'stripe' });
   }
-  if (sub.status === 'active' && ctx.workspaceState === 'PAST_DUE') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'payment recovered');
+  if (!statusStale && sub.status === 'active') await billingStateChange(tx, ctx, 'ACTIVE_PAID', ['PAST_DUE'], 'payment recovered');
   return 'processed';
 }
 
@@ -781,18 +832,27 @@ const PERIOD_INVOICE_REASONS = new Set(['subscription_create', 'subscription_cyc
  * the subscription row and the entitlement lock; the periods to expire come from the ledger itself, not from the
  * subscription row a customer.subscription.updated may already have moved on (x-races-08).
  */
-async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice): Promise<'processed'> {
+async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice, at: Date): Promise<'processed'> {
   const subId = subscriptionIdOf(inv as never);
   if (!subId) return 'processed';
   const [s] = await tx`select * from subscriptions where stripe_subscription_id = ${subId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!s) throw new DomainError('NOT_FOUND', 'subscription row not committed yet');
   const reason = (inv as unknown as { billing_reason?: string | null }).billing_reason ?? null;
+  if (s.status === 'canceled') {
+    // The plan already ended (dunning over, or cancelled) and its last open invoice was paid later through the
+    // hosted invoice link: the debt is settled (mirrored above), but Stripe never renews a canceled subscription,
+    // so it stays ended — no new period, no Creative Tests, no reactivation (x-sublife-07).
+    await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { invoicePaidAfterEnd: inv.id, stripeSubscriptionId: subId });
+    return 'processed';
+  }
+  // A newer event already set the plan's status (e.g. the next renewal failed): this older payment doesn't undo it.
+  const fresh = !s.status_event_at || at >= new Date(s.status_event_at as string);
   const recover = async () => {
-    if (ctx.workspaceState === 'PAST_DUE' || ctx.workspaceState === 'ACTIVE_FREE' || ctx.workspaceState === 'CANCELLED') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'invoice paid');
+    if (fresh) await billingStateChange(tx, ctx, 'ACTIVE_PAID', ['PAST_DUE', 'ACTIVE_FREE', 'CANCELLED'], 'invoice paid');
   };
   if (reason && !PERIOD_INVOICE_REASONS.has(reason)) {
     // A proration (upgrade) or manual invoice: paid, so the plan is in good standing, but no new period.
-    if (s.status === 'past_due') await tx`update subscriptions set status = 'active', next_payment_attempt = null, payment_attempt_count = 0 where id = ${s.id}`;
+    if (s.status === 'past_due' && fresh) await tx`update subscriptions set status = 'active', status_event_at = ${at}, next_payment_attempt = null, payment_attempt_count = 0 where id = ${s.id}`;
     await recover();
     return 'processed';
   }
@@ -819,7 +879,10 @@ async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice): P
   const earlier = await tx`select distinct period_key from ledger_entries where workspace_id = ${ctx.workspaceId} and unit = 'creative_test'
                              and period_key is not null and period_key < ${periodKey} order by period_key`;
   for (const e of earlier) await expirePeriod(tx, ctx, e.period_key as string);
-  await tx`update subscriptions set status = 'active', current_period_start = ${start}, current_period_end = ${end}, next_payment_attempt = null, payment_attempt_count = 0 where id = ${s.id}`;
+  if (fresh) {
+    await tx`update subscriptions set status = 'active', status_event_at = ${at}, current_period_start = ${start}, current_period_end = ${end},
+               next_payment_attempt = null, payment_attempt_count = 0 where id = ${s.id}`;
+  }
   const [granted] = await tx`select 1 from ledger_entries where workspace_id = ${ctx.workspaceId} and unit = 'creative_test' and type = 'CREDIT_GRANTED'
                                and period_key = ${periodKey} and idempotency_key like 'grant:%' limit 1`;
   if (!granted) {

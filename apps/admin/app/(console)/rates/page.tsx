@@ -38,7 +38,7 @@ export default async function Rates() {
     }),
   );
   return (
-    <Page title="Provider rate tables" sub={<>Standard 15s Creative Test estimate at the rates in effect: <strong>{money(current)}</strong> (ceiling {money(currentViability.ceilingMicros)}). Discounts are recorded as savings in notes, not as the rate.</>}>
+    <Page title="Provider rate tables" sub={<>Standard 15s Creative Test estimate at the rates in effect: <strong>{money(current)}</strong> (ceiling {money(currentViability.ceilingMicros)}). A promotional package is never the rate: set <Mono>promo_paid_ppm</Mono> (share of list actually paid, per million) and realized cost drops while estimates stay at list; the difference is reported as savings under Ledger → COGS.</>}>
       {currentViability.alert ? <p className="ak-banner ak-banner--risk" role="alert">{currentViability.alert}</p> : null}
       <Table head={['Provider', 'Model', 'Version', 'Unit', 'Rates', 'Status', 'Effective', 'Created by', 'Approved by']} rows={rows.map((r) => [
         r.provider as string, <Mono key="m">{r.model as string}</Mono>, `v${r.version}`, r.unit as string, <Mono key="r">{JSON.stringify(r.rates)}</Mono>, status(r), dt(r.effective_from), (r.creator as string) ?? 'seed', (r.approver as string) ?? '—',

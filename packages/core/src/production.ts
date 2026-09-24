@@ -31,6 +31,7 @@ import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
 import { factsForStatements, mapStatements, statementCheck } from './statements';
 import { factTokens } from './recompose';
+import { bonusHookDue } from './offers';
 
 export const PRODUCTION_STEPS = [
   { key: 'prepare', label: 'Preparing your product' },
@@ -1147,6 +1148,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         }
         await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
         if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
+        // A one-off ad whose offer promised an alternate opening hook (§7 bonus entitlements) gets it the same way.
+        else if (await bonusHookDue(tx, projectId)) await enqueue(tx, ws, Queues.hookVariants, { projectId, bonus: true }, { singletonKey: `bonus-hook:${projectId}` });
       });
     });
     const [final] = await withTenant(ws, (tx) => tx`select state from projects where id = ${projectId}`);

@@ -2,7 +2,7 @@ import type { Tx } from '@arkiv/db';
 import { DomainError, OFFER_RULES, PRICES, type Micros, type OfferType } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { emit } from './events';
-import { assignVariantOrNull } from './flags';
+import { assignVariantOrNull, isFlagOn } from './flags';
 
 /**
  * Offer Engine (standard §5, §7; plan 04 L8–L10; plan 05 §6). Deterministic and experimentable — never
@@ -198,11 +198,14 @@ export async function issueTasteOffer(tx: Tx, ctx: TenantContext, projectId: str
     window = v.windowMinutes ?? window;
     price = v.priceMicros ?? price;
   }
+  // The bonus shown is the bonus delivered: an alternate hook only where its rollout flag is on for the workspace.
+  const bonus = { ...((def.bonus as Record<string, unknown>) ?? {}) };
+  if (bonusHooks(bonus) && !(await isFlagOn(tx, 'offer.taste_bonus_hook', ctx.workspaceId))) delete bonus.alternateHook;
   const [o] = await tx`
     insert into offers (workspace_id, definition_code, type, project_id, price_micros, reference_price_micros, starts_at,
       expires_at, bonus, variant, experiment_key)
     values (${ctx.workspaceId}, ${code}, 'TASTE', ${projectId}, ${price}, ${ref}, now(),
-      now() + make_interval(mins => ${window}), ${tx.json(def.bonus as never)}, ${variant}, ${variant ? exp!.key : null})
+      now() + make_interval(mins => ${window}), ${tx.json(bonus as never)}, ${variant}, ${variant ? exp!.key : null})
     on conflict do nothing
     returning *`;
   const offer = o ?? (await tx`select * from offers where type = 'TASTE'`)[0];
@@ -264,6 +267,18 @@ export async function currentQuote(tx: Tx): Promise<PriceQuote> {
   if (o) {
     const q = await quoteFromOffer(tx, o);
     if (q.status === 'active' && o.status === 'active') return q;
+  }
+  return quoteAfterOffer(tx);
+}
+
+/**
+ * The price this workspace pays once its Taste offer (if any) is over: what its next-eligible-offer policy names,
+ * else the live standalone version. It is what "after that" and "regular" copy must state (plan 04 L9: an anchor
+ * references a live, purchasable price, never a constant).
+ */
+export async function quoteAfterOffer(tx: Tx): Promise<PriceQuote> {
+  const [o] = await tx`select definition_code from offers where type = 'TASTE'`;
+  if (o) {
     const def = await definition(tx, o.definition_code as string);
     const next = (def?.next_offer_policy as { next?: string } | null)?.next;
     if (next) {
@@ -274,17 +289,74 @@ export async function currentQuote(tx: Tx): Promise<PriceQuote> {
   return standaloneQuote(tx);
 }
 
+/** Facts of a first-time visitor (no workspace yet): what the public pricing page quotes. */
+const VISITOR_FACTS: OfferFacts = { never_purchased: true, new_workspace: true, workspace_age_days: 0, state: 'ACTIVE_FREE', plan: null, source_page: null };
+
+/**
+ * The one-off prices a first-time visitor can actually buy today, from the live offer definitions (plan 04 L9, §3):
+ * the standalone price, and the intro Taste price and window when a Taste version is live (null otherwise).
+ */
+export async function publicOneOffPrices(tx: Tx): Promise<{ standaloneMicros: Micros; tasteMicros: Micros | null; tasteWindowMinutes: number | null }> {
+  const standalone = await standaloneQuote(tx, VISITOR_FACTS);
+  const taste = await resolveDefinition(tx, 'TASTE', VISITOR_FACTS);
+  return {
+    standaloneMicros: standalone.priceMicros,
+    tasteMicros: taste ? Number(taste.price_micros) : null,
+    tasteWindowMinutes: taste ? Number(taste.window_minutes ?? OFFER_RULES.TASTE_WINDOW_MINUTES) : null,
+  };
+}
+
 /** Mark the Taste offer redeemed once payment is confirmed. */
 export async function redeemOffer(tx: Tx, ctx: TenantContext, offerId: string) {
   const [o] = await tx`update offers set status = 'redeemed' where id = ${offerId} and status in ('active','expired') returning id`;
   if (o) await emit(tx, ctx, 'OFFER_REDEEMED', { type: 'offer', id: offerId }, {});
 }
 
-/** Sweep: flip expired offers (display is already time-based; this keeps the table truthful). */
+/**
+ * Sweep: flip expired offers (display is already time-based; this keeps the table truthful) and record each one as
+ * OFFER_EXPIRED (§36, Appendix B), for the tenant it belongs to. Expired offers remain expired (§7).
+ */
 export async function expireOffers(tx: Tx): Promise<number> {
   const r = await tx`update offers set status = 'expired' where status = 'active' and expires_at is not null
-                     and expires_at <= now() returning id, workspace_id`;
+                     and expires_at <= now() returning id, workspace_id, definition_code, variant, expires_at, project_id`;
+  for (const o of r) {
+    await emit(
+      tx,
+      { workspaceId: o.workspace_id as string, actor: { kind: 'system', id: 'sweep-offers' } },
+      'OFFER_EXPIRED',
+      { type: 'offer', id: o.id as string },
+      { code: o.definition_code as string, variant: (o.variant as string | null) ?? null, expiresAt: o.expires_at },
+      { projectId: (o.project_id as string | null) ?? null },
+    );
+  }
   return r.count;
+}
+
+// ───────────── Bonus entitlements (standard §7: every offer has bonus entitlements; §8 alternate opening hook) ─────────────
+
+/** How many alternate opening hooks an offer's bonus grants (the only bonus the engine delivers; at most one). */
+export function bonusHooks(bonus: unknown): number {
+  const n = Number((bonus as { alternateHook?: unknown } | null)?.alternateHook ?? 0);
+  return Number.isFinite(n) && n >= 1 ? 1 : 0;
+}
+
+/** Bonus entitlements the engine can deliver; staff can't save a bonus nothing would honour. */
+export function validateOfferBonus(bonus: Record<string, unknown>, type: OfferType): void {
+  for (const [k, v] of Object.entries(bonus)) {
+    if (k !== 'alternateHook') throw new DomainError('INVALID', `Unknown bonus “${k}”. The engine delivers: alternateHook (1 = one alternate opening hook).`);
+    if (v !== 0 && v !== 1) throw new DomainError('INVALID', 'alternateHook is 0 or 1 (one alternate opening hook, the low-COGS bonus).');
+    // Issued offers carry their bonus to the purchase; only the Taste offer is issued per workspace.
+    if (v === 1 && type !== 'TASTE') throw new DomainError('INVALID', 'An alternate hook is a bonus of the Taste offer.');
+  }
+}
+
+/** Does this finished one-off ad still owe its offer's bonus alternate hook? */
+export async function bonusHookDue(tx: Tx, projectId: string): Promise<boolean> {
+  const [r] = await tx`select o.bonus, p.bonus_hook_creative_id, p.bonus_hook_failed_at from projects p
+                       join purchases pu on pu.project_id = p.id and pu.workspace_id = p.workspace_id and pu.status = 'paid'
+                       join offers o on o.id = pu.offer_id and o.workspace_id = pu.workspace_id
+                       where p.id = ${projectId} and p.experiment_id is null limit 1`;
+  return !!r && !r.bonus_hook_creative_id && !r.bonus_hook_failed_at && bonusHooks(r.bonus) > 0;
 }
 
 /** Stripe Checkout session expiry (plan 02 B5): Stripe's minimum is 30 min; the offer itself is never extended. */

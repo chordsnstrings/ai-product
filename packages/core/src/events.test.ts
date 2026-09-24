@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { EVENT_REF_KEYS, EVENT_REQUIRED_REFS, EVENT_SUBJECT, EventType, SUBJECT_REF } from '@arkiv/shared';
-import { authorize, settle } from './cost-governor';
+import { authorize, recordProviderCost, settle } from './cost-governor';
 import { emit, eventsFor } from './events';
 import { append } from './ledger';
 import { confirmFact, decideFact, recordFacts } from './product-truth';
@@ -54,6 +54,23 @@ describe('event envelope (standard §36: actor, timestamp, tenant, object IDs, s
     await withTenant(t.workspaceId, (tx) => confirmFact(tx, ctx, observed!.fact as string));
     const [confirmed] = await ownerPool()`select payload from events where type = 'PRODUCT_FACT_CHANGED' and payload->>'confirmed' = 'true'`;
     expect(confirmed!.payload).toMatchObject({ factId: observed!.fact, value: { text: '30 ml' } });
+    expect(await eventContractProblems(t.workspaceId)).toEqual([]);
+  });
+
+  it('a recorded provider cost is an event too, about its provider job (arch-06)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH', state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
+    const jobId = '00000000-0000-4000-8000-00000000c057';
+    await withTenant(t.workspaceId, async (tx) => {
+      await recordProviderCost(tx, ctx, jobId, 1_250_000, null, null);
+      await recordProviderCost(tx, ctx, jobId, 1_250_000, null, null); // idempotent: one entry, one event
+    });
+    const rows = await ownerPool()`select e.subject_type, e.subject_id, e.payload, e.refs, e.schema_version, e.actor, l.id as ledger_id
+                                   from events e join ledger_entries l on l.id::text = e.refs->>'ledgerEntryId'
+                                   where e.workspace_id = ${t.workspaceId} and e.type = 'PROVIDER_COST_RECORDED'`;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ subject_type: 'provider_job', subject_id: jobId, schema_version: 2, payload: { unit: 'usd_micros', amount: 1_250_000 } });
+    expect(rows[0]!.refs).toMatchObject({ providerJobId: jobId, ledgerEntryId: rows[0]!.ledger_id });
     expect(await eventContractProblems(t.workspaceId)).toEqual([]);
   });
 });

@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withSystem } from '@arkiv/db';
 import { truncateAll } from '@arkiv/db/testing';
 import { COST_LIMITS, newId, type StaffRole } from '@arkiv/shared';
 import { decideApproval, requestOrExecute, type Staff } from './admin';
-import { diffRates, estimate, loadRates, planMarginImpact, priceLine, RATE_TEMPLATES, RATE_UNITS, rateViability, retireSupersededRates, validateRateTable, type CostLine } from './rates';
+import { diffRates, estimate, loadRates, planMarginImpact, priceLine, promoSplit, RATE_TEMPLATES, RATE_UNITS, rateViability, retireSupersededRates, validateRateTable, type CostLine, type RateTable } from './rates';
 
 async function staff(roles: StaffRole[], name: string): Promise<Staff> {
   const id = newId();
@@ -106,5 +106,29 @@ describe('rate table publish (plan 05 §9)', () => {
     expect(e.rateVersions['minimax/speech-2.8-hd']).toBe(2);
     rates.set('byteplus/seedream-5-0-pro', { provider: 'byteplus', model: 'seedream-5-0-pro', version: 9, unit: 'per_image', rates: { input: 1 } });
     expect(() => estimate(rates, [lines[1]!])).toThrow(/can’t price a image line/);
+  });
+});
+
+describe('modality and promotions (standard §6, biz-31)', () => {
+  const seedance: RateTable = { provider: 'byteplus', model: 'dreamina-seedance-2-5', version: 1, unit: 'per_second', rates: { per_second_720p: 231333, per_second_1080p: 520500, per_million_tokens: 10_700_000, per_million_tokens_video_input: 6_400_000 } };
+  const rates = new Map([['byteplus/dreamina-seedance-2-5', seedance]]);
+  const video = (extra: Partial<Extract<CostLine, { kind: 'video' }>> = {}): CostLine => ({ kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 15, resolution: '720p', retryReserve: false, ...extra });
+
+  it('prices a request with reference video at the video-input token rate, input seconds included', () => {
+    expect(priceLine(rates, video()).micros).toBe(15 * 231333);
+    // 15 s out + 5 s of input video, at $6.40 instead of $10.70 per million tokens.
+    expect(priceLine(rates, video({ videoInputSeconds: 5 })).micros).toBe(Math.ceil((20 * 231333 * 6_400_000) / 10_700_000));
+    // Without token prices the input video is priced like output seconds, never cheaper.
+    const plain = new Map([['byteplus/dreamina-seedance-2-5', { ...seedance, rates: { per_second_720p: 231333, per_second_1080p: 520500 } }]]);
+    expect(priceLine(plain, video({ videoInputSeconds: 5 })).micros).toBe(20 * 231333);
+  });
+
+  it('splits a promotional package into realized cost and savings; no promotion, no savings', () => {
+    expect(promoSplit(rates, 'byteplus', 'dreamina-seedance-2-5', 1_000_000)).toEqual({ realizedMicros: 1_000_000, savingsMicros: 0 });
+    const promo = new Map([['byteplus/dreamina-seedance-2-5', { ...seedance, rates: { ...seedance.rates, promo_paid_ppm: 555_556 } }]]);
+    expect(promoSplit(promo, 'byteplus', 'dreamina-seedance-2-5', 1_000_000)).toEqual({ realizedMicros: 555_556, savingsMicros: 444_444 });
+    // The estimate itself stays at list.
+    expect(priceLine(promo, video()).micros).toBe(15 * 231333);
+    expect(() => validateRateTable({ provider: 'byteplus', model: 'dreamina-seedance-2-5', unit: 'per_second', rates: { ...seedance.rates, promo_paid_ppm: 1_500_000 } })).toThrow(/parts per million/);
   });
 });
