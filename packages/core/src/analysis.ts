@@ -186,7 +186,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
 
   // 2. Photos: uploaded first, then page images (downloaded into our own storage).
   await withTenant(ws, (tx) => step(tx, ws, skuId, 'photos', 'active'));
-  let photoIds = (await withTenant(ws, (tx) => tx`select id from assets where sku_id = ${skuId} and kind = 'product_photo' order by created_at`)).map((r) => r.id as string);
+  let photoIds = (await withTenant(ws, (tx) => tx`select id from assets where sku_id = ${skuId} and kind = 'product_photo' and deleted_at is null order by created_at`)).map((r) => r.id as string);
   if (photoIds.length < 3 && extracted?.images.length) {
     for (const url of extracted.images.slice(0, 3 - photoIds.length)) {
       const bytes = await fetchImage(url);

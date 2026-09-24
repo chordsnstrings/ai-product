@@ -12,6 +12,8 @@ export const metadata: Metadata = { title: 'Product · Arkiv' };
 const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', texture: 'Texture', ingredients: 'Ingredients', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
 /** Where a value that disagrees with the merchant's correction came from. */
 const SOURCE_WORDS: Record<string, string> = { shopify: 'Shopify', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label', import: 'Your import' };
+/** Files the customer uploaded (deleteAsset refuses generated work). */
+const DELETABLE_KINDS = new Set(['product_photo', 'reference_view', 'creator_footage', 'evidence_doc', 'brand_logo', 'historical_creative']);
 const TABS = ['facts', 'look', 'language', 'assets', 'history'] as const;
 
 /** A4 Product Brain: facts with provenance, visual fingerprint, customer language, assets, imported history. */
@@ -161,6 +163,9 @@ export default async function Product({ params, searchParams }: { params: Promis
             <figure key={a.id as string} className="ak-frame">
               <div className="ak-well" style={{ aspectRatio: '1' }}>{a.url ? <img src={a.url} alt={String(a.kind)} style={{ objectFit: 'contain', width: '100%', height: '100%' }} /> : <span className="ak-index">{String(a.mime)}</span>}</div>
               <figcaption className="ak-index">{String(a.kind).replace(/_/g, ' ')} · {new Date(a.created_at as string).toLocaleDateString()}</figcaption>
+              {canEdit && DELETABLE_KINDS.has(a.kind) ? (
+                <ActionButton slug={slug} action="asset-delete" variant="text" body={{ assetId: a.id }} confirm="Delete this file? It disappears from Arkiv. Evidence behind an approved claim and delivered ads are kept for our records.">Delete</ActionButton>
+              ) : null}
             </figure>
           ))}
         </div>

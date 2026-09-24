@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { globalTx } from '@arkiv/db';
-import { revokeAllSessions, revokeSession } from '@arkiv/auth';
+import { assertRecentLogin, revokeAllSessions, revokeSession } from '@arkiv/auth';
+import { deleteUser } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
 import { currentUser } from '@/lib/session';
@@ -28,6 +29,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ action: st
       const { id } = await body(req, z.object({ id: z.string().uuid() }));
       await globalTx((tx) => tx`delete from passkeys where id = ${id} and user_id = ${u.userId}`);
       return json({ ok: true });
+    }
+    case 'delete-account': {
+      // Standard §40 / plan 02 §7: type-to-confirm and a recent sign-in (M14 step-up).
+      const { confirm } = await body(req, z.object({ confirm: z.string() }));
+      if (confirm.trim().toLowerCase() !== u.email.toLowerCase()) throw new DomainError('INVALID', 'Type your email address to confirm.');
+      assertRecentLogin(u);
+      await deleteUser(u.userId, { by: 'self' });
+      return json({ ok: true, next: '/' });
     }
     default:
       throw new DomainError('NOT_FOUND', 'Unknown action');

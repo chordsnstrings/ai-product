@@ -10,6 +10,7 @@ import {
   changeRole,
   createExperiment,
   decideFact,
+  deleteAsset,
   disconnectIntegration,
   EVIDENCE_APPLICABILITY,
   dismissNotice,
@@ -167,6 +168,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const n = i.key.includes('price') ? Number(i.value.replace(/[^0-9.]/g, '')) : null;
       await t((tx) => decideFact(tx, ctx, i.skuId, i.key, n != null && n > 0 ? { number: n } : { text: i.value }));
       return json({ ok: true });
+    }
+    case 'asset-delete': {
+      const i = await body(req, z.object({ assetId: uuid }));
+      return json({ ok: true, ...(await t((tx) => deleteAsset(tx, ctx, i.assetId))) });
     }
     case 'fact-accept-source': {
       // "Use the store's value": a source reading that changed after the merchant's decision becomes the truth again.

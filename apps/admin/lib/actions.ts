@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
 import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
+  deleteUser,
   actOnBehalf,
   addTenantNote,
   approveClaim,
@@ -912,6 +913,26 @@ export const ACTIONS = {
 
   /* ── Privacy ── */
   'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(DataRequestKind), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
+  // Plan 02 §7 "Delete user" for a delete_user request: the requester's account leaves every workspace and is
+  // anonymised; refused (with the workspaces named) while they are the last Owner of a live workspace.
+  'privacy.delete_user': a({
+    perm: 'privacy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, reason }),
+    run: async (s, i) => {
+      const [r] = await withAdmin((tx) => tx`select kind, status, requester_email from data_requests where id = ${i.id}`);
+      if (!r) throw new DomainError('NOT_FOUND', 'Request not found');
+      if (r.kind !== 'delete_user' || !['open', 'in_progress'].includes(r.status as string)) throw new DomainError('CONFLICT', 'Only an open account-deletion request can be carried out.');
+      const [u] = await withAdmin((tx) => tx`select id from users where email = ${r.requester_email as string} and deleted_at is null`);
+      const done = u ? await deleteUser(u.id as string, { by: 'staff' }) : { workspaces: 0 };
+      await withAdmin(async (tx) => {
+        const note = u ? `Account deleted (${done.workspaces} workspace memberships removed).` : 'No account with this email.';
+        await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${note}) where id = ${i.id}`;
+        await audit(tx, s, 'privacy.delete_user', { type: 'data_request', id: i.id }, { reason: i.reason, after: { userId: (u?.id as string) ?? null, ...done } });
+      });
+      return { message: u ? 'Account deleted.' : 'No account with this email — request completed.' };
+    },
+  }),
   'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status, notes, workspace_id from data_requests where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Request not found'); await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, before: { status: b.status, notes: b.notes }, after: { status: i.status, notes: i.notes ?? b.notes } }); }) }),
   'privacy.erase_reviews': a({
     perm: 'privacy.manage',

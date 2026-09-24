@@ -99,6 +99,8 @@ export const EventType = [
   'TASTE_DELIVERED',
   'ASSET_WATCHED',
   'ASSET_EXPORTED',
+  // Standard §40: a customer deleted an uploaded file (bytes purged unless retained for evidence/delivery).
+  'ASSET_DELETED',
   // Standard §7 "Ad account connected — Meta/TikTok connection rate".
   'AD_ACCOUNT_CONNECTED',
   'SUBSCRIPTION_STARTED',
@@ -311,6 +313,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   TASTE_DELIVERED: 'project',
   ASSET_WATCHED: 'asset',
   ASSET_EXPORTED: 'asset',
+  ASSET_DELETED: 'asset',
   AD_ACCOUNT_CONNECTED: 'integration',
   SUBSCRIPTION_STARTED: 'subscription',
 };
