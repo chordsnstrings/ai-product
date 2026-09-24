@@ -1,5 +1,5 @@
 import { withAdmin, type Tx } from '@arkiv/db';
-import { DomainError, newId, PLANS, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type Role, type StaffRole, type WorkspaceState } from '@arkiv/shared';
+import { DomainError, newId, PLANS, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type StaffRole, type WorkspaceState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { emit } from './events';

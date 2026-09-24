@@ -90,6 +90,13 @@ describe('Transfer SKU to workspace (plan 05 §2.3)', () => {
 
     const ev2 = await ownerPool()`select workspace_id, payload->>'direction' as dir from events where type = 'SKU_TRANSFERRED' order by dir`;
     expect(ev2).toEqual([{ workspace_id: to.workspaceId, dir: 'in' }, { workspace_id: from.workspaceId, dir: 'out' }]);
+    // Neither tenant's event names the other tenant's workspace or rows.
+    const [outEv] = await ownerPool()`select payload from events where type = 'SKU_TRANSFERRED' and workspace_id = ${from.workspaceId}`;
+    const [inEv] = await ownerPool()`select payload from events where type = 'SKU_TRANSFERRED' and workspace_id = ${to.workspaceId}`;
+    expect(JSON.stringify(outEv!.payload)).not.toContain(to.workspaceId);
+    expect(JSON.stringify(outEv!.payload)).not.toContain(newSku);
+    expect(JSON.stringify(inEv!.payload)).not.toContain(from.workspaceId);
+    expect(JSON.stringify(inEv!.payload)).not.toContain(src.sku);
     const audits = await ownerPool()`select action, workspace_id from admin_audit_log where action like 'tenant.sku_transfer%' order by id`;
     expect(audits.map((a) => a.action)).toEqual(['tenant.sku_transfer_requested', 'tenant.sku_transfer_requested', 'tenant.sku_transfer_completed', 'tenant.sku_transfer_completed']);
     expect(new Set(audits.map((a) => a.workspace_id))).toEqual(new Set([from.workspaceId, to.workspaceId]));

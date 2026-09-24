@@ -548,20 +548,24 @@ async function Integrations({ id, canManage }: { id: string; canManage: boolean 
 }
 
 async function Emails({ id, pii, canUnsuppress, canResend }: { id: string; pii: PiiView; canUnsuppress: boolean; canResend: boolean }) {
-  const rows = await withAdmin((tx) => tx`select l.id, l.to_email, l.template, l.stream, l.status, l.created_at, l.data is not null as has_data,
+  const rows = await withAdmin((tx) => tx`select l.id, l.workspace_id, l.to_email, l.template, l.stream, l.status, l.created_at, l.data is not null as has_data,
       (select reason from email_suppressions s where s.email = l.to_email) as suppressed
     from email_log l where l.workspace_id = ${id} or l.to_email in (select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${id}) order by l.created_at desc limit 100`);
   // The unsuppress button carries a hash of the address, never the address itself (masked views stay masked);
-  // resend and the rendered view carry the log id.
+  // resend and the rendered view carry the log id. Mail a member got from another workspace is listed, but is
+  // viewed and resent from that workspace.
   return (
-    <Table head={['When', 'To', 'Template', 'Stream', 'Status', '']} rows={rows.map((r) => [
-      <Link key="w" href={`/tenants/${id}/emails/${r.id as string}`}>{dt(r.created_at)}</Link>,
+    <Table head={['When', 'To', 'Template', 'Stream', 'Status', '']} rows={rows.map((r) => {
+      const ours = !r.workspace_id || r.workspace_id === id;
+      return [
+      ours ? <Link key="w" href={`/tenants/${id}/emails/${r.id as string}`}>{dt(r.created_at)}</Link> : <span key="w" title="Sent from another workspace">{dt(r.created_at)} · other workspace</span>,
       pii.email(r.to_email), r.template as string, r.stream as string, r.status as string,
       <span key="a" className="ak-row">
-        {canResend && r.has_data && canResendTemplate(r.template as string) ? <ActButton small action="email.resend" payload={{ logId: r.id, requestId: newId() }} reason="Why resend (ticket #)">Resend</ActButton> : null}
+        {ours && canResend && r.has_data && canResendTemplate(r.template as string) ? <ActButton small action="email.resend" payload={{ logId: r.id, requestId: newId() }} reason="Why resend (ticket #)">Resend</ActButton> : null}
         {r.suppressed && canUnsuppress ? <ActButton small action="email.unsuppress" payload={{ emailKey: emailKey(r.to_email as string) }} reason>Unsuppress ({r.suppressed as string})</ActButton> : r.suppressed ? `suppressed (${r.suppressed as string})` : null}
       </span>,
-    ])} empty="No emails." />
+      ];
+    })} empty="No emails." />
   );
 }
 

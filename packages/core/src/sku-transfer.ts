@@ -28,8 +28,8 @@ export async function requestSkuTransfer(s: Staff, input: { fromWorkspaceId: str
     const ws = await tx`select id, state, name from workspaces where id in ${tx([from, to])}`;
     const src = ws.find((w) => w.id === from);
     const dst = ws.find((w) => w.id === to);
-    if (!dst) throw new DomainError('NOT_FOUND', 'Target workspace not found');
-    for (const w of [src!, dst]) if (!TRANSFERABLE.has(w.state as WorkspaceState)) throw new DomainError('CONFLICT', `${w.name as string} is ${String(w.state).toLowerCase()}; transfers need two live workspaces.`);
+    if (!src || !dst) throw new DomainError('NOT_FOUND', 'Target workspace not found');
+    for (const w of [src, dst]) if (!TRANSFERABLE.has(w.state as WorkspaceState)) throw new DomainError('CONFLICT', `${w.name as string} is ${String(w.state).toLowerCase()}; transfers need two live workspaces.`);
     const [sku] = await tx`select catalogue_no, name, status from skus where id = ${skuId} and workspace_id = ${from}`;
     if (!sku) throw new DomainError('NOT_FOUND', 'SKU not found in this workspace');
     if (sku.status === 'archived') throw new DomainError('CONFLICT', 'Archived SKUs aren’t transferred.');
@@ -155,8 +155,10 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
       // The SKU leaves the source catalogue (archived, not deleted: its experiments and history stay readable).
       await tx`update skus set status = 'archived' where id = ${skuId} and workspace_id = ${from}`;
       const payload = { transferId, fromWorkspaceId: from, toWorkspaceId: to, fromSkuId: skuId, toSkuId: newSku, counts };
-      await emit(tx, { workspaceId: from, actor: { kind: 'staff', id: t.requested_by as string } }, 'SKU_TRANSFERRED', { type: 'sku', id: skuId }, { direction: 'out', ...payload });
-      await emit(tx, { workspaceId: to, actor: { kind: 'staff', id: t.requested_by as string } }, 'SKU_TRANSFERRED', { type: 'sku', id: newSku }, { direction: 'in', ...payload });
+      // Each tenant's event names only its own rows; the cross-workspace mapping lives in the staff audit log.
+      const actor = { kind: 'staff' as const, id: t.requested_by as string };
+      await emit(tx, { workspaceId: from, actor }, 'SKU_TRANSFERRED', { type: 'sku', id: skuId }, { direction: 'out', transferId, catalogueNo: Number(sku.catalogue_no), counts });
+      await emit(tx, { workspaceId: to, actor }, 'SKU_TRANSFERRED', { type: 'sku', id: newSku }, { direction: 'in', transferId, catalogueNo: Number(no!.no), counts });
       await tx`update sku_transfers set status = 'completed', new_sku_id = ${newSku}, counts = ${tx.json(counts)}, completed_at = now() where id = ${transferId}`;
       for (const w of [from, to]) {
         await tx`insert into admin_audit_log (staff_id, action, target_type, target_id, workspace_id, reason, after)
