@@ -201,6 +201,32 @@ describe('platform-deleted creatives (§48, edge-48-14)', () => {
   });
 });
 
+describe('creative edited in Ads Manager (§48, edge-48-15)', () => {
+  it('a sync that sees another creative on a test ad forks a new variant', async () => {
+    const { t, ctx } = await paid();
+    const id = await integration(t.workspaceId, 'meta', 'act_1');
+    const [sku] = await ownerPool()`insert into skus (workspace_id, catalogue_no, name, status) values (${t.workspaceId}, 1, 'Dew', 'active') returning id`;
+    const [e] = await ownerPool()`insert into experiments (workspace_id, sku_id, hypothesis, primary_variable, mode, state, created_by) values (${t.workspaceId}, ${sku!.id}, 'h', 'hook', 'CONTROLLED', 'GATHERING_SIGNAL', 'test') returning id`;
+    const [cr] = await ownerPool()`insert into creatives (workspace_id, sku_id, origin) values (${t.workspaceId}, ${sku!.id}, 'generated') returning id`;
+    const [v] = await ownerPool()`insert into variants (workspace_id, experiment_id, label, code, role, creative_id) values (${t.workspaceId}, ${e!.id}, 'Hook A', 'AK-001-A', 'variant', ${cr!.id}) returning id`;
+    let creative = { id: '2385', video_id: '9911' };
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.includes('/insights')) return json({ data: [{ account_id: '1', ad_id: 'ad-7', ad_name: 'Dew AK-001-A', date_start: new Date().toISOString().slice(0, 10), spend: '1', impressions: '10', clicks: '1' }] });
+      return json({ 'ad-7': { id: 'ad-7', effective_status: 'ACTIVE', creative } });
+    });
+    expect(await syncIntegration(ctx, id)).toEqual({ ok: true });
+    expect(await ownerPool()`select 1 from variants where experiment_id = ${e!.id}`).toHaveLength(1);
+    expect((await ownerPool()`select platform_refs from creatives where id = ${cr!.id}`)[0]!.platform_refs).toMatchObject({ creative_refs: { 'meta:ad-7': '2385:9911' } });
+    creative = { id: '2385', video_id: '4242' };
+    expect(await syncIntegration(ctx, id)).toEqual({ ok: true });
+    const vs = await ownerPool()`select id, code, creative_id from variants where experiment_id = ${e!.id} order by code`;
+    expect(vs.map((x) => x.code)).toEqual(['AK-001-A', 'AK-001-B']);
+    const [o] = await ownerPool()`select variant_id from performance_observations where ad_id = 'ad-7' and superseded_at is null`;
+    expect(o!.variant_id).toBe(vs[1]!.id);
+    expect(v!.id).toBe(vs[0]!.id);
+  });
+});
+
 describe('sync failures, backoff and freshness (integ-27, arch-08, integ-16)', () => {
   it('a transient outage keeps the connection active and retries with backoff; repeated failures degrade it; recovery is announced', async () => {
     const { t, ctx } = await paid();

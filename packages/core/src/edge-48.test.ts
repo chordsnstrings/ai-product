@@ -5,7 +5,7 @@ import { newId } from '@arkiv/shared';
 import { assertAssetUsable, replaceAsset, sweepExpiredRights, unusableAssets } from './asset-rights';
 import { authorize } from './cost-governor';
 import { createExperiment, linkAdToVariant } from './experiments';
-import { ingestObservations } from './performance';
+import { ingestObservations, recordAdCreativeRefs } from './performance';
 import type { NormalizedObservation } from '@arkiv/integrations';
 import { mockConcepts } from './mock-intel';
 import { sweepDelayedProductions } from './production-delays';
@@ -185,5 +185,51 @@ describe('delivery settings change mid-test (§48 audience/bid/optimization)', (
     const { t, ctx } = await tenant();
     await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [obs('ad_x', day(2), 'OFFSITE_CONVERSIONS'), obs('ad_x', day(1), 'LINK_CLICKS')]));
     expect(await ownerPool()`select 1 from confounders where workspace_id = ${t.workspaceId}`).toHaveLength(0);
+  });
+});
+
+describe('creative edited on the platform (§48 fork lineage)', () => {
+  const day = (n: number) => new Date(Date.now() - n * 86400_000).toISOString().slice(0, 10);
+  const obs = (date: string, clicks = 48): NormalizedObservation => ({
+    platform: 'meta', accountId: 'act_1', campaignId: 'c1', adgroupId: 'as1', adId: 'ad_1', adName: 'Serum ad', date, currency: 'USD',
+    spendMicros: 20_000_000, impressions: 4000, reach: null, frequency: null, clicks, outboundClicks: null,
+    videoStarts: 2400, video25: null, video50: null, video75: 600, video100: null, avgWatchMs: null,
+    addToCart: null, checkout: null, purchases: 1, purchaseValueMicros: 38_000_000,
+    attributionModel: 'meta_default', attributionWindow: '7d_click_1d_view', optimizationEvent: 'OFFSITE_CONVERSIONS', campaignType: 'OUTCOME_SALES', measurementContext: 'META_PAID_ATTRIBUTED',
+  });
+
+  it('remembers the served creative, then forks a child creative and a new variant from the edit on', async () => {
+    const { t, ctx, skuId } = await tenant();
+    const proposal = mockConcepts({ name: 'Glow Serum', category: 'serum', approvedClaims: [], themes: [], testedAngles: [] }).concepts[0]!;
+    const { experimentId } = await withTenant(t.workspaceId, (tx) => createExperiment(tx, ctx, { skuId, proposal }));
+    const [v] = await ownerPool()`select id, code from variants where experiment_id = ${experimentId} order by code limit 1`;
+    const [cr] = await ownerPool()`insert into creatives (workspace_id, sku_id, origin, genome) values (${t.workspaceId}, ${skuId}, 'generated', '{"angle":"ROUTINE"}') returning id`;
+    await ownerPool()`update variants set creative_id = ${cr!.id} where id = ${v!.id}`;
+    await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [obs(day(4)), obs(day(3))]));
+    await withTenant(t.workspaceId, (tx) => linkAdToVariant(tx, ctx, 'meta', 'ad_1', v!.id as string));
+
+    // First sighting: remembered on the creative, nothing forked.
+    expect(await withTenant(t.workspaceId, (tx) => recordAdCreativeRefs(tx, ctx, 'meta', new Map([['ad_1', 'cr-1:vid-1']])))).toEqual([]);
+    const [c1] = await ownerPool()`select platform_refs, content_hash from creatives where id = ${cr!.id}`;
+    expect(c1!.platform_refs).toMatchObject({ creative_refs: { 'meta:ad_1': 'cr-1:vid-1' } });
+    expect(c1!.content_hash).toBeTruthy();
+    expect(await withTenant(t.workspaceId, (tx) => recordAdCreativeRefs(tx, ctx, 'meta', new Map([['ad_1', 'cr-1:vid-1']])))).toEqual([]);
+
+    // The merchant swapped the video in Ads Manager: a new creative and variant from the edit day on.
+    const [forked] = await withTenant(t.workspaceId, (tx) => recordAdCreativeRefs(tx, ctx, 'meta', new Map([['ad_1', 'cr-2:vid-9']]), day(3)));
+    expect(forked).toBeTruthy();
+    const [nv] = await ownerPool()`select experiment_id, code, role, creative_id, changed_variables, label from variants where id = ${forked!}`;
+    expect(nv).toMatchObject({ experiment_id: experimentId, role: 'variant', changed_variables: ['platform_edit'], label: expect.stringMatching(/edited on Meta/) });
+    expect(nv!.code).not.toBe(v!.code);
+    const [child] = await ownerPool()`select parent_creative_id, platform_refs from creatives where id = ${nv!.creative_id}`;
+    expect(child).toMatchObject({ parent_creative_id: cr!.id, platform_refs: { creative_refs: { 'meta:ad_1': 'cr-2:vid-9' } } });
+    const byDate = async () => Object.fromEntries((await ownerPool()`select date::text as d, variant_id from performance_observations where ad_id = 'ad_1' and superseded_at is null`).map((r) => [r.d, r.variant_id]));
+    expect(await byDate()).toEqual({ [day(4)]: v!.id, [day(3)]: forked });
+    // New days follow the edit; a correction of a day before it stays with the original (never rewritten).
+    await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [obs(day(2)), obs(day(4), 60)]));
+    expect(await byDate()).toEqual({ [day(4)]: v!.id, [day(3)]: forked, [day(2)]: forked });
+    expect(await ownerPool()`select 1 from events where workspace_id = ${t.workspaceId} and type = 'CREATIVE_VERSIONED' and subject_id = ${nv!.creative_id}`).toHaveLength(1);
+    // The same edit seen again forks nothing more.
+    expect(await withTenant(t.workspaceId, (tx) => recordAdCreativeRefs(tx, ctx, 'meta', new Map([['ad_1', 'cr-2:vid-9']])))).toEqual([]);
   });
 });

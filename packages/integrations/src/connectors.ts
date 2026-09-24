@@ -617,18 +617,27 @@ export async function metaFetchInsights(token: string, accountId: string, since:
 /** Ads Meta reports as gone (§48 "historical creative deleted from ad platform"). */
 const META_GONE = new Set(['DELETED', 'ARCHIVED']);
 
+/** An ad's status, and what creative it currently runs (§48: an edit made outside Arkiv changes this). */
+export interface AdStatus {
+  status: string;
+  deleted: boolean;
+  /** The platform's creative (and video) the ad now serves; null when the platform didn't say. */
+  creativeRef?: string | null;
+}
+
 /**
- * Effective status of each ad id (`ACTIVE`, `PAUSED`, `DELETED`, `ARCHIVED`, …). An id Meta says does not exist
- * (error 100) is reported as DELETED; an id it didn't answer for is left out (unknown, never guessed).
+ * Effective status of each ad id (`ACTIVE`, `PAUSED`, `DELETED`, `ARCHIVED`, …) and the creative it serves. An id
+ * Meta says does not exist (error 100) is reported as DELETED; an id it didn't answer for is left out (unknown).
  */
-export async function metaFetchAdStatuses(token: string, adIds: string[]): Promise<Map<string, { status: string; deleted: boolean }>> {
-  const out = new Map<string, { status: string; deleted: boolean }>();
+export async function metaFetchAdStatuses(token: string, adIds: string[]): Promise<Map<string, AdStatus>> {
+  const out = new Map<string, AdStatus>();
   const one = async (ids: string[]) => {
-    const q = new URLSearchParams({ ids: ids.join(','), fields: 'id,effective_status', access_token: token });
-    const j = await metaGet<Record<string, { id?: string; effective_status?: string }>>(`${META_API}/?${q}`);
+    const q = new URLSearchParams({ ids: ids.join(','), fields: 'id,effective_status,creative{id,video_id}', access_token: token });
+    const j = await metaGet<Record<string, { id?: string; effective_status?: string; creative?: { id?: string; video_id?: string } }>>(`${META_API}/?${q}`);
     for (const id of ids) {
       const s = j[id]?.effective_status;
-      if (s) out.set(id, { status: s, deleted: META_GONE.has(s) });
+      const c = j[id]?.creative;
+      if (s) out.set(id, { status: s, deleted: META_GONE.has(s), creativeRef: c?.id ? `${c.id}${c.video_id ? `:${c.video_id}` : ''}` : null });
     }
   };
   for (let i = 0; i < adIds.length; i += 50) {
@@ -875,18 +884,18 @@ export function normalizeTikTokGmvMaxRow(r: TikTokReportRow, advertiserId: strin
 }
 
 /** Ad statuses (§48): an ad TikTok reports deleted is marked; one it doesn't return stays unknown. */
-export async function tiktokFetchAdStatuses(token: string, advertiserId: string, adIds: string[]): Promise<Map<string, { status: string; deleted: boolean }>> {
-  const out = new Map<string, { status: string; deleted: boolean }>();
+export async function tiktokFetchAdStatuses(token: string, advertiserId: string, adIds: string[]): Promise<Map<string, AdStatus>> {
+  const out = new Map<string, AdStatus>();
   for (let i = 0; i < adIds.length; i += 100) {
-    const d = await tiktokGet<{ list?: { ad_id: string | number; operation_status?: string; secondary_status?: string }[] }>(token, 'ad/get/', {
+    const d = await tiktokGet<{ list?: { ad_id: string | number; operation_status?: string; secondary_status?: string; video_id?: string | null }[] }>(token, 'ad/get/', {
       advertiser_id: advertiserId,
       filtering: JSON.stringify({ ad_ids: adIds.slice(i, i + 100), primary_status: 'STATUS_ALL' }),
-      fields: JSON.stringify(['ad_id', 'operation_status', 'secondary_status']),
+      fields: JSON.stringify(['ad_id', 'operation_status', 'secondary_status', 'video_id']),
       page_size: '100',
     });
     for (const a of d.list ?? []) {
       const status = a.secondary_status ?? a.operation_status ?? 'UNKNOWN';
-      out.set(String(a.ad_id), { status, deleted: /DELETE/i.test(status) });
+      out.set(String(a.ad_id), { status, deleted: /DELETE/i.test(status), creativeRef: a.video_id ? String(a.video_id) : null });
     }
   }
   return out;

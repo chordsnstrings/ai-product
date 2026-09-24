@@ -191,10 +191,11 @@ describe('Meta Marketing API insights contract', () => {
         if (ids.length > 1) return json({ error: { code: 100, message: '(#100) Some of the aliases you requested do not exist: gone' } });
         return json({ error: { code: 100, message: 'Object with ID gone does not exist' } });
       }
-      return json(Object.fromEntries(ids.filter((i) => i !== 'silent').map((i) => [i, { id: i, effective_status: i === 'arch' ? 'ARCHIVED' : 'ACTIVE' }])));
+      return json(Object.fromEntries(ids.filter((i) => i !== 'silent').map((i) => [i, { id: i, effective_status: i === 'arch' ? 'ARCHIVED' : 'ACTIVE', ...(i === 'live' ? { creative: { id: '2385', video_id: '9911' } } : {}) }])));
     });
     const s = await metaFetchAdStatuses('t', ['live', 'arch', 'gone', 'silent']);
-    expect(Object.fromEntries(s)).toEqual({ live: { status: 'ACTIVE', deleted: false }, arch: { status: 'ARCHIVED', deleted: true }, gone: { status: 'DELETED', deleted: true } });
+    // The creative (and video) each ad serves is read too (§48: an edit outside Arkiv changes it).
+    expect(Object.fromEntries(s)).toEqual({ live: { status: 'ACTIVE', deleted: false, creativeRef: '2385:9911' }, arch: { status: 'ARCHIVED', deleted: true, creativeRef: null }, gone: { status: 'DELETED', deleted: true } });
   });
 });
 
@@ -245,7 +246,7 @@ describe('TikTok API for Business reporting contract', () => {
 
   it('reads deleted ads; maps TikTok codes to error classes', async () => {
     stub(() => json(tt.ads));
-    expect(Object.fromEntries(await tiktokFetchAdStatuses('tok', '7001', ['1790000000000001', '1790000000000002']))).toEqual({ '1790000000000001': { status: 'AD_STATUS_DELETE', deleted: true } });
+    expect(Object.fromEntries(await tiktokFetchAdStatuses('tok', '7001', ['1790000000000001', '1790000000000002']))).toEqual({ '1790000000000001': { status: 'AD_STATUS_DELETE', deleted: true, creativeRef: null } });
     expect(tiktokErrorKind(40105)).toBe('auth_revoked');
     expect(tiktokErrorKind(40100)).toBe('rate_limited');
     expect(tiktokErrorKind(40002)).toBe('partial_scopes');
