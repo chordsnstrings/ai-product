@@ -50,6 +50,9 @@ describe('"Not right?" (plan 03 P10, standard §48)', () => {
     await generateStoryboard(ctx, r.projectId, rev!.storyboard_id as string, rev!.selected_concept_id as string);
     await withTenant(t.workspaceId, (tx) => produceFreeRevision(tx, ctx, r.projectId));
     expect((await ownerPool()`select state, entitlement_unit from projects where id = ${r.projectId}`)[0]).toMatchObject({ state: 'STORYBOARD_APPROVED', entitlement_unit: 'taste' });
+    // Reopened later to fix a blocked line, it is finished through "Finish my ad" — never produced free twice.
+    await ownerPool()`update projects set state = 'STORYBOARD_READY' where id = ${r.projectId}`;
+    await expect(withTenant(t.workspaceId, (tx) => produceFreeRevision(tx, ctx, r.projectId))).rejects.toMatchObject({ code: 'CONFLICT' });
 
     // Once used, product accuracy is no longer free for this ad: the next re-plan is at the one-off price.
     await ownerPool()`update projects set state = 'COMPLETE' where id = ${r.projectId}`;

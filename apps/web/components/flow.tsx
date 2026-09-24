@@ -832,14 +832,14 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
-      {sb && sb.status !== 'generating' && v.project.revisionFree ? (
+      {sb && sb.status !== 'generating' && v.project.revisionFree && !resumable ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
           <h2 className="ak-label">Make it again — free</h2>
           <p className="ak-small ak-muted">This re-plan is on us, because your first ad didn’t show your product accurately. Check the scenes, then we’ll make it — nothing to pay.</p>
           <Button block id="cta" disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/produce-free`, {})) window.location.assign(`/produce/${projectId}`); }}>Make my ad</Button>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && resumable && !v.project.revisionFree ? (
+      {sb && sb.status !== 'generating' && resumable ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
           <h2 className="ak-label">Finish your ad</h2>
           <p className="ak-small ak-muted">You’ve already paid for this ad, so there’s nothing more to pay. We check your changes, then produce it — scenes that were already made are reused.</p>

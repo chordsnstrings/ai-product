@@ -92,9 +92,13 @@ export async function reportNotRight(tx: Tx, ctx: TenantContext, projectId: stri
  */
 export async function produceFreeRevision(tx: Tx, ctx: TenantContext, projectId: string) {
   assertCan(ctx, 'storyboard.approve');
-  const [p] = await tx`select kind, state, revision_of, revision_free from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  const [p] = await tx`select kind, state, revision_of, revision_free, storyboard_id from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
   if (!p.revision_free || !p.revision_of) throw new DomainError('CONFLICT', 'This storyboard isn’t a free re-plan.');
+  // Produced once already and reopened to fix a line: finishing goes through finishAfterEdit (claims re-checked,
+  // the same credit), never a second grant of production here.
+  const [sb] = p.storyboard_id ? await tx`select approved_at from storyboards where id = ${p.storyboard_id}` : [];
+  if (sb?.approved_at && p.state === 'STORYBOARD_READY') throw new DomainError('CONFLICT', 'Fix the line, then use “Finish my ad”.');
   const [granted] = await tx`select 1 from ledger_entries where workspace_id = ${ctx.workspaceId} and idempotency_key = ${`replan:${p.revision_of}`} and project_id = ${projectId}`;
   if (!granted) throw new DomainError('CONFLICT', 'This storyboard isn’t a free re-plan.');
   return approveForProduction(tx, ctx, projectId, p.kind as 'taste' | 'standalone');
