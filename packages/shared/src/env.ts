@@ -25,6 +25,8 @@ const EnvSchema = z.object({
   DB_ROLES: z.string().regex(/^(owner|app|admin|system)(,(owner|app|admin|system))*$/).optional(),
   // Set when APP/ADMIN URLs go through PgBouncer in transaction mode (DO connection pools): disables prepared statements.
   DB_PGBOUNCER: z.enum(['0', '1']).default('0'),
+  /** Serve the design-system catalogue (/internal/catalogue) in production too; it is always on in dev and test. */
+  CATALOGUE_ENABLED: z.enum(['0', '1']).default('0'),
 
   PROVIDERS_MODE: z.enum(['mock', 'live']).default('mock'),
   ANTHROPIC_API_KEY: z.string().optional(),

@@ -41,6 +41,9 @@ async function main() {
   await shot(a, 'magic-link-expired', `${WEB}/auth/magic/not-a-real-token-000000000000`);
   await shot(a, 'invite-not-found', `${WEB}/invite/not-a-real-token-000000000000`);
   await shot(a, 'start-upload', `${WEB}/start`);
+  // Design-system catalogue (design §3), both themes.
+  await shot(a, 'catalogue-light', `${WEB}/internal/catalogue?theme=light`);
+  await shot(a, 'catalogue-dark', `${WEB}/internal/catalogue?theme=dark`);
 
   // Anonymous funnel up to the save gate.
   await a.locator('input[type=file][multiple]').setInputFiles(fixture);

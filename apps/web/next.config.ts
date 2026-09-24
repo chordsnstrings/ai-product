@@ -4,6 +4,8 @@ const config: NextConfig = {
   transpilePackages: ['@arkiv/auth', '@arkiv/billing', '@arkiv/core', '@arkiv/db', '@arkiv/email', '@arkiv/integrations', '@arkiv/shared', '@arkiv/ui', '@arkiv/providers', '@arkiv/media'],
   serverExternalPackages: ['sharp', '@node-rs/argon2', 'postgres', 'file-type', 'heic-decode', 'libheif-js'],
   poweredByHeader: false,
+  // No dev-mode badge in the corner: it would show up in the catalogue's visual regression screenshots.
+  devIndicators: false,
   output: 'standalone',
   outputFileTracingRoot: new URL('../..', import.meta.url).pathname,
   experimental: { serverActions: { bodySizeLimit: '26mb' } },
