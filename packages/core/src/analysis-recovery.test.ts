@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { ProviderError, type LlmJsonRequest, type LlmProvider } from '@arkiv/providers';
 import { FREE_EXPLORATION, PROVISIONAL } from '@arkiv/shared';
-import { analyzeProduct, ANALYSIS_FAILED_COPY, failAnalysis, generateConceptBatch, requestConcepts, retryAnalysis, startPreview } from './analysis';
+import { analyzeProduct, ANALYSIS_FAILED_COPY, failAnalysis, generateConceptBatch, requestConcepts, retryAnalysis, selectHeroProduct, SELECT_PRODUCT_COPY, startPreview } from './analysis';
 import { authorize, estimateCost } from './cost-governor';
 import { selectConcept } from './storyboard';
 import { buildContext, gateProposal, verifiedIngredients } from './creative-director';
@@ -25,6 +25,17 @@ class ExtractionDown implements LlmProvider {
   async json<T>(req: LlmJsonRequest<T>) {
     if (req.system.includes('product analyst')) throw new ProviderError('anthropic', 'extraction service down', false, 'server');
     return this.mock.json(req);
+  }
+}
+
+/** An analyst that sees several products in the photo (everything else as the mock). */
+class SeveralProducts implements LlmProvider {
+  readonly name = 'anthropic';
+  private mock = new MockLlm();
+  async json<T>(req: LlmJsonRequest<T>) {
+    const r = await this.mock.json(req);
+    if (req.system.includes('product analyst')) (r.data as { multipleProductsVisible: boolean }).multipleProductsVisible = true;
+    return r;
   }
 }
 
@@ -165,6 +176,39 @@ describe('free-preview SKU cap under concurrency (plan 02 §4, standard §48)', 
     const [n] = await ownerPool()`select count(*)::int as n from skus where workspace_id = ${t.workspaceId}`;
     expect(n!.n).toBe(PROVISIONAL.MAX_SKUS);
   });
+});
+
+describe('several products in the photo (plan 03 P2)', () => {
+  it('stops before the fingerprint, asks for the hero product, and carries on from the merchant’s crop', async () => {
+    setProviders({ llm: new SeveralProducts(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const { t, ctx, skuId, projectId } = await preview();
+    expect(await analyzeProduct(ctx, skuId, projectId)).toMatchObject({ status: 'needs_input', reason: 'select_product' });
+    const [s1] = await ownerPool()`select s.status, s.analysis, p.state, p.failure_reason from skus s join projects p on p.sku_id = s.id where s.id = ${skuId}`;
+    expect(s1).toMatchObject({ status: 'needs_input', state: 'NEEDS_USER_ACTION', failure_reason: SELECT_PRODUCT_COPY });
+    expect((await ownerPool()`select count(*)::int as n from visual_fingerprints where sku_id = ${skuId}`)[0]!.n).toBe(0);
+    const photoId = (s1!.analysis as { selectPhotoId: string }).selectPhotoId;
+    expect(photoId).toBeTruthy();
+    // Nothing is held: the preview authorization was settled.
+    expect((await ownerPool()`select count(*)::int as n from cost_authorizations where project_id = ${projectId} and status = 'active'`)[0]!.n).toBe(0);
+
+    // A box too small is refused; a real box crops the photo into the leading product photo and resumes.
+    await expect(withTenant(t.workspaceId, (tx) => selectHeroProduct(tx, ctx, projectId, { x: 0.5, y: 0.5, w: 0.01, h: 0.01 }))).rejects.toMatchObject({ code: 'INVALID' });
+    const r = await withTenant(t.workspaceId, (tx) => selectHeroProduct(tx, ctx, projectId, { x: 0.3, y: 0.1, w: 0.4, h: 0.8 }));
+    const [crop] = await ownerPool()`select width, height, origin from assets where id = ${r.assetId}`;
+    expect(crop!.origin).toMatchObject({ heroCrop: true, from: photoId });
+    expect(Number(crop!.width)).toBe(400);
+    expect(Number(crop!.height)).toBe(1000);
+    expect((await ownerPool()`select status from skus where id = ${skuId}`)[0]!.status).toBe('analyzing');
+    // Picking again while it runs is refused.
+    await expect(withTenant(t.workspaceId, (tx) => selectHeroProduct(tx, ctx, projectId, { x: 0.3, y: 0.1, w: 0.4, h: 0.8 }))).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    // The analyst still sees several products in the other photos, but the merchant already chose: it finishes,
+    // keyed from the crop.
+    expect(await analyzeProduct(ctx, skuId, projectId)).toMatchObject({ status: 'ready' });
+    const [fp] = await ownerPool()`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and active`;
+    expect((fp!.reference_asset_ids as string[])[0]).toBe(r.assetId);
+    expect((await ownerPool()`select count(*)::int as n from concepts where project_id = ${projectId}`)[0]!.n).toBeGreaterThan(0);
+  }, 60_000);
 });
 
 describe('creative goal (standard §8)', () => {

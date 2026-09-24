@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, selectHeroProduct, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { CreativeGoal, DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -16,6 +16,7 @@ import { projectAccess } from '@/lib/tenant';
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   recompose – "Update my ad" after the product's price or size changed: new on-screen text, same footage (§42)
+ *   select-product – mark the hero product in a photo that shows several (plan 03 P2); the analysis resumes
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   photos    – add photos to this product (multipart `photos`): resumes an analysis waiting for them (the URL
  *               failed, §13), or adds side/back reference views to an analysed one (P4)
@@ -135,6 +136,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const photos = await Promise.all(files.map(async (f) => ({ bytes: Buffer.from(await f.arrayBuffer()), filename: f.name })));
       const r = await withTenant(a.ctx.workspaceId, (tx) => addProductPhotos(tx, a.ctx, id, photos));
       return json({ ok: true, ...r }, r.mode === 'resumed' ? 202 : 200);
+    }
+    case 'select-product': {
+      // Plan 03 P2: the photo shows several products — the box (fractions of the photo) marks the hero one.
+      const box = await body(req, z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1), w: z.number().gt(0).max(1), h: z.number().gt(0).max(1) }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => selectHeroProduct(tx, a.ctx, id, box));
+      return json({ ok: true, queued: true, ...r }, 202);
     }
     case 'retry-analysis': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));

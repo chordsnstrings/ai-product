@@ -231,7 +231,9 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
 
   // 2. Photos: uploaded first, then page images (downloaded into our own storage).
   await withTenant(ws, (tx) => step(tx, ws, skuId, 'photos', 'active'));
-  let photoIds = (await withTenant(ws, (tx) => tx`select id from assets where sku_id = ${skuId} and kind = 'product_photo' and deleted_at is null order by created_at`)).map((r) => r.id as string);
+  // The hero product the merchant tapped (a crop of a multi-product photo, plan 03 P2) leads.
+  let photoIds = (await withTenant(ws, (tx) => tx`select id from assets where sku_id = ${skuId} and kind = 'product_photo' and deleted_at is null
+                                                   order by (origin->>'heroCrop') is null, created_at`)).map((r) => r.id as string);
   if (photoIds.length < 3 && extracted?.images.length) {
     for (const url of extracted.images.slice(0, 3 - photoIds.length)) {
       const bytes = await fetchImage(url);
@@ -362,7 +364,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       await recordFacts(tx, ctx, skuId, extractionFacts(x, extracted, sku.source_url as string | null, ext.jobId));
       const name = extracted?.name ?? x.name;
       await tx`update skus set name = ${name}, category = ${x.category}, fidelity_confidence = ${x.assetQualityConfidence},
-                 analysis = ${tx.json({ missingEvidence: x.missingEvidence, suggestedViews: x.suggestedViews, multipleProductsVisible: x.multipleProductsVisible } as never)}
+                 analysis = coalesce(analysis, '{}'::jsonb) || ${tx.json({ missingEvidence: x.missingEvidence, suggestedViews: x.suggestedViews, multipleProductsVisible: x.multipleProductsVisible } as never)}
                where id = ${skuId}`;
       await step(tx, ws, skuId, 'identify', 'done', `${name}${x.sizeText ? ` · ${x.sizeText}` : ''}`);
       await step(tx, ws, skuId, 'claims', 'active');
@@ -370,6 +372,19 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       const [cc] = await tx`select count(*) filter (where status in ('BLOCKED','RESTRICTED'))::int as risky, count(*)::int as n from claims where sku_id = ${skuId}`;
       await step(tx, ws, skuId, 'claims', 'done', cc!.n ? `${cc!.n} claim${cc!.n > 1 ? 's' : ''} found${cc!.risky ? ` · ${cc!.risky} we won’t use` : ''}` : 'No claims found on the page');
     });
+
+    // 6a. Several products in the photo (plan 03 P2 edge case, §42): the merchant taps the hero product before
+    //     anything is keyed or drawn from it; the analysis resumes from their crop (selectHeroProduct).
+    if (x.multipleProductsVisible && !(sku.analysis as { heroSelected?: boolean } | null)?.heroSelected) {
+      await withTenant(ws, async (tx) => {
+        await step(tx, ws, skuId, 'fingerprint', 'failed', SELECT_PRODUCT_COPY);
+        await tx`update progress_steps set status = 'skipped' where subject_id = ${skuId} and status = 'pending'`;
+        await tx`update skus set status = 'needs_input', analysis = coalesce(analysis, '{}'::jsonb) || ${tx.json({ selectPhotoId: usable[0] } as never)} where id = ${skuId}`;
+        await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: SELECT_PRODUCT_COPY, detail: 'select_product' });
+        await settle(tx, ctx, auth.authorizationId, 'consumed');
+      });
+      return { status: 'needs_input', reason: 'select_product' };
+    }
 
     // 6. Visual Fingerprint + cut-out (deterministic keying; a photo keying can't separate gets one background-removal
     //    try when the storyboard first needs the cut-out — see cutout.ts).
@@ -432,6 +447,39 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
     });
     throw e;
   }
+}
+
+/** Customer copy when the photo shows several products (plan 03 P2 "tap-to-select the hero product"). */
+export const SELECT_PRODUCT_COPY = 'Your photo shows more than one product. Tap the one this ad is for.';
+
+/**
+ * The merchant marks the hero product in a photo that shows several (plan 03 P2 edge case; §42). The box is in
+ * fractions of the photo (0–1). The crop becomes this product's leading photo — validated and re-encoded like any
+ * upload — and the analysis resumes from it (no restart of what the merchant entered).
+ */
+export async function selectHeroProduct(tx: Tx, ctx: TenantContext, projectId: string, box: { x: number; y: number; w: number; h: number }): Promise<{ skuId: string; assetId: string }> {
+  assertCan(ctx, 'sku.edit');
+  const [p] = await tx`select p.state, p.sku_id, s.status, s.analysis from projects p join skus s on s.id = p.sku_id where p.id = ${projectId} for update of p, s`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  const photoId = (p.analysis as { selectPhotoId?: string } | null)?.selectPhotoId;
+  if (p.status !== 'needs_input' || p.state !== 'NEEDS_USER_ACTION' || !photoId) throw new DomainError('CONFLICT', 'There’s no product to pick right now.');
+  const clamp = (n: number) => Math.min(1, Math.max(0, n));
+  const x0 = clamp(box.x);
+  const y0 = clamp(box.y);
+  const x1 = clamp(box.x + box.w);
+  const y1 = clamp(box.y + box.h);
+  const { default: sharp } = await import('sharp');
+  const src = await assetBytes(tx, photoId);
+  const meta = await sharp(src).rotate().metadata();
+  const W = meta.autoOrient?.width ?? meta.width ?? 0;
+  const H = meta.autoOrient?.height ?? meta.height ?? 0;
+  const region = { left: Math.round(x0 * W), top: Math.round(y0 * H), width: Math.round((x1 - x0) * W), height: Math.round((y1 - y0) * H) };
+  if (region.width < 64 || region.height < 64) throw new DomainError('INVALID', 'Draw the box around the whole product.');
+  const crop = await sharp(src).rotate().extract(region).jpeg({ quality: 92 }).toBuffer();
+  const asset = await ingestBytes(tx, ctx, crop, 'product_photo', p.sku_id as string, { heroCrop: true, from: photoId, box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } });
+  await tx`update skus set analysis = coalesce(analysis, '{}'::jsonb) || ${tx.json({ heroSelected: true } as never)} where id = ${p.sku_id}`;
+  await retryAnalysis(tx, ctx, projectId);
+  return { skuId: p.sku_id as string, assetId: asset.id };
 }
 
 export const PHOTOS_IN_REVIEW = 'Your photos need a quick check by our team (before/after or people in shot). Add a plain photo of the product to continue now.';

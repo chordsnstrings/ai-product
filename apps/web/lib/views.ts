@@ -191,6 +191,12 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** Views the analyst suggested (e.g. "back label"), and how many the merchant has added since. */
         suggestedViews: ((p.analysis as { suggestedViews?: string[] } | null)?.suggestedViews ?? []).slice(0, 4),
         addedViews: Number((p.analysis as { addedViews?: number } | null)?.addedViews ?? 0),
+        /** The photo shows several products: the merchant taps the hero one (plan 03 P2), on this photo. */
+        selectProduct: await (async () => {
+          const a = (p.analysis ?? {}) as { selectPhotoId?: string; heroSelected?: boolean };
+          if (p.sku_status !== 'needs_input' || p.state !== 'NEEDS_USER_ACTION' || !a.selectPhotoId || a.heroSelected) return null;
+          return { photoUrl: await assetUrl(tx, a.selectPhotoId, 3600) };
+        })(),
         /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
         missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
       },

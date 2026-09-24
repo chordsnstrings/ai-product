@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { awaitingPayment, conceptCost, disputeChoices, tensionSourceWords } from './flow-helpers';
+import { awaitingPayment, conceptCost, disputeChoices, tapBox, tensionSourceWords } from './flow-helpers';
 
 describe('disputed fact choices (plan 03 P4, one tap per fact)', () => {
   it('offers each distinct value once with its source in customer words; prices read as money', () => {
@@ -38,5 +38,14 @@ describe('waiting for payment on P9 (plan 03 P8)', () => {
     expect(at('STORYBOARD_READY', 'expired')).toBe('unpaid');
     expect(at('STORYBOARD_READY', null, true)).toBeNull();
     expect(at('RENDERING', 'paid')).toBeNull();
+  });
+});
+
+describe('tap-to-select the hero product (plan 03 P2)', () => {
+  it('boxes the tapped point and keeps the box inside the photo', () => {
+    expect(tapBox({ x: 0.5, y: 0.5 })).toEqual({ x: 0.5 - 1 / 6, y: 0.5 - 1 / 6, w: 1 / 3, h: 1 / 3 });
+    const edge = tapBox({ x: 0.98, y: 0.01 });
+    expect(edge.x + edge.w).toBeCloseTo(1);
+    expect(edge.y).toBe(0);
   });
 });

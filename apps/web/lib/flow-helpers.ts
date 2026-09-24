@@ -44,3 +44,11 @@ export function awaitingPayment(v: { project: { state: string; resumable: boolea
   if (v.project.state !== 'STORYBOARD_READY' || v.project.resumable) return null;
   return v.purchase?.status === 'pending' || v.purchase?.status === 'paid' ? 'confirming' : 'unpaid';
 }
+
+/** A tap on the hero product (plan 03 P2): a box a third of the photo each way around the point, kept inside it. */
+export function tapBox(p: { x: number; y: number }, size = 1 / 3): { x: number; y: number; w: number; h: number } {
+  const half = size / 2;
+  const x = Math.min(1 - size, Math.max(0, p.x - half));
+  const y = Math.min(1 - size, Math.max(0, p.y - half));
+  return { x, y, w: size, h: size };
+}

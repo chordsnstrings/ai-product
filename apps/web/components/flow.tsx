@@ -8,7 +8,7 @@ import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
 import { EmailLinkForm } from './email-link';
 import { registerPasskey } from './profile';
 import type { ProjectView } from '@/lib/views';
-import { awaitingPayment, conceptCost, disputeChoices, tensionSourceWords } from '@/lib/flow-helpers';
+import { awaitingPayment, conceptCost, disputeChoices, tapBox, tensionSourceWords } from '@/lib/flow-helpers';
 import type { CreativeGoal } from '@arkiv/shared';
 
 type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null; passkeyPrompt?: boolean } };
@@ -231,6 +231,66 @@ function VariantPicker({ projectId, v, onSaved }: { projectId: string; v: View; 
       </select>
       {chosen?.available === false ? <Banner tone="warn">{chosen.title} is out of stock on your store. You can still make the ad, but check it before you run it.</Banner> : null}
       {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * Plan 03 P2 "Photo shows several products → tap-to-select the hero product": tap the product (a box is placed
+ * around the tap) or drag a box around it; the analysis carries on from that crop.
+ */
+function HeroPicker({ projectId, photoUrl, onPicked }: { projectId: string; photoUrl: string; onPicked: () => void }) {
+  const [box, setBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const start = useRef<{ x: number; y: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const at = (e: React.PointerEvent<HTMLDivElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
+  };
+  async function use() {
+    if (!box) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/select-product`, box);
+      onPicked();
+    } catch (e) {
+      setErr((e as Error).message);
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="ak-panel ak-stack">
+      <h2 className="ak-label">Which product is this ad for?</h2>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>Your photo shows more than one product. Tap it, or drag a box around it.</p>
+      <div
+        style={{ position: 'relative', touchAction: 'none', userSelect: 'none', cursor: 'crosshair' }}
+        onPointerDown={(e) => {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          start.current = at(e);
+          setBox(null);
+        }}
+        onPointerMove={(e) => {
+          if (!start.current) return;
+          const p = at(e);
+          const s0 = start.current;
+          setBox({ x: Math.min(s0.x, p.x), y: Math.min(s0.y, p.y), w: Math.abs(p.x - s0.x), h: Math.abs(p.y - s0.y) });
+        }}
+        onPointerUp={(e) => {
+          const s0 = start.current;
+          start.current = null;
+          if (!s0) return;
+          const p = at(e);
+          // A tap (no drag): a box around the tapped point, a third of the photo each way.
+          if (Math.abs(p.x - s0.x) < 0.03 && Math.abs(p.y - s0.y) < 0.03) setBox(tapBox(s0));
+        }}
+      >
+        <img src={photoUrl} alt="Your product photo" style={{ display: 'block', width: '100%', height: 'auto' }} draggable={false} />
+        {box ? <div aria-hidden style={{ position: 'absolute', left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%`, border: '2px solid var(--ink)', boxShadow: '0 0 0 9999px rgba(0,0,0,0.35)' }} /> : null}
+      </div>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      <div><Button disabled={!box || box.w < 0.05 || box.h < 0.05 || busy} onClick={() => void use()}>{busy ? 'Carrying on…' : 'This one — carry on'}</Button></div>
     </div>
   );
 }
@@ -462,6 +522,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
               {failed ? (
                 <div className="ak-stack">
                   <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
+                  {v.sku.selectProduct ? <HeroPicker projectId={projectId} photoUrl={v.sku.selectProduct.photoUrl} onPicked={() => { resume(); refresh(); }} /> : null}
                   {v.sku.sourceUrl ? <p className="ak-small ak-muted" style={{ margin: 0, overflowWrap: 'anywhere' }}>Your link is saved: {v.sku.sourceUrl}</p> : null}
                   <PhotoAdder
                     projectId={projectId}
@@ -470,7 +531,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                     cta="Add photos and continue"
                     onAdded={() => { resume(); refresh(); }}
                   />
-                  {v.sku.usablePhotos ? (
+                  {v.sku.usablePhotos && !v.sku.selectProduct ? (
                     <>
                       <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
                       <div><Button variant="secondary" onClick={() => void retryAnalysis()}>Try again</Button></div>
