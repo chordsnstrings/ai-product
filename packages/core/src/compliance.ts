@@ -73,24 +73,44 @@ const NEUTRAL = [
   /\b(lightweight|gel|cream|serum|oil|balm|lotion|foam|mist|texture|absorbs?|finish|dewy|matte|non[- ]?sticky|glides?|layers?|apply|use|morning|night|am|pm|routine|step|drops?|pump|shop|try|get yours|link in bio|free shipping|bundle|save|off|new|ml|oz|fragrance[- ]free|vegan|cruelty[- ]free)\b/i,
 ];
 
+/** How one creative line was resolved against the Claims Vault (plan 05 §13 "each line → Claim ID or ⚠ unmapped"). */
+export interface LineMapping {
+  line: string;
+  /** The approved claim this line uses, when it makes one. */
+  claimId: string | null;
+  status: 'claim' | 'neutral' | 'violation' | 'unmapped';
+}
+
 export interface ScanResult {
+  /** No blocked, restricted, unapproved or unqualified claim. */
   ok: boolean;
   violations: { text: string; ruleId: string; reason: string; status: SuggestedStatus; alternative?: string }[];
+  /** Product-effect statements that map to no approved Claim ID (§25 check 3: these may not ship either). */
   unmapped: string[];
+  mapping: LineMapping[];
 }
+
+/** A scan passes only with no violations and no unmapped effect statement. */
+export const scanPasses = (s: ScanResult) => s.ok && s.unmapped.length === 0;
 
 /**
  * Scan final creative text (voice-over, overlays, captions, CTA) against the Claims Vault (§25 check 3).
- * Every sentence must either be neutral or be covered by an allowed claim; anything blocked/restricted fails.
+ * Every sentence must either be neutral or be covered by an allowed claim (recorded as its Claim ID); anything
+ * blocked/restricted fails, and an effect statement no claim covers is reported as unmapped.
+ * `names` (product and brand names) are not statements: "Glow Serum · 30 ml" is a name, not a glow claim.
  */
 export function scanCreativeText(
   sentences: string[],
   allowedClaims: { id: string; wording: string; qualifier?: string | null }[],
+  opts: { names?: (string | null | undefined)[] } = {},
 ): ScanResult {
   const violations: ScanResult['violations'] = [];
   const unmapped: string[] = [];
+  const mapping: LineMapping[] = [];
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9% ]+/g, ' ').replace(/\s+/g, ' ').trim();
-  const allowed = allowedClaims.map((c) => ({ ...c, n: norm(c.wording) }));
+  const allowed = allowedClaims.map((c) => ({ ...c, n: norm(c.wording) })).filter((c) => c.n);
+  const names = (opts.names ?? []).map((x) => (x ? norm(x) : '')).filter((x) => x.length >= 3).sort((a, b) => b.length - a.length);
+  const withoutNames = (raw: string) => names.reduce((t, x) => t.replace(new RegExp(`\\b${x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), ' '), norm(raw)).trim();
   for (const raw of sentences.map((s) => s.trim()).filter(Boolean)) {
     const cls = classifyClaim(raw);
     const n = norm(raw);
@@ -98,21 +118,32 @@ export function scanCreativeText(
     const hard = cls.matched.length > 0 && (cls.status === 'BLOCKED' || cls.status === 'RESTRICTED');
     if (hard) {
       violations.push({ text: raw, ruleId: cls.matched[0]!.ruleId, reason: cls.matched[0]!.reason, status: cls.status, alternative: cls.matched[0]!.alternative });
+      mapping.push({ line: raw, claimId: null, status: 'violation' });
       continue;
     }
     if (cls.matched.length > 0 && !covered) {
       violations.push({ text: raw, ruleId: cls.matched[0]!.ruleId, reason: 'Claim is not approved in the Claims Vault', status: cls.status });
+      mapping.push({ line: raw, claimId: null, status: 'violation' });
       continue;
     }
     if (covered?.qualifier && !n.includes(norm(covered.qualifier))) {
       // VERIFIED_WITH_QUALIFIER claims may only be used with the exact approved qualification (§17).
       violations.push({ text: raw, ruleId: 'qualifier.missing', reason: `Must include the qualifier: "${covered.qualifier}"`, status: 'VERIFIED_WITH_QUALIFIER' });
+      mapping.push({ line: raw, claimId: covered.id, status: 'violation' });
+      continue;
+    }
+    if (covered) {
+      mapping.push({ line: raw, claimId: covered.id, status: 'claim' });
       continue;
     }
     // Effect statements always need a Claim ID; neutral vocabulary only exempts descriptive/usage lines.
-    if (!covered && (looksLikeProductStatement(raw) || !NEUTRAL.some((p) => p.test(raw))) && looksLikeClaim(raw)) unmapped.push(raw);
+    const text = names.length ? withoutNames(raw) : raw;
+    if (text && (looksLikeProductStatement(text) || !NEUTRAL.some((p) => p.test(text))) && looksLikeClaim(text)) {
+      unmapped.push(raw);
+      mapping.push({ line: raw, claimId: null, status: 'unmapped' });
+    } else mapping.push({ line: raw, claimId: null, status: 'neutral' });
   }
-  return { ok: violations.length === 0, violations, unmapped };
+  return { ok: violations.length === 0, violations, unmapped, mapping };
 }
 
 /** Heuristic: does the sentence assert something about what the product does? */
