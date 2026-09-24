@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./log": "./src/log.ts",
+    "./trace": "./src/trace.ts",
     "./format": "./src/format.ts",
     "./variants": "./src/variants.ts",
     "./auth": "./src/auth.ts"

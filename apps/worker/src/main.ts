@@ -9,6 +9,7 @@ import { sweepQueue, sweeps } from './sweeps';
 import { grantQueueVisibility, processOpsCommands } from './ops';
 import { QUEUE_CONFIG } from './queues';
 import { logger, setLogService, withLogContext } from '@arkiv/shared/log';
+import { flushTraces, reportError, setTraceService } from '@arkiv/shared/trace';
 
 /**
  * Worker process (plan 01 §2 layout). Responsibilities:
@@ -21,6 +22,7 @@ import { logger, setLogService, withLogContext } from '@arkiv/shared/log';
  * layer 5). Paid work also carries a higher priority within its queue.
  */
 setLogService('worker');
+setTraceService('worker');
 const log = logger('worker');
 
 async function dispatchOnce(boss: PgBoss): Promise<number> {
@@ -74,7 +76,7 @@ async function main() {
           const n = await s.run();
           if (n) log.info('sweep finished', { result: JSON.stringify(n).slice(0, 300), durationMs: Date.now() - t0 });
         } catch (e) {
-          log.error('sweep failed', { durationMs: Date.now() - t0, err: e });
+          reportError(e, { msg: 'sweep failed', durationMs: Date.now() - t0 });
           throw e;
         }
       }),
@@ -95,7 +97,7 @@ async function main() {
       await processPendingWebhooks({ resendEvent: handleResendEvent });
       await processOpsCommands(boss);
     } catch (e) {
-      log.error('dispatch error', { err: e });
+      reportError(e, { msg: 'dispatch error' });
     } finally {
       busy = false;
     }
@@ -114,6 +116,7 @@ async function main() {
     clearInterval(timer);
     clearInterval(heartbeat);
     await boss.stop({ graceful: true, timeout: 30_000 });
+    await flushTraces();
     await closeAll();
     process.exit(0);
   };

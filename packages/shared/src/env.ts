@@ -25,6 +25,11 @@ const EnvSchema = z.object({
   DB_ROLES: z.string().regex(/^(owner|app|admin|system)(,(owner|app|admin|system))*$/).optional(),
   // Set when APP/ADMIN URLs go through PgBouncer in transaction mode (DO connection pools): disables prepared statements.
   DB_PGBOUNCER: z.enum(['0', '1']).default('0'),
+  // Observability (plan 06 Phase 0 D10): OTLP/HTTP trace export (e.g. Grafana Cloud); unset = no export.
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+  /** "key=value,key2=value2" headers for the OTLP endpoint (e.g. Authorization). A secret. */
+  OTEL_EXPORTER_OTLP_HEADERS: z.string().optional(),
+  OTEL_SERVICE_NAME: z.string().max(60).optional(),
   /** Serve the design-system catalogue (/internal/catalogue) in production too; it is always on in dev and test. */
   CATALOGUE_ENABLED: z.enum(['0', '1']).default('0'),
 

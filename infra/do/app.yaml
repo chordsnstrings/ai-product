@@ -40,6 +40,9 @@ envs:
   - { key: TOKEN_ENCRYPTION_KEY, value: CHANGE_ME_base64_32_bytes, scope: RUN_TIME, type: SECRET }   # AES-256-GCM for OAuth tokens
   # Structured JSON logs; optional Prometheus endpoint (/api/health/metrics) when METRICS_TOKEN (>= 24 chars) is set.
   - { key: LOG_LEVEL, value: info, scope: RUN_TIME }
+  # Traces over OTLP/HTTP (plan 06 D10: OpenTelemetry → Grafana Cloud). Unset endpoint = no export.
+  - { key: OTEL_EXPORTER_OTLP_ENDPOINT, value: CHANGE_ME_otlp_gateway_url, scope: RUN_TIME }
+  - { key: OTEL_EXPORTER_OTLP_HEADERS, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: EMAIL_FROM, value: "Arkiv <hello@mail.arkiv.app>", scope: RUN_TIME }
   - { key: ANTHROPIC_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: ARK_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }

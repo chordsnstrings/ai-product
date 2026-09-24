@@ -1,4 +1,5 @@
 import postgres from 'postgres';
+import { withSpan } from '@arkiv/shared/trace';
 import { env, isUuid, DomainError } from '@arkiv/shared';
 
 export type Sql = postgres.Sql;
@@ -84,10 +85,13 @@ export const ownerPool = () => pool('owner');
  */
 export async function withTenant<T>(workspaceId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
   if (!isUuid(workspaceId)) throw new DomainError('NOT_FOUND', 'Workspace not found');
-  return appPool().begin(async (tx) => {
-    await tx`select set_config('app.workspace_id', ${workspaceId}, true)`;
-    return fn(tx);
-  }) as Promise<T>;
+  // A span per tenant transaction (plan 06 Phase 0 D10): time spent holding a connection, per workspace.
+  return withSpan('db tenant transaction', { 'arkiv.workspace_id': workspaceId }, () =>
+    appPool().begin(async (tx) => {
+      await tx`select set_config('app.workspace_id', ${workspaceId}, true)`;
+      return fn(tx);
+    }) as Promise<T>,
+  );
 }
 
 /** Transaction on the app pool without tenant context: only global tables are reachable (RLS fails closed). */

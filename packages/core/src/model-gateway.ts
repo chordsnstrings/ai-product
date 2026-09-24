@@ -21,6 +21,7 @@ import {
   type VideoPoll,
 } from '@arkiv/providers';
 import { logger } from '@arkiv/shared/log';
+import { withSpan } from '@arkiv/shared/trace';
 import type { z } from 'zod';
 import { raiseAlert } from './alerts';
 import { saveAsset } from './assets';
@@ -165,20 +166,25 @@ function withTimeout<T>(p: Promise<T>, ms: number, provider: string): Promise<T>
 }
 
 /** A provider request under the registry's policy: per-request timeout and bounded transient retries. */
-const request = <T>(started: { route: Route; policy: ProviderPolicy; billed?: BilledUnits[] }, fn: () => Promise<T>) =>
-  withTransientRetry(
-    async () => {
-      try {
-        return await withTimeout(fn(), started.policy.timeoutMs, started.route.provider);
-      } catch (e) {
-        // An attempt that failed after the provider billed it (partial provider billing) is booked on the job,
-        // whether or not a retry then succeeds.
-        noteBilled(started, e);
-        throw e;
-      }
-    },
-    started.policy.retryAttempts,
-    started.policy.retryBackoffMs,
+const request = <T>(started: { route: Route; policy: ProviderPolicy; billed?: BilledUnits[]; jobId?: string }, fn: () => Promise<T>): Promise<T> =>
+  // One client span per provider request (plan 06 Phase 0 D10): task, provider, model and provider job.
+  withSpan(`provider ${started.route.task}`, { 'arkiv.task': started.route.task, 'arkiv.provider': started.route.provider, 'arkiv.model': started.route.model, 'arkiv.provider_job_id': started.jobId },
+    () =>
+      withTransientRetry(
+        async () => {
+          try {
+            return await withTimeout(fn(), started.policy.timeoutMs, started.route.provider);
+          } catch (e) {
+            // An attempt that failed after the provider billed it (partial provider billing) is booked on the job,
+            // whether or not a retry then succeeds.
+            noteBilled(started, e);
+            throw e;
+          }
+        },
+        started.policy.retryAttempts,
+        started.policy.retryBackoffMs,
+      ),
+    { kind: 'client' },
   );
 
 /** Record what a failed attempt was billed for (see BilledUnits), once per error. */

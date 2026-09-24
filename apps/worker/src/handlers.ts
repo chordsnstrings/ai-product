@@ -41,6 +41,7 @@ import { jobContext } from './context';
 import { sendQueuedEmail } from './emails';
 import { QUEUE_CONFIG } from './queues';
 import { logger, payloadBindings, withLogContext } from '@arkiv/shared/log';
+import { reportError, withSpan } from '@arkiv/shared/trace';
 
 export type Handler = (ctx: TenantContext, data: Record<string, unknown>, jobId: string) => Promise<unknown>;
 
@@ -182,18 +183,22 @@ const jobLog = logger('jobs');
  * its payload and the request id of the request that enqueued it (§34).
  */
 export async function runJob(queue: string, data: Record<string, unknown>, jobId: string): Promise<unknown> {
-  return withLogContext({ ...payloadBindings(data), jobId, queue }, async () => {
-    const t0 = Date.now();
-    try {
-      const r = await runJobInContext(queue, data, jobId);
-      const outcome = r && typeof r === 'object' ? Object.keys(r as object).find((k) => ['skipped', 'held', 'failed', 'requeued'].includes(k)) ?? 'ok' : 'ok';
-      jobLog.info('job finished', { outcome, durationMs: Date.now() - t0, result: JSON.stringify(r ?? null).slice(0, 200) });
-      return r;
-    } catch (e) {
-      jobLog.error('job failed', { durationMs: Date.now() - t0, err: e });
-      throw e;
-    }
-  });
+  return withLogContext({ ...payloadBindings(data), jobId, queue }, () =>
+    // One consumer span per job (plan 06 Phase 0 D10); provider calls and tenant transactions nest under it.
+    withSpan(`job ${queue}`, { 'arkiv.queue': queue, 'arkiv.job_id': jobId, 'arkiv.workspace_id': typeof data.workspaceId === 'string' ? data.workspaceId : undefined }, async (span) => {
+      const t0 = Date.now();
+      try {
+        const r = await runJobInContext(queue, data, jobId);
+        const outcome = r && typeof r === 'object' ? Object.keys(r as object).find((k) => ['skipped', 'held', 'failed', 'requeued'].includes(k)) ?? 'ok' : 'ok';
+        span.setAttribute('arkiv.outcome', outcome);
+        jobLog.info('job finished', { outcome, durationMs: Date.now() - t0, result: JSON.stringify(r ?? null).slice(0, 200) });
+        return r;
+      } catch (e) {
+        reportError(e, { msg: 'job failed', durationMs: Date.now() - t0 });
+        throw e;
+      }
+    }, { kind: 'consumer' }),
+  );
 }
 
 async function runJobInContext(queue: string, data: Record<string, unknown>, jobId: string): Promise<unknown> {

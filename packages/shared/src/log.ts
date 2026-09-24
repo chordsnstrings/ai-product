@@ -78,9 +78,40 @@ function threshold(): number {
 export function serializeError(e: unknown): Record<string, unknown> {
   if (e instanceof Error) {
     const code = (e as { code?: unknown }).code;
-    return { name: e.name, message: e.message, ...(code ? { code } : {}), ...(process.env.NODE_ENV === 'production' ? {} : { stack: e.stack?.split('\n').slice(0, 6).join('\n') }) };
+    return { name: e.name, message: redactText(e.message), ...(code ? { code } : {}), ...(process.env.NODE_ENV === 'production' ? {} : { stack: redactText(e.stack?.split('\n').slice(0, 6).join('\n') ?? '') }) };
   }
-  return { message: String(e) };
+  return { message: redactText(String(e)) };
+}
+
+// ───────────── Redaction (plan 06 Phase 0 D10 "structured logs with redaction"; standard §40) ─────────────
+
+/** Field names whose values never reach a log line: credentials, session material and personal contact data. */
+const SECRET_KEYS = new Set([
+  'email', 'emails', 'phone', 'password', 'passcode', 'secret', 'token', 'accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
+  'idtoken', 'id_token', 'apikey', 'api_key', 'authorization', 'cookie', 'cookies', 'set-cookie', 'clientsecret', 'client_secret', 'signature',
+  'sessiontoken', 'otp', 'code_verifier',
+]);
+const isSecretKey = (k: string) => {
+  const l = k.toLowerCase();
+  return SECRET_KEYS.has(l) || l.endsWith('_enc') || /(^|_)(password|secret|api_?key)$/.test(l);
+};
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const BEARER_RE = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+
+/** Email addresses and bearer credentials inside free text. */
+export function redactText(s: string): string {
+  return s.replace(EMAIL_RE, '[email]').replace(BEARER_RE, '$1 [redacted]');
+}
+
+/** A copy of `v` with secret-named fields replaced and email-shaped strings masked (depth-limited). */
+export function redact(v: unknown, depth = 0): unknown {
+  if (typeof v === 'string') return redactText(v);
+  if (v === null || typeof v !== 'object' || depth > 5) return v;
+  if (v instanceof Error) return v;
+  if (Array.isArray(v)) return v.slice(0, 50).map((x) => redact(x, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) out[k] = isSecretKey(k) && x != null && x !== '' ? '[redacted]' : redact(x, depth + 1);
+  return out;
 }
 
 export interface Logger {
@@ -102,7 +133,7 @@ export function logger(component: string, base: LogBindings = {}): Logger {
   const write = (level: LogLevel, msg: string, fields: Record<string, unknown> = {}) => {
     if (RANK[level] < threshold()) return;
     const { err, ...rest } = fields as { err?: unknown };
-    const line = JSON.stringify({ ts: new Date().toISOString(), level, service: SERVICE, component, msg, ...logContext(), ...base, ...rest, ...(err !== undefined ? { err: serializeError(err) } : {}) });
+    const line = JSON.stringify({ ts: new Date().toISOString(), level, service: SERVICE, component, msg: redactText(msg), ...logContext(), ...(redact({ ...base, ...rest }) as object), ...(err !== undefined ? { err: serializeError(err) } : {}) });
     (level === 'error' || level === 'warn' ? process.stderr : process.stdout).write(line + '\n');
   };
   return {
