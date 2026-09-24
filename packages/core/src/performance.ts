@@ -31,7 +31,7 @@ export const FRESHNESS_DAYS = 7;
 export async function saveIntegration(
   tx: Tx,
   ctx: TenantContext,
-  input: { provider: Provider; externalAccountId: string; displayName?: string | null; token: string; refreshToken?: string | null; scopes: string[]; timezone?: string | null; currency?: string | null },
+  input: { provider: Provider; externalAccountId: string; displayName?: string | null; token: string; refreshToken?: string | null; scopes: string[]; timezone?: string | null; currency?: string | null; platformUserId?: string | null },
 ) {
   assertCan(ctx, 'integration.manage');
   if (input.provider === 'shopify') {
@@ -43,10 +43,11 @@ export async function saveIntegration(
     }
   }
   const [row] = await tx`
-    insert into integrations (workspace_id, provider, external_account_id, display_name, scopes, status, token_enc, refresh_token_enc, timezone, currency)
+    insert into integrations (workspace_id, provider, external_account_id, display_name, scopes, status, token_enc, refresh_token_enc, timezone, currency, platform_user_id)
     values (${ctx.workspaceId}, ${input.provider}, ${input.externalAccountId}, ${input.displayName ?? null}, ${input.scopes}, 'active',
-            ${encryptToken(input.token)}, ${input.refreshToken ? encryptToken(input.refreshToken) : null}, ${input.timezone ?? null}, ${input.currency ?? null})
+            ${encryptToken(input.token)}, ${input.refreshToken ? encryptToken(input.refreshToken) : null}, ${input.timezone ?? null}, ${input.currency ?? null}, ${input.platformUserId ?? null})
     on conflict (workspace_id, provider, external_account_id) do update set token_enc = excluded.token_enc,
+      platform_user_id = coalesce(excluded.platform_user_id, integrations.platform_user_id),
       refresh_token_enc = coalesce(excluded.refresh_token_enc, integrations.refresh_token_enc), scopes = excluded.scopes, status = 'active', error = null
     returning id`;
   if (input.provider === 'shopify') {

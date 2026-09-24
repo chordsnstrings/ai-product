@@ -119,3 +119,49 @@ grant execute on function waitlist_join(citext, text, text, text, text) to app_r
 grant select on waitlist to admin_rw;
 grant select, insert, delete on waitlist to system_rw;
 insert into table_registry values ('waitlist', 'global');
+
+-- ───────────── Webhook receipts (standard §38: verify signature, deduplicate, persist raw receipt, async process) ─────
+-- Shopify, Resend, Meta and TikTok deliveries are verified in the web app, stored here once per delivery id and
+-- processed by the worker (system role). Stripe keeps its own stripe_events table. No workspace_id: the workspace is
+-- resolved when the receipt is processed.
+create table webhook_receipts (
+  id uuid primary key default gen_random_uuid(),
+  provider text not null check (provider in ('shopify', 'resend', 'meta', 'tiktok')),
+  delivery_id text not null,
+  topic text not null,
+  payload text not null,
+  headers jsonb not null default '{}',
+  status text not null default 'pending' check (status in ('pending', 'processing', 'processed', 'failed', 'ignored')),
+  attempts int not null default 0,
+  error text,
+  received_at timestamptz not null default now(),
+  claimed_at timestamptz,
+  processed_at timestamptz,
+  unique (provider, delivery_id)
+);
+create index webhook_receipts_pending on webhook_receipts (received_at) where status in ('pending', 'processing');
+alter table webhook_receipts enable row level security;
+alter table webhook_receipts force row level security;
+create policy staff_read on webhook_receipts for select to admin_rw using (true);
+create policy system_access on webhook_receipts to system_rw using (true) with check (true);
+do $$ begin execute format('create policy owner_access on webhook_receipts to %I using (true) with check (true)', current_user); end $$;
+grant select on webhook_receipts to admin_rw;
+grant select, insert, update on webhook_receipts to system_rw;
+insert into table_registry values ('webhook_receipts', 'global');
+
+-- The web app stores a verified delivery without being able to read any: true when it is new.
+create or replace function webhook_receive(p_provider text, p_delivery text, p_topic text, p_payload text, p_headers jsonb) returns boolean
+language plpgsql volatile security definer set search_path = public as $$
+declare v uuid;
+begin
+  insert into webhook_receipts (provider, delivery_id, topic, payload, headers) values (p_provider, p_delivery, p_topic, p_payload, coalesce(p_headers, '{}'))
+  on conflict (provider, delivery_id) do nothing returning id into v;
+  if v is not null then perform pg_notify('outbox', 'webhook'); end if;
+  return v is not null;
+end $$;
+revoke all on function webhook_receive(text, text, text, text, jsonb) from public;
+grant execute on function webhook_receive(text, text, text, text, jsonb) to app_rw, system_rw;
+
+-- Meta's deauthorize and data-deletion callbacks name the app-scoped user who authorised the connection.
+alter table integrations add column platform_user_id text;
+create index integrations_platform_user on integrations (provider, platform_user_id) where platform_user_id is not null;

@@ -1,20 +1,18 @@
-import { withTenant } from '@arkiv/db';
-import { workspaceForShop } from '@arkiv/core';
+import { createHash } from 'node:crypto';
+import { receiveWebhook } from '@arkiv/core';
 import { verifyShopifyWebhook } from '@arkiv/integrations';
 
 /**
- * Shopify webhooks: app/uninstalled and the mandatory GDPR topics. Tokens are revoked on uninstall; customer
- * data requests are acknowledged (we store no Shopify customer PII — read_products scope only).
+ * Shopify webhooks (§38): verify the HMAC, store the raw delivery once per X-Shopify-Webhook-Id, ack fast. The
+ * worker processes it: app/uninstalled and shop/redact revoke the integration (INTEGRATION_DISCONNECTED), the
+ * mandatory customers/* GDPR topics are recorded as data requests (we hold no Shopify customer data), and
+ * products/update queues a product sync.
  */
 export async function POST(req: Request) {
   const raw = await req.text();
   if (!verifyShopifyWebhook(raw, req.headers.get('x-shopify-hmac-sha256'))) return new Response('Unauthorized', { status: 401 });
-  const topic = req.headers.get('x-shopify-topic') ?? '';
-  const shop = req.headers.get('x-shopify-shop-domain') ?? '';
-  const ws = shop ? await workspaceForShop(shop) : null;
-  if (ws && (topic === 'app/uninstalled' || topic === 'shop/redact')) {
-    await withTenant(ws, (tx) => tx`update integrations set status = 'disconnected', token_enc = null, refresh_token_enc = null, updated_at = now()
-                                where workspace_id = ${ws} and provider = 'shopify'`);
-  }
-  return Response.json({ ok: true });
+  const topic = req.headers.get('x-shopify-topic') ?? 'unknown';
+  const delivery = req.headers.get('x-shopify-webhook-id') ?? `sha256:${createHash('sha256').update(`${topic}\n${raw}`).digest('hex')}`;
+  const duplicate = !(await receiveWebhook('shopify', delivery, topic, raw, { 'x-shopify-shop-domain': req.headers.get('x-shopify-shop-domain') }));
+  return Response.json({ ok: true, duplicate });
 }
