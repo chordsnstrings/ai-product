@@ -3,7 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
 import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProductionMode, type ProjectState } from '@arkiv/shared';
-import { brandAccent, captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { brandAccent, captionCues, composeAd, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
@@ -25,7 +25,7 @@ import { referenceAssetIds } from './sku-variants';
 import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
-import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
+import { qaClaims, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -44,6 +44,11 @@ export const ASPECTS: Aspect[] = ['9x16', '4x5', '1x1'];
 const MIN_GEN_SECONDS = 5;
 /** Generated environment plates for strict product composites (§23). */
 export const PLATE_TASK = 'image.environment_plate';
+/** The whole-creative implied-claim scan and the cross-scene continuity check (QA Gateway, §25). */
+export const IMPLIED_TASK = 'qa.implied_claims';
+export const CONTINUITY_TASK = 'qa.continuity';
+/** Frames of the finished 9:16 export the implied-claim scan looks at. */
+const IMPLIED_FRAMES = 3;
 /** A voice-over may run this far past the end of the ad before the export is refused (never cut mid-word). */
 const VO_OVERFLOW_TOLERANCE_MS = 250;
 
@@ -100,6 +105,9 @@ export interface ProductionRoutes {
   tts: RouteModel[];
   qa: RouteModel[];
   plate: RouteModel[] | null;
+  /** Whole-creative implied-claim scan (§43) and cross-scene continuity (§44) — null when the route isn't set up. */
+  implied: RouteModel[] | null;
+  continuity: RouteModel[] | null;
 }
 
 /** A task's route and its approved fallback route (when one is set). */
@@ -109,12 +117,14 @@ async function withFallbackRoute(tx: Tx, task: string, workspaceId: string | nul
 }
 
 export async function productionRoutes(tx: Tx, workspaceId: string | null): Promise<ProductionRoutes> {
-  const [plate] = await tx`select 1 from model_routes where task = ${PLATE_TASK}`;
+  const has = async (task: string) => (await tx`select 1 from model_routes where task = ${task}`).length > 0;
   return {
     video: await withFallbackRoute(tx, 'video.scene', workspaceId),
     tts: await withFallbackRoute(tx, 'tts.voiceover', workspaceId),
     qa: await withFallbackRoute(tx, 'qa.fidelity', workspaceId),
-    plate: plate ? await withFallbackRoute(tx, PLATE_TASK, workspaceId) : null,
+    plate: (await has(PLATE_TASK)) ? await withFallbackRoute(tx, PLATE_TASK, workspaceId) : null,
+    implied: (await has(IMPLIED_TASK)) ? await withFallbackRoute(tx, IMPLIED_TASK, workspaceId) : null,
+    continuity: (await has(CONTINUITY_TASK)) ? await withFallbackRoute(tx, CONTINUITY_TASK, workspaceId) : null,
   };
 }
 
@@ -179,12 +189,19 @@ export function planProduction(
   const shortest = secs.length ? Math.min(...secs) : 0;
   const plates = routes.plate ? (opts.plates ?? 0) : 0;
   const voice = (): CostLine[] => (voiceChars ? [voiceLine(routes, rates, voiceChars)] : []);
+  // One whole-creative implied-claim scan, and one continuity check when two or more generated scenes show people.
+  const people = scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION' && !!s.shows_human_skin).length;
+  const review = (): CostLine[] => [
+    ...(routes.implied ? [dearerLine(routes.implied, rates, { kind: 'llm', inputTokens: 1_500 * IMPLIED_FRAMES + 3_000, outputTokens: 1_200 })] : []),
+    ...(routes.continuity && people >= 2 ? [dearerLine(routes.continuity, rates, { kind: 'llm', inputTokens: 1_500 * Math.min(6, people) + 500, outputTokens: 600 })] : []),
+  ];
   const tail = (reserve: number): CostLine[] => {
     const repairs = generative.length ? Math.min(generative.length, Math.floor((reserve + 1e-6) / shortest)) : 0;
     const inspections = 2 * generative.length + repairs + plates + 1;
     return [
       ...voice(),
       dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
+      ...review(),
       ...(plates && routes.plate ? [dearerLine(routes.plate, rates, { kind: 'image', images: plates })] : []),
       { kind: 'media', outputs: 1 },
     ];
@@ -858,6 +875,30 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         else if (s.production_mode === 'STRICT_COMPOSITE') slots.push(await strict(s, n));
         else slots.push(await still(s, n, await frameOf(s, n)));
       }
+
+      // Continuity of generated people across scenes (§44, §48): scenes that break it with the first become the
+      // exact-product composite — no extra renders ("continuity is not worth endless retries").
+      const people = slots.map((sl, i) => ({ sl, s: body[i]! })).filter(({ sl, s }) => sl.entry.kind === 'video' && sl.entry.technique === 'generative' && !!s.shows_human_skin);
+      if (people.length >= 2 && routes.continuity) {
+        await heartbeat();
+        const frames = await Promise.all(
+          people.map(async ({ sl, s }) => ({ sceneId: s.id, planText: (s.visual_plan as string) ?? '', bytes: await withTempDir(async (sub) => readFile((await extractFrames(sl.input.file, 1, sub))[0]!)) })),
+        );
+        let cont: Awaited<ReturnType<typeof qaContinuity>>;
+        try {
+          cont = await qaContinuity(ctx, auth.token, projectId, frames);
+        } catch (e) {
+          if (isProviderOutage(e)) throw new ProviderOutage(CONTINUITY_TASK, e);
+          throw e;
+        }
+        if (cont) {
+          checks.push(cont.check);
+          for (const sceneId of cont.inconsistentSceneIds) {
+            const i = body.findIndex((s) => s.id === sceneId);
+            if (i >= 0) slots[i] = await exactFallback(body[i]!, i + 1, 'AI talent inconsistent across scenes');
+          }
+        }
+      }
       await heartbeat();
       await withTenant(ws, async (tx) => {
         await step(tx, ws, projectId, 'scenes', 'done', `${scenes.length} scenes`);
@@ -978,6 +1019,37 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         generatedScenes,
       };
       const outs = await composeAd({ scenes: slots.map((s) => s.input), voiceover: voPath, captions, endCard, aspects: ASPECTS, metadata: disclosureMetadata(disclosure) }, dir);
+
+      // The whole creative — script, on-screen text, hook, CTA and the finished pictures together — is scanned
+      // for implied claims (§25 check 3, §43 "Visual implies a medical result"). An implied medical,
+      // structure/function or before/after result blocks the ad like a blocked line.
+      if (routes.implied) {
+        await heartbeat();
+        const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
+        const frames = await withTempDir(async (sub) => Promise.all((await extractFrames(vertical.file, IMPLIED_FRAMES, sub)).map((f) => readFile(f))));
+        let implied: CheckResult;
+        try {
+          implied = await qaImpliedClaims(ctx, auth.token, projectId, {
+            scenes: scenes.map((s) => ({ visualPlan: (s.visual_plan as string | null) ?? null, spokenLine: (s.spoken_line as string | null) ?? null, overlayText: (s.overlay_text as string | null) ?? null })),
+            hook: (sb.hook_text as string | null) ?? null,
+            cta: endCard.cta,
+            frames,
+          });
+        } catch (e) {
+          if (isProviderOutage(e)) throw new ProviderOutage(IMPLIED_TASK, e);
+          throw e;
+        }
+        checks.push(implied);
+        if (!implied.pass) {
+          await withTenant(ws, async (tx) => {
+            await step(tx, ws, projectId, 'claims', 'failed', 'Something in the ad needs changing before we can finish');
+            await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: implied.detail.slice(0, 500), code: 'claims_blocked' });
+            await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), impliedClaims: implied.data } as never)} where id = ${projectId}`;
+            await settle(tx, ctx, auth.authorizationId, 'released');
+          });
+          return;
+        }
+      }
       const [concept] = await withTenant(ws, (tx) => tx`select proposal from concepts where id = ${p.selected_concept_id}`);
       const proposal = (concept?.proposal ?? {}) as Record<string, unknown>;
       const manifest: CompositionManifest = {

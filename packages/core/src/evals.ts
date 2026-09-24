@@ -10,6 +10,7 @@ import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
 import { lineFor, llmJson } from './model-gateway';
 import { findPrompt, latestPrompt, parsePromptRef } from './prompts';
+import { impliedClaimSignals } from './qa';
 import { compareVariants, DEFAULT_BASELINES } from './statistics';
 
 /**
@@ -46,6 +47,11 @@ export const DATASETS: Record<string, DatasetInfo> = {
   'reviews.deceptive': {
     category: 'Deceptive review language',
     description: 'Customer-review lines proposed as copy for a generated presenter: first-person testimonials and drug-outcome language must be blocked (§40, §43).',
+    kind: 'rules',
+  },
+  'implied.creative': {
+    category: 'Implied claims in the whole creative',
+    description: 'A scene description or line from a finished ad → pass, or block when it implies a medical, before/after or time-bound result even without saying it (§43). Gates the implied-claim scan.',
     kind: 'rules',
   },
   'performance.confounded': {
@@ -97,6 +103,18 @@ export const GOLDEN: Record<string, GoldenCase[]> = {
     { id: 'rd-05', input: 'A gel texture that sinks right in.', expect: 'pass' },
     { id: 'rd-06', input: 'It healed my acne scars completely.', expect: 'block', note: 'drug outcome' },
   ],
+  'implied.creative': [
+    { id: 'ic-01', input: 'Split-screen of the same face: red, bumpy skin on the left, smooth clear skin on the right.', expect: 'block', note: 'visual before/after' },
+    { id: 'ic-02', input: 'Close-up as the blemish on her chin fades away while she applies the serum.', expect: 'block', note: 'a condition that disappears on screen' },
+    { id: 'ic-03', input: 'Clear skin in just 7 days.', expect: 'block', note: 'time-bound result' },
+    { id: 'ic-04', input: 'A woman in a lab coat applies the cream in a clinic.', expect: 'block', note: 'clinical staging implies a treatment' },
+    { id: 'ic-05', input: 'Before & after: day 1 vs day 30.', expect: 'block' },
+    { id: 'ic-06', input: 'A hand releases a drop onto the back of the other hand; slow spread.', expect: 'pass' },
+    { id: 'ic-07', input: 'Macro close-up of the serum on warm paper, soft side light.', expect: 'pass' },
+    { id: 'ic-08', input: 'Apply before bed for a dewy look after you wake up.', expect: 'pass', note: 'routine timing, not a before/after' },
+    { id: 'ic-09', input: 'Skin feels soft and looks dewy.', expect: 'pass' },
+    { id: 'ic-10', input: 'Wrinkles vanish as the cream sinks in.', expect: 'block' },
+  ],
   'performance.confounded': [
     { id: 'pc-01', input: perf([40000, 800, 7], [40000, 480, 7], 0), expect: 'ACTIONABLE', note: 'clear winner, clean period' },
     { id: 'pc-02', input: perf([40000, 800, 7], [40000, 480, 7], 1), expect: 'OPERATIONALLY_CONFOUNDED', note: 'same result during a stock-out' },
@@ -117,6 +135,7 @@ export const EXPECTED_LABELS: Record<string, readonly string[]> = {
   'compliance.classify': ['VERIFIED', 'VERIFIED_WITH_QUALIFIER', 'MERCHANT_REVIEW_REQUIRED', 'RESTRICTED', 'BLOCKED', 'INFERRED_ONLY'],
   'compliance.scan': ['pass', 'block'],
   'reviews.deceptive': ['pass', 'block'],
+  'implied.creative': ['pass', 'block'],
   'performance.confounded': ['GATHERING_SIGNAL', 'DIRECTIONAL', 'ACTIONABLE', 'INCONCLUSIVE', 'OPERATIONALLY_CONFOUNDED'],
   'extract.packaging': ['dropper_bottle', 'pump_bottle', 'jar', 'tube', 'spray', 'stick', 'bottle', 'other'],
 };
@@ -140,7 +159,8 @@ export function evalDatasetFor(task: string): string | null {
   if (GOLDEN[task]) return task;
   const model = Object.entries(DATASETS).find(([, d]) => d.kind === 'model' && d.task === task);
   if (model) return model[0];
-  if (task.startsWith('compliance') || task.startsWith('creative_director') || task === 'qa.implied_claims') return 'compliance.scan';
+  if (task === 'qa.implied_claims') return 'implied.creative';
+  if (task.startsWith('compliance') || task.startsWith('creative_director')) return 'compliance.scan';
   return null;
 }
 
@@ -187,6 +207,8 @@ function ruleOutcome(dataset: string, input: string): string {
       return scanCreativeText([input], []).ok ? 'pass' : 'block';
     case 'reviews.deceptive':
       return isFirstPersonTestimonial(input) || !scanCreativeText([input], []).ok ? 'block' : 'pass';
+    case 'implied.creative':
+      return impliedClaimSignals([input]).length ? 'block' : 'pass';
     case 'performance.confounded': {
       const x = JSON.parse(input) as { a: [number, number, number]; b: [number, number, number]; confounders: number };
       const ev = [x.a, x.b].map(([impressions, clicks, days], i) => ({ variantId: String.fromCharCode(97 + i), obs: { successes: clicks, trials: impressions }, days }));

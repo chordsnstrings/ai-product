@@ -72,7 +72,8 @@ export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
   RENDERING: ['QA_RUNNING', ...IN_FLIGHT_SIDE],
   QA_RUNNING: ['COMPOSING', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
   COMPOSING: ['PLATFORM_VARIANTS', ...IN_FLIGHT_SIDE],
-  PLATFORM_VARIANTS: ['FINAL_QA', ...IN_FLIGHT_SIDE],
+  // The whole-creative implied-claim scan runs on the composed ad (§43): it can still block it.
+  PLATFORM_VARIANTS: ['FINAL_QA', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
   FINAL_QA: ['COMPLETE', ...IN_FLIGHT_SIDE],
   COMPLETE: [],
   NEEDS_USER_ACTION: [

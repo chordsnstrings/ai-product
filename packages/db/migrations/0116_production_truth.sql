@@ -11,3 +11,11 @@ alter table variants add column platform_assets jsonb not null default '[]';
 -- cost, are kept with the scene so the merchant sees them before approving and nothing is downgraded silently.
 alter table scenes add column planner_reason text;
 alter table scenes add column estimate_micros bigint;
+
+-- ───────────── Whole-creative QA routes (standard §25 check 2–3, §43, §44, §48) ─────────────
+-- The implied-claim scan now runs on every finished ad (words and pictures together), and generated people are
+-- checked for continuity across scenes. Both are billable model calls, so they have routes (and circuits).
+insert into model_routes (task, provider, model, prompt_version) values
+  ('qa.implied_claims', 'anthropic', 'claude-opus-5-5', 'implied-claims@1.1.0'),
+  ('qa.continuity', 'anthropic', 'claude-opus-5-5', 'continuity@1.0.0')
+on conflict (task) do update set prompt_version = excluded.prompt_version;

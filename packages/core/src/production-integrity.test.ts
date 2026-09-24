@@ -417,6 +417,56 @@ describe('cancelling a running production (standard §38, §46: arch-11)', () =>
   }, 240_000);
 });
 
+describe('whole-creative QA (standard §43 implied claims, §44/§48 continuity: edge-43-04, edge-44-04)', () => {
+  it('a finished ad whose pictures imply a medical result is blocked like a blocked line, and nothing is charged', async () => {
+    const r = await storyboardReady();
+    // The claim is carried by what the scene shows, not by any line (the mock reviewer reads the marker).
+    await ownerPool()`update scenes set visual_plan = visual_plan || ' [[qa:implied]]' where storyboard_id = ${r.storyboardId} and purpose = 'routine'`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('failed');
+    await withTenant(r.t.workspaceId, async (tx) => {
+      const [p] = await tx`select state, failure_code, qa_report from projects where id = ${r.projectId}`;
+      expect(p).toMatchObject({ state: 'BLOCKED_COMPLIANCE', failure_code: 'claims_blocked' });
+      const report = p!.qa_report as { impliedClaims: { impliedClaims: { basis: string; severity: string }[] }; checks: { check: string; pass: boolean; detail: string }[] };
+      expect(report.impliedClaims.impliedClaims).toEqual([expect.objectContaining({ basis: 'combined', severity: 'block' })]);
+      expect(report.checks.find((c) => c.check === 'claims' && !c.pass)!.detail).toMatch(/^Implied claim: Scene \d+: The pictures imply/);
+      expect(await available(tx, 'taste')).toBe(1); // released: the customer is not charged for a blocked ad
+      const [job] = await tx`select task, status from provider_jobs where task = 'qa.implied_claims'`;
+      expect(job).toMatchObject({ status: 'succeeded' });
+    });
+    // The blocked implication is listed for the merchant to change, like a blocked line.
+    const [p] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect(blockedLines(p!.qa_report).map((l) => l.reason)).toContain('Implied claim carried by the pictures or the whole ad');
+  }, 240_000);
+
+  it('a clean ad passes the implied-claim scan', async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const [p] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect((p!.qa_report as { checks: { check: string; pass: boolean; detail: string }[] }).checks).toContainEqual(expect.objectContaining({ check: 'claims', pass: true, detail: expect.stringMatching(/implied claims \(words and pictures\)/) }));
+  }, 240_000);
+
+  it('a generated person who changes between scenes switches that scene to the exact product, without retries', async () => {
+    const r = await storyboardReady();
+    const [first, second] = await ownerPool()`select id from scenes where storyboard_id = ${r.storyboardId} and purpose not in ('cta', 'product_reveal') order by position limit 2`;
+    await ownerPool()`update scenes set production_mode = 'GENERATIVE_INTERACTION', shows_human_skin = true where id in ${ownerPool()([first!.id, second!.id])}`;
+    await ownerPool()`update scenes set visual_plan = visual_plan || ' [[qa:continuity]]' where id = ${second!.id}`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const m = await manifestOf(r.projectId);
+    expect(m.scenes.find((s) => s.sceneId === first!.id)).toMatchObject({ kind: 'video', technique: 'generative' });
+    expect(m.scenes.find((s) => s.sceneId === second!.id)).toMatchObject({ kind: 'still', technique: 'exact_product_composite' });
+    const [p] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    const cont = (p!.qa_report as { checks: { check: string; detail: string; data?: { inconsistentSceneIds?: string[] } }[] }).checks.find((c) => /^Continuity/.test(c.detail));
+    expect(cont).toMatchObject({ check: 'visual', data: { inconsistentSceneIds: [second!.id] } });
+    // No extra render was paid for: one render per generated scene.
+    const renders = await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`;
+    expect(renders[0]!.n).toBe(2);
+    expect((await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'qa.continuity'`)[0]!.n).toBe(1);
+  }, 240_000);
+});
+
 describe('repeated product-fidelity failure KPI (standard §10: biz-21)', () => {
   it('counts paid projects with a scene that failed product fidelity hard twice', async () => {
     const r = await storyboardReady();
