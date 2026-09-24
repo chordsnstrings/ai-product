@@ -78,6 +78,7 @@ function Account({ staff }: { staff: { name: string; roles: string[] } }) {
       <div className="ak-muted ak-mono" style={{ fontSize: 11 }}>{staff.roles.join(' · ')}</div>
       <div className="ak-row" style={{ gap: 12 }}>
         <Link href="/account" className="ak-textbtn">Passkeys</Link>
+        <span className="ak-muted" title="Keyboard shortcuts"><kbd>?</kbd> keys</span>
         <button className="ak-textbtn" onClick={async () => { await fetch('/api/logout', { method: 'POST' }); window.location.assign('/login'); }}>Sign out</button>
       </div>
     </div>
