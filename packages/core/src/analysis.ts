@@ -60,9 +60,10 @@ export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPrevi
   const projectId = newId();
   const no = await nextCatalogueNo(tx);
   const [brand] = await tx`select id from brands order by created_at limit 1`;
-  await tx`insert into skus (id, workspace_id, brand_id, catalogue_no, name, status, source_url, source_kind)
+  // origin_visitor_id keeps the preview's funnel attribution if the SKU later moves into an existing account.
+  await tx`insert into skus (id, workspace_id, brand_id, catalogue_no, name, status, source_url, source_kind, origin_visitor_id)
            values (${skuId}, ${ctx.workspaceId}, ${brand?.id ?? null}, ${no}, 'Reading your product…', 'analyzing',
-                   ${input.url ?? null}, ${input.url ? 'url' : 'photos'})`;
+                   ${input.url ?? null}, ${input.url ? 'url' : 'photos'}, ${input.visitorId ?? null})`;
   for (const a of input.photoAssetIds ?? []) await tx`update assets set sku_id = ${skuId}, kind = 'product_photo' where id = ${a} and sku_id is null`;
   await tx`insert into projects (id, workspace_id, sku_id, kind, state, created_by)
            values (${projectId}, ${ctx.workspaceId}, ${skuId}, 'preview', 'PRODUCT_UPLOADED', ${ctx.actor.kind + ':' + ctx.actor.id})`;

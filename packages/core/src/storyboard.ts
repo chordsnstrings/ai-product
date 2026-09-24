@@ -8,7 +8,7 @@ import type { TenantContext } from './context';
 import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
 import { allowedClaimTexts, planStoryboard } from './creative-director';
 import { emit } from './events';
-import { recordFunnel } from './funnel';
+import { projectVisitor, recordFunnel } from './funnel';
 import type { StoryboardPlan } from './intel-schemas';
 import { generateImage, route } from './model-gateway';
 import { issueTasteOffer } from './offers';
@@ -156,7 +156,7 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
       // Standard §5: the 60-minute Taste window starts only now.
       await issueTasteOffer(tx, ctx, projectId);
       await emit(tx, ctx, 'STORYBOARD_READY', { type: 'project', id: projectId }, { storyboardId });
-      await recordFunnel('STORYBOARD_READY', { workspaceId: ws }, tx);
+      await recordFunnel('STORYBOARD_READY', { workspaceId: ws, visitorId: await projectVisitor(tx, ws, projectId) }, tx);
     });
   } catch (e) {
     await withTenant(ws, async (tx) => {

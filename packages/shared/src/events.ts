@@ -1,5 +1,7 @@
 // Appendix B event catalogue (V1.2) + platform events from the build plan.
 // Event envelope per §36: actor, timestamp, tenant, object IDs, schema version.
+import { z } from 'zod';
+import { ClaimStatus, Role } from './enums';
 
 export const EventType = [
   // Product
@@ -17,6 +19,7 @@ export const EventType = [
   'CLAIM_APPROVED',
   'CLAIM_RESTRICTED',
   'CLAIM_BLOCKED',
+  'CLAIM_UNBLOCKED',
   // Creative
   'CREATIVE_IMPORTED',
   'GENOME_EXTRACTED',
@@ -101,3 +104,25 @@ export function actorRef(a: Actor): string {
 }
 
 export const EVENT_SCHEMA_VERSION = 1;
+
+/**
+ * Payload schemas for event types written from more than one code path (customer app, staff console, system),
+ * so every writer produces one shape under the same schema_version (§36). emit() checks them.
+ */
+export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
+  // One event per member whose role changed. `transfer` marks an ownership transfer; `byStaff` a support action.
+  MEMBER_ROLE_CHANGED: z
+    .object({ from: z.enum(Role), to: z.enum(Role), transfer: z.literal(true).optional(), byStaff: z.literal(true).optional(), reason: z.string().optional() })
+    .strict(),
+  CLAIM_RESTRICTED: z.object({ reason: z.string() }).strict(),
+  // COMPLIANCE lifted a block (four-eyes): the claim goes back to review, never straight to approved.
+  CLAIM_UNBLOCKED: z.object({ from: z.literal('BLOCKED'), to: z.enum(ClaimStatus), reason: z.string() }).strict(),
+};
+
+/** Throws when a payload doesn't match the registered schema for its type (types without one always pass). */
+export function assertEventPayload(type: EventType, payload: unknown): void {
+  const schema = EVENT_PAYLOADS[type];
+  if (!schema) return;
+  const r = schema.safeParse(payload);
+  if (!r.success) throw new Error(`${type} payload does not match its schema: ${r.error.issues.map((i) => `${i.path.join('.') || '(root)'} ${i.message}`).join('; ')}`);
+}

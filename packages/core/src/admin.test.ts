@@ -7,8 +7,14 @@ import {
   assertBreakGlass,
   cancelProjectBeforeDispatch,
   cancelTenantPurge,
+  churnRisk,
   decideApproval,
+  healthScore,
+  mrrMovement,
+  qaQueueSql,
   requestOpsCommand,
+  RISK_WEIGHTS,
+  tenantHealth,
   requestOrExecute,
   retryProjectProduction,
   scheduleTenantPurge,
@@ -23,6 +29,7 @@ import { authorize } from './cost-governor';
 import { holdJob } from './holds';
 import { append, available, balances } from './ledger';
 import { refreshRiskFlags } from './lifecycle';
+import { clearSettingsCache } from './settings';
 import { ctxFor } from './testing';
 
 async function staff(roles: StaffRole[], name = roles.join('+')): Promise<Staff> {
@@ -65,9 +72,9 @@ describe('break-glass', () => {
     const t = await makeTenant();
     const s = await staff(['SUPPORT']);
     await expect(withAdmin((tx) => assertBreakGlass(tx, s, t.workspaceId, 'view SKU'))).rejects.toThrow(/break-glass/);
-    await expect(startBreakGlass(s, t.workspaceId, { reason: 'ticket', write: false })).rejects.toThrow(/Describe why/);
-    await expect(startBreakGlass(s, t.workspaceId, { reason: 'Ticket #812: storyboard looks wrong', write: true, writeReason: 'fix it for them' })).rejects.toThrow(/role/);
-    await startBreakGlass(s, t.workspaceId, { reason: 'Ticket #812: storyboard looks wrong', ticket: '812' });
+    await expect(startBreakGlass(s, t.workspaceId, { reasonKind: 'ticket', ticket: '812', reason: 'ticket', write: false })).rejects.toThrow(/Describe why/);
+    await expect(startBreakGlass(s, t.workspaceId, { reasonKind: 'ticket', ticket: '812', reason: 'Ticket #812: storyboard looks wrong', write: true, writeReason: 'fix it for them' })).rejects.toThrow(/role/);
+    await startBreakGlass(s, t.workspaceId, { reasonKind: 'ticket', reason: 'Ticket #812: storyboard looks wrong', ticket: '812' });
     await withAdmin((tx) => assertBreakGlass(tx, s, t.workspaceId, 'view SKU'));
     await expect(withAdmin((tx) => assertBreakGlass(tx, s, t.workspaceId, 'edit claim', true))).rejects.toThrow(/write access/);
     // Customer-visible access log (RLS: the tenant sees its own sessions).
@@ -302,5 +309,94 @@ describe('experiments & jobs tab (plan 05 §2.2)', () => {
     const pid2 = await project(t.workspaceId, 'PROVIDER_FAILED');
     await setTenantHold(ops, t.workspaceId, 'SUSPENDED', 'fraud review');
     await expect(retryProjectProduction(ops, t.workspaceId, pid2, 'retry')).rejects.toThrow(/suspended/);
+  });
+});
+
+describe('tenant metrics for the console (plan 05 §1, §2.1, §2.2, §13)', () => {
+  it('scores churn risk by indicator weight into bands', () => {
+    expect(churnRisk([])).toEqual({ score: 0, band: 'low' });
+    expect(churnRisk(['stockout', 'idle_7d'])).toEqual({ score: 20, band: 'medium' });
+    expect(churnRisk(['paid_no_export', 'negative_support_sentiment', 'idle_7d', 'idle_7d'])).toEqual({ score: 65, band: 'high' });
+    expect(churnRisk(Object.keys(RISK_WEIGHTS)).score).toBe(100);
+  });
+
+  it('health score lists every factor that lowered it', () => {
+    expect(healthScore({ riskScore: 0, daysSinceActive: 1, paying: true, exports30d: 3, failedJobs7d: 0, quotasOver: 0 })).toEqual({ score: 100, band: 'healthy', factors: [] });
+    const h = healthScore({ riskScore: 40, daysSinceActive: 10, paying: true, exports30d: 0, failedJobs7d: 2, quotasOver: 1 });
+    expect(h.factors.map((f) => f.points)).toEqual([-20, -15, -15, -10, -10]);
+    expect(h).toMatchObject({ score: 30, band: 'at risk' });
+  });
+
+  it('shows plan quotas (settings-aware) against usage, and Creative Tests used this period', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID', plan: 'LAUNCH' });
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, current_period_start, current_period_end, consent_record_id)
+                      values (${t.workspaceId}, 'sub_h1', 'LAUNCH', 'active', '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', gen_random_uuid())`;
+    await ownerPool()`insert into ledger_entries (workspace_id, type, unit, amount, period_key, actor, idempotency_key) values
+                        (${t.workspaceId}, 'CREDIT_GRANTED', 'creative_test', 3, '2026-09-01', 'system:t', 'g1'),
+                        (${t.workspaceId}, 'CREDIT_RESERVED', 'creative_test', -2, '2026-09-01', 'system:t', 'r1'),
+                        (${t.workspaceId}, 'CREDIT_RELEASED', 'creative_test', 1, '2026-09-01', 'system:t', 'r2')`;
+    await ownerPool()`insert into brands (workspace_id, name) values (${t.workspaceId}, 'Second brand')`; // LAUNCH allows 1
+    await ownerPool()`insert into risk_flags (workspace_id, indicator) values (${t.workspaceId}, 'paid_no_export')`;
+    const r = await withAdmin((tx) => tenantHealth(tx, t.workspaceId));
+    const q = Object.fromEntries(r.quotas.map((x) => [x.key, [x.used, x.limit]]));
+    expect(q).toMatchObject({ brands: [2, 1], members: [1, 2], creativeTests: [1, 3], renderConcurrency: [0, 2] });
+    expect(r.risk).toEqual({ score: 25, band: 'medium' });
+    expect(r.health.factors.map((f) => f.label)).toEqual(expect.arrayContaining(['churn risk 25', 'no member has signed in', 'paying, no export in 30 days', '1 quota exceeded']));
+    // Staff raise a plan's member quota through the settings, and the Overview follows.
+    await ownerPool()`update platform_settings set value = jsonb_set(value, '{LAUNCH,members}', '5') where key = 'quota.plan_defaults'`;
+    clearSettingsCache();
+    const r2 = await withAdmin((tx) => tenantHealth(tx, t.workspaceId));
+    expect(r2.quotas.find((x) => x.key === 'members')!.limit).toBe(5);
+    await ownerPool()`update platform_settings set value = jsonb_set(value, '{LAUNCH,members}', '2') where key = 'quota.plan_defaults'`;
+    clearSettingsCache();
+  });
+
+  it('net new MRR comes from the subscription mirror: new + expansion − contraction − churned', async () => {
+    const a = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    const b = await makeTenant({ state: 'ACTIVE_PAID', plan: 'SCALE' });
+    const c = await makeTenant({ state: 'CANCELLED' });
+    const test = await makeTenant({ state: 'ACTIVE_PAID', plan: 'SCALE' });
+    await ownerPool()`update workspaces set is_test = true where id = ${test.workspaceId}`;
+    const ev = (ws: string, type: string, payload: Record<string, unknown>, daysAgo = 0) =>
+      ownerPool()`insert into events (workspace_id, type, actor, payload, at) values (${ws}, ${type}, 'system:stripe', ${ownerPool().json(payload as never)}, now() - make_interval(days => ${daysAgo}))`;
+    await ev(a.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'GROWTH' });
+    await ev(b.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'LAUNCH' });
+    await ev(b.workspaceId, 'SUBSCRIPTION_CHANGED', { from: 'LAUNCH', to: 'SCALE', effective: 'now' });
+    await ev(a.workspaceId, 'SUBSCRIPTION_CHANGED', { cancelAtPeriodEnd: true, reason: 'seasonal' }); // a request, not a price change
+    await ev(test.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'SCALE' });
+    await ev(a.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'SCALE' }, 40);
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id) values (${c.workspaceId}, 'sub_gone', 'LAUNCH', 'canceled', gen_random_uuid())`;
+    const m = await withAdmin((tx) => mrrMovement(tx, 30));
+    expect(m).toEqual({ new: 99_000_000 + 49_000_000, expansion: 150_000_000, contraction: 0, churned: 49_000_000, net: 249_000_000 });
+    expect((await withAdmin((tx) => mrrMovement(tx, 30, { includeTest: true }))).new).toBe(99_000_000 + 49_000_000 + 199_000_000);
+  });
+
+  it('the QA queue holds hard fidelity fails, outputs that failed twice, and unreviewed calibration samples', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const sku = await makeSku(t.workspaceId);
+    const proj = async (state: string, report: Record<string, unknown> = {}) => {
+      const id = newId();
+      await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by, qa_report) values (${id}, ${t.workspaceId}, ${sku}, 'taste', ${state}, 'test', ${ownerPool().json(report as never)})`;
+      return id;
+    };
+    const hard = await proj('NEEDS_USER_ACTION', { checks: [{ check: 'product_fidelity', pass: false, hard: true }] });
+    const softFail = await proj('NEEDS_USER_ACTION', { checks: [{ check: 'audio', pass: false, hard: false }] });
+    const twice = await proj('REFUNDED');
+    const [sb] = await ownerPool()`insert into storyboards (workspace_id, project_id, concept_id, status) values (${t.workspaceId}, ${twice}, ${newId()}, 'approved') returning id`;
+    const [sc] = await ownerPool()`insert into scenes (workspace_id, storyboard_id, position, purpose, duration_ms, visual_plan, production_mode) values (${t.workspaceId}, ${sb!.id}, 1, 'hook', 3000, 'x', 'STRICT_COMPOSITE') returning id`;
+    for (const attempt of [1, 2]) await ownerPool()`insert into events (workspace_id, type, actor, subject_type, subject_id, payload) values (${t.workspaceId}, 'QA_FAILED', 'system:qa', 'scene', ${sc!.id}, ${ownerPool().json({ attempt, checks: [] })})`;
+    // Find a project id that falls into the 2% calibration sample.
+    let sample = '';
+    for (let n = 0; n < 500 && !sample; n++) {
+      const id = newId();
+      const [h] = await ownerPool()`select abs(hashtext(${id}::text)) % 50 = 0 as hit`;
+      if (h!.hit) sample = id;
+    }
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by) values (${sample}, ${t.workspaceId}, ${sku}, 'taste', 'COMPLETE', 'test')`;
+    const queue = async () => Object.fromEntries((await withAdmin((tx) => tx`${qaQueueSql(tx)}`)).map((r) => [r.id, r.why]));
+    expect(await queue()).toEqual({ [hard]: 'hard fidelity fail', [twice]: 'failed QA twice', [sample]: 'calibration sample' });
+    expect(Object.keys(await queue())).not.toContain(softFail);
+    await ownerPool()`insert into qa_reviews (workspace_id, project_id, staff_id, verdicts) values (${t.workspaceId}, ${hard}, ${newId()}, '{}')`;
+    expect(Object.keys(await queue())).not.toContain(hard);
   });
 });

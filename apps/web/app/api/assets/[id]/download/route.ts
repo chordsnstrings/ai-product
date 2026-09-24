@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withTenant } from '@arkiv/db';
-import { assetUrl, DELIVERY_HOLD_STATES, emit, recordFunnel } from '@arkiv/core';
+import { assetUrl, DELIVERY_HOLD_STATES, emit, projectVisitor, recordFunnel } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { errorResponse } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
@@ -17,7 +17,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       const [asset] = await tx`select id, lineage from assets where id = ${id}`;
       if (!asset) throw new Error('not found');
       await emit(tx, a.ctx, 'ASSET_EXPORTED', { type: 'asset', id }, { aspect: (asset.lineage as { aspect?: string })?.aspect ?? null });
-      await recordFunnel('ASSET_EXPORTED', { workspaceId: a.ctx.workspaceId, props: { aspect: (asset.lineage as { aspect?: string })?.aspect ?? null } }, tx);
+      const visitorId = await projectVisitor(tx, a.ctx.workspaceId, q.get('project') ?? '');
+      await recordFunnel('ASSET_EXPORTED', { workspaceId: a.ctx.workspaceId, visitorId, props: { aspect: (asset.lineage as { aspect?: string })?.aspect ?? null } }, tx);
       return assetUrl(tx, id, 600, (q.get('name') ?? 'arkiv-ad.mp4').replace(/[^\w.\-]/g, '_'));
     });
     return NextResponse.redirect(url, 303);

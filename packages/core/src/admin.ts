@@ -1,14 +1,15 @@
 import { withAdmin, type Tx } from '@arkiv/db';
-import { DomainError, newId, type ProjectState, type StaffRole, type WorkspaceState } from '@arkiv/shared';
+import { DomainError, newId, PLANS, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type Role, type StaffRole, type WorkspaceState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { settle } from './cost-governor';
+import { emit } from './events';
 import { adjust, type LedgerUnit } from './ledger';
 import { restoreFromScheduledPurge } from './lifecycle';
 import { Queues } from './outbox';
 import { retryProduction } from './production';
 import { transition } from './projects';
 import { retireSupersededRates } from './rates';
-import { setting } from './settings';
+import { planQuota, setting } from './settings';
 import { transitionWorkspace } from './workspaces';
 
 /**
@@ -75,6 +76,8 @@ const P = {
   'audit.read': ['SUPER_ADMIN'],
   'staff.manage': ['SUPER_ADMIN'],
   'approvals.read': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'FINANCE', 'COMPLIANCE', 'GROWTH', 'ENGINEERING'],
+  // Your own sign-in factors (passkeys): every staff member.
+  'account.self': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'FINANCE', 'COMPLIANCE', 'GROWTH', 'ENGINEERING', 'ANALYST'],
 } as const satisfies Record<string, readonly StaffRole[]>;
 export type Permission = keyof typeof P;
 export const PERMISSIONS = P;
@@ -99,15 +102,49 @@ export async function audit(
                    ${s.ip ?? null}, ${s.userAgent ?? null})`;
 }
 
-/** Staff actor context for domain functions that emit tenant events. */
-export const staffCtx = (s: Staff, workspaceId: string) => ({ workspaceId, actor: { kind: 'staff' as const, id: s.staffId } });
+/**
+ * §0.4 "Every admin page view of tenant data … writes to admin_audit_log": one row per render of a console page
+ * that lists tenant rows, with the filters that shaped it.
+ */
+export async function auditView(tx: Tx, s: Staff, module: string, filters: Record<string, unknown> = {}, workspaceId: string | null = null) {
+  const used = Object.fromEntries(Object.entries(filters).filter(([, v]) => v !== undefined && v !== null && v !== '' && v !== false));
+  await audit(tx, s, `view.${module}`, { type: 'module', id: module }, { workspaceId, after: Object.keys(used).length ? used : undefined });
+}
+
+/**
+ * §0.2 SUPPORT: "Tenant read (masked PII)". Emails, IPs and devices are masked for a viewer whose only roles are
+ * SUPPORT (or ANALYST), unless they hold an active break-glass session on that tenant.
+ */
+const PII_MASKED_ROLES: readonly StaffRole[] = ['SUPPORT', 'ANALYST'];
+export const shouldMaskPii = (roles: readonly StaffRole[], breakGlass = false) => !breakGlass && roles.every((r) => PII_MASKED_ROLES.includes(r));
+
+/**
+ * Staff actor context for domain functions that emit tenant events. `onBehalf` marks a break-glass write
+ * (plan 05 §0.3): the actor is recorded as `staff:<id>>workspace:<id>`, i.e. actor=staff, on_behalf_of=workspace.
+ */
+export const staffCtx = (s: Pick<Staff, 'staffId'>, workspaceId: string, opts: { onBehalf?: boolean } = {}): { workspaceId: string; actor: Actor } => ({
+  workspaceId,
+  actor: opts.onBehalf ? { kind: 'staff', id: s.staffId, onBehalfOf: `workspace:${workspaceId}` } : { kind: 'staff', id: s.staffId },
+});
 
 // ───────────── Break-glass (plan 05 §0.3) ─────────────
 
 export const BREAK_GLASS_MINUTES = 60;
 
-export async function startBreakGlass(s: Staff, workspaceId: string, input: { reason: string; ticket?: string | null; write?: boolean; writeReason?: string | null }) {
+/** §0.3 step 1: "Choose a reason (support ticket #, incident #, compliance review) and write free text." */
+export const BREAK_GLASS_REASON_KINDS = ['ticket', 'incident', 'compliance_review'] as const;
+export type BreakGlassReasonKind = (typeof BREAK_GLASS_REASON_KINDS)[number];
+export const BREAK_GLASS_REASON_LABEL: Record<BreakGlassReasonKind, string> = { ticket: 'Support ticket', incident: 'Incident', compliance_review: 'Compliance review' };
+
+export async function startBreakGlass(
+  s: Staff,
+  workspaceId: string,
+  input: { reasonKind: BreakGlassReasonKind; reason: string; ticket?: string | null; write?: boolean; writeReason?: string | null },
+) {
   assertStaff(s, input.write ? 'breakglass.write' : 'breakglass.read');
+  if (!BREAK_GLASS_REASON_KINDS.includes(input.reasonKind)) throw new DomainError('INVALID', 'Choose why you need access: support ticket, incident or compliance review.');
+  const ref = input.ticket?.trim() || null;
+  if (input.reasonKind !== 'compliance_review' && !ref) throw new DomainError('INVALID', `Add the ${input.reasonKind === 'ticket' ? 'support ticket' : 'incident'} number.`);
   if (input.reason.trim().length < 8) throw new DomainError('INVALID', 'Describe why you need access (at least a sentence).');
   if (input.write && (input.writeReason ?? '').trim().length < 8) throw new DomainError('INVALID', 'Write access needs a second, specific reason.');
   return withAdmin(async (tx) => {
@@ -115,10 +152,10 @@ export async function startBreakGlass(s: Staff, workspaceId: string, input: { re
     if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
     await tx`update break_glass_sessions set ended_at = now() where workspace_id = ${workspaceId} and staff_id = ${s.staffId} and ended_at is null`;
     const reason = input.write ? `${input.reason} — write: ${input.writeReason}` : input.reason;
-    const [bg] = await tx`insert into break_glass_sessions (workspace_id, staff_id, staff_name, reason, ticket, write_access, expires_at)
-                          values (${workspaceId}, ${s.staffId}, ${s.name}, ${reason}, ${input.ticket ?? null}, ${!!input.write},
+    const [bg] = await tx`insert into break_glass_sessions (workspace_id, staff_id, staff_name, reason_kind, reason, ticket, write_access, expires_at)
+                          values (${workspaceId}, ${s.staffId}, ${s.name}, ${input.reasonKind}, ${reason}, ${ref}, ${!!input.write},
                                   now() + make_interval(mins => ${BREAK_GLASS_MINUTES})) returning id, expires_at`;
-    await audit(tx, s, input.write ? 'breakglass.start_write' : 'breakglass.start', { type: 'workspace', id: workspaceId }, { workspaceId, reason });
+    await audit(tx, s, input.write ? 'breakglass.start_write' : 'breakglass.start', { type: 'workspace', id: workspaceId }, { workspaceId, reason, after: { reasonKind: input.reasonKind, reference: ref, write: !!input.write } });
     return { id: bg!.id as string, expiresAt: bg!.expires_at as string };
   });
 }
@@ -144,6 +181,17 @@ export async function assertBreakGlass(tx: Tx, s: Staff, workspaceId: string, wh
   if (write && !bg.write) throw new DomainError('FORBIDDEN', 'This needs write access (act on behalf).', { breakGlass: true, write: true });
   await audit(tx, s, write ? 'content.write' : 'content.view', { type: 'workspace', id: workspaceId }, { workspaceId, reason: `${what} (break-glass ${bg.id})` });
   return bg;
+}
+
+/**
+ * Break-glass "act on behalf" (§0.3 step 2): needs SUPER_ADMIN or OPS and an active write session (audited as
+ * content.write), and returns a tenant context whose writes carry actor=staff:<id>, on_behalf_of=workspace:<id>.
+ */
+export async function actOnBehalf(tx: Tx, s: Staff, workspaceId: string, what: string): Promise<TenantContext> {
+  assertStaff(s, 'breakglass.write');
+  await assertBreakGlass(tx, s, workspaceId, what, true);
+  const ctx = await staffTenantCtx(tx, s, workspaceId);
+  return { ...ctx, actor: staffCtx(s, workspaceId, { onBehalf: true }).actor };
 }
 
 // ───────────── Four-eyes approvals (plan 05 §0.5) ─────────────
@@ -305,9 +353,8 @@ registerExecutor('claim.unblock', async (p, { approver }) =>
     const [c] = await tx`update claims set status = 'MERCHANT_REVIEW_REQUIRED', block_reason = null, reviewed_at = now()
                          where id = ${p.claimId as string} and workspace_id = ${ws} and status = 'BLOCKED' returning id`;
     if (!c) throw new DomainError('CONFLICT', 'Claim is not blocked');
-    await tx`insert into events (workspace_id, type, actor, subject_type, subject_id, payload)
-             values (${ws}, 'CLAIM_RESTRICTED', ${`staff:${approver.staffId}`}, 'claim', ${p.claimId as string}, ${tx.json({ unblocked: true, reason: String(p.reason ?? "") })})`;
-    await audit(tx, approver, 'claim.unblocked', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string });
+    await emit(tx, staffCtx(approver, ws), 'CLAIM_UNBLOCKED', { type: 'claim', id: p.claimId as string }, { from: 'BLOCKED', to: 'MERCHANT_REVIEW_REQUIRED', reason: String(p.reason ?? '') });
+    await audit(tx, approver, 'claim.unblocked', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string, before: { status: 'BLOCKED' }, after: { status: 'MERCHANT_REVIEW_REQUIRED' } });
     return { claimId: p.claimId };
   }),
 );
@@ -351,6 +398,33 @@ export async function addTenantNote(s: Staff, workspaceId: string, body: string,
   await withAdmin(async (tx) => {
     await tx`insert into tenant_notes (workspace_id, staff_id, body, sentiment) values (${workspaceId}, ${s.staffId}, ${body.trim().slice(0, 4000)}, ${sentiment})`;
     await audit(tx, s, 'tenant.note', { type: 'workspace', id: workspaceId }, { workspaceId, after: sentiment ? { sentiment } : undefined });
+  });
+}
+
+/**
+ * Members tab 🔐 transfer ownership (plan 05 §2.2), on a written reason and the current owner's confirmation.
+ * Emits one MEMBER_ROLE_CHANGED per member whose role changed, in the same payload shape the customer app
+ * writes (EVENT_PAYLOADS), marked byStaff. Returns who to notify.
+ */
+export async function staffTransferOwnership(s: Staff, workspaceId: string, userId: string, reason: string) {
+  assertStaff(s, 'tenant.state');
+  if (reason.trim().length < 4) throw new DomainError('INVALID', 'A reason is required.');
+  return withAdmin(async (tx) => {
+    const [w] = await tx`select slug from workspaces where id = ${workspaceId} for update`;
+    if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
+    const [m] = await tx`select role from memberships where workspace_id = ${workspaceId} and user_id = ${userId} for update`;
+    if (!m) throw new DomainError('NOT_FOUND', 'That user is not a member');
+    if (m.role === 'OWNER') throw new DomainError('CONFLICT', 'That member already owns this workspace.');
+    const prev = await tx`update memberships set role = 'ADMIN' where workspace_id = ${workspaceId} and role = 'OWNER' returning user_id`;
+    await tx`update memberships set role = 'OWNER' where workspace_id = ${workspaceId} and user_id = ${userId}`;
+    await tx`update workspaces set membership_version = membership_version + 1 where id = ${workspaceId}`;
+    const ctx = staffCtx(s, workspaceId);
+    await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: userId }, { from: m.role as Role, to: 'OWNER', transfer: true, byStaff: true, reason });
+    for (const p of prev) await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: p.user_id as string }, { from: 'OWNER', to: 'ADMIN', transfer: true, byStaff: true, reason });
+    const previousOwners = prev.map((p) => p.user_id as string);
+    await audit(tx, s, 'tenant.transfer_owner', { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { owners: previousOwners, newOwnerRole: m.role }, after: { owners: [userId] } });
+    const emails = await tx`select email from users where id in ${tx([userId, ...previousOwners])}`;
+    return { slug: w.slug as string, previousOwners, notify: emails.map((e) => e.email as string) };
   });
 }
 
@@ -506,4 +580,142 @@ export async function requestOpsCommand(s: Staff, kind: OpsCommandKind, payload:
     await audit(tx, s, `ops.${kind}`, { type: 'ops_command', id: c!.id as string }, { workspaceId: (payload.workspaceId as string) ?? null, reason, after: payload });
     return c!.id as string;
   });
+}
+
+// ───────────── Tenant metrics for the console (plan 05 §1, §2.1, §2.2, §13) ─────────────
+
+/** Churn-risk weights per open §10 indicator; the score is their sum, capped at 100. */
+export const RISK_WEIGHTS: Record<RiskIndicator, number> = {
+  paid_no_export: 25,
+  negative_support_sentiment: 25,
+  ad_account_disconnected: 20,
+  repeated_qa_rejects: 20,
+  idle_7d: 15,
+  low_utilisation: 15,
+  ignored_recommendations: 10,
+  high_utilisation_friction: 10,
+  no_performance_linked_test: 10,
+  stockout: 5,
+};
+export type RiskBand = 'low' | 'medium' | 'high';
+/** Lower bounds of each band (the tenant list filters on them in SQL too). */
+export const RISK_BAND_MIN = { medium: 15, high: 40 } as const;
+export const riskBand = (score: number): RiskBand => (score >= RISK_BAND_MIN.high ? 'high' : score >= RISK_BAND_MIN.medium ? 'medium' : 'low');
+
+export function churnRisk(indicators: readonly string[]): { score: number; band: RiskBand } {
+  const score = Math.min(100, [...new Set(indicators)].reduce((a, i) => a + (RISK_WEIGHTS[i as RiskIndicator] ?? 10), 0));
+  return { score, band: riskBand(score) };
+}
+
+/** Production states with work in flight (a render slot in use). */
+export const ACTIVE_PRODUCTION_STATES: readonly ProjectState[] = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA'];
+
+export interface HealthInputs {
+  riskScore: number;
+  daysSinceActive: number | null;
+  paying: boolean;
+  exports30d: number;
+  failedJobs7d: number;
+  quotasOver: number;
+}
+export type HealthBand = 'healthy' | 'watch' | 'at risk';
+
+/**
+ * Tenant health (§2.2 Overview), 0–100: starts at 100 and loses points for churn risk, inactivity, a paying
+ * tenant with no exports, recent failed productions and quotas exceeded. Each factor is listed for the reader.
+ */
+export function healthScore(h: HealthInputs): { score: number; band: HealthBand; factors: { label: string; points: number }[] } {
+  const factors: { label: string; points: number }[] = [];
+  if (h.riskScore) factors.push({ label: `churn risk ${h.riskScore}`, points: -Math.round(h.riskScore / 2) });
+  if (h.daysSinceActive === null || h.daysSinceActive > 14) factors.push({ label: h.daysSinceActive === null ? 'no member has signed in' : `inactive ${h.daysSinceActive} days`, points: -25 });
+  else if (h.daysSinceActive > 7) factors.push({ label: `inactive ${h.daysSinceActive} days`, points: -15 });
+  if (h.paying && h.exports30d === 0) factors.push({ label: 'paying, no export in 30 days', points: -15 });
+  if (h.failedJobs7d) factors.push({ label: `${h.failedJobs7d} failed production${h.failedJobs7d === 1 ? '' : 's'} (7d)`, points: -Math.min(20, 5 * h.failedJobs7d) });
+  if (h.quotasOver) factors.push({ label: `${h.quotasOver} quota${h.quotasOver === 1 ? '' : 's'} exceeded`, points: -10 * h.quotasOver });
+  const score = Math.max(0, Math.min(100, 100 + factors.reduce((a, f) => a + f.points, 0)));
+  return { score, band: score >= 70 ? 'healthy' : score >= 40 ? 'watch' : 'at risk', factors };
+}
+
+/** Overview tab: plan quotas (settings-aware, 2-multi-tenancy §4) against usage, and the health score. */
+export async function tenantHealth(tx: Tx, workspaceId: string) {
+  const [w] = await tx`select plan_code, state from workspaces where id = ${workspaceId}`;
+  if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
+  const quota = await planQuota(tx, (w.plan_code as PlanCode | null) ?? null);
+  const [u] = await tx`select
+      (select count(*) from brands where workspace_id = ${workspaceId})::int as brands,
+      (select count(*) from memberships where workspace_id = ${workspaceId})::int as members,
+      (select coalesce(sum(bytes), 0) from assets where workspace_id = ${workspaceId} and deleted_at is null)::bigint as bytes,
+      (select count(*) from projects where workspace_id = ${workspaceId} and state in ${tx(ACTIVE_PRODUCTION_STATES as ProjectState[])})::int as rendering,
+      (select to_char(current_period_start, 'YYYY-MM-DD') from subscriptions where workspace_id = ${workspaceId} and status in ('active','trialing','past_due') order by created_at desc limit 1) as period,
+      (select coalesce(array_agg(distinct indicator), '{}') from risk_flags where workspace_id = ${workspaceId} and resolved_at is null) as risks,
+      (select extract(day from now() - max(s.last_seen_at))::int from sessions s join memberships m on m.user_id = s.user_id where m.workspace_id = ${workspaceId}) as idle_days,
+      (select count(*) from events where workspace_id = ${workspaceId} and type = 'ASSET_EXPORTED' and at > now() - interval '30 days')::int as exports30,
+      (select count(*) from projects where workspace_id = ${workspaceId} and state = 'PROVIDER_FAILED' and updated_at > now() - interval '7 days')::int as failed7`;
+  const [p] = u!.period
+    ? await tx`select coalesce(sum(amount) filter (where type = 'CREDIT_GRANTED'), 0)::int as granted,
+                      (coalesce(sum(-amount) filter (where type = 'CREDIT_RESERVED'), 0) - coalesce(sum(amount) filter (where type in ('CREDIT_RELEASED','CREDIT_REFUNDED')), 0))::int as used
+               from ledger_entries where workspace_id = ${workspaceId} and unit = 'creative_test' and period_key = ${u!.period as string}`
+    : [{ granted: 0, used: 0 }];
+  const quotas = [
+    { key: 'brands', label: 'Brands', used: Number(u!.brands), limit: quota.brands },
+    { key: 'members', label: 'Members', used: Number(u!.members), limit: quota.members },
+    { key: 'storageGb', label: 'Storage (GB)', used: Math.round((Number(u!.bytes) / 1e9) * 100) / 100, limit: quota.storageGb },
+    { key: 'renderConcurrency', label: 'Productions in flight', used: Number(u!.rendering), limit: quota.renderConcurrency },
+    { key: 'creativeTests', label: 'Creative Tests this period', used: Number(p!.used), limit: w.plan_code ? Math.max(Number(p!.granted), quota.creativeTestsPerMonth) : 0 },
+  ];
+  const risk = churnRisk((u!.risks as string[]) ?? []);
+  const health = healthScore({
+    riskScore: risk.score,
+    daysSinceActive: u!.idle_days === null ? null : Number(u!.idle_days),
+    paying: ['ACTIVE_PAID', 'PAST_DUE'].includes(w.state as string),
+    exports30d: Number(u!.exports30),
+    failedJobs7d: Number(u!.failed7),
+    quotasOver: quotas.filter((q) => q.limit > 0 && q.used > q.limit).length,
+  });
+  return { quotas, risk, health };
+}
+
+/**
+ * §1 / §7 MRR movement over the last `days`, from the Stripe mirror (subscriptions and the SUBSCRIPTION_* events
+ * written by Stripe webhooks) priced at each plan's price: new, expansion, contraction and churned MRR, and the
+ * net. Test workspaces are excluded unless asked for.
+ */
+export async function mrrMovement(tx: Tx, days: number, opts: { includeTest?: boolean } = {}) {
+  const price = tx.json(Object.fromEntries(Object.entries(PLANS).map(([k, p]) => [k, p.priceMicros])));
+  const test = opts.includeTest ? tx`` : tx`and workspace_id not in (select id from workspaces where is_test)`;
+  const [m] = await tx`
+    with moves as (
+      select type,
+             case when type = 'SUBSCRIPTION_STARTED' then (${price}->>(payload->>'plan'))::bigint
+                  when payload ? 'to' then (${price}->>(payload->>'to'))::bigint - (${price}->>(payload->>'from'))::bigint end as delta
+      from events where type in ('SUBSCRIPTION_STARTED', 'SUBSCRIPTION_CHANGED') and at > now() - make_interval(days => ${days}) ${test})
+    select coalesce(sum(delta) filter (where type = 'SUBSCRIPTION_STARTED'), 0)::bigint as new,
+           coalesce(sum(delta) filter (where type = 'SUBSCRIPTION_CHANGED' and delta > 0), 0)::bigint as expansion,
+           coalesce(-sum(delta) filter (where type = 'SUBSCRIPTION_CHANGED' and delta < 0), 0)::bigint as contraction,
+           (select coalesce(sum((${price}->>plan_code)::bigint), 0) from subscriptions
+             where status = 'canceled' and updated_at > now() - make_interval(days => ${days}) ${test})::bigint as churned
+    from moves`;
+  const r = { new: Number(m!.new), expansion: Number(m!.expansion), contraction: Number(m!.contraction), churned: Number(m!.churned) };
+  return { ...r, net: r.new + r.expansion - r.contraction - r.churned };
+}
+
+/**
+ * §13 QA review queue: outputs that failed QA twice (technique switched), hard fidelity fails, and a 2% sample
+ * of passed outputs for calibration — minus what a reviewer already judged. One definition for the QA page and
+ * the Pulse open-queues tile.
+ */
+export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
+  const failedTwice = tx`exists (select 1 from events e join scenes sc on sc.id = e.subject_id and sc.workspace_id = e.workspace_id
+                           join storyboards sb on sb.id = sc.storyboard_id and sb.workspace_id = sc.workspace_id
+                           where e.workspace_id = p.workspace_id and sb.project_id = p.id and e.type = 'QA_FAILED' and (e.payload->>'attempt')::int >= 2)`;
+  const hard = tx`exists (select 1 from jsonb_array_elements(case when jsonb_typeof(p.qa_report->'checks') = 'array' then p.qa_report->'checks' else '[]'::jsonb end) c
+                          where c->>'check' = 'product_fidelity' and coalesce((c->>'hard')::boolean, false) and not coalesce((c->>'pass')::boolean, true))`;
+  const sample = tx`(p.state = 'COMPLETE' and abs(hashtext(p.id::text)) % 50 = 0)`;
+  return tx`
+    select p.id, p.workspace_id, p.state, p.qa_report, p.updated_at,
+           case when ${hard} then 'hard fidelity fail' when ${failedTwice} then 'failed QA twice' else 'calibration sample' end as why
+    from projects p
+    where not exists (select 1 from qa_reviews r where r.project_id = p.id)
+      and (${!!opts.includeTest} or p.workspace_id not in (select id from workspaces where is_test))
+      and (${hard} or ${failedTwice} or ${sample})`;
 }
