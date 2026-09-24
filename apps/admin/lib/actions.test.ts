@@ -113,15 +113,17 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
     const eng = await staff(['ENGINEERING']);
     const task = 'creative_director.storyboard';
     try {
-      await expect(act(eng, 'route.update', { task: 'tts.voiceover', rolloutPct: '5', model: 'speech-2.8-turbo', reason: 'cheaper voice' })).rejects.toThrow(/No golden dataset covers tts\.voiceover/);
-      await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing compliance\.scan eval for creative_director\.storyboard · claude-opus-5-5 · storyboard@1\.1\.0/);
+      // A route no benchmark covers can't be changed.
+      await ownerPool()`insert into model_routes (task, provider, model, prompt_version) select 'video.unbenchmarked', provider, model, prompt_version from model_routes where task = 'video.scene'`;
+      await expect(act(eng, 'route.update', { task: 'video.unbenchmarked', rolloutPct: '5', reason: 'no benchmark yet' })).rejects.toThrow(/No golden dataset covers video\.unbenchmarked/);
+      await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing storyboard\.compliant eval for creative_director\.storyboard · claude-opus-5-5 · storyboard@1\.1\.0/);
       // A passing run of the dataset for some other candidate doesn't count.
-      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@9.9.9', 'claude-opus-5-5', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@9.9.9', 'claude-opus-5-5', 'storyboard.compliant', 'passed', ${eng.staffId})`;
       await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing/);
       // eval.run records the run for the candidate and queues it for the worker.
       await act(eng, 'eval.run', { task, promptVersion: 'storyboard@1.1.0', reason: 'candidate' });
       const [run] = await ownerPool()`select id, task, model, prompt_version, dataset, status from eval_runs where prompt_version = 'storyboard@1.1.0'`;
-      expect(run).toMatchObject({ task, model: 'claude-opus-5-5', dataset: 'compliance.scan', status: 'queued' });
+      expect(run).toMatchObject({ task, model: 'claude-opus-5-5', dataset: 'storyboard.compliant', status: 'queued' });
       expect(await ownerPool()`select 1 from ops_commands where kind = 'eval.run' and payload->>'evalRunId' = ${run!.id as string}`).toHaveLength(1);
       await ownerPool()`update eval_runs set status = 'passed' where id = ${run!.id}`; // the worker's verdict
       const r = await act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' });
@@ -136,10 +138,11 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
       const [c3] = await ownerPool()`select canary from model_routes where task = ${task}`;
       expect(c3!.canary).toBeNull();
       // A candidate model the Cost Governor can't price is refused even with a passing eval.
-      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.2.0', 'unpriced-model', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.2.0', 'unpriced-model', 'storyboard.compliant', 'passed', ${eng.staffId})`;
       await expect(act(eng, 'route.update', { task, rolloutPct: '5', model: 'unpriced-model', reason: 'try it' })).rejects.toThrow(/No published rate for anthropic\/unpriced-model/);
     } finally {
       await ownerPool()`update model_routes set canary = null`;
+      await ownerPool()`delete from model_routes where task = 'video.unbenchmarked'`;
     }
   });
 

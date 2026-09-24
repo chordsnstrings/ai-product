@@ -586,6 +586,8 @@ export interface ImageCall extends CallMeta {
 
 export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
   const p = await providers();
+  // An eval of a candidate measures that candidate: it never fails over to another route.
+  if (call.candidate) return imageOnce(call, p);
   return withRouteFallback(call, p.image, (m, a) => imageOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'image', pr));
 }
 
@@ -625,6 +627,7 @@ export async function removeBackground(call: CutoutCall): Promise<SegmentationRe
   const p = await providers();
   const adapter = p.segmentation;
   if (!adapter) throw new DomainError('UNAVAILABLE', 'Background removal isn’t available right now.', { notConfigured: 'segmentation' });
+  if (call.candidate) return cutoutOnce(call, p, adapter);
   return withRouteFallback(call, adapter, (m, a) => cutoutOnce({ ...call, task: m.task }, p, a));
 }
 
@@ -677,6 +680,7 @@ export interface VideoCall extends CallMeta {
  */
 export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
   const p = await providers();
+  if (call.candidate) return videoOnce(call, p);
   return withRouteFallback(call, p.video, (m, a) => videoOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'video', pr));
 }
 
@@ -791,6 +795,8 @@ const voiceFallbackEligible = (e: unknown) => e instanceof ProviderError || (e i
 export async function synthesizeVoice(call: TtsCall): Promise<VoiceResult> {
   const p = await providers();
   const primary = await withTenant(call.ctx.workspaceId, (tx) => route(tx, call.task, call.ctx.workspaceId));
+  // An eval of a candidate measures that route's own provider, with no fallback.
+  if (call.candidate) return ttsCall(call, call.task, p.tts?.name === primary.provider ? p.tts : p.ttsFallback?.name === primary.provider ? p.ttsFallback : p.tts);
   try {
     return await ttsCall(call, call.task, p.tts);
   } catch (primaryErr) {

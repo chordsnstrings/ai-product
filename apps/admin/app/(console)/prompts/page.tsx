@@ -59,7 +59,7 @@ export default async function Prompts({ searchParams }: { searchParams: Promise<
             return [
               <Mono key="k">{name}</Mono>,
               <span key="c" className="ak-small">{info.category}<br /><span className="ak-muted">{info.description}</span></span>,
-              info.kind === 'model' ? <span key="r">model · <Mono>{info.task}</Mono></span> : 'rules',
+              info.kind === 'rules' ? 'rules' : <span key="r">{info.kind} · <Mono>{info.task}</Mono></span>,
               `${seed.length} + ${added}`,
               <span key="s" className="ak-small">{seed.slice(0, 2).map((c) => `“${c.input.slice(0, 50)}” → ${c.expect}`).join(' · ')}</span>,
               canRun ? <ActButton key="b" small action="eval.run" payload={{ dataset: name }}>Run</ActButton> : null,

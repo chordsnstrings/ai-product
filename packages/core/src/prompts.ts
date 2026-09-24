@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * Prompt registry (plan 05 §11; standard §41 "prompt changes are software changes"). Git is the source: every
  * system template is versioned (semver) with its variables, the Zod schema its output must satisfy, a changelog
@@ -377,6 +379,15 @@ export function latestPrompt(name: string): PromptTemplate {
   if (!t) throw new Error(`no prompt template named ${name}`);
   return t;
 }
+
+/**
+ * A template version's content hash (sha256 of its text, first 16 hex). prompts.lock.json pins each registered
+ * version's hash, and a test fails when a registered version's text changes without a new version — a prompt
+ * version names exactly one text (§41 "prompt changes are software changes").
+ */
+export const promptHash = (t: Pick<PromptTemplate, 'text'>) => createHash('sha256').update(t.text).digest('hex').slice(0, 16);
+
+export const PROMPT_HASHES: Readonly<Record<string, string>> = Object.fromEntries(PROMPT_TEMPLATES.map((t) => [promptRef(t), promptHash(t)]));
 
 /** Latest texts, for code that needs a template outside a routed call (tests, docs). */
 export const EXTRACT_PRODUCT_SYSTEM = latestPrompt('extract-product').text;

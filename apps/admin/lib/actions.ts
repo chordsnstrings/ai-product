@@ -728,7 +728,7 @@ export const ACTIONS = {
         [task, model, promptVersion, dataset] = [routeTask, i.model || (route.model as string), i.promptVersion || (route.prompt_version as string), ds];
         assertCandidatePrompt(route.prompt_version as string, promptVersion);
         // Model runs are priced before dispatch like any call: the candidate needs a published rate.
-        if (DATASETS[ds]?.kind === 'model') await assertPublishedRate(routeTask, model);
+        if (DATASETS[ds]?.kind !== 'rules') await assertPublishedRate(routeTask, model);
       } else {
         if (!i.dataset || !DATASETS[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset');
         [task, model, promptVersion, dataset] = [i.dataset, 'deterministic', 'rules', i.dataset];

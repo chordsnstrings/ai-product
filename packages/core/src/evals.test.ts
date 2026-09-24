@@ -3,6 +3,7 @@ import { closeAll, ownerPool, withAdmin, withSystem } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId, type StaffRole } from '@arkiv/shared';
 import { startBreakGlass, type Staff } from './admin';
+import { MODEL_SUITES } from './eval-suites';
 import { addGoldenCase, assertCandidatePrompt, DATASETS, evalDatasetFor, EVAL_WORKSPACE_SLUG, GOLDEN, loadCases, retireGoldenCase, runDeterministicEval, runModelEval } from './evals';
 
 /** Plan 05 §11 golden datasets and eval runs (standard §51). */
@@ -31,12 +32,23 @@ describe('seed datasets', () => {
     }
   });
 
-  it('gates model-backed routes with their model dataset and creative routes with the scan', () => {
+  it('gates every model-backed route with a dataset that runs the model itself (§22, §41)', async () => {
     expect(evalDatasetFor('extract.product_facts')).toBe('extract.packaging');
-    expect(evalDatasetFor('creative_director.storyboard')).toBe('compliance.scan');
-    expect(evalDatasetFor('video.scene')).toBeNull();
-    // The whole-creative implied-claim scan is gated by its own golden set (§43).
-    expect(evalDatasetFor('qa.implied_claims')).toBe('implied.creative');
+    expect(evalDatasetFor('creative_director.storyboard')).toBe('storyboard.compliant');
+    expect(evalDatasetFor('creative_director.concepts')).toBe('concepts.compliant');
+    expect(evalDatasetFor('qa.implied_claims')).toBe('implied.model');
+    expect(evalDatasetFor('video.scene')).toBe('scene.render');
+    expect(evalDatasetFor('tts.voiceover_fallback')).toBe('voice_fallback.render');
+    expect(evalDatasetFor('video.unbenchmarked')).toBeNull(); // no benchmark: the route stays locked
+    // Every route a call site uses has a model or media benchmark — none is gated only by a rules check.
+    const used = ['extract.product_facts', 'creative_director.concepts', 'creative_director.recommendations', 'creative_director.storyboard', 'genome.extract', 'customer_language.themes', 'qa.implied_claims', 'qa.fidelity', 'qa.continuity', 'image.storyboard_frame', 'image.environment_plate', 'video.scene', 'tts.voiceover', 'tts.voiceover_fallback', 'vision.cutout'];
+    const routes = (await ownerPool()`select task from model_routes`).map((r) => r.task as string);
+    for (const task of used) {
+      expect(routes, task).toContain(task);
+      const ds = evalDatasetFor(task);
+      expect(DATASETS[ds!]?.kind, task).not.toBe('rules');
+      expect(MODEL_SUITES[ds!], task).toBeDefined();
+    }
   });
 
   it('only lets a route move to a registered version of its own template', () => {
@@ -69,6 +81,32 @@ describe('model eval runs (template × model × dataset)', () => {
     const old = await runModelEval({ evalRunId: newId(), dataset: 'extract.packaging', task: 'extract.product_facts', model: 'claude-opus-5-5', promptVersion: 'extract-product@1.0.0', cases: GOLDEN['extract.packaging']!.slice(0, 1) });
     expect(old.cases).toBe(1);
     expect(await ownerPool()`select 1 from provider_jobs where workspace_id = ${ws!.id} and prompt_version = 'extract-product@1.0.0'`).toHaveLength(1);
+  });
+
+  it('runs every model and media benchmark on its route’s candidate, with no fallback, and the mocks pass them', async () => {
+    for (const [dataset, info] of Object.entries(DATASETS)) {
+      if (info.kind === 'rules') continue;
+      const [route] = await ownerPool()`select model, prompt_version from model_routes where task = ${info.task!}`;
+      const runId = newId();
+      const r = await runModelEval({ evalRunId: runId, dataset, task: info.task!, model: route!.model as string, promptVersion: route!.prompt_version as string, cases: GOLDEN[dataset]! });
+      expect(r.results.filter((c) => !c.ok), dataset).toEqual([]);
+      expect(r.passed, dataset).toBe(true);
+      expect(r.costMicros, dataset).toBeGreaterThan(0);
+      const jobs = await ownerPool()`select task, status from provider_jobs where input_refs->>'evalRunId' = ${runId}`;
+      expect(jobs.length, dataset).toBe(r.cases);
+      expect(jobs.every((j) => j.task === info.task && j.status === 'succeeded'), dataset).toBe(true);
+    }
+  });
+
+  it('scores a model answer that breaks the rules as a failed case', async () => {
+    const suite = MODEL_SUITES['implied.model']!;
+    if (suite.kind !== 'model') throw new Error('expected a model suite');
+    expect(suite.score({ impliedClaims: [], notes: 'missed it' }, 'Before & after: day 1 vs day 30.')).toBe('pass'); // ≠ expected 'block'
+    const concepts = MODEL_SUITES['concepts.compliant']!;
+    if (concepts.kind !== 'model') throw new Error('expected a model suite');
+    const good = concepts.mock(GOLDEN['concepts.compliant']![0]!.input) as { concepts: { hookOptions: string[] }[] };
+    good.concepts[0]!.hookOptions = ['Cures acne in 3 days.', ...good.concepts[0]!.hookOptions.slice(1)];
+    expect(concepts.score(good, GOLDEN['concepts.compliant']![0]!.input)).toBe('violating');
   });
 
   it('refuses a candidate version that isn’t the dataset’s template', async () => {
