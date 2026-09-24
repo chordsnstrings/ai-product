@@ -238,8 +238,12 @@ export async function planStoryboardScenes(tx: Tx, workspaceId: string, skuId: s
                         where f.workspace_id = ${workspaceId} and f.sku_id = ${skuId} and f.active`;
   const [footage] = await tx`select count(*)::int as n from assets where workspace_id = ${workspaceId} and sku_id = ${skuId} and kind = 'creator_footage'
                              and deleted_at is null and coalesce(review_status, 'approved') = 'approved'`;
+  // Video counts as unavailable only for a lasting outage: an open circuit announced to reopen within a day is
+  // queued at production with its ETA (§44), not designed around, so a brief outage never downgrades the ad.
+  const lastingOutage = async (task: string) =>
+    ((await tx`select 1 from model_routes where task = ${task} and circuit_open and (circuit_until is null or circuit_until > now() + interval '24 hours')`).length) > 0;
   const video = await route(tx, 'video.scene', workspaceId);
-  const videoAvailable = !video.circuitOpen || (!!video.fallbackTask && !(await route(tx, video.fallbackTask, workspaceId)).circuitOpen);
+  const videoAvailable = !(await lastingOutage('video.scene')) || (!!video.fallbackTask && !(await lastingOutage(video.fallbackTask)));
   const facts: PlannerFacts = {
     transparency: (fp?.transparency as string | null) ?? null,
     referenceViews: Number(fp?.views ?? 0),

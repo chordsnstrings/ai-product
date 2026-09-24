@@ -11,7 +11,7 @@ import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, listClaims, proposeClaim } from './claims';
 import { recordAssetWatched } from './funnel';
 import { append, available } from './ledger';
-import { approveForProduction, blockedLines, finishAfterEdit, hardFidelityFail, produceProject, reopenForEdit } from './production';
+import { approveForProduction, blockedLines, finishAfterEdit, hardFidelityFail, planStoryboardScenes, produceProject, reopenForEdit } from './production';
 import sharp from 'sharp';
 import { authorize } from './cost-governor';
 import { exactProductFrame, productImagery } from './composite';
@@ -84,6 +84,23 @@ describe('free preview → storyboard (Launch Gate 1, first half)', () => {
       const [c] = await tx`select coalesce(sum(spent_micros),0)::bigint as n from cost_authorizations where purpose = 'free_preview'`;
       expect(Number(c!.n)).toBeLessThanOrEqual(200_000);
     });
+  }, 60_000);
+
+  it('the planner designs around a lasting video outage, never a brief one that production queues through (§23, §44)', async () => {
+    const { t, skuId, storyboardId } = await previewToStoryboard();
+    const scenes = (await ownerPool()`select purpose, duration_ms, production_mode from scenes where storyboard_id = ${storyboardId} order by position`).map((s) => ({ purpose: s.purpose as string, durationMs: Number(s.duration_ms), productionMode: s.production_mode as string }));
+    const modes = () => withTenant(t.workspaceId, async (tx) => (await planStoryboardScenes(tx, t.workspaceId, skuId, scenes)).map((p) => p.mode));
+    try {
+      expect(await modes()).toContain('GENERATIVE_INTERACTION');
+      // Open for 40 minutes: the ad keeps its video scenes (production waits with the ETA).
+      await ownerPool()`update model_routes set circuit_open = true, circuit_until = now() + interval '40 minutes' where task = 'video.scene'`;
+      expect(await modes()).toContain('GENERATIVE_INTERACTION');
+      // Open with no announced reopening: no video scene is planned.
+      await ownerPool()`update model_routes set circuit_until = null where task = 'video.scene'`;
+      expect(await modes()).not.toContain('GENERATIVE_INTERACTION');
+    } finally {
+      await ownerPool()`update model_routes set circuit_open = false, circuit_until = null where task = 'video.scene'`;
+    }
   }, 60_000);
 
   it('refuses blocked claim edits in the storyboard with a compliant alternative', async () => {
@@ -196,10 +213,11 @@ describe('Taste production (Launch Gate 1, second half)', () => {
   it('a materially wrong shade is a hard product-fidelity failure, whatever the inspector says (§16)', async () => {
     const { t, ctx, skuId } = await previewToStoryboard();
     const paid = { ...ctx, workspaceState: 'ACTIVE_PAID' as const };
+    const [route] = await ownerPool()`select provider, model from model_routes where task = 'qa.fidelity'`;
     const { imagery, fp, auth } = await withTenant(t.workspaceId, async (tx) => ({
       imagery: await productImagery(tx, skuId),
       fp: (await tx`select label_text, closure, dominant_colors, thresholds from visual_fingerprints where sku_id = ${skuId} and active`)[0]!,
-      auth: await authorize(tx, paid, { purpose: 'storyboard', skuId, lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 20_000, outputTokens: 2_000 }], idempotencyKey: 'qa-shade' }),
+      auth: await authorize(tx, paid, { purpose: 'storyboard', skuId, lines: [{ kind: 'llm', provider: route!.provider as string, model: route!.model as string, inputTokens: 20_000, outputTokens: 2_000 }], idempotencyKey: 'qa-shade' }),
     }));
     // Thresholds come from the fingerprint (defaults written at analysis).
     expect(fp.thresholds).toMatchObject({ paletteDistanceMax: 70, regionColorMax: 60 });

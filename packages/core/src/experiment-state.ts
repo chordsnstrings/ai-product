@@ -4,7 +4,6 @@ import { assertCan } from './authz';
 import { actorString, type TenantContext } from './context';
 import { emit } from './events';
 import { enqueue, Queues } from './outbox';
-import { queueRecompositions } from './recompose';
 
 /**
  * Experiment state machine (§35): DRAFT → RECOMMENDED → APPROVED → PRODUCING → READY_TO_RUN → GATHERING_SIGNAL →
@@ -129,7 +128,11 @@ export async function confoundRunning(tx: Tx, ctx: Pick<TenantContext, 'workspac
  */
 export async function onMaterialProductChange(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, skuId: string, key: string) {
   // Delivered ads that show this price or size on screen are recomposed with the new value — no new footage (§42).
-  if (key === 'price' || key === 'size') await queueRecompositions(tx, ctx.workspaceId, skuId);
+  if (key === 'price' || key === 'size') {
+    // Loaded lazily: recompose depends on production, which depends (via projects) on this module.
+    const { queueRecompositions } = await import('./recompose');
+    await queueRecompositions(tx, ctx.workspaceId, skuId);
+  }
   // A price change, or a compare-at ("was") price appearing, changing or ending — a promotion (§48).
   const kind = key === 'price' ? 'price_change' : key === 'compare_at_price' ? 'offer_change' : null;
   if (!kind) return;
