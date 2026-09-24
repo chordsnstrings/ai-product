@@ -76,3 +76,15 @@ describe('HEIC uploads', () => {
     expect((await sharp(stored).metadata()).format).toBe('jpeg');
   });
 });
+
+describe('upload rate limit (plan 02 §4: 100 per workspace per hour)', () => {
+  it('rejected uploads spend the budget: the 101st invalid upload in an hour is RATE_LIMITED', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const junk = Buffer.from('not an image at all');
+    for (let i = 0; i < 100; i++) {
+      await expect(withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, junk, 'product_photo', null))).rejects.toMatchObject({ code: 'INVALID' });
+    }
+    await expect(withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, junk, 'product_photo', null))).rejects.toMatchObject({ code: 'RATE_LIMITED' });
+  });
+});

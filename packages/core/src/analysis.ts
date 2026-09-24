@@ -49,6 +49,9 @@ export interface StartPreviewInput {
 export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPreviewInput) {
   assertCan(ctx, 'sku.create');
   if (!input.url && !input.photoAssetIds?.length) throw new DomainError('INVALID', 'Add a product link or at least one photo.');
+  // The SKU caps are counted under the workspace row lock (the same lock nextCatalogueNo takes), so parallel
+  // submissions queue here and each sees the others' SKUs instead of all counting before any commits.
+  if (ctx.workspaceState === 'PROVISIONAL' || isFreeTier(ctx)) await tx`select 1 from workspaces where id = ${ctx.workspaceId} for update`;
   if (ctx.workspaceState === 'PROVISIONAL') {
     const [n] = await tx`select count(*)::int as n from skus`;
     if (n!.n >= PROVISIONAL.MAX_SKUS) {
