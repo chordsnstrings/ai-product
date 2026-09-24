@@ -90,7 +90,7 @@ function useTurnstile(siteKey: string | null | undefined) {
  * P2 upload (plan 04 L2/L5/L6/L19): photo or link, no account, starts immediately. Mobile camera + library are
  * first-class; the URL field uses the url keyboard; errors keep what the user entered.
  */
-export function UploadModule({ page, variant, compact, turnstileSiteKey }: { page: string; variant?: string | null; compact?: boolean; turnstileSiteKey?: string | null }) {
+export function UploadModule({ page, variant, compact, turnstileSiteKey, assurance }: { page: string; variant?: string | null; compact?: boolean; turnstileSiteKey?: string | null; assurance?: string }) {
   const turnstile = useTurnstile(turnstileSiteKey);
   const [url, setUrl] = useState('');
   const [files, setFiles] = useState<File[]>([]);
@@ -194,7 +194,7 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey }: { pag
       <button type="submit" className="ak-btn ak-btn--accent ak-btn--block" disabled={state === 'busy'}>
         {state === 'busy' ? 'Starting…' : 'Analyze my product — free'}
       </button>
-      <p id="upload-help" className="ak-small ak-muted" style={{ margin: 0 }}>Free analysis · no card · about 40 seconds</p>
+      <p id="upload-help" className="ak-small ak-muted" style={{ margin: 0 }}>{assurance || 'Free analysis · no card · about 40 seconds'}</p>
     </form>
   );
 }

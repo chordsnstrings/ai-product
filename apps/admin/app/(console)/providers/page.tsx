@@ -12,6 +12,7 @@ export default async function Providers() {
   const s = await requireStaff('providers.read');
   const e = env();
   const d0 = await withAdmin(async (tx) => ({
+    registry: await tx`select p.*, u.name as updated_by_name from providers p left join staff_users u on u.id = p.updated_by order by p.name`,
     routes: await tx`select * from model_routes order by task`,
     health: await tx`select provider, count(*)::int as n, count(*) filter (where status = 'failed')::int as failed,
                             percentile_cont(0.5) within group (order by latency_ms)::int as p50, percentile_cont(0.95) within group (order by latency_ms)::int as p95,
@@ -25,16 +26,41 @@ export default async function Providers() {
     rollbacks: staffCan(s.roles, 'audit.read') ? await tx`select target_id, reason, at from admin_audit_log where action = 'route.canary_rollback' order by at desc limit 10` : [],
     kills: await tx`select key, enabled from feature_flags where key like 'kill.provider.%' order by key`,
   }));
-  const keys: [string, string, boolean][] = [
-    ['anthropic', 'ANTHROPIC_API_KEY', !!e.ANTHROPIC_API_KEY],
-    ['byteplus (Seedream/Seedance)', 'ARK_API_KEY', !!e.ARK_API_KEY],
-    ['minimax (TTS)', 'MINIMAX_API_KEY', !!e.MINIMAX_API_KEY],
-    ['byteplus speech (fallback TTS)', 'BYTEPLUS_SPEECH_TOKEN', !!e.BYTEPLUS_SPEECH_TOKEN],
-  ];
+  // Secrets live in the platform's secret store: the console shows their names and whether they're set, never values.
+  const isSet = (k: string) => !!(e as unknown as Record<string, unknown>)[k];
+  const canManage = staffCan(s.roles, 'providers.manage');
+  const health = (name: string) => d0.health.find((h) => h.provider === name);
   return (
     <Page title="Providers & model routing" sub={`Mode: ${e.PROVIDERS_MODE}. Pinned ids — Seedream ${e.SEEDREAM_MODEL}, Seedance ${e.SEEDANCE_MODEL}, TTS ${e.MINIMAX_TTS_MODEL}.`}>
-      <Table head={['Provider', 'Secret (name only)', 'Configured']} rows={keys.map(([p, k, set]) => [p, <Mono key="k">{k}</Mono>, set ? 'yes' : 'no (mock)'])} />
-      <Section title="Health (24h)"><Table head={['Provider', 'Calls', 'Error rate', 'p50', 'p95', 'Moderation rejects']} rows={d0.health.map((h) => [h.provider as string, h.n as number, pct(Number(h.failed) / Number(h.n)), `${h.p50 ?? '—'}ms`, `${h.p95 ?? '—'}ms`, h.moderated as number])} empty="No calls in 24h." /></Section>
+      <Section title="Provider registry">
+        <p className="ak-small ak-muted">The Model Gateway applies these on every call: a disabled provider is refused (approved fallbacks take over), each request times out after its limit, transient errors retry with exponential backoff, and in-flight requests per worker process are capped.</p>
+        <Table head={['Provider', 'Status', 'Secrets (names only)', 'Region', 'Concurrency', 'Timeout', 'Retries', 'Health 24h (p50 / p95 · errors · moderation)', 'Updated', '']} rows={d0.registry.map((p) => {
+          const h = health(p.name as string);
+          return [
+            <span key="n"><Mono>{p.name as string}</Mono><br /><span className="ak-small ak-muted">{p.display_name as string}</span></span>,
+            p.status === 'active' ? 'active' : <span key="s" className={`ak-chip ${p.status === 'disabled' ? 'ak-chip--risk' : ''}`}>{p.status as string}</span>,
+            <span key="k" className="ak-small">{((p.secret_names as string[]) ?? []).map((k) => `${k} ${isSet(k) ? '✓' : '(not set: mock)'}`).join(' · ')}</span>,
+            (p.region as string) ?? '—', p.concurrency_limit as number, `${Math.round(Number(p.timeout_ms) / 1000)}s`, `${p.retry_attempts} × ${p.retry_backoff_ms}ms backoff`,
+            h ? `${h.p50 ?? '—'} / ${h.p95 ?? '—'}ms · ${pct(Number(h.failed) / Number(h.n))} · ${pct(Number(h.moderated) / Number(h.n))} of ${h.n}` : 'no calls',
+            <span key="u" className="ak-small">{dt(p.updated_at)}{p.updated_by_name ? ` · ${p.updated_by_name as string}` : ''}</span>,
+            canManage ? (
+              <details key="e">
+                <summary className="ak-small">Edit</summary>
+                <ActForm action="provider.update" extra={{ name: p.name }} submit="🔐 Save" fields={[
+                  { name: 'status', label: 'Status', type: 'select', options: ['active', 'degraded', 'disabled'], defaultValue: p.status as string },
+                  { name: 'region', label: 'Region', defaultValue: (p.region as string) ?? '' },
+                  { name: 'concurrencyLimit', label: 'Concurrency limit (in-flight per worker)', type: 'number', defaultValue: p.concurrency_limit as number },
+                  { name: 'timeoutMs', label: 'Timeout per request (ms)', type: 'number', defaultValue: p.timeout_ms as number },
+                  { name: 'retryAttempts', label: 'Attempts on transient errors', type: 'number', defaultValue: p.retry_attempts as number },
+                  { name: 'retryBackoffMs', label: 'First backoff (ms, doubles)', type: 'number', defaultValue: p.retry_backoff_ms as number },
+                  { name: 'notes', label: 'Notes', defaultValue: (p.notes as string) ?? '' },
+                  { name: 'reason', label: 'Reason (audit)', required: true },
+                ]} />
+              </details>
+            ) : null,
+          ];
+        })} />
+      </Section>
       <Section title="Routes">
         <Table head={['Task', 'Provider', 'Model', 'Prompt', 'Rollout', 'Canary', 'Approved fallback', 'Circuit', '']} rows={d0.routes.map((r) => [
           <Mono key="t">{r.task as string}</Mono>, r.provider as string, <Mono key="m">{r.model as string}</Mono>, <Mono key="p">{r.prompt_version as string}</Mono>, `${r.rollout_pct}%`, r.canary ? <Mono key="c">{JSON.stringify(r.canary)}</Mono> : '—',

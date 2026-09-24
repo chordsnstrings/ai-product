@@ -93,6 +93,61 @@ export async function routedLines(tx: Tx, workspaceId: string | null, items: ({ 
   return out;
 }
 
+// ───────────── Provider registry (plan 05 §10) ─────────────
+
+/** Per-provider settings staff manage in the console: status, concurrency limit, per-request timeout, retry policy. */
+export interface ProviderPolicy {
+  status: 'active' | 'degraded' | 'disabled';
+  concurrencyLimit: number;
+  timeoutMs: number;
+  retryAttempts: number;
+  retryBackoffMs: number;
+}
+
+/** Used for a provider the registry doesn't list (it always should). */
+export const DEFAULT_PROVIDER_POLICY: ProviderPolicy = { status: 'active', concurrencyLimit: 8, timeoutMs: 180_000, retryAttempts: 3, retryBackoffMs: 500 };
+
+export async function providerPolicy(tx: Tx, provider: string): Promise<ProviderPolicy> {
+  const [p] = await tx`select status, concurrency_limit, timeout_ms, retry_attempts, retry_backoff_ms from providers where name = ${provider}`;
+  if (!p) return DEFAULT_PROVIDER_POLICY;
+  return { status: p.status, concurrencyLimit: Number(p.concurrency_limit), timeoutMs: Number(p.timeout_ms), retryAttempts: Number(p.retry_attempts), retryBackoffMs: Number(p.retry_backoff_ms) };
+}
+
+/**
+ * In-flight provider requests per provider in this process, capped at the registry's concurrency limit: a call
+ * over the limit waits for a slot (it already holds its Cost Governor reservation, so nothing is double-spent).
+ */
+const inflight = new Map<string, { active: number; waiters: (() => void)[] }>();
+async function acquireSlot(provider: string, limit: number): Promise<() => void> {
+  let s = inflight.get(provider);
+  if (!s) inflight.set(provider, (s = { active: 0, waiters: [] }));
+  while (s.active >= Math.max(1, limit)) await new Promise<void>((resolve) => s!.waiters.push(resolve));
+  s.active++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    s!.active--;
+    s!.waiters.shift()?.();
+  };
+}
+
+/** Current in-flight count for a provider in this process (tests, health). */
+export const providerInflight = (provider: string) => inflight.get(provider)?.active ?? 0;
+
+/** One provider request, abandoned as a retryable timeout after the registry's per-request timeout. */
+function withTimeout<T>(p: Promise<T>, ms: number, provider: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const t = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ProviderError(provider, `request timed out after ${ms}ms`, true, 'timeout')), ms);
+  });
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
+}
+
+/** A provider request under the registry's policy: per-request timeout and bounded transient retries. */
+const request = <T>(started: { route: Route; policy: ProviderPolicy }, fn: () => Promise<T>) =>
+  withTransientRetry(() => withTimeout(fn(), started.policy.timeoutMs, started.route.provider), started.policy.retryAttempts, started.policy.retryBackoffMs);
+
 /** Tasks that dispatch a render; `kill.renders` stops them at the gateway as well as at authorization. */
 const isRenderTask = (task: string) => task.startsWith('video.');
 
@@ -113,6 +168,8 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
   return withTenant(meta.ctx.workspaceId, async (tx) => {
     const r = await route(tx, meta.task, meta.ctx.workspaceId);
     if (r.circuitOpen) throw new DomainError('UNAVAILABLE', `Provider circuit open for ${meta.task}`, { circuitOpen: meta.task });
+    const policy = await providerPolicy(tx, r.provider);
+    if (policy.status === 'disabled') throw new DomainError('UNAVAILABLE', `${r.provider} is disabled in the provider registry. Your work is saved.`, { providerDisabled: r.provider });
     if (await isFlagOn(tx, `kill.provider.${r.provider}`, meta.ctx.workspaceId)) {
       throw new DomainError('UNAVAILABLE', `${r.provider} is switched off for maintenance. Your work is saved.`, { killSwitch: r.provider });
     }
@@ -128,10 +185,16 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
         request_hash, input_refs, status, authorization_id, estimate_micros, arm)
       values (${meta.ctx.workspaceId}, ${auth.projectId}, ${meta.subject?.type ?? null}, ${meta.subject?.id ?? null},
         ${r.provider}, ${meta.task}, ${r.model}, ${r.promptVersion}, ${hashRequest(requestFingerprint)},
-        ${tx.json((meta.inputRefs ?? {}) as never)}, 'dispatched', ${auth.authorizationId}, ${expected}, ${r.arm})
+        ${tx.json({ ...(meta.inputRefs ?? {}), units: unitsOf(costLine) } as never)}, 'dispatched', ${auth.authorizationId}, ${expected}, ${r.arm})
       returning id`;
-    return { route: r, line: costLine, jobId: job!.id as string, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
+    return { route: r, policy, line: costLine, jobId: job!.id as string, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
   });
+}
+
+/** The billable units of a call (resolution, seconds, images, chars, tokens), kept on the job for COGS breakdowns (plan 05 §8). */
+function unitsOf(line: CostLine): Record<string, unknown> {
+  const { provider: _p, model: _m, ...units } = line as CostLine & { provider: string; model: string };
+  return units;
 }
 
 const gatewayLog = logger('gateway');
@@ -172,8 +235,11 @@ async function finish(
   });
 }
 
-/** Provider-safe retry for transient failures — bounded and separate from creative QA retries (§39). */
-async function withTransientRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+/**
+ * Provider-safe retry for transient failures — bounded and separate from creative QA retries (§39). Attempts and
+ * the (exponential) backoff come from the provider registry.
+ */
+async function withTransientRetry<T>(fn: () => Promise<T>, attempts = DEFAULT_PROVIDER_POLICY.retryAttempts, backoffMs = DEFAULT_PROVIDER_POLICY.retryBackoffMs): Promise<T> {
   let last: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -181,7 +247,7 @@ async function withTransientRetry<T>(fn: () => Promise<T>, attempts = 3): Promis
     } catch (e) {
       last = e;
       if (!(e instanceof ProviderError) || !e.retryable || i === attempts - 1) throw e;
-      await sleep(process.env.NODE_ENV === 'test' ? 5 : 500 * 2 ** i);
+      await sleep(process.env.NODE_ENV === 'test' ? 5 : backoffMs * 2 ** i);
     }
   }
   throw last;
@@ -204,9 +270,11 @@ export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & {
     task: call.task,
     content: call.content.map((c) => (c.type === 'image' ? { type: 'image', len: c.base64.length } : c)),
   });
+  // Waiting for a concurrency slot is not provider latency.
+  const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
   const t0 = Date.now();
   try {
-    const res = await withTransientRetry(() =>
+    const res = await request(started, () =>
       p.llm.json({
         task: call.task,
         model: p.wireModel(started.route.model),
@@ -229,6 +297,8 @@ export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & {
   } catch (e) {
     await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
     throw e;
+  } finally {
+    release();
   }
 }
 
@@ -243,9 +313,11 @@ export interface ImageCall extends CallMeta {
 export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string }> {
   const p = await providers();
   const started = await begin(call, (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: call.references.length });
+  // Waiting for a concurrency slot is not provider latency.
+  const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
   const t0 = Date.now();
   try {
-    const r = await withTransientRetry(() =>
+    const r = await request(started, () =>
       p.image.generate({ model: p.wireModel(started.route.model), prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }),
     );
     await finish(call, started, { ok: true, actualLine: started.line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
@@ -253,6 +325,8 @@ export async function generateImage(call: ImageCall): Promise<ImageResult & { jo
   } catch (e) {
     await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
     throw e;
+  } finally {
+    release();
   }
 }
 
@@ -277,10 +351,12 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
   const p = await providers();
   const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
   const line = started.line;
+  // Waiting for a concurrency slot is not provider latency.
+  const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
   const t0 = Date.now();
   let requestId: string | null = null;
   try {
-    ({ providerRequestId: requestId } = await withTransientRetry(() =>
+    ({ providerRequestId: requestId } = await request(started, () =>
       p.video.submit({ model: p.wireModel(started.route.model), prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel }),
     ));
     await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId} where id = ${started.jobId}`);
@@ -292,7 +368,7 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
         beat = Date.now();
         await call.heartbeat();
       }
-      res = await withTransientRetry(() => p.video.poll(requestId!));
+      res = await request(started, () => p.video.poll(requestId!));
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
       if (Date.now() > deadline) {
         await p.video.cancel(requestId).catch(() => {});
@@ -315,6 +391,8 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
   } catch (e) {
     await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
     throw e;
+  } finally {
+    release();
   }
 }
 
@@ -335,14 +413,18 @@ async function ttsCall(call: TtsCall, task: string, adapter: TtsProvider | null)
   const p = await providers();
   const meta: CallMeta = { ...call, task };
   const started = await begin(meta, (rt) => lineFor(rt, { kind: 'tts', chars: call.text.length }), { text: call.text, voice: call.voice, speed: call.speed ?? 1 });
+  // Waiting for a concurrency slot is not provider latency.
+  const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
   const t0 = Date.now();
   try {
-    const r = await withTransientRetry(() => adapter.synthesize({ model: p.wireModel(started.route.model), text: call.text, voice, speed: call.speed }));
+    const r = await request(started, () => adapter.synthesize({ model: p.wireModel(started.route.model), text: call.text, voice, speed: call.speed }));
     await finish(meta, started, { ok: true, actualLine: lineFor(started.route, { kind: 'tts', chars: r.chars }), modelVersion: r.model, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
     return { ...r, jobId: started.jobId, task, provider: started.route.provider };
   } catch (e) {
     await finish(meta, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
     throw e;
+  } finally {
+    release();
   }
 }
 

@@ -1,5 +1,6 @@
 import { withAdmin } from '@arkiv/db';
-import { ACTIVE_PRODUCTION_STATES, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures } from '@arkiv/core';
+import { ACTIVE_PRODUCTION_STATES, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
+import { ActButton } from '@/components/act';
 import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs, daysFrom } from '@/lib/prefs';
@@ -8,6 +9,14 @@ import { notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Pulse' };
+
+/** Where an alert's subject is managed. */
+const ALERT_HREF: Record<string, (id: string) => string> = {
+  offer: () => '/offers',
+  offer_experiment: () => '/offers',
+  stripe_price: () => '/offers',
+  landing_page: (id) => `/landing-pages/${id}`,
+};
 
 const STAGES = [
   ['LP_VIEWED', 'Visitors'],
@@ -24,7 +33,7 @@ const STAGES = [
  * links to its module, pre-filtered.
  */
 export default async function Pulse({ searchParams }: { searchParams: Promise<{ range?: string }> }) {
-  await requireStaff('pulse.read');
+  const s = await requireStaff('pulse.read');
   const prefs = await consolePrefs();
   const days = daysFrom((await searchParams).range, prefs, 30);
   const tz = prefs.tz;
@@ -71,8 +80,11 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       union all select 'Unmatched Stripe', count(*)::int, min(received_at), '/billing?tab=unmatched' from stripe_events where status = 'unmatched'
       union all select 'Data requests', count(*)::int, min(created_at), '/privacy' from data_requests where status in ('open','in_progress') ${t()}
       union all select 'Abuse signals (24h)', count(*)::int, min(at), '/abuse' from abuse_signals where at > now() - interval '24 hours' ${t()}
-      union all select 'Approvals', count(*)::int, min(created_at), '/approvals' from approvals where status = 'pending'`;
-    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, exports, conn, risk, queues };
+      union all select 'Approvals', count(*)::int, min(created_at), '/approvals' from approvals where status = 'pending'
+      union all select 'Platform alerts', count(*)::int, min(created_at), '/#alerts' from platform_alerts where resolved_at is null
+      union all select 'Stripe reconciliation', count(*)::int, min(created_at), '/billing?tab=recon' from stripe_recon_exceptions where resolved_at is null`;
+    const alerts = await tx`select id, kind, severity, subject_type, subject_id, message, created_at from platform_alerts where resolved_at is null order by created_at desc limit 50`;
+    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, exports, conn, risk, queues, alerts };
   });
   const count = (t: string) => Number(m.funnel.find((r) => r.type === t)?.n ?? 0);
   const base = (t: string) => Number(m.funnel.find((r) => r.type === t)?.base ?? 0);
@@ -150,6 +162,17 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
           return [<a key="q" href={q.href as string}>{q.q as string}</a>, q.n as number, ago(q.oldest), sla ? `${sla >= 48 ? `${Math.round(sla / 24)}d` : `${sla}h`}` : '—', breach ? <span key="b" className="ak-chip ak-chip--risk"><span aria-hidden="true">⚠</span> SLA breach</span> : ''];
         })} />
       </Section>
+      <section id="alerts">
+        <Section title="Platform alerts">
+          <Table head={['Raised', 'Severity', 'What happened', 'About', '']} rows={m.alerts.map((a) => [
+            ago(a.created_at),
+            a.severity === 'risk' ? <span key="s" className="ak-chip ak-chip--risk">risk</span> : (a.severity as string),
+            a.message as string,
+            <a key="h" href={ALERT_HREF[a.subject_type as string]?.(a.subject_id as string) ?? '#'}>{`${a.subject_type as string} ${a.subject_id as string}`}</a>,
+            staffCan(s.roles, 'alerts.manage') ? <ActButton key="r" small action="alert.resolve" payload={{ id: a.id }} reason="What did you do about it?">Resolve</ActButton> : null,
+          ])} empty="No open alerts." />
+        </Section>
+      </section>
     </Page>
   );
 }

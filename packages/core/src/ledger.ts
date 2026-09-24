@@ -21,7 +21,8 @@ export type LedgerType =
   | 'FREE_QA_RETRY'
   | 'PROVIDER_COST_RECORDED';
 
-const COUNTED: LedgerType[] = [
+/** Entry types that change the available balance (the rest are informational). */
+export const BALANCE_TYPES: readonly LedgerType[] = [
   'CREDIT_GRANTED',
   'CREDIT_RESERVED',
   'CREDIT_RELEASED',
@@ -72,7 +73,7 @@ export async function append(
 
 export async function available(tx: Tx, unit: LedgerUnit): Promise<number> {
   const [r] = await tx`select coalesce(sum(amount), 0)::bigint as n from ledger_entries
-                       where unit = ${unit} and type in ${tx(COUNTED)}`;
+                       where unit = ${unit} and type in ${tx([...BALANCE_TYPES])}`;
   return Number(r!.n);
 }
 
@@ -84,7 +85,7 @@ export interface Balances {
 
 export async function balances(tx: Tx): Promise<Balances> {
   const rows = await tx`select unit, coalesce(sum(amount), 0)::bigint as n from ledger_entries
-                        where type in ${tx(COUNTED)} group by unit`;
+                        where type in ${tx([...BALANCE_TYPES])} group by unit`;
   const by = Object.fromEntries(rows.map((r) => [r.unit as string, Number(r.n)]));
   return { creativeTests: by.creative_test ?? 0, taste: by.taste ?? 0, standalone: by.standalone ?? 0 };
 }

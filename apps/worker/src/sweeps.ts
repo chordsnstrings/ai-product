@@ -1,4 +1,5 @@
 import { withSystem, withTenant } from '@arkiv/db';
+import { reconcileStripe } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import {
@@ -19,6 +20,8 @@ import {
   retireSupersededRates,
   sweepExpiredAuthorizations,
   sweepExpiringEvidence,
+  sweepLandingGalleryRights,
+  sweepOfferGuardrails,
   sweepProvisional,
   sweepRateLimits,
   sweepRetention,
@@ -190,6 +193,12 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
+  // Plan 05 §5: an example asset whose rights expire is removed from every landing page's gallery (Pulse alert).
+  'landing-gallery-rights': { cron: '12 * * * *', run: () => withSystem(async (tx) => { const changed = await sweepLandingGalleryRights(tx); return changed.length ? changed : 0; }) },
+  // Plan 05 §6: a pricing experiment whose guardrail (refund, dispute or support rate) degrades past its threshold stops.
+  'offer-guardrails': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const stopped = await sweepOfferGuardrails(tx); return stopped.length ? stopped : 0; }) },
+  // Plan 05 §7: nightly full reconciliation of Stripe (customers, subscriptions, recent charges) against our mirror.
+  'stripe-reconcile': { cron: '40 3 * * *', run: async () => { const r = await reconcileStripe(); return r.status === 'completed' ? r.counts : 0; } },
   'sync-integrations': {
     cron: '0 */6 * * *',
     run: () =>

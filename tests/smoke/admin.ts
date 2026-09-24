@@ -5,6 +5,7 @@
  */
 import { createStaff, totp } from '@arkiv/auth';
 import { closeAll, withSystem } from '@arkiv/db';
+import { DEFAULT_LANDING_BLOCKS } from '@arkiv/shared';
 
 const BASE = process.env.ADMIN ?? 'http://localhost:3001';
 
@@ -122,9 +123,11 @@ async function main() {
   step('Kill switch needs 🔐; landing page lint blocks fake proof');
   await A.act('flag.set', { key: 'kill.free_preview', enabled: true, reason: 'smoke on' }, sa.totpSecret);
   await A.act('flag.set', { key: 'kill.free_preview', enabled: false, reason: 'smoke off' }, sa.totpSecret);
-  const lint = await A.post('/api/act/lp.save', { slug: `smoke-${tag}`, archetype: 'general', content: { headline: 'Brands see 3x ROAS guaranteed' }, variants: [], utmMatch: '' });
-  if (lint.status !== 422) throw new Error(`lint should block, got ${lint.status}`);
-  await A.act('lp.save', { slug: `smoke-${tag}`, archetype: 'general', content: { label: 'Skincare', headline: 'Texture ads for your serum', sub: 'Three ideas in a minute.' }, variants: [], utmMatch: '' });
+  const hero = { ...DEFAULT_LANDING_BLOCKS.hero, label: 'Skincare', headline: 'Texture ads for your serum', sub: 'Three ideas in a minute.' };
+  const lint = await A.post('/api/act/lp.save', { slug: `smoke-${tag}`, archetype: 'general', content: { ...DEFAULT_LANDING_BLOCKS, hero: { ...hero, headline: 'Brands see 3x ROAS guaranteed' } }, variants: [], utmMatch: '' });
+  if (lint.status !== 422 || !/Compliance lint/.test(JSON.stringify(await lint.json()))) throw new Error(`lint should block, got ${lint.status}`);
+  await A.act('lp.save', { slug: `smoke-${tag}`, archetype: 'general', content: { ...DEFAULT_LANDING_BLOCKS, hero }, variants: [], utmMatch: '' });
+  await A.act('lp.publish', { slug: `smoke-${tag}` });
   console.log('  ✓');
 
   step('Audit CSV');

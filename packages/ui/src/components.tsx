@@ -129,11 +129,13 @@ export function Empty({ title, body, action }: { title: string; body: string; ac
  * Plan 04 §3/§4 enforcement: example assets are always labelled; testimonials require a consent record id
  * (FTC 16 CFR 465). There is deliberately no scarcity/"people viewing" component in this library.
  */
-export function ExampleAsset({ src, caption, poster }: { src: string; caption: string; poster?: string }) {
+export function ExampleAsset({ src, caption, poster, video }: { src: string; caption: string; poster?: string; video?: boolean }) {
+  // Signed URLs carry no file extension, so callers that know the media type say so.
+  const isVideo = video ?? /\.mp4($|\?)/.test(src);
   return (
     <figure className="ak-specimen" style={{ margin: 0 }}>
       <div className="ak-well ak-well--916">
-        {src.endsWith('.mp4') ? <video src={src} poster={poster} muted playsInline loop autoPlay preload="metadata" /> : <img src={src} alt={caption} loading="lazy" />}
+        {isVideo ? <video src={src} poster={poster} muted playsInline loop autoPlay preload="metadata" aria-label={caption} /> : <img src={src} alt={caption} loading="lazy" />}
         <span className="ak-chip" style={{ position: 'absolute', top: 8, left: 8, background: 'var(--paper-raised)' }}>Example</span>
       </div>
       <figcaption className="ak-specimen-caption ak-index">{caption}</figcaption>

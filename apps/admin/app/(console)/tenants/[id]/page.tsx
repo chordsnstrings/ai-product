@@ -430,6 +430,10 @@ async function Billing({ id, canRefund, canManage, pii }: { id: string; canRefun
                               coalesce(e.payload->'data'->'object'->>'payment_intent', e.payload->'data'->'object'->'payments'->'data'->0->'payment'->>'payment_intent') as pi
                        from stripe_events e where e.workspace_id = ${id} and e.type = 'invoice.paid' order by e.received_at desc limit 24`,
     refunds: await tx`select r.*, a.name as approver from refunds r left join staff_users a on a.id = r.approved_by where r.workspace_id = ${id} order by r.created_at desc limit 50`,
+    // §6 Assignments: every offer issued to this workspace, when it expires and what became of it.
+    offers: await tx`select o.id, o.definition_code, o.type, o.variant, o.experiment_key, o.price_micros, o.reference_price_micros, o.created_at, o.expires_at, o.status,
+                            (select p.status from purchases p where p.workspace_id = o.workspace_id and p.offer_id = o.id order by p.created_at desc limit 1) as purchase
+                     from offers o where o.workspace_id = ${id} order by o.created_at desc`,
   }));
   const refundedByPi = new Map<string, number>();
   for (const r of d0.refunds) if (r.status === 'succeeded') refundedByPi.set(r.payment_intent_id as string, (refundedByPi.get(r.payment_intent_id as string) ?? 0) + Number(r.amount_micros));
@@ -444,7 +448,7 @@ async function Billing({ id, canRefund, canManage, pii }: { id: string; canRefun
       <p className="ak-small">Stripe customer: <Mono>{(d0.cust?.customer_id as string) ?? '—'}</Mono> {d0.cust ? <ActButton small action="billing.portal" payload={{ workspaceId: id }}>Open in Stripe</ActButton> : null}</p>
       <p className="ak-small ak-muted">Refunds over $200 need a second FINANCE approver. Each refund writes CREDIT_REFUNDED; a full refund of an unused credit withdraws it.</p>
       <Section title="Subscriptions">
-        <Table head={['Plan', 'Status', 'Period', 'Cancel at end', 'Pending', 'Coupon', 'Stripe id']} rows={d0.subs.map((s) => [s.plan_code as string, s.status as string, `${d(s.current_period_start)} → ${d(s.current_period_end)}`, s.cancel_at_period_end ? 'yes' : 'no', (s.pending_plan_code as string) ?? '—', (s.coupon as string) ?? '—', <Mono key="i">{s.stripe_subscription_id as string}</Mono>])} />
+        <Table head={['Plan', 'Status', 'Period', 'Cancel at end', 'Pending', 'Coupon', 'Payment retries', 'Stripe id']} rows={d0.subs.map((s) => [s.plan_code as string, s.status as string, `${d(s.current_period_start)} → ${d(s.current_period_end)}`, s.cancel_at_period_end ? 'yes' : 'no', (s.pending_plan_code as string) ?? '—', (s.coupon as string) ?? '—', s.status === 'past_due' ? `${s.payment_attempt_count} failed · next ${s.next_payment_attempt ? dt(s.next_payment_attempt) : 'none (retries exhausted)'}` : '—', <Mono key="i">{s.stripe_subscription_id as string}</Mono>])} />
         {canManage && d0.subs.some((s) => ['active', 'trialing', 'past_due'].includes(s.status as string)) ? (
           <div className="ak-grid-2" style={{ alignItems: 'start', marginTop: 12 }}>
             <div className="ak-panel">
@@ -465,6 +469,13 @@ async function Billing({ id, canRefund, canManage, pii }: { id: string; canRefun
             </div>
           </div>
         ) : null}
+      </Section>
+      <Section title="Offers issued">
+        <Table head={['Issued', 'Offer', 'Type', 'Variant', 'Price', 'Anchor', 'Expires', 'Status', 'Payment']} rows={d0.offers.map((o) => [
+          dt(o.created_at), <Mono key="c">{o.definition_code as string}</Mono>, o.type as string, o.variant ? `${o.variant as string}${o.experiment_key ? ` (${o.experiment_key as string})` : ''}` : '—',
+          money(o.price_micros), o.reference_price_micros ? money(o.reference_price_micros) : '—', dt(o.expires_at),
+          o.status === 'active' && o.expires_at && new Date(o.expires_at as string) < new Date() ? 'expired' : (o.status as string), (o.purchase as string) ?? '—',
+        ])} empty="No offers issued to this workspace." />
       </Section>
       <Section title="Invoices (Stripe mirror)">
         <Table head={['Created', 'Invoice', 'Reason', 'Status', 'Due', 'Paid', 'Remaining', 'Period', '']} rows={d0.mirror.map((v) => [

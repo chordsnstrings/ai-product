@@ -351,23 +351,31 @@ describe('tenant metrics for the console (plan 05 §1, §2.1, §2.2, §13)', () 
     clearSettingsCache();
   });
 
-  it('net new MRR comes from the subscription mirror: new + expansion − contraction − churned', async () => {
+  it('net new MRR comes from subscription events: new + expansion − contraction − churned', async () => {
     const a = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
     const b = await makeTenant({ state: 'ACTIVE_PAID', plan: 'SCALE' });
     const c = await makeTenant({ state: 'CANCELLED' });
+    const d = await makeTenant({ state: 'ACTIVE_PAID', plan: 'LAUNCH' });
     const test = await makeTenant({ state: 'ACTIVE_PAID', plan: 'SCALE' });
     await ownerPool()`update workspaces set is_test = true where id = ${test.workspaceId}`;
-    const ev = (ws: string, type: string, payload: Record<string, unknown>, daysAgo = 0) =>
-      ownerPool()`insert into events (workspace_id, type, actor, payload, at) values (${ws}, ${type}, 'system:stripe', ${ownerPool().json(payload as never)}, now() - make_interval(days => ${daysAgo}))`;
-    await ev(a.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'GROWTH' });
-    await ev(b.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'LAUNCH' });
-    await ev(b.workspaceId, 'SUBSCRIPTION_CHANGED', { from: 'LAUNCH', to: 'SCALE', effective: 'now' });
-    await ev(a.workspaceId, 'SUBSCRIPTION_CHANGED', { cancelAtPeriodEnd: true, reason: 'seasonal' }); // a request, not a price change
-    await ev(test.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'SCALE' });
-    await ev(a.workspaceId, 'SUBSCRIPTION_STARTED', { plan: 'SCALE' }, 40);
-    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id) values (${c.workspaceId}, 'sub_gone', 'LAUNCH', 'canceled', gen_random_uuid())`;
+    const ev = (ws: string, sub: string, type: string, payload: Record<string, unknown>, daysAgo = 0) =>
+      ownerPool()`insert into events (workspace_id, type, actor, subject_type, subject_id, payload, at) values (${ws}, ${type}, 'system:stripe', 'subscription', ${sub}, ${ownerPool().json(payload as never)}, now() - make_interval(days => ${daysAgo}))`;
+    const [sa, sb, sc, sd, st] = [newId(), newId(), newId(), newId(), newId()];
+    await ev(a.workspaceId, sa, 'SUBSCRIPTION_STARTED', { plan: 'GROWTH' });
+    await ev(b.workspaceId, sb, 'SUBSCRIPTION_STARTED', { plan: 'LAUNCH' });
+    await ev(b.workspaceId, sb, 'SUBSCRIPTION_CHANGED', { from: 'LAUNCH', to: 'SCALE', effective: 'now' });
+    await ev(a.workspaceId, sa, 'SUBSCRIPTION_CHANGED', { cancelAtPeriodEnd: true, reason: 'seasonal' }); // a request, not a price change
+    await ev(test.workspaceId, st, 'SUBSCRIPTION_STARTED', { plan: 'SCALE' });
+    // c subscribed before the window and ended inside it: churned MRR at its plan's price.
+    await ev(c.workspaceId, sc, 'SUBSCRIPTION_STARTED', { plan: 'LAUNCH' }, 90);
+    await ev(c.workspaceId, sc, 'SUBSCRIPTION_ENDED', { plan: 'LAUNCH' }, 3);
+    // d scheduled a downgrade (no MRR yet), then it took effect.
+    await ev(d.workspaceId, sd, 'SUBSCRIPTION_STARTED', { plan: 'GROWTH' }, 60);
+    await ev(d.workspaceId, sd, 'SUBSCRIPTION_CHANGED', { from: 'GROWTH', to: 'LAUNCH', effective: 'period_end' }, 20);
+    expect((await withAdmin((tx) => mrrMovement(tx, 30))).contraction).toBe(0);
+    await ev(d.workspaceId, sd, 'SUBSCRIPTION_CHANGED', { from: 'GROWTH', to: 'LAUNCH', effective: 'applied' }, 1);
     const m = await withAdmin((tx) => mrrMovement(tx, 30));
-    expect(m).toEqual({ new: 99_000_000 + 49_000_000, expansion: 150_000_000, contraction: 0, churned: 49_000_000, net: 249_000_000 });
+    expect(m).toEqual({ new: 99_000_000 + 49_000_000, expansion: 150_000_000, contraction: 50_000_000, churned: 49_000_000, net: 199_000_000 });
     expect((await withAdmin((tx) => mrrMovement(tx, 30, { includeTest: true }))).new).toBe(99_000_000 + 49_000_000 + 199_000_000);
   });
 

@@ -1,6 +1,7 @@
 import type { PgBoss } from 'pg-boss';
 import { ownerPool, withSystem } from '@arkiv/db';
 import { runDeterministicEval, GOLDEN } from '@arkiv/core';
+import { reconcileStripe } from '@arkiv/billing';
 
 /**
  * Staff-requested queue operations (plan 05 §12), executed here because the worker owns pg-boss. The admin
@@ -9,6 +10,7 @@ import { runDeterministicEval, GOLDEN } from '@arkiv/core';
  *  - job.cancel: pg-boss cancel (reservations are released by the stranded-reservation sweep).
  *  - dlq.requeue: redrive dead-lettered jobs back to their source queue.
  *  - eval.run: run a golden-set evaluation and store the result.
+ *  - stripe.reconcile: the nightly Stripe reconciliation, on demand (plan 05 §7).
  */
 export async function processOpsCommands(boss: PgBoss): Promise<number> {
   const cmds = await withSystem((tx) => tx`select * from ops_commands where status = 'pending' order by created_at limit 20`);
@@ -35,6 +37,9 @@ export async function processOpsCommands(boss: PgBoss): Promise<number> {
           result = { score: r.score, passed: r.passed };
           break;
         }
+        case 'stripe.reconcile':
+          result = await reconcileStripe();
+          break;
         case 'integration.verify_webhooks': {
           // Shopify registrations are verified per shop with its token; without app credentials we only report scope.
           const [n] = await withSystem((tx) => tx`select count(*)::int as n from shopify_shops`);

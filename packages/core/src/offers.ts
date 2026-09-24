@@ -200,9 +200,9 @@ export async function issueTasteOffer(tx: Tx, ctx: TenantContext, projectId: str
   }
   const [o] = await tx`
     insert into offers (workspace_id, definition_code, type, project_id, price_micros, reference_price_micros, starts_at,
-      expires_at, bonus, variant)
+      expires_at, bonus, variant, experiment_key)
     values (${ctx.workspaceId}, ${code}, 'TASTE', ${projectId}, ${price}, ${ref}, now(),
-      now() + make_interval(mins => ${window}), ${tx.json(def.bonus as never)}, ${variant})
+      now() + make_interval(mins => ${window}), ${tx.json(def.bonus as never)}, ${variant}, ${variant ? exp!.key : null})
     on conflict do nothing
     returning *`;
   const offer = o ?? (await tx`select * from offers where type = 'TASTE'`)[0];

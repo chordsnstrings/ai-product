@@ -1,8 +1,9 @@
 import { withAdmin, type Tx } from '@arkiv/db';
-import { DomainError, newId, PLANS, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type StaffRole, type WorkspaceState } from '@arkiv/shared';
+import { DomainError, newId, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type StaffRole, type WorkspaceState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { emit } from './events';
+import { classifySubscriptionEvents, mrrTotals, subscriptionEvents } from './finance';
 import { adjust, type LedgerUnit } from './ledger';
 import { restoreFromScheduledPurge, RISK_PLAYBOOKS } from './lifecycle';
 import { enqueue, Queues } from './outbox';
@@ -48,10 +49,14 @@ const P = {
   'billing.manage': ['SUPER_ADMIN', 'FINANCE'],
   'ledger.read': ['SUPER_ADMIN', 'FINANCE', 'OPS'],
   'ledger.adjust': ['SUPER_ADMIN', 'FINANCE'],
+  // Provider invoice import and COGS reconciliation (plan 05 §8).
+  'cogs.reconcile': ['SUPER_ADMIN', 'FINANCE'],
   'rates.propose': ['SUPER_ADMIN', 'FINANCE', 'OPS'],
   'rates.publish': ['SUPER_ADMIN', 'FINANCE'],
   'providers.read': ['SUPER_ADMIN', 'ENGINEERING', 'OPS'],
   'providers.circuit': ['SUPER_ADMIN', 'ENGINEERING', 'OPS'],
+  // Provider registry settings (plan 05 §10): status, region, concurrency, timeout, retry policy.
+  'providers.manage': ['SUPER_ADMIN', 'ENGINEERING', 'OPS'],
   'routes.manage': ['SUPER_ADMIN', 'ENGINEERING'],
   'evals.run': ['SUPER_ADMIN', 'ENGINEERING'],
   'jobs.read': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'ENGINEERING'],
@@ -80,6 +85,8 @@ const P = {
   'audit.read': ['SUPER_ADMIN'],
   'staff.manage': ['SUPER_ADMIN'],
   'approvals.read': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'FINANCE', 'COMPLIANCE', 'GROWTH', 'ENGINEERING'],
+  // Resolve a Pulse platform alert (every operating role; ANALYST is read-only).
+  'alerts.manage': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'FINANCE', 'COMPLIANCE', 'GROWTH', 'ENGINEERING'],
   // Your own sign-in factors (passkeys): every staff member.
   'account.self': ['SUPER_ADMIN', 'OPS', 'SUPPORT', 'FINANCE', 'COMPLIANCE', 'GROWTH', 'ENGINEERING', 'ANALYST'],
 } as const satisfies Record<string, readonly StaffRole[]>;
@@ -613,10 +620,12 @@ export async function cancelProjectBeforeDispatch(s: Staff, workspaceId: string,
  */
 export const NO_SPEND_QUEUES: ReadonlySet<string> = new Set([Queues.sendEmail, Queues.syncIntegration, Queues.computeResults, Queues.processUpload, Queues.exportWorkspace]);
 
-export type OpsCommandKind = 'job.retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks';
+export type OpsCommandKind = 'job.retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks' | 'stripe.reconcile';
 
 function opsPermission(kind: OpsCommandKind): Permission {
   switch (kind) {
+    case 'stripe.reconcile':
+      return 'billing.unmatched';
     case 'eval.run':
       return 'evals.run';
     case 'integration.verify_webhooks':
@@ -743,27 +752,13 @@ export async function tenantHealth(tx: Tx, workspaceId: string) {
 }
 
 /**
- * §1 / §7 MRR movement over the last `days`, from the Stripe mirror (subscriptions and the SUBSCRIPTION_* events
- * written by Stripe webhooks) priced at each plan's price: new, expansion, contraction and churned MRR, and the
- * net. Test workspaces are excluded unless asked for.
+ * §1 / §7 MRR movement over the last `days`, from the SUBSCRIPTION_* events the Stripe webhooks write, priced at each
+ * plan's price: new (and reactivated), expansion, contraction and churned MRR, and the net. A scheduled downgrade or
+ * cancellation moves no MRR until it takes effect (finance.ts classifies). Test workspaces are excluded unless asked.
  */
 export async function mrrMovement(tx: Tx, days: number, opts: { includeTest?: boolean } = {}) {
-  const price = tx.json(Object.fromEntries(Object.entries(PLANS).map(([k, p]) => [k, p.priceMicros])));
-  const test = opts.includeTest ? tx`` : tx`and workspace_id not in (select id from workspaces where is_test)`;
-  const [m] = await tx`
-    with moves as (
-      select type,
-             case when type = 'SUBSCRIPTION_STARTED' then (${price}->>(payload->>'plan'))::bigint
-                  when payload ? 'to' then (${price}->>(payload->>'to'))::bigint - (${price}->>(payload->>'from'))::bigint end as delta
-      from events where type in ('SUBSCRIPTION_STARTED', 'SUBSCRIPTION_CHANGED') and at > now() - make_interval(days => ${days}) ${test})
-    select coalesce(sum(delta) filter (where type = 'SUBSCRIPTION_STARTED'), 0)::bigint as new,
-           coalesce(sum(delta) filter (where type = 'SUBSCRIPTION_CHANGED' and delta > 0), 0)::bigint as expansion,
-           coalesce(-sum(delta) filter (where type = 'SUBSCRIPTION_CHANGED' and delta < 0), 0)::bigint as contraction,
-           (select coalesce(sum((${price}->>plan_code)::bigint), 0) from subscriptions
-             where status = 'canceled' and updated_at > now() - make_interval(days => ${days}) ${test})::bigint as churned
-    from moves`;
-  const r = { new: Number(m!.new), expansion: Number(m!.expansion), contraction: Number(m!.contraction), churned: Number(m!.churned) };
-  return { ...r, net: r.new + r.expansion - r.contraction - r.churned };
+  const c = classifySubscriptionEvents(await subscriptionEvents(tx, opts));
+  return mrrTotals(c, new Date(Date.now() - days * 86400_000));
 }
 
 export interface ReconciliationException {
