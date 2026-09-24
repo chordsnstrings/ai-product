@@ -5,6 +5,7 @@ import { autoRenewText } from '@arkiv/billing';
 import { PLANS, formatUsd, type PlanCode } from '@arkiv/shared';
 import { requireUser } from '@/lib/session';
 import { userWorkspaces } from '@/lib/tenant';
+import { ThemeScope } from '@arkiv/ui/client';
 import { PlanPicker } from '@/components/plan-picker';
 
 export const metadata: Metadata = { title: 'Choose a plan · Arkiv', robots: { index: false } };
@@ -21,13 +22,13 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ p
   const initial = (['LAUNCH', 'GROWTH', 'SCALE'].includes(sp.plan ?? '') ? sp.plan : 'GROWTH') as PlanCode;
   const plans = (['LAUNCH', 'GROWTH', 'SCALE'] as const).map((c) => ({ code: c, name: PLANS[c].name, price: formatUsd(PLANS[c].priceMicros, 0), tests: PLANS[c].creativeTestsPerMonth, perTest: formatUsd(PLANS[c].priceMicros / PLANS[c].creativeTestsPerMonth, 0), consent: autoRenewText(c) }));
   return (
-    <div data-theme="light" style={{ background: 'var(--paper)', minHeight: '100vh' }}>
+    <ThemeScope theme="light">
       <div className="ak-wrap ak-section" style={{ maxWidth: 720 }}>
         <p className="ak-label">{w.name as string}</p>
         <h1 className="ak-h1">Choose your plan</h1>
         <p className="ak-muted">Creative Tests reset monthly. Upgrade, downgrade or cancel online anytime.</p>
         <PlanPicker slug={w.slug as string} plans={plans} initial={initial} canBuy={['OWNER', 'ADMIN'].includes(w.role as string)} />
       </div>
-    </div>
+    </ThemeScope>
   );
 }

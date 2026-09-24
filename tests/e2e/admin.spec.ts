@@ -19,22 +19,28 @@ test('staff can sign in and use the console', async ({ page }) => {
   await page.getByRole('link', { name: 'Flags & config' }).click();
   await expect(page.getByRole('heading', { name: 'Kill switches' })).toBeVisible(); // Section titles are headings
   await headingOutline(page);
-  // Turning a kill switch on asks for confirmation and a reason (and a fresh code if 2FA is older than 5 min).
-  const dialogs: string[] = [];
-  page.on('dialog', async (d) => {
-    dialogs.push(d.message());
-    if (d.type() === 'confirm') await d.accept();
-    else if (/authenticator/i.test(d.message())) await d.accept(totp(c.secret));
-    else await d.accept('e2e toggle');
+  // Turning a kill switch on asks for confirmation and a reason in the console's confirmation sheet (never the
+  // browser's own dialogs), and a fresh code if 2FA is older than 5 min.
+  page.on('dialog', () => {
+    throw new Error('native browser dialog used instead of the confirmation sheet');
   });
+  const answer = async (confirmName: RegExp) => {
+    const sheet = page.getByRole('dialog');
+    await expect(sheet).toBeVisible();
+    await sheet.getByLabel(/reason/i).fill('e2e toggle');
+    await sheet.getByRole('button', { name: confirmName }).click();
+    await expect(sheet).toBeHidden();
+  };
   const row = page.locator('tr', { hasText: 'kill.read_only' });
   await row.getByRole('button', { name: /Turn on/ }).click();
+  await expect(page.getByRole('dialog', { name: /Turn ON this kill switch/ })).toBeVisible();
+  await answer(/Turn on/);
   await expect(row.getByText('ON', { exact: true })).toBeVisible();
   await row.getByRole('button', { name: /Turn off/ }).click();
+  await answer(/Turn off/);
   await expect(row.getByText('ON', { exact: true })).toBeHidden();
-  // A fresh login counts as a recent second factor (5 min), so only the confirm + reason prompts appear here;
+  // A fresh login counts as a recent second factor (5 min), so only the confirm + reason sheet appears here;
   // the stale-session 🔐 path is exercised by tests/smoke/admin.ts.
-  expect(dialogs.some((m) => /reason/i.test(m))).toBe(true);
 });
 
 /**

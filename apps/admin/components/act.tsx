@@ -3,6 +3,8 @@
 import { useRouter } from 'next/navigation';
 import { useState, type ReactNode } from 'react';
 import { startAuthentication } from '@simplewebauthn/browser';
+import { Field, Input, Select, splitConfirm, Textarea } from '@arkiv/ui';
+import { confirmSheet, toast } from '@arkiv/ui/client';
 
 export async function post(url: string, body: unknown) {
   const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
@@ -29,9 +31,9 @@ export async function reauthenticate(): Promise<void> {
       return;
     }
   }
-  const code = window.prompt('Confirm with your authenticator code');
-  if (!code) throw new Error('Cancelled');
-  await post('/api/reauth', { code });
+  const r = await confirmSheet({ title: 'Confirm it’s you', body: 'This action needs a fresh second factor.', confirmLabel: 'Confirm', input: { label: 'Authenticator code', kind: 'code', required: true } });
+  if (!r.ok) throw new Error('Cancelled');
+  await post('/api/reauth', { code: r.value.trim() });
 }
 
 /** Runs an admin action; if the server asks for a fresh second factor (🔐), re-authenticates and retries once. */
@@ -60,21 +62,27 @@ export function ActButton({ action, payload = {}, children, confirm, reason, dan
   return (
     <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
       <button
-        className={`ak-btn ${danger ? 'ak-btn--accent' : 'ak-btn--secondary'}${small ? ' ak-btn--sm' : ''}`}
+        className={`ak-btn ${danger ? 'ak-btn--danger' : 'ak-btn--secondary'}${small ? ' ak-btn--sm' : ''}`}
         style={small ? { padding: '4px 10px', minHeight: 28, fontSize: 12 } : undefined}
         disabled={busy}
         onClick={async () => {
-          if (confirm && !window.confirm(confirm)) return;
           let why: string | null = null;
-          if (reason) {
-            why = window.prompt(typeof reason === 'string' ? reason : 'Reason (recorded in the audit log)');
-            if (!why) return;
+          // One sheet asks both: the confirmation and, when the audit log needs it, the reason.
+          if (confirm || reason) {
+            const label = typeof children === 'string' ? children : 'Confirm';
+            const q = confirm ? splitConfirm(confirm) : { title: `${label}?` };
+            const res = await confirmSheet({ ...q, danger, confirmLabel: label, input: reason ? { label: typeof reason === 'string' ? reason : 'Reason (recorded in the audit log)', kind: 'textarea', required: true } : undefined });
+            if (!res.ok) return;
+            if (reason) why = res.value.trim();
           }
           setBusy(true);
           setMsg(null);
           try {
             const r = await act(action, { ...payload, ...(why ? { reason: why } : {}) });
-            setMsg({ ok: true, text: describe(r) });
+            // A plain success is a toast (design §3); what the server says (a secret to hand over, a count) or a
+            // request left waiting for a second approver stays on the page.
+            if (r.status === 'pending' || r.message) setMsg({ ok: true, text: describe(r) });
+            else toast(describe(r));
             if (typeof r.url === 'string') window.open(r.url, '_blank', 'noopener');
             router.refresh();
           } catch (e) {
@@ -131,7 +139,10 @@ export function ActForm({ action, fields, submit, extra = {}, inline }: { action
         setMsg(null);
         try {
           const r = await act(action, payload);
-          setMsg({ ok: true, text: describe(r) });
+          // A plain success is a toast (design §3); what the server says (a secret to hand over, a count) or a
+          // request left waiting for a second approver stays on the page.
+          if (r.status === 'pending' || r.message) setMsg({ ok: true, text: describe(r) });
+          else toast(describe(r));
           router.refresh();
         } catch (x) {
           setMsg({ ok: false, text: (x as Error).message });
@@ -139,22 +150,28 @@ export function ActForm({ action, fields, submit, extra = {}, inline }: { action
         setBusy(false);
       }}
     >
-      {fields.map((f) => (
-        <label key={f.name} className="ak-field" style={inline ? { minWidth: 140 } : undefined}>
-          <span className="ak-label">{f.label}</span>
-          {f.type === 'textarea' || f.type === 'json' ? (
-            <textarea className="ak-textarea" name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue as string} rows={f.type === 'json' ? 8 : 3} style={f.type === 'json' ? { fontFamily: 'var(--font-mono)', fontSize: 12 } : undefined} />
-          ) : f.type === 'select' ? (
-            <select className="ak-input" name={f.name} required={f.required} defaultValue={f.defaultValue as string}>
-              {(f.options ?? []).map((o) => (typeof o === 'string' ? <option key={o} value={o}>{o}</option> : <option key={o.value} value={o.value}>{o.label}</option>))}
-            </select>
-          ) : f.type === 'checkbox' ? (
+      {fields.map((f) =>
+        f.type === 'checkbox' ? (
+          <label key={f.name} className="ak-check" style={inline ? { minWidth: 140 } : undefined}>
             <input type="checkbox" name={f.name} defaultChecked={!!f.defaultValue} />
-          ) : (
-            <input className="ak-input" type={f.type ?? 'text'} name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue as string} step={f.type === 'number' ? 'any' : undefined} />
-          )}
-        </label>
-      ))}
+            <span className="ak-label">{f.label}</span>
+          </label>
+        ) : (
+          <div key={f.name} style={inline ? { minWidth: 140 } : undefined}>
+            <Field label={f.label}>
+              {f.type === 'textarea' || f.type === 'json' ? (
+                <Textarea name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue as string} rows={f.type === 'json' ? 8 : 3} style={f.type === 'json' ? { fontFamily: 'var(--font-mono)', fontSize: 12 } : undefined} />
+              ) : f.type === 'select' ? (
+                <Select name={f.name} required={f.required} defaultValue={f.defaultValue as string}>
+                  {(f.options ?? []).map((o) => (typeof o === 'string' ? <option key={o} value={o}>{o}</option> : <option key={o.value} value={o.value}>{o.label}</option>))}
+                </Select>
+              ) : (
+                <Input type={f.type ?? 'text'} name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue as string} step={f.type === 'number' ? 'any' : undefined} />
+              )}
+            </Field>
+          </div>
+        ),
+      )}
       <div>
         <button className="ak-btn ak-btn--sm" type="submit" disabled={busy}>{busy ? '…' : submit}</button>
         {msg ? <span className={`ak-small ${msg.ok ? 'ak-muted' : 'ak-error'}`} style={{ marginLeft: 8 }}>{msg.text}</span> : null}

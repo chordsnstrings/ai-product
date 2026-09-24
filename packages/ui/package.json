@@ -12,7 +12,10 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@arkiv/shared": "workspace:*",
     "@radix-ui/react-dialog": "^1.1.23",
+    "@radix-ui/react-popover": "^1.1.23",
+    "@radix-ui/react-toast": "^1.2.23",
     "motion": "^13.4.1",
     "react": "19.3.0",
     "react-dom": "19.3.0"

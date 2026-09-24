@@ -67,8 +67,14 @@ test('anonymous visitor to delivered ad', async ({ page }) => {
   await expect(page.locator('.ak-timer')).toBeVisible(); // server-issued intro expiry
   await a11yFloor(page);
 
+  // Each frame's caption and controls are laid out below the image, not clipped by the frame.
+  const editWords = page.getByRole('button', { name: 'Edit words' }).first();
+  await editWords.scrollIntoViewIfNeeded();
+  await expect(editWords).toBeInViewport();
+  await expect(page.getByRole('button', { name: /Lock scene 1/ })).toHaveAttribute('aria-pressed', 'false');
+
   // Free, claim-checked edit.
-  await page.getByRole('button', { name: 'Edit words' }).first().click();
+  await editWords.click();
   await page.getByLabel('Spoken line').fill('Cures acne overnight');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByRole('alert')).toContainText(/drug claim/i);

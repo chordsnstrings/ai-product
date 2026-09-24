@@ -7,6 +7,7 @@ import { SignalChip } from '@arkiv/ui';
 import { CreatorPacks } from '@/components/creator-packs';
 import { StudioClient } from '@/components/studio';
 import { workspacePage } from '@/lib/tenant';
+import { variantPreviewUrl } from '@/lib/variant-preview';
 
 export const metadata: Metadata = { title: 'Studio · Arkiv' };
 
@@ -25,11 +26,15 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
     const variants = await Promise.all(
       v.variants.map(async (x) => {
         let files: { aspect: string; label: string; url: string }[] = [];
+        // §2.4 video thumbnail: the 9:16 cut, signed without a download name so it plays inline.
+        const preview = await variantPreviewUrl(tx, x);
+        // The variant code already carries the catalogue number (AK-014-A).
+        const caption = [x.code as string, x.label as string, '9:16'].filter(Boolean).join(' · ');
         // Variant.platform_assets[] (§20): one download per placement, named for the platform it goes to.
         const placements = (x.platform_assets as PlatformAsset[] | null) ?? [];
         if (placements.length) {
           files = await Promise.all(placements.map(async (pa) => ({ aspect: pa.aspect, label: `${PLACEMENT_LABEL[pa.platform]} ${pa.aspect.replace('x', ':')}`, url: await assetUrl(tx, pa.assetId, 3600, `${x.code}-${pa.platform.toLowerCase()}-${pa.aspect}.mp4`) })));
-          return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files };
+          return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files, preview, caption };
         }
         const creativeId = x.creative_id ?? (x.project_id ? (await tx`select final_creative_id from projects where id = ${x.project_id}`)[0]?.final_creative_id : null);
         if (creativeId) {
@@ -37,7 +42,7 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
           const assets = (cr?.final_asset_ids as string[] | undefined)?.length ? await tx`select id, lineage from assets where id in ${tx(cr!.final_asset_ids as string[])}` : [];
           files = await Promise.all(assets.map(async (a) => ({ aspect: (a.lineage as { aspect?: string }).aspect ?? 'video', label: (a.lineage as { aspect?: string }).aspect ?? 'video', url: await assetUrl(tx, a.id as string, 3600, `${x.code}-${(a.lineage as { aspect?: string }).aspect ?? 'ad'}.mp4`) })));
         }
-        return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files };
+        return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files, preview, caption };
       }),
     );
     // AI-content disclosure of the experiment's ads (the variants reuse the master's media, standard §40).

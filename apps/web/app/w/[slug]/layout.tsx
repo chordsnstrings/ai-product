@@ -1,13 +1,17 @@
 import Link from 'next/link';
+import { cookies } from 'next/headers';
 import type { ReactNode } from 'react';
 import { withTenant } from '@arkiv/db';
 import { freshness, periodUsage } from '@arkiv/core';
 import { Banner } from '@arkiv/ui';
+import { Announcer, ConfirmHost, ThemeScope, Toaster } from '@arkiv/ui/client';
+import { formatDate } from '@arkiv/shared/format';
 import { ActionButton } from '@/components/actions';
 import { AppNav, TabBar } from '@/components/app-nav';
 import { StatusBanner } from '@/components/status-banner';
 import { requireUser } from '@/lib/session';
 import { userWorkspaces, workspacePage } from '@/lib/tenant';
+import { parseTheme, THEME_COOKIE } from '@/lib/theme';
 
 /** Workspace chrome (plan 03 Part B): left rail on desktop, bottom tabs on phone, freshness + entitlement meter. */
 export default async function WorkspaceLayout({ children, params }: { children: ReactNode; params: Promise<{ slug: string }> }) {
@@ -20,7 +24,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
     let meter: string | null = null;
     if (sub) {
       const u = await periodUsage(tx, new Date(sub.current_period_start as string).toISOString().slice(0, 10));
-      meter = `${u.remaining} of ${u.granted} tests left · renews ${new Date(sub.current_period_end as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+      meter = `${u.remaining} of ${u.granted} tests left · renews ${formatDate(sub.current_period_end as string)}`;
     }
     const [ws] = await tx`select state, purge_at, owner_email_bouncing_at, plan_code from workspaces where id = ${w.ctx.workspaceId}`;
     // In-app notices from Arkiv (retention playbooks, plan 05 §17), until dismissed or expired.
@@ -31,7 +35,9 @@ export default async function WorkspaceLayout({ children, params }: { children: 
     return { meter, fresh: await freshness(tx), ws, notices, providers };
   });
   const stale = fresh.filter((f) => f.stale);
-  return (
+  // The viewer's manual light/dark choice (design §2.1); without one the app follows the system setting.
+  const theme = parseTheme((await cookies()).get(THEME_COOKIE)?.value);
+  const shell = (
     <div className="ak-shell">
       <AppNav slug={slug} current={w.name} meter={meter} workspaces={all.map((x) => ({ slug: x.slug as string, name: x.name as string }))} />
       <header className="ak-topbar ak-topbar--mobile">
@@ -41,7 +47,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
       <main className="ak-main">
         <StatusBanner viewer={{ workspaceId: w.ctx.workspaceId, planCode: (ws?.plan_code as string | null) ?? null, providers }} />
         {ws?.state === 'PURGE_SCHEDULED' ? (
-          <Banner tone="risk">This workspace is scheduled for deletion on {new Date(ws.purge_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}. <Link href={`/w/${slug}/settings/data`}>Cancel deletion</Link></Banner>
+          <Banner tone="risk">This workspace is scheduled for deletion on {formatDate(ws.purge_at as string)}. <Link href={`/w/${slug}/settings/data`}>Cancel deletion</Link></Banner>
         ) : null}
         {ws?.owner_email_bouncing_at ? (
           // Plan 05 §18 / 02 M13: mail to the Owner's address bounced, so billing and security notices aren't arriving.
@@ -59,6 +65,10 @@ export default async function WorkspaceLayout({ children, params }: { children: 
         {children}
       </main>
       <TabBar slug={slug} />
+      <ConfirmHost />
+      <Toaster />
+      <Announcer />
     </div>
   );
+  return theme ? <ThemeScope theme={theme}>{shell}</ThemeScope> : shell;
 }

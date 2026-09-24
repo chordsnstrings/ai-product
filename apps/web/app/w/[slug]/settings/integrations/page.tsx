@@ -88,7 +88,7 @@ export default async function Integrations({ params, searchParams }: { params: P
                     <span className="ak-row">
                       <ActionButton slug={slug} action="integration-sync" body={{ id: c.id }} variant="text">Sync now</ActionButton>
                       {p !== 'shopify' && info.configured() ? <a className="ak-textbtn" href={`/api/w/${slug}/connect/${p}`}>Switch account</a> : null}
-                      <ActionButton slug={slug} action="integration-disconnect" body={{ id: c.id }} variant="text" confirm={`Disconnect ${info.name}? We'll delete the access token. Past data stays in your archive.`}>Disconnect</ActionButton>
+                      <ActionButton slug={slug} action="integration-disconnect" body={{ id: c.id }} variant="text" danger confirm={`Disconnect ${info.name}? We'll delete the access token. Past data stays in your archive.`}>Disconnect</ActionButton>
                     </span>
                   ) : null}
                 </div>

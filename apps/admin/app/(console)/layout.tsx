@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { apiVersions, setting, staffCan, upcomingSunsets } from '@arkiv/core';
 import { withAdmin } from '@arkiv/db';
+import { ConfirmHost, Toaster } from '@arkiv/ui/client';
 import { Nav } from '@/components/nav';
 import { requireStaff } from '@/lib/staff';
 import { NAV } from '@/lib/nav';
@@ -33,6 +34,8 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
         {drift.length ? <div className="ak-banner ak-banner--risk" style={{ marginBottom: 16 }}>Model version drift on {drift.join(', ')} — <a href="/providers">check routes</a>.</div> : null}
         {children}
       </main>
+      <ConfirmHost />
+      <Toaster />
     </div>
   );
 }

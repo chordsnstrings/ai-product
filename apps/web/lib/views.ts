@@ -97,6 +97,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         value: f.value.valueText ?? (f.value.valueNumber != null ? (key.includes('price') ? `$${f.value.valueNumber.toFixed(2)}` : String(f.value.valueNumber)) : JSON.stringify(f.value.valueJson)),
         state: f.value.state,
         source: f.value.sourceType,
+        /** When this value was observed (or decided): the provenance chip shows it with the source. */
+        observedAt: f.value.observedAt,
         disputed: f.disputed,
         candidates: f.disputed ? f.candidates.map((c) => ({ value: c.valueText ?? String(c.valueNumber ?? ''), source: c.sourceType })) : [],
         /** A source still disagrees with the merchant's correction (§28): shown, never hidden behind the decision. */
