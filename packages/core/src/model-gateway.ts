@@ -676,6 +676,18 @@ export interface VideoCall extends CallMeta {
   pollMs?: number;
   /** Called while waiting on the provider (at most once a minute) so the caller can keep its run lease alive. */
   heartbeat?: () => Promise<void>;
+  /**
+   * Called when the provider's reported state changes (queued → running) or its ETA moves by a minute or more, so
+   * the caller can show the truthful wait (§48 "very long provider queue: expose truthful queued state/ETA").
+   */
+  onQueue?: (q: ProviderQueueState) => Promise<void>;
+}
+
+/** What the provider says about a submitted task while it waits (§48). */
+export interface ProviderQueueState {
+  status: 'queued' | 'running';
+  position: number | null;
+  etaAt: Date | null;
 }
 
 /**
@@ -706,6 +718,7 @@ async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider =
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
     let res: VideoPoll;
     let beat = Date.now();
+    let shown: { status: string; etaMin: number | null } | null = null;
     for (;;) {
       if (call.heartbeat && Date.now() - beat > 60_000) {
         beat = Date.now();
@@ -720,6 +733,15 @@ async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider =
       res = await request(started, () => video.poll(requestId!));
       lastMeta = res.rawMeta ?? lastMeta;
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
+      // Record what the provider says about the wait — never resubmit because it is slow (§48).
+      const etaAt = res.etaSeconds != null ? new Date(Date.now() + res.etaSeconds * 1000) : null;
+      const etaMin = etaAt ? Math.ceil((etaAt.getTime() - Date.now()) / 60_000) : null;
+      if (!shown || shown.status !== res.status || shown.etaMin !== etaMin) {
+        shown = { status: res.status, etaMin };
+        const q: ProviderQueueState = { status: res.status, position: res.queuePosition ?? null, etaAt };
+        await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set poll_status = ${q.status}, provider_eta_at = ${etaAt}, queue_position = ${q.position} where id = ${started.jobId}`);
+        await call.onQueue?.(q).catch((e) => gatewayLog.warn('queue update failed', { jobId: started.jobId, error: (e as Error).message }));
+      }
       if (Date.now() > deadline) {
         await video.cancel(requestId).catch(() => {});
         throw new ProviderError(started.route.provider, 'video generation timed out', true, 'timeout');

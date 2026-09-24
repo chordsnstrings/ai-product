@@ -18,7 +18,7 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, currentPeriodKey, type LedgerUnit } from './ledger';
 import { setting } from './settings';
-import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
+import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type ProviderQueueState, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
@@ -498,6 +498,13 @@ const VIDEO_PRODUCT_VIEWS = 3;
  * The render prompt: the scene, then how to use the references — the first image is the scene's storyboard frame,
  * the others are the exact product, which must not change (label text, shape, closure, colours).
  */
+/** The scenes step's detail while a render waits on the provider (§48): its queue state and ETA, when known. */
+export function queueDetail(q: ProviderQueueState, scene: number, now = Date.now()): string {
+  const min = q.etaAt ? Math.max(1, Math.ceil((q.etaAt.getTime() - now) / 60_000)) : null;
+  if (q.status === 'queued') return `Waiting in the video queue${q.position != null ? ` (position ${q.position})` : ''}${min != null ? ` · ~${min} min` : ''}`;
+  return `Rendering scene ${scene}${min != null ? ` · ~${min} min` : ''}`;
+}
+
 export function videoPrompt(s: Record<string, unknown>, attempt: number, productRefs: number): string {
   const product = productRefs
     ? `The first reference image is the scene's storyboard frame; the other ${productRefs} reference images show the exact product. Keep the product identical to those product images: the same label text, shape, closure and colours.`
@@ -808,6 +815,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                 ratio: '9:16',
                 mockLabel: `${s.purpose} · ${(s.visual_plan as string).slice(0, 60)}`,
                 heartbeat,
+                // §48 "very long provider queue": the progress shows the provider's truthful wait, not a stalled bar.
+                onQueue: (q) => withTenant(ws, (tx) => step(tx, ws, projectId, 'scenes', 'active', queueDetail(q, n))),
               });
               // Paid output goes to our own storage before anything else can fail (§39 "every output is copied to
               // owned object storage immediately"): a crash or a QA error never loses a render we paid for.

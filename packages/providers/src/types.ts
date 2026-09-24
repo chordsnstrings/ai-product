@@ -88,6 +88,10 @@ export interface VideoPoll {
   /** Seconds of video generated — billed by the provider, also on a failed task that generated some. */
   outputSeconds?: number;
   rawMeta?: RawMeta;
+  /** Where the task stands in the provider's queue, when the provider says (§48 "truthful queued state/ETA"). */
+  queuePosition?: number;
+  /** The provider's own estimate of seconds until the task completes, when it gives one. */
+  etaSeconds?: number;
 }
 export interface VideoProvider {
   readonly name: string;

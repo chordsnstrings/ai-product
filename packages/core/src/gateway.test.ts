@@ -6,7 +6,8 @@ import { MockImage, MockLlm, MockTts, MockVideo, providers, setProviders, type L
 import { newId } from '@arkiv/shared';
 import { armComparison } from './canary';
 import { authorize } from './cost-governor';
-import { generateVideo, llmJson, reconcileProviderJobs, routedLines } from './model-gateway';
+import { generateVideo, llmJson, reconcileProviderJobs, routedLines, type ProviderQueueState } from './model-gateway';
+import { queueDetail } from './production';
 import { ctxFor, eventContractProblems } from './testing';
 
 /**
@@ -296,5 +297,37 @@ describe('reconciling provider jobs a crashed worker left open (standard §39; a
     expect((await ownerPool()`select count(*)::int as n from ledger_entries where workspace_id = ${t.workspaceId} and type = 'PROVIDER_COST_RECORDED'`)[0]!.n).toBe(2);
     const events = await ownerPool()`select type from events where workspace_id = ${t.workspaceId} and type like 'PROVIDER_JOB_%'`;
     expect(events.map((e) => e.type).sort()).toEqual(['PROVIDER_JOB_FAILED', 'PROVIDER_JOB_FAILED', 'PROVIDER_JOB_SUCCEEDED']);
+  });
+});
+
+describe('provider queue state (§48 very long provider queue)', () => {
+  it('records the provider’s queued/running state and ETA and tells the caller, without resubmitting', async () => {
+    const video = new MockVideo(60, 'byteplus', 150);
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video, tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const t = await makeTenant();
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId, 'video.scene', 'video');
+    const seen: ProviderQueueState[] = [];
+    const jobs: unknown[] = [];
+    await generateVideo({
+      ctx, token, task: 'video.scene', subject: null, prompt: 'hands', references: [], seconds: 5, resolution: '720p', ratio: '9:16', pollMs: 10,
+      onQueue: async (q) => {
+        seen.push(q);
+        jobs.push((await ownerPool()`select poll_status, queue_position from provider_jobs where workspace_id = ${t.workspaceId}`)[0]);
+      },
+    });
+    expect(video.requests).toHaveLength(1); // waited, never resubmitted
+    expect(seen[0]).toMatchObject({ status: 'queued', position: 3 });
+    expect(seen[0]!.etaAt).toBeInstanceOf(Date);
+    expect(seen.some((q) => q.status === 'running')).toBe(true);
+    expect(jobs[0]).toEqual({ poll_status: 'queued', queue_position: 3 });
+    const [job] = await ownerPool()`select status, poll_status from provider_jobs where workspace_id = ${t.workspaceId}`;
+    expect(job).toMatchObject({ status: 'succeeded', poll_status: 'running' });
+  });
+
+  it('shows the wait on the production progress', () => {
+    const now = Date.parse('2026-09-24T12:00:00Z');
+    expect(queueDetail({ status: 'queued', position: 4, etaAt: new Date(now + 7.5 * 60_000) }, 2, now)).toBe('Waiting in the video queue (position 4) · ~8 min');
+    expect(queueDetail({ status: 'queued', position: null, etaAt: null }, 2, now)).toBe('Waiting in the video queue');
+    expect(queueDetail({ status: 'running', position: null, etaAt: new Date(now + 30_000) }, 3, now)).toBe('Rendering scene 3 · ~1 min');
   });
 });

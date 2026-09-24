@@ -20,3 +20,9 @@ alter table model_routes add column drift_policy text not null default 'alert' c
 alter table eval_runs alter column created_by drop not null;
 alter table ops_commands alter column requested_by drop not null;
 grant insert on eval_runs, ops_commands to system_rw;
+
+-- What the provider says about a submitted video task while it waits (standard §48 "very long provider queue: expose
+-- truthful queued state/ETA where available; do not submit duplicates"): shown on the production progress.
+alter table provider_jobs add column poll_status text check (poll_status in ('queued', 'running')),
+  add column provider_eta_at timestamptz,
+  add column queue_position int;
