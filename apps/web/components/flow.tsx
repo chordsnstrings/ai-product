@@ -82,6 +82,40 @@ function MissingFacts({ projectId, fields, onSaved }: { projectId: string; field
   );
 }
 
+/**
+ * §42 "Variants / sizes": which size or shade this ad is for, so it never shows the wrong one. Chosen before an
+ * idea is picked (the storyboard is drawn for it); until then no size or price that differs between them is used.
+ */
+function VariantPicker({ projectId, v, onSaved }: { projectId: string; v: View; onSaved: () => void }) {
+  const [err, setErr] = useState<string | null>(null);
+  const locked = !['PRODUCT_UPLOADED', 'PRODUCT_ANALYZED', 'BRIEF_READY', 'CONCEPTS_READY', 'NEEDS_USER_ACTION'].includes(v.project.state);
+  const chosen = v.sku.variants.find((x) => x.id === v.project.variantId) ?? null;
+  async function choose(variantId: string) {
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/variant`, { variantId: variantId || null });
+      onSaved();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  }
+  return (
+    <div className="ak-panel ak-stack">
+      <label className="ak-label" htmlFor="variant">Which one is this ad for?</label>
+      <select id="variant" className="ak-input" value={v.project.variantId ?? ''} disabled={locked} onChange={(e) => void choose(e.target.value)}>
+        <option value="">Not chosen — we won’t mention a size, shade or price that differs</option>
+        {v.sku.variants.map((x) => (
+          <option key={x.id} value={x.id}>
+            {x.title}{x.priceMicros != null ? ` · ${usd(x.priceMicros)}` : ''}{x.available === false ? ' · out of stock' : ''}
+          </option>
+        ))}
+      </select>
+      {chosen?.available === false ? <Banner tone="warn">{chosen.title} is out of stock on your store. You can still make the ad, but check it before you run it.</Banner> : null}
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
 export function AnalysisFlow({ projectId }: { projectId: string }) {
   const active = useCallback((v: View | null) => !v || v.sku.status === 'analyzing' || (v.sku.status === 'active' && v.concepts.length === 0 && v.project.state !== 'NEEDS_USER_ACTION'), []);
   const { data: v, error, refresh, resume } = useProject(projectId, active);
@@ -178,6 +212,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Key ingredients', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
                 </div>
               ) : null}
+              {!failed && v.sku.variants.length > 1 ? <VariantPicker projectId={projectId} v={v} onSaved={refresh} /> : null}
               {!failed && v.sku.missingEvidence.length ? (
                 <div>
                   <h2 className="ak-label">What would make these ads stronger</h2>

@@ -10,6 +10,7 @@ import { ConceptSet, StoryboardPlan, type Proposal } from './intel-schemas';
 import { mockConcepts, mockStoryboard, type ProductContext } from './mock-intel';
 import { llmJson } from './model-gateway';
 import { currentFacts, factText } from './product-truth';
+import { listVariants, projectVariant, variantTruth } from './sku-variants';
 import { CONCEPTS_SYSTEM, STORYBOARD_SYSTEM } from './prompts';
 
 /** Sources that observe a real ingredient list (the page, structured data, the store, the label itself). */
@@ -44,7 +45,7 @@ export const UNVERIFIED_INGREDIENTS_REASON = 'ingredient creative needs your ing
  * ContextBuilder (§22, §33): a curated, bounded Context Packet — never raw DB access. Everything comes through
  * tenant-scoped reads, so a packet can only contain this workspace's rows (plan 02 §3 layer 6).
  */
-export async function buildContext(tx: Tx, skuId: string) {
+export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: string | null } = {}) {
   const [sku] = await tx`select * from skus where id = ${skuId}`;
   if (!sku) throw new DomainError('NOT_FOUND', 'Product not found');
   const facts = await currentFacts(tx, skuId);
@@ -65,10 +66,15 @@ export async function buildContext(tx: Tx, skuId: string) {
   // Stable ids for every packet item, so a proposal can cite what it rests on (rationale ids, §38).
   const FACT_KEYS = ['category', 'size', 'price', 'texture', 'format', 'key_ingredients', 'ingredients'];
   const factIds = Object.fromEntries(FACT_KEYS.filter((k) => facts[k]).map((k) => [k, facts[k]!.value.id]));
+  // §42 variants: the advertised variant's size, shade and price — never another variant's (e.g. variants[0]).
+  const variants = await listVariants(tx, skuId);
+  const chosen = opts.projectId ? await projectVariant(tx, opts.projectId) : null;
+  const factPrice = facts.price?.value.valueNumber;
+  const truth = variantTruth(variants, chosen, { size: factText(facts, 'size'), priceMicros: factPrice != null ? Math.round(factPrice * 1_000_000) : null });
   const productContext: ProductContext = {
     name: sku.name as string,
     category: (factText(facts, 'category') ?? sku.category ?? 'skincare') as string,
-    sizeText: factText(facts, 'size'),
+    sizeText: truth.size,
     texture: factText(facts, 'texture'),
     ingredients,
     approvedClaims: approvedRows.map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
@@ -81,7 +87,11 @@ export async function buildContext(tx: Tx, skuId: string) {
       name: productContext.name,
       category: productContext.category,
       size: productContext.sizeText,
-      price: factText(facts, 'price'),
+      price: truth.priceMicros != null ? (truth.priceMicros / 1_000_000).toFixed(2) : null,
+      shade: truth.shade,
+      variant: truth.variantTitle,
+      // Sold in several sizes/shades and none chosen: state no size, shade or price that differs between them.
+      variantNote: truth.ambiguous ? `Sold in ${variants.length} variants (${variants.map((v) => v.title).slice(0, 6).join(', ')}); no variant chosen — do not state a size, shade or price that is not listed here.` : null,
       texture: productContext.texture,
       format: factText(facts, 'format'),
       keyIngredients: ingredients,
@@ -169,7 +179,7 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -263,7 +273,7 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (
 
 export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string; brandBrainVersionId: string | null }> {
   const { productContext, packet, concept, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, async (tx) => {
-    const c = await buildContext(tx, run.skuId);
+    const c = await buildContext(tx, run.skuId, { projectId: run.projectId });
     const [row] = await tx`select proposal from concepts where id = ${run.conceptId}`;
     if (!row) throw new DomainError('NOT_FOUND', 'Concept not found');
     return { ...c, concept: row.proposal as Proposal };

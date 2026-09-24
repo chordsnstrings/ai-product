@@ -97,6 +97,21 @@ export async function safeFetch(raw: string, accept = 'text/html,application/jso
   throw new DomainError('UNAVAILABLE', 'Too many redirects.');
 }
 
+/** One sellable variant (size, shade…) with its own price, availability and image (§42 "Variants / sizes"). */
+export interface ExtractedVariant {
+  /** Store's id for the variant (Shopify variant id; JSON-LD sku or url). */
+  externalId?: string;
+  title: string;
+  /** Option name → value, e.g. { Size: '50 ml', Shade: 'Light' }. */
+  options?: Record<string, string>;
+  priceMicros?: number;
+  compareAtMicros?: number;
+  sku?: string;
+  gtin?: string;
+  available?: boolean;
+  imageUrl?: string;
+}
+
 export interface ExtractedProduct {
   source: 'shopify' | 'json_ld' | 'opengraph' | 'html';
   name?: string;
@@ -108,7 +123,9 @@ export interface ExtractedProduct {
   images: string[];
   sku?: string;
   gtin?: string;
-  variants?: { title: string; priceMicros?: number; sku?: string }[];
+  variants?: ExtractedVariant[];
+  /** The variant the pasted link points at (Shopify `?variant=`), if any. */
+  selectedVariantId?: string;
   inStock?: boolean;
   ingredients?: string;
   sizeText?: string;
@@ -146,7 +163,7 @@ function findIngredients(text: string): string | undefined {
   return m ? m[1]!.trim() : undefined;
 }
 
-function findSize(text: string): string | undefined {
+export function findSize(text: string): string | undefined {
   const m = /\b(\d+(?:\.\d+)?\s?(?:ml|mL|fl\.?\s?oz|oz|g))\b/.exec(text);
   return m?.[1];
 }
@@ -175,6 +192,20 @@ function jsonLd(html: string): Partial<ExtractedProduct> | null {
     const offers = [p.offers].flat().filter(Boolean) as Record<string, unknown>[];
     const offer = (offers[0]?.offers ? [offers[0].offers].flat()[0] : offers[0]) as Record<string, unknown> | undefined;
     const images = [p.image].flat().filter(Boolean).map((i) => (typeof i === 'string' ? i : String((i as Record<string, unknown>).url ?? '')));
+    // Several offers (or an AggregateOffer's offers) are the product's variants: each keeps its own price.
+    const allOffers = offers.flatMap((o) => (o.offers ? ([o.offers].flat() as Record<string, unknown>[]) : [o]));
+    const variants: ExtractedVariant[] | undefined =
+      allOffers.length > 1
+        ? allOffers.map((o) => ({
+            externalId: (o.sku as string) ?? (o.url as string) ?? undefined,
+            title: decode(String(o.name ?? o.sku ?? '')).trim() || `Option ${allOffers.indexOf(o) + 1}`,
+            priceMicros: toMicros(o.price ?? o.lowPrice),
+            sku: o.sku as string | undefined,
+            gtin: (o.gtin13 ?? o.gtin ?? o.gtin12) as string | undefined,
+            available: o.availability ? /InStock/i.test(String(o.availability)) : undefined,
+            imageUrl: typeof o.image === 'string' ? o.image : undefined,
+          }))
+        : undefined;
     return {
       name: p.name ? decode(String(p.name)) : undefined,
       description: p.description ? stripHtml(String(p.description)) : undefined,
@@ -185,6 +216,7 @@ function jsonLd(html: string): Partial<ExtractedProduct> | null {
       sku: p.sku as string | undefined,
       gtin: (p.gtin13 ?? p.gtin ?? p.gtin12) as string | undefined,
       images: images.filter(Boolean),
+      variants,
     };
   }
   return null;
@@ -204,12 +236,28 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
         title: string;
         body_html: string;
         vendor: string;
-        images: { src: string }[];
-        variants: { title: string; price: string; compare_at_price: string | null; sku: string; barcode?: string; available?: boolean }[];
+        images: { id?: number; src: string }[];
+        options?: { name: string; position?: number }[];
+        variants: {
+          id?: number;
+          title: string;
+          price: string;
+          compare_at_price: string | null;
+          sku: string;
+          barcode?: string;
+          available?: boolean;
+          option1?: string | null;
+          option2?: string | null;
+          option3?: string | null;
+          image_id?: number | null;
+          featured_image?: { src: string } | null;
+        }[];
       };
     };
     if (!product?.title) return null;
     const v0 = product.variants?.[0];
+    const optionNames = (product.options ?? []).map((o) => o.name);
+    const imageById = new Map((product.images ?? []).filter((i) => i.id != null).map((i) => [i.id!, i.src]));
     return {
       source: 'shopify',
       shopifyProductId: String(product.id),
@@ -222,7 +270,21 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
       images: (product.images ?? []).map((i) => i.src),
       sku: v0?.sku || undefined,
       gtin: v0?.barcode || undefined,
-      variants: (product.variants ?? []).map((v) => ({ title: v.title, priceMicros: toMicros(v.price), sku: v.sku || undefined })),
+      variants: (product.variants ?? []).map((v) => {
+        const values = [v.option1, v.option2, v.option3];
+        const options = Object.fromEntries(optionNames.map((n, i) => [n, values[i]]).filter(([n, val]) => n && val && !(n === 'Title' && val === 'Default Title'))) as Record<string, string>;
+        return {
+          externalId: v.id != null ? String(v.id) : undefined,
+          title: v.title,
+          options,
+          priceMicros: toMicros(v.price),
+          compareAtMicros: toMicros(v.compare_at_price),
+          sku: v.sku || undefined,
+          gtin: v.barcode || undefined,
+          available: v.available,
+          imageUrl: v.featured_image?.src ?? (v.image_id != null ? imageById.get(v.image_id) : undefined),
+        };
+      }),
     };
   } catch {
     return null;
@@ -255,6 +317,7 @@ export function parseProductHtml(html: string, pageUrl: string): ExtractedProduc
     images: [...(ld?.images ?? []), ...(og.image ? [og.image] : [])].map((i) => new URL(i, pageUrl).toString()).filter((v, i, a) => a.indexOf(v) === i),
     sku: ld?.sku,
     gtin: ld?.gtin,
+    variants: ld?.variants,
     inStock: ld?.inStock,
     ingredients: findIngredients(text),
     sizeText: findSize(`${ld?.name ?? ''} ${ld?.description ?? og.description ?? ''} ${text}`),
@@ -271,6 +334,7 @@ export async function importProductUrl(raw: string): Promise<ExtractedProduct> {
     throw new DomainError('INVALID', 'Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.');
   }
   const sj = shopifyJsonUrl(url);
+  const selectedVariantId = url.searchParams.get('variant') ?? undefined;
   let shopify: Partial<ExtractedProduct> | null = null;
   if (sj) {
     const r = await safeFetch(sj, 'application/json').catch(() => null);
@@ -293,6 +357,7 @@ export async function importProductUrl(raw: string): Promise<ExtractedProduct> {
       ingredients: parsed.ingredients ?? findIngredients(shopify.description ?? ''),
       sizeText: parsed.sizeText ?? findSize(`${shopify.name} ${shopify.description ?? ''}`),
       rawText: parsed.rawText || shopify.description || '',
+      selectedVariantId,
     } as ExtractedProduct;
   }
   return parsed;

@@ -94,7 +94,18 @@ export interface ShopifyProduct {
   status: string;
   vendor: string | null;
   images: string[];
-  variants: { id: string; title: string; price: number; compareAtPrice: number | null; sku: string | null; barcode: string | null }[];
+  variants: {
+    id: string;
+    title: string;
+    price: number;
+    compareAtPrice: number | null;
+    sku: string | null;
+    barcode: string | null;
+    /** Option name → value (Size, Shade…), without Shopify's "Title: Default Title" placeholder. */
+    options: Record<string, string>;
+    available: boolean | null;
+    imageUrl: string | null;
+  }[];
   updatedAt: string;
 }
 
@@ -103,7 +114,7 @@ const PRODUCTS_QUERY = `query Products($cursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes { id title description status vendor updatedAt
       media(first: 6) { nodes { ... on MediaImage { image { url } } } }
-      variants(first: 20) { nodes { id title price compareAtPrice sku barcode } } }
+      variants(first: 20) { nodes { id title price compareAtPrice sku barcode availableForSale selectedOptions { name value } image { url } } } }
   }
 }`;
 
@@ -129,6 +140,11 @@ export function normalizeShopifyProduct(n: Record<string, unknown>): ShopifyProd
     compareAtPrice: numOrNull(v.compareAtPrice),
     sku: (v.sku as string) || null,
     barcode: (v.barcode as string) || null,
+    options: Object.fromEntries(
+      ((v.selectedOptions as { name: string; value: string }[] | undefined) ?? []).filter((o) => !(o.name === 'Title' && o.value === 'Default Title')).map((o) => [o.name, o.value]),
+    ),
+    available: typeof v.availableForSale === 'boolean' ? v.availableForSale : null,
+    imageUrl: ((v.image as { url?: string } | null)?.url as string) ?? null,
   }));
   return { id: String(n.id), title: String(n.title), descriptionText: String(n.description ?? ''), status: String(n.status), vendor: (n.vendor as string) ?? null, images: media, variants, updatedAt: String(n.updatedAt) };
 }

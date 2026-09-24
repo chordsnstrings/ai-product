@@ -19,6 +19,7 @@ import { planSteps, step } from './progress';
 import { sceneClaimIds } from './production';
 import { transition } from './projects';
 import { qaClaims } from './qa';
+import { ensureVariantImage, referenceAssetIds } from './sku-variants';
 import { toDataUrl } from './vision';
 
 const FRAME = { width: 1080, height: 1920 };
@@ -58,9 +59,8 @@ export async function selectConcept(tx: Tx, ctx: TenantContext, projectId: strin
   return { storyboardId: sb!.id as string, replayed: false };
 }
 
-async function referenceDataUrls(tx: Tx, skuId: string): Promise<string[]> {
-  const [fp] = await tx`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and active`;
-  const ids = ((fp?.reference_asset_ids as string[]) ?? []).slice(0, 2);
+async function referenceDataUrls(tx: Tx, skuId: string, projectId: string | null): Promise<string[]> {
+  const ids = await referenceAssetIds(tx, skuId, projectId);
   return Promise.all(ids.map(async (id) => toDataUrl(await assetBytes(tx, id))));
 }
 
@@ -127,7 +127,9 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
 
     // Frames: exact product composites where possible; at most 2 generated frames (COGS, §6).
     const scenes = await withTenant(ws, (tx) => tx`select * from scenes where storyboard_id = ${storyboardId} order by position`);
-    const { imagery, refs } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId), refs: await referenceDataUrls(tx, skuId) }));
+    const [pv] = await withTenant(ws, (tx) => tx`select sku_variant_id from projects where id = ${projectId}`);
+    if (pv?.sku_variant_id) await ensureVariantImage(ctx, pv.sku_variant_id as string);
+    const { imagery, refs } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId), refs: await referenceDataUrls(tx, skuId, projectId) }));
     const cut = imagery.cutout?.keyed ? imagery.cutout : null;
     let generated = 0;
     for (const s of scenes) {
@@ -286,7 +288,7 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
     if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
     const [done] = await tx`select 1 from scene_versions where scene_id = ${sceneId} and kind = 'frame' and version = ${version}`;
     const imagery = done ? null : await productImagery(tx, s.sku_id as string);
-    return { s, done: !!done, cut: imagery?.cutout?.keyed ? imagery.cutout : null, refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string) };
+    return { s, done: !!done, cut: imagery?.cutout?.keyed ? imagery.cutout : null, refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string, s.project_id as string) };
   });
   if (info.done) {
     await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'done'));

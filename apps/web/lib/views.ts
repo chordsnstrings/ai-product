@@ -9,6 +9,7 @@ import {
   IN_PRODUCTION,
   listClaims,
   listSteps,
+  listVariants,
   liveness,
   SLOW_STEP_MS,
   stepEta,
@@ -28,6 +29,7 @@ export async function projectView(workspaceId: string, projectId: string) {
     if (!p) return null;
     const skuSteps = await listSteps(tx, p.sku_id as string);
     const facts = await currentFacts(tx, p.sku_id as string);
+    const variants = await listVariants(tx, p.sku_id as string);
     const claims = await listClaims(tx, p.sku_id as string);
     const [fp] = await tx`select cutout_asset_id, label_text, package_type, closure from visual_fingerprints where sku_id = ${p.sku_id} and active`;
     const [maxBatch] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
@@ -82,6 +84,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** What we checked, in customer words (plan 03 P10), derived from the stored QA report. */
         qa: customerQaSummary(p.qa_report as QaReport | null),
         storyboardId: (p.storyboard_id as string) ?? null,
+        /** The size/shade this ad is for (§42). */
+        variantId: (p.sku_variant_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
         deliveryHeld,
       },
@@ -98,6 +102,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         missingEvidence: ((p.analysis as { missingEvidence?: string[] } | null)?.missingEvidence ?? []).slice(0, 6),
         /** Ingredient-led tests need a sourced ingredient list (§42 "request source"). */
         ingredientsVerified: verifiedIngredients(facts).verified,
+        /** Sizes/shades with their own price and availability (§42); the project records which one it advertises. */
+        variants: variants.map((x) => ({ id: x.id, title: x.title, size: x.size, shade: x.shade, priceMicros: x.priceMicros, available: x.available })),
         /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
         missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
       },

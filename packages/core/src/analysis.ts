@@ -17,6 +17,7 @@ import { llmJson, routedLines } from './model-gateway';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
+import { recordVariants } from './sku-variants';
 import { isTerminal, transition } from './projects';
 import { EXTRACT_PRODUCT_SYSTEM } from './prompts';
 import { cutout, dominantColors, toJpegBase64 } from './vision';
@@ -115,6 +116,14 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       extracted = await importProductUrl(sku.source_url as string);
       await withTenant(ws, async (tx) => {
         await recordFacts(tx, ctx, skuId, factsFromStructured(extracted!, sku.source_url as string));
+        // §42: each size/shade keeps its own price, availability and image; a link to one variant chooses it.
+        if (extracted!.variants?.length) {
+          await recordVariants(tx, ctx, skuId, extracted!.source === 'shopify' ? 'shopify' : 'json_ld', extracted!.variants, extracted!.currency ?? null);
+          if (extracted!.selectedVariantId) {
+            await tx`update projects p set sku_variant_id = v.id from sku_variants v
+                     where p.id = ${projectId} and v.sku_id = ${skuId} and v.external_id = ${extracted!.selectedVariantId} and v.workspace_id = p.workspace_id`;
+          }
+        }
         await step(tx, ws, skuId, 'read_page', 'done', extracted!.name ? `Found “${extracted!.name}”` : 'Page read');
         await tx`update skus set shopify_product_id = ${extracted!.shopifyProductId ?? null} where id = ${skuId}`;
       });

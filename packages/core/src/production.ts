@@ -20,6 +20,7 @@ import { append, type LedgerUnit } from './ledger';
 import { generateImage, generateVideo, lineFor, route, synthesizeVoice, type Route } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
+import { referenceAssetIds } from './sku-variants';
 import { getProject, IN_PRODUCTION, isTerminal, PATH, transition } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
@@ -482,7 +483,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await advance(tx, ctx, projectId, 'RENDERING');
       await step(tx, ws, projectId, 'scenes', 'active');
     });
-    const refs = await withTenant(ws, async (tx) => Promise.all(((fp?.reference_asset_ids as string[]) ?? []).slice(0, 2).map((id) => assetBytes(tx, id))));
+    // Fidelity QA compares against the advertised variant's own image first (§42), then the fingerprint's photos.
+    const refs = await withTenant(ws, async (tx) => Promise.all((await referenceAssetIds(tx, sku.id as string, projectId)).map((id) => assetBytes(tx, id))));
     const fingerprint = { labelText: (fp?.label_text as string) ?? null, closure: (fp?.closure as string) ?? null, paletteDistanceMax: 70 };
     if (imagery.cutout && !imagery.cutout.keyed) checks.push({ check: 'product_fidelity', pass: true, hard: false, detail: `Your product photo couldn’t be cut out cleanly, so product shots use the photo itself. ${CLEAN_PHOTO_TIP}` });
 

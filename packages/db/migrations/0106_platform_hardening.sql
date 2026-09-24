@@ -143,3 +143,42 @@ $$;
 revoke all on function task_latency_p75 from public;
 grant execute on function task_latency_p75 to app_rw, admin_rw, system_rw;
 create index provider_jobs_task_recent on provider_jobs (task, created_at desc) where status = 'succeeded';
+
+-- ───────────── Product variants (standard §42 "Variants / sizes") ─────────────
+-- Variant-specific price, availability and media, so an ad never shows the wrong size or shade. Named
+-- sku_variants to keep it apart from experiment `variants`. Current catalogue state (upserted from the store);
+-- the history stays in the `variants` product fact.
+create table sku_variants (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null,
+  sku_id uuid not null,
+  source text not null check (source in ('shopify','json_ld','manual')),
+  external_id text not null,
+  title text not null,
+  options jsonb not null default '{}',
+  size text,
+  shade text,
+  price_micros bigint,
+  compare_at_micros bigint,
+  currency text,
+  sku_code text,
+  gtin text,
+  available boolean,
+  image_url text,
+  image_asset_ids uuid[] not null default '{}',
+  position int not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (workspace_id, id),
+  unique (workspace_id, sku_id, source, external_id),
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
+);
+create trigger sku_variants_touch before update on sku_variants for each row execute function arkiv_touch_updated_at();
+select arkiv_tenant_table('sku_variants');
+insert into table_registry values ('sku_variants','tenant');
+
+-- The variant a project advertises. Deferred: a SKU moving workspaces (provisional → account) moves the project
+-- and the variant in two cascades within one statement.
+alter table projects add column sku_variant_id uuid;
+alter table projects add constraint projects_sku_variant_fk foreign key (workspace_id, sku_variant_id)
+  references sku_variants(workspace_id, id) on delete set null (sku_variant_id) deferrable initially deferred;

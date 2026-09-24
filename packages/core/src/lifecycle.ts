@@ -31,7 +31,7 @@ export async function exportSatisfied(tx: Tx, workspaceId: string, requestedAt: 
   return !!a;
 }
 
-const EXPORT_TABLES = ['brand_brain_versions', 'skus', 'product_facts', 'claims', 'claim_evidence', 'customer_signals', 'customer_themes', 'experiments', 'variants', 'learnings', 'recommendations', 'creatives', 'performance_observations', 'confounders', 'events'];
+const EXPORT_TABLES = ['brand_brain_versions', 'skus', 'sku_variants', 'product_facts', 'claims', 'claim_evidence', 'customer_signals', 'customer_themes', 'experiments', 'variants', 'learnings', 'recommendations', 'creatives', 'performance_observations', 'confounders', 'events'];
 
 export async function buildExport(ctx: TenantContext): Promise<{ assetId: string; url: string }> {
   const ws = ctx.workspaceId;
@@ -98,7 +98,7 @@ export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
   return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
-const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integrations', 'invites', 'memberships', 'offers', 'refunds', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'break_glass_sessions', 'tenant_notes'];
+const PURGE_ORDER = ['scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'sku_variants', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integrations', 'invites', 'memberships', 'offers', 'refunds', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'break_glass_sessions', 'tenant_notes'];
 
 /**
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,
