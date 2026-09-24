@@ -67,3 +67,34 @@ alter table recommendations add column confidence numeric check (confidence is n
 -- The concepts prompt now asks for rationale ids (§41: prompt changes are versioned).
 update model_routes set prompt_version = 'concepts@1.1.0' where task = 'creative_director.concepts' and prompt_version = 'concepts@1.0.0';
 update model_routes set prompt_version = 'recommendations@1.1.0' where task = 'creative_director.recommendations' and prompt_version = 'recommendations@1.0.0';
+
+-- ───────────── Platform metrics (standard §34 "structured logs + traces + metrics") ─────────────
+-- Aggregates only (no tenant identifiers), for the token-protected /api/health/metrics endpoint: queue depth,
+-- dead letters, held jobs, Stripe backlog, provider calls, latency and cost.
+create or replace function arkiv_platform_metrics()
+returns table (name text, labels jsonb, value double precision)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  return query select 'arkiv_outbox_pending'::text, '{}'::jsonb, count(*)::double precision from outbox where dispatched_at is null;
+  return query select 'arkiv_outbox_oldest_pending_seconds', '{}'::jsonb,
+    coalesce(extract(epoch from now() - min(created_at)), 0)::double precision from outbox where dispatched_at is null and run_after <= now();
+  return query select 'arkiv_held_jobs', '{}'::jsonb, count(*)::double precision from held_jobs where released_at is null;
+  return query select 'arkiv_stripe_events', jsonb_build_object('status', status), count(*)::double precision
+    from stripe_events where status in ('received','processing','unmatched','failed') group by status;
+  return query select 'arkiv_provider_calls_15m', jsonb_build_object('task', task, 'status', status), count(*)::double precision
+    from provider_jobs where created_at > now() - interval '15 minutes' group by task, status;
+  return query select 'arkiv_provider_latency_ms_p95_1h', jsonb_build_object('task', task),
+    percentile_cont(0.95) within group (order by latency_ms)::double precision
+    from provider_jobs where created_at > now() - interval '1 hour' and latency_ms is not null group by task;
+  return query select 'arkiv_provider_cost_micros_1h', jsonb_build_object('task', task), coalesce(sum(actual_micros), 0)::double precision
+    from provider_jobs where created_at > now() - interval '1 hour' group by task;
+  -- pg-boss lives in its own schema, created by the worker; absent (e.g. a fresh database) → no job metrics.
+  if to_regclass('pgboss.job') is not null then
+    return query execute $q$
+      select 'arkiv_jobs'::text, jsonb_build_object('queue', name, 'state', state::text), count(*)::double precision
+      from pgboss.job where state::text in ('created','retry','active') or (state::text = 'failed' and completed_on > now() - interval '1 hour')
+      group by name, state $q$;
+  end if;
+end $$;
+revoke all on function arkiv_platform_metrics from public;
+grant execute on function arkiv_platform_metrics to app_rw, admin_rw, system_rw;

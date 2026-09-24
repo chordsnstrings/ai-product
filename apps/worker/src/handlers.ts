@@ -35,6 +35,7 @@ import {
 import { jobContext } from './context';
 import { sendQueuedEmail } from './emails';
 import { QUEUE_CONFIG } from './queues';
+import { logger, payloadBindings, withLogContext } from '@arkiv/shared/log';
 
 export type Handler = (ctx: TenantContext, data: Record<string, unknown>, jobId: string) => Promise<unknown>;
 
@@ -143,8 +144,29 @@ async function exclusive(ctx: TenantContext, queue: typeof Queues.syncIntegratio
   return { requeued: `${resource} is already running` };
 }
 
-/** Run one job with tenant context. Domain errors are final (no retry); others bubble up for pg-boss retry. */
+const jobLog = logger('jobs');
+
+/**
+ * Run one job with tenant context. Domain errors are final (no retry); others bubble up for pg-boss retry.
+ * Every log line of the job (and of the provider calls it makes) carries its queue, job id, the domain ids in
+ * its payload and the request id of the request that enqueued it (§34).
+ */
 export async function runJob(queue: string, data: Record<string, unknown>, jobId: string): Promise<unknown> {
+  return withLogContext({ ...payloadBindings(data), jobId, queue }, async () => {
+    const t0 = Date.now();
+    try {
+      const r = await runJobInContext(queue, data, jobId);
+      const outcome = r && typeof r === 'object' ? Object.keys(r as object).find((k) => ['skipped', 'held', 'failed', 'requeued'].includes(k)) ?? 'ok' : 'ok';
+      jobLog.info('job finished', { outcome, durationMs: Date.now() - t0, result: JSON.stringify(r ?? null).slice(0, 200) });
+      return r;
+    } catch (e) {
+      jobLog.error('job failed', { durationMs: Date.now() - t0, err: e });
+      throw e;
+    }
+  });
+}
+
+async function runJobInContext(queue: string, data: Record<string, unknown>, jobId: string): Promise<unknown> {
   const h = handlers[queue];
   if (!h) throw new Error(`no handler for ${queue}`);
   if (queue === Queues.purgeWorkspace) return h({} as TenantContext, data, jobId);
@@ -186,6 +208,6 @@ export async function processPendingStripeEvents(process: (id: string) => Promis
        or (status = 'unmatched' and attempts < 3 and received_at > now() - interval '10 minutes')
        or (status = 'processing' and claimed_at < now() - make_interval(mins => ${STRIPE_CLAIM_STALE_MINUTES}))
     order by received_at limit 50`);
-  for (const r of rows) await process(r.id as string).catch((e) => console.error('[stripe]', r.id, e));
+  for (const r of rows) await process(r.id as string).catch((e) => jobLog.error('stripe event failed', { stripeEventId: r.id, err: e }));
   return rows.length;
 }

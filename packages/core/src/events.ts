@@ -1,6 +1,9 @@
 import type { Tx } from '@arkiv/db';
 import { assertEventEnvelope, assertEventPayload, eventRefs, EVENT_SCHEMA_VERSION, type EventRefs, type EventType } from '@arkiv/shared';
+import { logger } from '@arkiv/shared/log';
 import { actorString, type TenantContext } from './context';
+
+const log = logger('events');
 
 /**
  * Durable domain event (§36). Always written in the same transaction as the mutation it describes. Carries actor,
@@ -23,7 +26,7 @@ export async function emit(
     assertEventEnvelope(type, subject, allRefs);
   } catch (e) {
     if (process.env.NODE_ENV === 'test') throw e;
-    console.warn(`[events] ${(e as Error).message}`);
+    log.warn('event contract mismatch', { eventType: type, error: (e as Error).message });
   }
   await tx`
     insert into events (workspace_id, type, actor, subject_type, subject_id, payload, refs, schema_version)

@@ -2,6 +2,7 @@ import { notFound } from 'next/navigation';
 import { globalTx } from '@arkiv/db';
 import { resolveProvisional, type TenantContext } from '@arkiv/core';
 import { DomainError, type Role, type WorkspaceState } from '@arkiv/shared';
+import { currentRequestId } from '@arkiv/shared/log';
 import { rememberWorkspace } from '@arkiv/auth';
 import { currentUser, provisionalToken } from './session';
 
@@ -23,7 +24,7 @@ export async function workspaceBySlug(slug: string): Promise<WorkspaceInfo> {
   if (!m) throw new DomainError('NOT_FOUND', 'Not found');
   if (user.lastWorkspaceId !== m.workspace_id) void rememberWorkspace(user.sessionId, m.workspace_id as string);
   return {
-    ctx: { workspaceId: m.workspace_id, workspaceState: m.state as WorkspaceState, role: m.role as Role, actor: { kind: 'user', id: user.userId }, requestId: crypto.randomUUID(), planCode: m.plan_code },
+    ctx: { workspaceId: m.workspace_id, workspaceState: m.state as WorkspaceState, role: m.role as Role, actor: { kind: 'user', id: user.userId }, requestId: currentRequestId() ?? crypto.randomUUID(), planCode: m.plan_code },
     slug: m.slug,
     name: m.name,
     user: { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId },
@@ -53,7 +54,7 @@ export async function projectAccess(projectId: string): Promise<WorkspaceInfo & 
     const [m] = await globalTx((tx) => tx`select * from list_user_workspaces(${user.userId}) where workspace_id = ${ws}`);
     if (m) {
       return {
-        ctx: { workspaceId: ws, workspaceState: m.state as WorkspaceState, role: m.role as Role, actor: { kind: 'user', id: user.userId }, requestId: crypto.randomUUID(), planCode: m.plan_code },
+        ctx: { workspaceId: ws, workspaceState: m.state as WorkspaceState, role: m.role as Role, actor: { kind: 'user', id: user.userId }, requestId: currentRequestId() ?? crypto.randomUUID(), planCode: m.plan_code },
         slug: m.slug,
         name: m.name,
         user: { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId },
@@ -64,7 +65,7 @@ export async function projectAccess(projectId: string): Promise<WorkspaceInfo & 
   const prov = await resolveProvisional(await provisionalToken());
   if (prov === ws) {
     return {
-      ctx: { workspaceId: ws, workspaceState: 'PROVISIONAL', role: 'OWNER', actor: { kind: 'provisional', id: ws }, requestId: crypto.randomUUID() },
+      ctx: { workspaceId: ws, workspaceState: 'PROVISIONAL', role: 'OWNER', actor: { kind: 'provisional', id: ws }, requestId: currentRequestId() ?? crypto.randomUUID() },
       slug: '',
       name: 'Your brand',
       user: user ? { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId } : null,

@@ -6,6 +6,7 @@ import { processPendingStripeEvents, runJob } from './handlers';
 import { sweepQueue, sweeps } from './sweeps';
 import { grantQueueVisibility, processOpsCommands } from './ops';
 import { QUEUE_CONFIG } from './queues';
+import { logger, setLogService, withLogContext } from '@arkiv/shared/log';
 
 /**
  * Worker process (plan 01 §2 layout). Responsibilities:
@@ -17,7 +18,8 @@ import { QUEUE_CONFIG } from './queues';
  * queues with their own, smaller worker pools, so paying tenants never wait behind preview traffic (plan 02 §3
  * layer 5). Paid work also carries a higher priority within its queue.
  */
-const log = (...a: unknown[]) => console.log(new Date().toISOString(), '[worker]', ...a);
+setLogService('worker');
+const log = logger('worker');
 
 async function dispatchOnce(boss: PgBoss): Promise<number> {
   return withSystem(async (tx) => {
@@ -36,23 +38,15 @@ async function dispatchOnce(boss: PgBoss): Promise<number> {
 
 async function main() {
   const boss = new PgBoss({ connectionString: env().DATABASE_URL, schema: 'pgboss' });
-  boss.on('error', (e) => log('pg-boss error', e));
+  boss.on('error', (e) => log.error('pg-boss error', { err: e }));
   await boss.start();
   for (const [name, cfg] of Object.entries(QUEUE_CONFIG)) {
     await boss.createQueue(`${name}-dlq`).catch(() => {});
     await boss.createQueue(name, { retryLimit: cfg.retryLimit, retryDelay: 15, retryBackoff: true, expireInSeconds: cfg.expireInSeconds, deadLetter: `${name}-dlq` }).catch(() => {});
     for (let i = 0; i < cfg.concurrency; i++) {
       await boss.work(name, { batchSize: 1, pollingIntervalSeconds: 1 }, async (jobs) => {
-        for (const job of jobs) {
-          const t0 = Date.now();
-          try {
-            const r = await runJob(name, job.data as Record<string, unknown>, job.id);
-            log(name, job.id, 'ok', `${Date.now() - t0}ms`, JSON.stringify(r ?? null).slice(0, 160));
-          } catch (e) {
-            log(name, job.id, 'error', (e as Error).message);
-            throw e;
-          }
-        }
+        // runJob logs each job with its queue, job id, payload domain ids and originating request id.
+        for (const job of jobs) await runJob(name, job.data as Record<string, unknown>, job.id);
       });
     }
   }
@@ -63,10 +57,18 @@ async function main() {
     await boss.unschedule(key).catch(() => {}); // remove schedules registered under the old, colliding name
     await boss.createQueue(name).catch(() => {});
     await boss.schedule(name, s.cron, {});
-    await boss.work(name, async () => {
-      const n = await s.run();
-      if (n) log(name, JSON.stringify(n));
-    });
+    await boss.work(name, async () =>
+      withLogContext({ sweep: key }, async () => {
+        const t0 = Date.now();
+        try {
+          const n = await s.run();
+          if (n) log.info('sweep finished', { result: JSON.stringify(n).slice(0, 300), durationMs: Date.now() - t0 });
+        } catch (e) {
+          log.error('sweep failed', { durationMs: Date.now() - t0, err: e });
+          throw e;
+        }
+      }),
+    );
   }
 
   await grantQueueVisibility();
@@ -81,18 +83,18 @@ async function main() {
       await processPendingStripeEvents(processStripeEvent);
       await processOpsCommands(boss);
     } catch (e) {
-      log('dispatch error', (e as Error).message);
+      log.error('dispatch error', { err: e });
     } finally {
       busy = false;
     }
   };
-  await systemPool().listen('outbox', () => void tick()).catch(() => log('LISTEN unavailable; polling only'));
+  await systemPool().listen('outbox', () => void tick()).catch(() => log.warn('LISTEN unavailable; polling only'));
   const timer = setInterval(tick, 1000);
   await tick();
-  log('ready', Object.keys(QUEUE_CONFIG).length, 'queues,', Object.keys(sweeps).length, 'schedules');
+  log.info('ready', { queues: Object.keys(QUEUE_CONFIG).length, schedules: Object.keys(sweeps).length });
 
   const shutdown = async () => {
-    log('shutting down');
+    log.info('shutting down');
     clearInterval(timer);
     await boss.stop({ graceful: true, timeout: 30_000 });
     await closeAll();
@@ -103,6 +105,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(e);
+  log.error('worker crashed', { err: e });
   process.exit(1);
 });

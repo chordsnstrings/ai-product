@@ -11,6 +11,7 @@ import {
   type TtsResult,
   type VideoPoll,
 } from '@arkiv/providers';
+import { logger } from '@arkiv/shared/log';
 import type { z } from 'zod';
 import type { TenantContext } from './context';
 import { consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
@@ -133,6 +134,8 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
   });
 }
 
+const gatewayLog = logger('gateway');
+
 async function finish(
   meta: CallMeta,
   started: { jobId: string; authorizationId: string; projectId: string | null; expected: Micros },
@@ -153,6 +156,19 @@ async function finish(
         output_asset_id = ${outcome.ok ? (outcome.outputAssetId ?? null) : null}
       where id = ${started.jobId}`;
     if (actual > 0) await recordProviderCost(tx, meta.ctx, started.jobId, actual, started.projectId, started.authorizationId);
+    // One line per provider call, joined to its workspace, project, subject and request (§34, §41).
+    const entry = {
+      workspaceId: meta.ctx.workspaceId,
+      projectId: started.projectId,
+      providerJobId: started.jobId,
+      task: meta.task,
+      subject: meta.subject ?? null,
+      latencyMs: outcome.latencyMs,
+      estimateMicros: started.expected,
+      actualMicros: actual,
+    };
+    if (outcome.ok) gatewayLog.info('provider call succeeded', entry);
+    else gatewayLog.warn('provider call failed', { ...entry, error: outcome.error.slice(0, 300) });
   });
 }
 

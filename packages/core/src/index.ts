@@ -48,3 +48,4 @@ export * from './recovery';
 export * from './vision';
 export * from './admin';
 export * from './evals';
+export * from './metrics';
