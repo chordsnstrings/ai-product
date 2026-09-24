@@ -6,3 +6,9 @@
 -- event (subscription or invoice payment); an older event never overwrites what a newer one set.
 alter table subscriptions add column stripe_event_at timestamptz;
 alter table subscriptions add column status_event_at timestamptz;
+
+-- ───────────── Promotional savings (§6) ─────────────
+-- A rate table may carry `promo_paid_ppm` (the share of its list price a prepaid package actually costs). Estimates
+-- and ceilings keep using the list price; a provider job records its realized cost in actual_micros and the
+-- difference to the list price here, so savings are reported, never assumed.
+alter table provider_jobs add column savings_micros bigint not null default 0 check (savings_micros >= 0);

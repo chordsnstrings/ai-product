@@ -17,7 +17,7 @@ export interface RateTable {
 export type CostLine =
   | { kind: 'llm'; provider: string; model: string; inputTokens: number; outputTokens: number; cachedTokens?: number }
   | { kind: 'image'; provider: string; model: string; images: number }
-  | { kind: 'video'; provider: string; model: string; seconds: number; resolution: '720p' | '1080p'; retryReserve?: boolean }
+  | { kind: 'video'; provider: string; model: string; seconds: number; resolution: '720p' | '1080p'; retryReserve?: boolean; videoInputSeconds?: number }
   | { kind: 'tts'; provider: string; model: string; chars: number }
   | { kind: 'media'; outputs: number };
 
@@ -43,7 +43,9 @@ const micros = z.number().int('Rates are whole micros (1 USD = 1,000,000)').nonn
 export const RATE_SCHEMAS: Record<RateUnit, z.ZodType<Record<string, number>>> = {
   per_million_tokens: z.object({ input: micros, output: micros, cache_read: micros.optional() }).catchall(micros),
   per_image: z.object({ image: micros }).catchall(micros),
-  per_second: z.object({ per_second_720p: micros, per_second_1080p: micros }).catchall(micros),
+  // Optional token prices (per million) price a request carrying reference video at the provider's video-input
+  // rate (§6: "actual requested modality"); without them such a request is priced at the per-second rate.
+  per_second: z.object({ per_second_720p: micros, per_second_1080p: micros, per_million_tokens: micros.optional(), per_million_tokens_video_input: micros.optional() }).catchall(micros),
   per_million_chars: z.object({ char_million: micros }).catchall(micros),
   per_output: z.object({ transcode_storage_delivery: micros, buffer: micros }).catchall(micros),
 };
@@ -69,6 +71,8 @@ export function validateRateTable(t: { provider: string; model: string; unit: st
   if (t.provider === 'internal' && t.model !== 'media-pipeline') throw new DomainError('INVALID', 'The internal provider has one model: media-pipeline.');
   const r = RATE_SCHEMAS[t.unit as RateUnit].safeParse(t.rates);
   if (!r.success) throw new DomainError('INVALID', `Rates for ${t.unit}: ${r.error.issues.map((i) => `${i.path.join('.') || 'rates'} ${i.message}`).join('; ')}.`);
+  const promo = r.data[PROMO_KEY];
+  if (promo !== undefined && promo > 1_000_000) throw new DomainError('INVALID', `${PROMO_KEY} is the share of the list price actually paid, in parts per million (at most 1000000).`);
   return r.data;
 }
 
@@ -104,7 +108,16 @@ export function priceLine(rates: Map<string, RateTable>, line: CostLine): { micr
     case 'video': {
       const r = rate(rates, line.provider, line.model);
       const perSecond = line.resolution === '1080p' ? r.rates.per_second_1080p! : r.rates.per_second_720p!;
-      const raw = line.seconds * perSecond;
+      const inputSeconds = Math.max(0, line.videoInputSeconds ?? 0);
+      const tokenRate = r.rates.per_million_tokens;
+      const videoInputRate = r.rates.per_million_tokens_video_input;
+      // A request with reference video is billed per token at the video-input rate, for the output and the input
+      // video alike; its tokens per second are those the per-second rate was derived from. Without token prices
+      // the input video is priced like output seconds (never cheaper than the table says).
+      const raw =
+        inputSeconds > 0 && tokenRate && videoInputRate !== undefined
+          ? ((line.seconds + inputSeconds) * perSecond * videoInputRate) / tokenRate
+          : (line.seconds + inputSeconds) * perSecond;
       const reserve = line.retryReserve === false ? 0 : raw * COST_LIMITS.RETRY_RESERVE_FRACTION;
       return { micros: Math.ceil(raw + reserve), key: `${r.provider}/${r.model}`, version: r.version };
     }
@@ -221,6 +234,21 @@ export function rateViability(testEstimateMicros: Micros): { ok: boolean; ceilin
 }
 
 /** Actual cost of a completed provider call (no retry reserve). */
+/**
+ * Promotional packages (§6): a rate table may say what share of its list price a prepaid package actually costs
+ * (`promo_paid_ppm`, parts per million). Estimates and ceilings always use the list price — a promotion is never
+ * needed for retail viability — while realized cost is the discounted amount and the difference is recorded as
+ * savings.
+ */
+export const PROMO_KEY = 'promo_paid_ppm';
+
+export function promoSplit(rates: Map<string, RateTable>, provider: string, model: string, listMicros: Micros): { realizedMicros: Micros; savingsMicros: Micros } {
+  const ppm = rates.get(`${provider}/${model}`)?.rates[PROMO_KEY];
+  if (ppm === undefined || !Number.isFinite(ppm) || ppm < 0 || ppm >= 1_000_000 || listMicros <= 0) return { realizedMicros: listMicros, savingsMicros: 0 };
+  const realizedMicros = Math.ceil((listMicros * ppm) / 1_000_000);
+  return { realizedMicros, savingsMicros: listMicros - realizedMicros };
+}
+
 export function actualCost(rates: Map<string, RateTable>, line: CostLine): Micros {
   return priceLine(rates, line.kind === 'video' ? { ...line, retryReserve: false } : line).micros;
 }
