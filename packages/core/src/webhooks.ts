@@ -3,6 +3,7 @@ import { logger } from '@arkiv/shared/log';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { enqueue, Queues } from './outbox';
+import { rightsCaseFromEmail, type InboundEmail } from './rights';
 
 const log = logger('webhooks');
 
@@ -70,6 +71,11 @@ async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ign
   const body = r.payload ? (JSON.parse(r.payload) as Record<string, unknown>) : {};
   switch (r.provider) {
     case 'resend': {
+      // Inbound mail (Resend receiving): complaints sent to the rights address open a rights case (plan 05 §15).
+      if (body.type === 'email.received') {
+        const opened = await withSystem((tx) => rightsCaseFromEmail(tx, (body.data ?? {}) as InboundEmail));
+        return opened ? 'processed' : 'ignored';
+      }
       await deps.resendEvent(body as { type: string; data: { email_id?: string; to?: string[] } });
       return 'processed';
     }

@@ -49,6 +49,7 @@ import {
   setLandingStatus,
   setOfferExperiment,
   normalizeAllowKey,
+  normalizeCidr,
   QA_VERDICT_KEY,
   Queues,
   registerExecutor,
@@ -161,6 +162,23 @@ async function workspaceSlug(workspaceId: string) {
   const [w] = await withAdmin((tx) => tx`select slug from workspaces where id = ${workspaceId}`);
   if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
   return w.slug as string;
+}
+
+/** Force the challenge and/or tighten rate limits for a normalised abuse key, until a time (plan 05 §15). */
+async function setAbuseOverride(s: StaffUser, rawKey: string, set: { forceChallenge?: boolean; rateLimitFactor?: number }, days: number, why: string) {
+  const key = normalizeAllowKey(rawKey);
+  return withAdmin(async (tx) => {
+    const [b] = await tx`select force_challenge, rate_limit_factor, until, reason from abuse_overrides where key = ${key} for update`;
+    const [r] = await tx`insert into abuse_overrides (key, force_challenge, rate_limit_factor, reason, until, created_by)
+                         values (${key}, ${set.forceChallenge ?? false}, ${set.rateLimitFactor ?? null}, ${why}, now() + make_interval(days => ${days}), ${s.staffId})
+                         on conflict (key) do update set
+                           force_challenge = abuse_overrides.force_challenge or excluded.force_challenge,
+                           rate_limit_factor = coalesce(least(abuse_overrides.rate_limit_factor, excluded.rate_limit_factor), abuse_overrides.rate_limit_factor, excluded.rate_limit_factor),
+                           reason = excluded.reason, until = greatest(abuse_overrides.until, excluded.until), created_by = excluded.created_by, updated_at = now()
+                         returning force_challenge, rate_limit_factor, until`;
+    await audit(tx, s, set.forceChallenge ? 'abuse.challenge' : 'abuse.tighten', { type: 'key', id: key }, { reason: why, before: b ?? null, after: r ?? null });
+    return { message: `${key}: ${r!.force_challenge ? 'challenge forced' : 'no forced challenge'}${r!.rate_limit_factor != null ? `, limits at ${Math.round(Number(r!.rate_limit_factor) * 100)}%` : ''} until ${new Date(r!.until as string).toISOString().slice(0, 10)}.` };
+  });
 }
 
 export const ACTIONS = {
@@ -840,12 +858,60 @@ export const ACTIONS = {
     schema: z.object({ id: uuid, status: z.enum(['frozen', 'resolved_kept', 'resolved_removed']), resolution: z.string().max(1000).optional() }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        const [b] = await tx`select status, resolution from rights_cases where id = ${i.id} for update`;
+        const [b] = await tx`select status, resolution, asset_id, workspace_id from rights_cases where id = ${i.id} for update`;
         if (!b) throw new DomainError('NOT_FOUND', 'Case not found');
-        const [c] = await tx`update rights_cases set status = ${i.status}, resolution = ${i.resolution ?? null}, resolved_at = case when ${i.status} like 'resolved%' then now() end where id = ${i.id} returning asset_id, workspace_id`;
-        // Freezing marks the asset's rights expired so it can't be used in new production.
-        if (c?.asset_id && i.status !== 'resolved_kept') await tx`update assets set rights_expires_at = now() where id = ${c.asset_id}`;
-        await audit(tx, s, `rights.${i.status}`, { type: 'rights_case', id: i.id }, { workspaceId: (c?.workspace_id as string) ?? null, reason: i.resolution ?? null, before: b, after: { status: i.status, resolution: i.resolution ?? null } });
+        if (String(b.status).startsWith('resolved')) throw new DomainError('CONFLICT', 'This case is already resolved.');
+        await tx`update rights_cases set status = ${i.status}, resolution = ${i.resolution ?? null}, resolved_at = case when ${i.status} like 'resolved%' then now() end where id = ${i.id}`;
+        // Freezing (or removing) makes the asset unavailable for new production (vision.ts usableAssetIds); a case
+        // resolved as kept lifts the freeze. The attested expiry date is left as it was.
+        if (b.asset_id && b.workspace_id) {
+          if (i.status === 'resolved_kept') await tx`update assets set rights_frozen_at = null where id = ${b.asset_id} and workspace_id = ${b.workspace_id}`;
+          else await tx`update assets set rights_frozen_at = coalesce(rights_frozen_at, now()) where id = ${b.asset_id} and workspace_id = ${b.workspace_id}`;
+        }
+        await audit(tx, s, `rights.${i.status}`, { type: 'rights_case', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, reason: i.resolution ?? null, before: { status: b.status, resolution: b.resolution }, after: { status: i.status, resolution: i.resolution ?? null } });
+      }),
+  }),
+  /* §15 enforcement: every action is time-boxed and audited; "suspend" is tenant.hold (🔐) from the same page. */
+  'abuse.challenge': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), days: z.number().int().min(1).max(30).default(7), reason }),
+    run: (s, i) => setAbuseOverride(s, i.key, { forceChallenge: true }, i.days, i.reason),
+  }),
+  'abuse.tighten': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), factor: z.number().min(0.05).max(0.9).default(0.25), days: z.number().int().min(1).max(30).default(7), reason }),
+    run: (s, i) => setAbuseOverride(s, i.key, { rateLimitFactor: i.factor }, i.days, i.reason),
+  }),
+  'abuse.override_remove': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`delete from abuse_overrides where key = ${i.key} returning force_challenge, rate_limit_factor, until, reason`;
+        if (!b) throw new DomainError('NOT_FOUND', 'No enforcement on that key');
+        await audit(tx, s, 'abuse.override_remove', { type: 'key', id: i.key }, { reason: i.reason, before: b, after: null });
+      }),
+  }),
+  'abuse.block_ip': a({
+    perm: 'abuse.manage',
+    reauth: true,
+    schema: z.object({ cidr: z.string().min(3).max(60), hours: z.number().int().min(1).max(24 * 30).default(24), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const cidr = normalizeCidr(i.cidr);
+        const [b] = await tx`insert into ip_blocks (cidr, reason, until, created_by) values (network(${cidr}::inet), ${i.reason}, now() + make_interval(hours => ${i.hours}), ${s.staffId}) returning id, cidr::text as cidr, until`;
+        await audit(tx, s, 'abuse.block_ip', { type: 'ip_block', id: b!.id as string }, { reason: i.reason, after: { cidr: b!.cidr, hours: i.hours } });
+        return { message: `Blocked ${b!.cidr as string} until ${new Date(b!.until as string).toISOString().slice(0, 16).replace('T', ' ')} UTC.` };
+      }),
+  }),
+  'abuse.unblock_ip': a({
+    perm: 'abuse.manage',
+    schema: z.object({ id: uuid, reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`update ip_blocks set lifted_at = now(), lifted_by = ${s.staffId} where id = ${i.id} and lifted_at is null returning cidr::text as cidr, until`;
+        if (!b) throw new DomainError('NOT_FOUND', 'No active block with that id');
+        await audit(tx, s, 'abuse.unblock_ip', { type: 'ip_block', id: i.id }, { reason: i.reason, before: b, after: { lifted: true } });
       }),
   }),
 

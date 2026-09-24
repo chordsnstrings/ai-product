@@ -18,15 +18,19 @@ export interface ProductImagery {
 
 /** The active Visual Fingerprint's cut-out (with whether keying succeeded), first reference photo and palette. */
 export async function productImagery(tx: Tx, skuId: string): Promise<ProductImagery> {
-  const [fp] = await tx`select f.cutout_asset_id, f.reference_asset_ids, f.dominant_colors, a.lineage->>'keyed' as keyed
+  const [fp] = await tx`select f.cutout_asset_id, f.reference_asset_ids, f.dominant_colors, a.lineage->>'keyed' as keyed, a.lineage->>'from' as cut_from
                         from visual_fingerprints f left join assets a on a.id = f.cutout_asset_id and a.workspace_id = f.workspace_id
                         where f.sku_id = ${skuId} and f.active`;
   if (!fp) return { cutout: null, reference: null, palette: [] };
-  // Media held for compliance review or rejected is never drawn into a frame (plan 05 §14).
+  // Media held for compliance review or rejected, or whose rights expired or are frozen by a takedown case, is never
+  // drawn into a frame (plan 05 §14–§15) — nor is a cut-out made from such a photo.
   const refId = (await usableAssetIds(tx, (fp.reference_asset_ids as string[] | null) ?? []))[0] ?? null;
+  const cutFrom = typeof fp.cut_from === 'string' && /^[0-9a-f-]{36}$/i.test(fp.cut_from) ? fp.cut_from : null;
+  const cutSources = fp.cutout_asset_id ? [fp.cutout_asset_id as string, ...(cutFrom ? [cutFrom] : [])] : [];
+  const cutUsable = cutSources.length > 0 && (await usableAssetIds(tx, cutSources)).length === cutSources.length;
   return {
     // Cut-outs recorded before keying was tracked were keyed ones (the unkeyed fallback always records keyed=false).
-    cutout: fp.cutout_asset_id ? { assetId: fp.cutout_asset_id as string, bytes: await assetBytes(tx, fp.cutout_asset_id as string), keyed: fp.keyed !== 'false' } : null,
+    cutout: fp.cutout_asset_id && cutUsable ? { assetId: fp.cutout_asset_id as string, bytes: await assetBytes(tx, fp.cutout_asset_id as string), keyed: fp.keyed !== 'false' } : null,
     reference: refId ? { assetId: refId, bytes: await assetBytes(tx, refId) } : null,
     palette: ((fp.dominant_colors as string[] | null) ?? []).filter((c) => typeof c === 'string'),
   };

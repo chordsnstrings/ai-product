@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { globalTx } from '@arkiv/db';
 import { DomainError, env } from '@arkiv/shared';
-import { hit } from '@arkiv/core';
+import { allowKey, assertNotBlocked, hit } from '@arkiv/core';
 import { sendEmail } from '@arkiv/email';
 import { recordLoginFailure, type LoginMeta } from './login-attempts';
 import { createSession, findOrCreateUser } from './sessions';
@@ -40,8 +40,11 @@ export async function requestMagicLink(input: {
 }): Promise<{ sent: true; suggestion: string | null }> {
   const email = input.email.trim().toLowerCase();
   if (!validEmail(email)) throw new DomainError('INVALID', 'Enter a valid email address.', { suggestion: emailSuggestion(email) });
-  await hit(`magic:email:${baseMailbox(email)}`, 5, 3600);
-  if (input.ip) await hit(`magic:ip:${input.ip}`, 30, 3600);
+  // Blocked ranges and staff-tightened limits (plan 05 §15) apply to sign-up/sign-in links too.
+  await assertNotBlocked(input.ip);
+  const who = [allowKey.ip(input.ip), allowKey.domain(email)];
+  await hit(`magic:email:${baseMailbox(email)}`, 5, 3600, undefined, { subject: who });
+  if (input.ip) await hit(`magic:ip:${input.ip}`, 30, 3600, undefined, { subject: who });
   const token = randomBytes(32).toString('base64url');
   const redirect = input.redirectTo && input.redirectTo.startsWith('/') && !input.redirectTo.startsWith('//') ? input.redirectTo : null;
   await globalTx((tx) => tx`

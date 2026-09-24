@@ -15,6 +15,7 @@ import {
   type Role,
   type WorkspaceState,
 } from '@arkiv/shared';
+import { noteProvisionalCreated, type ClientFingerprint } from './abuse';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
@@ -92,7 +93,11 @@ export async function uniqueSlug(base: string): Promise<string> {
 }
 
 /** Anonymous visitor's provisional workspace (plan 02 §2.1). Returns the raw cookie token once. */
-export async function createProvisionalWorkspace(): Promise<{ workspaceId: string; token: string }> {
+/**
+ * A provisional workspace for an anonymous visitor (plan 02 §2.1). With the visitor's fingerprint, the creation is
+ * counted against its network, device and ASN, and a farm is flagged for trust & safety (plan 05 §15).
+ */
+export async function createProvisionalWorkspace(fp?: ClientFingerprint): Promise<{ workspaceId: string; token: string }> {
   const workspaceId = newId();
   const token = randomToken();
   const slug = `p-${randomBytes(5).toString('hex')}`;
@@ -102,6 +107,7 @@ export async function createProvisionalWorkspace(): Promise<{ workspaceId: strin
                      now() + make_interval(days => ${PROVISIONAL.TTL_DAYS}))`;
     await tx`insert into brands (workspace_id, name) values (${workspaceId}, 'Your brand')`;
     await emit(tx, { workspaceId, actor: { kind: 'provisional', id: workspaceId } }, 'WORKSPACE_CREATED', { type: 'workspace', id: workspaceId }, { provisional: true });
+    if (fp) await noteProvisionalCreated(tx, workspaceId, fp);
   });
   return { workspaceId, token };
 }

@@ -344,6 +344,44 @@ describe('danger zone and jobs actions', () => {
     const keys = await ownerPool()`select key from abuse_allowlist order by key`;
     expect(keys.map((k) => k.key)).toEqual(['domain:agency.com', 'ip:203.0.113']);
   });
+
+  it('enforcement is time-boxed and audited: challenge, tighten, block an IP range and lift it', async () => {
+    const c = await staff(['COMPLIANCE']);
+    await act(c, 'abuse.challenge', { key: '203.0.113.77', days: 7, reason: 'bot burst on previews' });
+    await act(c, 'abuse.tighten', { key: 'ip:203.0.113', factor: 0.25, days: 3, reason: 'bot burst on previews' });
+    const [o] = await ownerPool()`select key, force_challenge, rate_limit_factor::float8 as f, until > now() + interval '6 days' as week from abuse_overrides`;
+    // Tightening keeps the forced challenge and the longer window.
+    expect(o).toEqual({ key: 'ip:203.0.113', force_challenge: true, f: 0.25, week: true });
+    await expect(act(c, 'abuse.block_ip', { cidr: '10.0.0.0/8', hours: 24, reason: 'too wide' })).rejects.toThrow(/16 or narrower/);
+    const r = await act(c, 'abuse.block_ip', { cidr: '203.0.113.77/24', hours: 24, reason: 'provisional farm' });
+    expect(String(r.message)).toMatch(/Blocked 203\.0\.113\.0\/24/);
+    const [b] = await ownerPool()`select id, cidr::text as cidr from ip_blocks`;
+    await act(c, 'abuse.unblock_ip', { id: b!.id, reason: 'farm stopped' });
+    await expect(act(c, 'abuse.unblock_ip', { id: b!.id, reason: 'farm stopped' })).rejects.toThrow(/No active block/);
+    await act(c, 'abuse.override_remove', { key: 'ip:203.0.113', reason: 'burst over' });
+    const audit = await ownerPool()`select action from admin_audit_log where action like 'abuse.%' order by id`;
+    expect(audit.map((x) => x.action)).toEqual(['abuse.challenge', 'abuse.tighten', 'abuse.block_ip', 'abuse.unblock_ip', 'abuse.override_remove']);
+  });
+
+  it('freezing a rights case makes the asset unavailable for production; resolving as kept lifts it', async () => {
+    const c = await staff(['COMPLIANCE']);
+    const t = await makeTenant();
+    const assetId = newId();
+    const expires = new Date(Date.now() + 30 * 86400_000);
+    await ownerPool()`insert into assets (id, workspace_id, kind, storage_key, mime, bytes, checksum_sha256, source, rights_expires_at)
+                      values (${assetId}, ${t.workspaceId}, 'creator_footage', 'k/1', 'video/mp4', 1, 'x', 'upload', ${expires})`;
+    await act(c, 'rights.create', { complainant: 'Sam Lens', detail: 'my footage used without licence', workspaceId: t.workspaceId, assetId });
+    const [rc] = await ownerPool()`select id from rights_cases`;
+    await act(c, 'rights.update', { id: rc!.id, status: 'frozen' });
+    const [a1] = await ownerPool()`select rights_frozen_at is not null as frozen, rights_expires_at from assets where id = ${assetId}`;
+    expect(a1!.frozen).toBe(true);
+    // The attested expiry date is kept.
+    expect(new Date(a1!.rights_expires_at as string).getTime()).toBe(expires.getTime());
+    await act(c, 'rights.update', { id: rc!.id, status: 'resolved_kept', resolution: 'licence shown' });
+    const [a2] = await ownerPool()`select rights_frozen_at from assets where id = ${assetId}`;
+    expect(a2!.rights_frozen_at).toBeNull();
+    await expect(act(c, 'rights.update', { id: rc!.id, status: 'frozen' })).rejects.toThrow(/already resolved/);
+  });
 });
 
 describe('staff sign-in policies (plan 05 §0.1, §23)', () => {

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
+import { notePromptInjection } from './abuse';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { emit } from './events';
@@ -44,6 +45,8 @@ export async function importSignals(tx: Tx, ctx: TenantContext, skuId: string, i
                      ${it.author ? createHash('sha256').update(it.author.toLowerCase()).digest('hex') : null}, ${it.observedAt ?? null})`;
     n++;
   }
+  // Imported reviews are data, never instructions (§48); attempts to smuggle instructions in are recorded.
+  if (n) await notePromptInjection(tx, { workspaceId: ctx.workspaceId, source: 'reviews', text: items.map((it) => it.text).join('\n'), subject: { type: 'sku', id: skuId } });
   return n;
 }
 

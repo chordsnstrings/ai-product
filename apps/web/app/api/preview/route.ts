@@ -1,7 +1,7 @@
-import { withTenant } from '@arkiv/db';
-import { ingestBytes, isMarketplaceUrl, MARKETPLACE_MESSAGE, recordFunnel, recordFunnelOnce, startPreview, uploadFailureCategory } from '@arkiv/core';
+import { globalTx, withTenant } from '@arkiv/db';
+import { abuseGate, allowKey, ingestBytes, isMarketplaceUrl, MARKETPLACE_MESSAGE, recordAbuseSignalSafe, recordFunnel, recordFunnelOnce, startPreview, uploadFailureCategory } from '@arkiv/core';
 import { DomainError, env } from '@arkiv/shared';
-import { clientIp, json, route } from '@/lib/http';
+import { clientFingerprint, json, route } from '@/lib/http';
 import { previewContext } from '@/lib/preview-context';
 import { visitorId } from '@/lib/session';
 import { verifyTurnstile } from '@/lib/turnstile';
@@ -35,18 +35,24 @@ export const POST = route(async (req) => {
 
 async function startUpload(req: Request, form: FormData, input: { url: string | null; photos: File[]; vid: string }) {
   const { url, photos, vid } = input;
-  const ip = clientIp(req);
+  const client = clientFingerprint(req);
+  const ip = client.ip;
   const uploaded = uploadedIds(form);
   // A marketplace link alone is refused now, with what to do instead, rather than dead-ending after the preview starts.
   if (url && isMarketplaceUrl(url) && !photos.length && !uploaded.length) throw new DomainError('INVALID', MARKETPLACE_MESSAGE);
 
-  if (env().TURNSTILE_SECRET) {
+  // Staff enforcement (plan 05 §15): a blocked IP range is refused; a key staff flagged must pass the challenge.
+  const gate = await globalTx((tx) => abuseGate(tx, ip, [allowKey.ip(ip)]));
+  if (gate.blocked) throw new DomainError('FORBIDDEN', 'Requests from your network are temporarily blocked. Contact support if you think this is a mistake.', { blocked: true });
+  const secret = env().TURNSTILE_SECRET;
+  if (secret || gate.forceChallenge) {
     // Bots: invisible challenge on submit only (plan 03 P1 edge cases). The form sends the token (UploadModule).
-    const ok = await verifyTurnstile(form.get('cf-turnstile-response') as string | null, env().TURNSTILE_SECRET!, ip);
+    // A forced challenge with no Turnstile configured can't be passed, so it fails closed.
+    const ok = secret ? await verifyTurnstile(form.get('cf-turnstile-response') as string | null, secret, ip) : false;
     if (!ok) throw new DomainError('FORBIDDEN', 'Please confirm you’re human and try again.', { challenge: true });
   }
 
-  const ctx = await previewContext(ip, { create: true });
+  const ctx = await previewContext(client, { create: true });
   // Photos uploaded as they were chosen (presigned into quarantine, then validated): they must be this workspace's
   // own product photos, not yet attached to a product.
   if (uploaded.length) {
@@ -58,6 +64,12 @@ async function startUpload(req: Request, form: FormData, input: { url: string | 
     const a = await withTenant(ctx.workspaceId, async (tx) => ingestBytes(tx, ctx, Buffer.from(await f.arrayBuffer()), 'product_photo', null, { filename: f.name }));
     assetIds.push(a.id);
   }
-  const r = await withTenant(ctx.workspaceId, (tx) => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip }));
+  const r = await withTenant(ctx.workspaceId, (tx) => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip })).catch(async (e) => {
+    // The free-preview multi-SKU heuristic (plan 05 §15): recorded for trust & safety (the refusal itself rolled back).
+    if (e instanceof DomainError && e.code === 'PAYMENT_REQUIRED' && (e.details as { needsAccount?: boolean } | undefined)?.needsAccount) {
+      await recordAbuseSignalSafe({ kind: 'multi_sku_limit', key: allowKey.ip(ip) ?? allowKey.ws(ctx.workspaceId)!, workspaceId: ctx.workspaceId, detail: { workspace: ctx.workspaceId } });
+    }
+    throw e;
+  });
   return json({ projectId: r.projectId, skuId: r.skuId, catalogueNo: r.catalogueNo });
 }

@@ -116,7 +116,7 @@ export interface AssetProblem {
 export async function landingAssetProblems(tx: Tx, ids: readonly string[]): Promise<AssetProblem[]> {
   if (!ids.length) return [];
   const rows = await tx`
-    select a.id, a.kind, a.mime, a.source, a.rights_attested_at, a.rights_expires_at, a.deleted_at,
+    select a.id, a.kind, a.mime, a.source, a.rights_attested_at, a.rights_expires_at, a.rights_frozen_at, a.deleted_at,
            a.rights_expires_at is not null and a.rights_expires_at <= now() as rights_expired,
            w.is_test, s.category, s.status as sku_status
     from assets a join workspaces w on w.id = a.workspace_id
@@ -128,6 +128,7 @@ export async function landingAssetProblems(tx: Tx, ids: readonly string[]): Prom
     const a = byId.get(id);
     if (!a) out.push({ assetId: id, why: 'No such asset.', expired: true });
     else if (a.deleted_at) out.push({ assetId: id, why: 'The asset was deleted.', expired: true });
+    else if (a.rights_frozen_at) out.push({ assetId: id, why: 'Frozen by an open rights / takedown case.', expired: true });
     else if (a.rights_expired) out.push({ assetId: id, why: `Usage rights expired ${new Date(a.rights_expires_at as string).toISOString().slice(0, 10)}.`, expired: true });
     else if (!a.is_test) out.push({ assetId: id, why: 'Examples must come from an internal demo workspace, never a customer’s.', expired: false });
     else if (!(EXAMPLE_ASSET_KINDS as readonly string[]).includes(a.kind as string) || !/^(image|video)\//.test(a.mime as string)) out.push({ assetId: id, why: `A ${String(a.kind).replace(/_/g, ' ')} can’t be an example; use a finished ad, scene or frame.`, expired: false });

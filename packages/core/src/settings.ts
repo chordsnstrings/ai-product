@@ -54,6 +54,9 @@ export const SETTING_DEFAULTS = {
   // Plan 05 §12 job detail "logs and traces (link out)": URL templates with {jobId}, {queue} and {requestId}.
   'ops.log_url_template': '',
   'ops.trace_url_template': '',
+  // Plan 05 §15 rights intake: inbound email to this address (besides rights@, takedown@, copyright@, dmca@, legal@)
+  // opens a rights case.
+  'rights.intake_address': '',
 } as const;
 export type SettingKey = keyof typeof SETTING_DEFAULTS;
 

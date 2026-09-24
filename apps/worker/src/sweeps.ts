@@ -28,6 +28,7 @@ import {
   sweepLandingGalleryRights,
   sweepOfferGuardrails,
   sweepProvisional,
+  sweepPreviewCogsOutliers,
   sweepRateLimits,
   sweepRetention,
   weekOf,
@@ -76,6 +77,8 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return n;
     },
   },
+  // Plan 05 §15: free-preview COGS outliers become abuse signals (once a day per workspace).
+  'abuse-cogs-outliers': { cron: '20 * * * *', run: () => withSystem((tx) => sweepPreviewCogsOutliers(tx)) },
   'sweep-authorizations': { cron: '* * * * *', run: () => withSystem((tx) => sweepExpiredAuthorizations(tx)) },
   'sweep-offers': { cron: '* * * * *', run: () => withSystem((tx) => expireOffers(tx)) },
   // L8/L20: a single honest reminder 15 minutes before the Taste window closes; then T+24h and T+3d nudges.

@@ -267,7 +267,9 @@ export async function scoringContext(tx: Tx, skuId: string) {
   // first days live (experiments.fatigue, refreshed with results).
   const fatigue = await tx`select distinct e.genes->>'angle' as angle from experiments e
                            where e.sku_id = ${skuId} and e.state not in ('INVALIDATED','ARCHIVED') and (e.fatigue->>'fatigued')::boolean is true`;
-  const [assets] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind in ('creator_footage','historical_creative') and deleted_at is null`;
+  // Only footage still usable for new production: rights not expired, not frozen by a takedown case (plan 05 §15).
+  const [assets] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind in ('creator_footage','historical_creative') and deleted_at is null
+                              and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null and coalesce(review_status, 'approved') = 'approved'`;
   const approved = (await tx`select preferred_wording, mandatory_qualifier from claims where sku_id = ${skuId} and status in ('VERIFIED','VERIFIED_WITH_QUALIFIER')`).map((c) => `${c.preferred_wording}${c.mandatory_qualifier ? ' ' + c.mandatory_qualifier : ''}`);
   const hasPerf = learnings.length > 0;
   const fresh = integ.filter((i) => i.status === 'active' && i.fresh).length;

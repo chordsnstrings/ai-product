@@ -10,6 +10,8 @@ export * from './settings';
 export * from './holds';
 export * from './leases';
 export * from './allowlist';
+export * from './abuse';
+export * from './rights';
 export * from './ledger';
 export * from './rates';
 export * from './cost-governor';
