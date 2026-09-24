@@ -2,7 +2,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import zlib from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { assertPublicUrl, fetchImage, parseProductHtml, parseShopifyProduct, safeFetch, shopifyJsonUrl } from './ingest';
+import { assertPublicUrl, fetchImage, importProductUrl, parseProductHtml, parseShopifyProduct, safeFetch, shopifyJsonUrl } from './ingest';
 import { isPublicAddress, type NetGuard } from './net-guard';
 
 describe('SSRF guard', () => {
@@ -75,6 +75,10 @@ describe('SSRF guard on real requests (redirects, rebinding, size caps)', () => 
         res.on('close', () => hits.push('closed:endless'));
         return void pump();
       }
+      // A bot-challenge page (Cloudflare-style 403) and a rate limit: the store refuses our reader.
+      if (u.pathname === '/blocked') return void res.writeHead(403, { 'content-type': 'text/html', server: 'cloudflare' }).end('<html><title>Just a moment...</title><div id="challenge-form">Checking your browser</div></html>');
+      if (u.pathname === '/rate-limited') return void res.writeHead(429, { 'content-type': 'text/html', 'retry-after': '60' }).end('Too Many Requests');
+      if (u.pathname === '/gone') return void res.writeHead(404, { 'content-type': 'text/html' }).end('Not found');
       if (u.pathname === '/bomb') {
         res.writeHead(200, { 'content-type': 'text/html', 'content-encoding': 'gzip' });
         return void res.end(zlib.gzipSync(Buffer.alloc(50 * 1024 * 1024, 0x61)));
@@ -94,6 +98,12 @@ describe('SSRF guard on real requests (redirects, rebinding, size caps)', () => 
   });
   const names = guard((h) => (h === 'shop.test' ? ['127.0.0.1'] : h === 'intranet.example' ? ['10.1.2.3'] : []));
   const shop = (path: string) => `http://shop.test:${port}${path}`;
+
+  it('a blocked, challenged or rate-limited store says so instead of reading the challenge page as a product', async () => {
+    await expect(importProductUrl(shop('/blocked'), { guard: names })).rejects.toMatchObject({ code: 'UNAVAILABLE', message: 'That store blocked our reader.' });
+    await expect(importProductUrl(shop('/rate-limited'), { guard: names })).rejects.toMatchObject({ code: 'UNAVAILABLE', message: 'That store blocked our reader.' });
+    await expect(importProductUrl(shop('/gone'), { guard: names })).rejects.toMatchObject({ code: 'UNAVAILABLE', message: 'We couldn’t open that page.' });
+  });
 
   it('follows a redirect between public pages', async () => {
     const page = await safeFetch(shop('/to-page'), undefined, { guard: names });
@@ -148,6 +158,30 @@ describe('product page parsing (fixtures)', () => {
     expect(p.images[0]).toBe('https://lumen.example/img/a.jpg');
     expect(p.ingredients).toMatch(/Niacinamide/);
     expect(p.sizeText).toBe('30 ml');
+  });
+
+  it('reads a WooCommerce product page (JSON-LD inside WooCommerce markup, plus og and product:price tags)', () => {
+    const html = `<html class="woocommerce-page"><head><title>Dew Drop Serum – Mira Skin</title>
+      <meta property="og:title" content="Dew Drop Serum" /><meta property="og:image" content="https://mira.example/wp-content/uploads/dew.jpg" />
+      <meta property="product:price:amount" content="29.00" /><meta property="product:price:currency" content="USD" />
+      <script type="application/ld+json" class="yoast-schema-graph">{"@context":"https://schema.org","@graph":[{"@type":"Organization","name":"Mira Skin"},
+        {"@type":"Product","name":"Dew Drop Serum","sku":"DD-30","image":"https://mira.example/wp-content/uploads/dew.jpg",
+         "description":"Hyaluronic acid serum. 30 ml.","offers":[{"@type":"Offer","price":"29.00","priceCurrency":"USD","availability":"http://schema.org/InStock"}]}]}</script></head>
+      <body class="single-product woocommerce"><div class="product type-product"><h1 class="product_title entry-title">Dew Drop Serum</h1>
+      <p class="price"><span class="woocommerce-Price-amount amount"><bdi><span class="woocommerce-Price-currencySymbol">$</span>29.00</bdi></span></p>
+      <div class="woocommerce-product-details__short-description"><p>Ingredients: Aqua, Sodium Hyaluronate, Glycerin, Panthenol.</p></div>
+      <form class="cart"><button name="add-to-cart" value="123">Add to cart</button></form></div></body></html>`;
+    const p = parseProductHtml(html, 'https://mira.example/product/dew-drop-serum/');
+    expect(p.source).toBe('json_ld');
+    expect(p.name).toBe('Dew Drop Serum');
+    expect(p.priceMicros).toBe(29_000_000);
+    expect(p.currency).toBe('USD');
+    expect(p.images).toEqual(['https://mira.example/wp-content/uploads/dew.jpg']);
+    expect(p.ingredients).toMatch(/Sodium Hyaluronate/);
+    expect(p.sizeText).toBe('30 ml');
+    // Without the JSON-LD the og/product tags still carry name, price and image.
+    const og = parseProductHtml(html.replace(/<script[\s\S]*?<\/script>/, ''), 'https://mira.example/product/dew-drop-serum/');
+    expect(og).toMatchObject({ source: 'opengraph', name: 'Dew Drop Serum', priceMicros: 29_000_000 });
   });
 
   it('falls back to OpenGraph and ignores prompt-injection text as data', () => {
