@@ -30,6 +30,7 @@ const EXT: Record<string, string> = {
   'image/jpeg': 'jpg',
   'image/webp': 'webp',
   'video/mp4': 'mp4',
+  'video/quicktime': 'mov',
   'audio/mpeg': 'mp3',
   'application/pdf': 'pdf',
   'text/plain': 'txt',

@@ -25,6 +25,8 @@ const EnvSchema = z.object({
   DB_ROLES: z.string().regex(/^(owner|app|admin|system)(,(owner|app|admin|system))*$/).optional(),
   // Set when APP/ADMIN URLs go through PgBouncer in transaction mode (DO connection pools): disables prepared statements.
   DB_PGBOUNCER: z.enum(['0', '1']).default('0'),
+  /** host:port of a clamd that scans uploaded videos and PDFs (standard §48 "scan where appropriate"); unset = no scan. */
+  CLAMAV_HOST: z.string().optional(),
   // Observability (plan 06 Phase 0 D10): OTLP/HTTP trace export (e.g. Grafana Cloud); unset = no export.
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
   /** "key=value,key2=value2" headers for the OTLP endpoint (e.g. Authorization). A secret. */

@@ -1,5 +1,9 @@
 /// <reference path="./heic-decode.d.ts" />
 import { fileTypeFromBuffer } from 'file-type';
+import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { probeUntrusted, withTempDir, type UntrustedProbe } from '@arkiv/media';
+import { malwareScan } from './malware-scan';
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
 import { DomainError, newId } from '@arkiv/shared';
@@ -20,8 +24,8 @@ import { holdForReview, nameReviewFlags } from './vision';
 
 export const UPLOAD_LIMITS = {
   image: { maxBytes: 25 * 1024 * 1024, maxPixels: 40_000_000, maxEdge: 4096 },
-  video: { maxBytes: 300 * 1024 * 1024, maxDurationMs: 180_000 },
-  pdf: { maxBytes: 20 * 1024 * 1024 },
+  video: { maxBytes: 300 * 1024 * 1024, maxDurationMs: 180_000, maxEdge: 4096, maxStreams: 4 },
+  pdf: { maxBytes: 20 * 1024 * 1024, maxPages: 300 },
 } as const;
 
 const ALLOWED: Record<string, 'image' | 'video' | 'pdf'> = {
@@ -53,7 +57,7 @@ export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, 
 
 export interface ValidatedMedia {
   bytes: Buffer;
-  mime: 'image/png' | 'image/jpeg' | 'image/webp' | 'video/mp4' | 'application/pdf';
+  mime: 'image/png' | 'image/jpeg' | 'image/webp' | 'video/mp4' | 'video/quicktime' | 'application/pdf';
 }
 
 const TOO_SMALL = 'That image is too small to use. Please upload at least 800px.';
@@ -136,8 +140,57 @@ export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
       throw new DomainError('INVALID', unreadable);
     }
   }
-  if (family === 'video') return { bytes: raw, mime: 'video/mp4' };
+  if (family === 'video') {
+    await validateVideo(raw);
+    await malwareScan(raw);
+    // Stored as what it is: a QuickTime file is never relabelled as MP4.
+    return { bytes: raw, mime: ft.mime === 'video/quicktime' ? 'video/quicktime' : 'video/mp4' };
+  }
+  validatePdf(raw);
+  await malwareScan(raw);
   return { bytes: raw, mime: 'application/pdf' };
+}
+
+const VIDEO_CODECS = new Set(['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg4', 'prores']);
+const VIDEO_UNREADABLE = 'We couldn’t read that video. Export it again as an MP4 (H.264) and try once more.';
+
+/**
+ * Standard §48 "Malicious or malformed upload": the container is parsed by ffprobe in a child process under kernel
+ * resource limits (never in the app process), and must hold one playable video track within the duration, dimension
+ * and stream-count caps.
+ */
+async function validateVideo(raw: Buffer): Promise<void> {
+  const L = UPLOAD_LIMITS.video;
+  let p: UntrustedProbe;
+  try {
+    p = await withTempDir(async (dir) => {
+      const f = path.join(dir, 'upload');
+      await writeFile(f, raw);
+      return probeUntrusted(f);
+    });
+  } catch {
+    throw new DomainError('INVALID', VIDEO_UNREADABLE);
+  }
+  const videos = p.streams.filter((s) => s.type === 'video');
+  if (videos.length !== 1 || !p.width || !p.height || !p.videoCodec || !VIDEO_CODECS.has(p.videoCodec)) throw new DomainError('INVALID', VIDEO_UNREADABLE);
+  if (p.streams.length > L.maxStreams) throw new DomainError('INVALID', 'That video has more tracks than we accept. Export a single video with one audio track.');
+  if (p.width > L.maxEdge || p.height > L.maxEdge) throw new DomainError('INVALID', `That video is larger than ${L.maxEdge} pixels on a side. Export it at 1080p or 4K.`);
+  if (!(p.durationMs > 0)) throw new DomainError('INVALID', VIDEO_UNREADABLE);
+  if (p.durationMs > L.maxDurationMs) throw new DomainError('INVALID', `Videos can be up to ${Math.round(L.maxDurationMs / 60_000)} minutes long.`);
+}
+
+/**
+ * PDF evidence documents: a real PDF (header and end-of-file marker), a page count within the cap, and no active
+ * content (JavaScript, launch or embedded-file actions) — evidence is read by people, never executed.
+ */
+export function validatePdf(raw: Buffer): void {
+  const head = raw.subarray(0, 1024).toString('latin1');
+  const tail = raw.subarray(Math.max(0, raw.length - 2048)).toString('latin1');
+  if (!/^%PDF-\d\.\d/.test(head) || !tail.includes('%%EOF')) throw new DomainError('INVALID', 'That PDF looks damaged. Export it again and upload the new file.');
+  const text = raw.toString('latin1');
+  if (/\/(JavaScript|JS|Launch|EmbeddedFile|OpenAction\s*<<[^>]*\/S\s*\/JavaScript)\b/.test(text)) throw new DomainError('INVALID', 'That PDF contains scripts or embedded files. Print it to a plain PDF and upload that.');
+  const pages = (text.match(/\/Type\s*\/Page(?!s)\b/g) ?? []).length;
+  if (pages > UPLOAD_LIMITS.pdf.maxPages) throw new DomainError('INVALID', `PDFs can have up to ${UPLOAD_LIMITS.pdf.maxPages} pages. Upload the relevant pages.`);
 }
 
 /** Worker step: move a quarantined upload into the tenant prefix as an asset. */
