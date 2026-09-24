@@ -24,24 +24,29 @@ export async function buildContext(tx: Tx, skuId: string) {
   // Only claims usable wherever this ad will be published (every export platform, the brand's market) are
   // offered as APPROVED; anything narrower would pass here and then fail claims QA after render spend.
   const usable = new Set((await renderableClaims(tx, skuId, { platforms: AD_PLATFORMS })).map((c) => c.id));
-  const themes = await tx`select label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
+  const themes = await tx`select id, label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
                           order by prevalence * relevance desc limit 6`;
   const snippets = await tx`select text from customer_signals where sku_id = ${skuId} order by observed_at desc nulls last limit 8`;
   const coverage = await tx`select genes->>'angle' as angle, state, count(*)::int as n from experiments where sku_id = ${skuId}
                             group by 1, 2`;
-  const learnings = await tx`select statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
+  const learnings = await tx`select id, statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
                              and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') and not confounded order by confidence desc limit 6`;
   const ingredients = (factText(facts, 'key_ingredients') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   const brand = await brandBrainFor(tx, skuId);
+  const approvedRows = claims.filter((c) => usable.has(c.id));
+  // Stable ids for every packet item, so a proposal can cite what it rests on (rationale ids, §38).
+  const FACT_KEYS = ['category', 'size', 'price', 'texture', 'format', 'key_ingredients', 'ingredients'];
+  const factIds = Object.fromEntries(FACT_KEYS.filter((k) => facts[k]).map((k) => [k, facts[k]!.value.id]));
   const productContext: ProductContext = {
     name: sku.name as string,
     category: (factText(facts, 'category') ?? sku.category ?? 'skincare') as string,
     sizeText: factText(facts, 'size'),
     texture: factText(facts, 'texture'),
     ingredients,
-    approvedClaims: claims.filter((c) => usable.has(c.id)).map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
+    approvedClaims: approvedRows.map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
     themes: themes.map((t) => ({ label: t.label as string, signalType: t.signal_type as string })),
     testedAngles: coverage.map((c) => c.angle as string).filter(Boolean),
+    rationaleIds: { themes: themes.map((t) => t.id as string), claims: approvedRows.map((c) => c.id), facts: Object.values(factIds), learnings: learnings.map((l) => l.id as string) },
   };
   const packet = {
     product: {
@@ -52,15 +57,16 @@ export async function buildContext(tx: Tx, skuId: string) {
       texture: productContext.texture,
       format: factText(facts, 'format'),
       keyIngredients: ingredients,
+      factIds,
     },
     claims: {
-      APPROVED: productContext.approvedClaims,
+      APPROVED: approvedRows.map((c, i) => ({ id: c.id, wording: productContext.approvedClaims[i]! })),
       NEEDS_REVIEW_DO_NOT_USE: claims.filter((c) => c.status === 'MERCHANT_REVIEW_REQUIRED' || ((c.status === 'VERIFIED' || c.status === 'VERIFIED_WITH_QUALIFIER') && !usable.has(c.id))).map((c) => c.preferredWording),
       BLOCKED_NEVER_USE: claims.filter((c) => c.status === 'BLOCKED' || c.status === 'RESTRICTED').map((c) => c.preferredWording),
     },
-    customerThemes: themes.map((t) => ({ label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
+    customerThemes: themes.map((t) => ({ id: t.id, label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
     coverage: coverage.map((c) => ({ angle: c.angle, state: c.state, count: c.n })),
-    learnings: learnings.map((l) => ({ statement: l.statement, state: l.state, platform: l.scope_platform })),
+    learnings: learnings.map((l) => ({ id: l.id, statement: l.statement, state: l.state, platform: l.scope_platform })),
     // The merchant's own Brand Brain (versioned): shapes voice and visuals, never overrides claim rules.
     brand: brand
       ? { name: brand.name, tone: brand.brain.tone, neverShowOrSay: brand.brain.prohibited, requiredDisclosures: brand.brain.disclosures, preferredCta: brand.brain.cta, colors: brand.brain.colors, market: brand.brain.market }
@@ -70,12 +76,22 @@ export async function buildContext(tx: Tx, skuId: string) {
   };
   // Product and brand names are names, not claims ("Glow Serum" makes no glow claim).
   const names = [sku.name as string, brand?.name ?? null];
-  return { sku, facts, productContext, packet, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
+  const r = productContext.rationaleIds!;
+  const packetIds = new Set([...r.themes, ...r.claims, ...r.facts, ...r.learnings]);
+  return { sku, facts, productContext, packet, packetIds, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
 }
 
-/** Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). */
-export function gateProposal(p: Proposal, approved: string[], names: (string | null | undefined)[] = []): { ok: boolean; reasons: string[]; cleaned: Proposal } {
+/**
+ * Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). Rationale ids are
+ * kept only when they name an item of the packet the proposal was drafted from (`packetIds`).
+ */
+export function gateProposal(p: Proposal, approved: string[], names: (string | null | undefined)[] = [], packetIds?: ReadonlySet<string>): { ok: boolean; reasons: string[]; cleaned: Proposal } {
   const reasons: string[] = [];
+  const rationaleIds = [...new Set(p.rationaleIds ?? [])].filter((id) => {
+    const known = !packetIds || packetIds.has(id);
+    if (!known) reasons.push(`unknown rationale id dropped: ${id.slice(0, 40)}`);
+    return known;
+  });
   const vault = approved.map((w, i) => ({ id: String(i), wording: w }));
   // Only customer-facing copy is claims-scanned; hypothesis/body are internal strategy notes. A hook that makes a
   // product claim no approved claim covers would be refused by claims QA after render spend, so it goes now.
@@ -93,7 +109,7 @@ export function gateProposal(p: Proposal, approved: string[], names: (string | n
     return ok;
   });
   while (cleanHooks.length < 3) cleanHooks.push(['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'][cleanHooks.length]!);
-  return { ok: !blockedStrategy, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims } };
+  return { ok: !blockedStrategy, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds } };
 }
 
 /** Three concepts must differ in hypothesis (angle or primary variable), not just copy (§13). */
@@ -115,7 +131,7 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, packetIds, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -137,7 +153,7 @@ export async function generateConcepts(run: ConceptRun) {
       effort: 'high',
       maxTokens: CONCEPTS_MAX_TOKENS,
     });
-    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names));
+    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, packetIds));
     const valid = gated.filter((g) => g.ok);
     if (valid.length === 3 && conceptsAreDistinct(valid.map((v) => v.cleaned))) break;
     content.push({ type: 'text', text: `Previous attempt was rejected by compliance/diversity gates: ${gated.flatMap((g) => g.reasons).join('; ') || 'concepts too similar'}. Fix and return three distinct compliant concepts.` });

@@ -58,3 +58,12 @@ alter table events add column seq bigint generated always as identity;
 -- A running production records its liveness; each heartbeat also extends its reservation, and the sweeper never
 -- releases a reservation whose project heartbeat is recent.
 alter table projects add column heartbeat_at timestamptz;
+
+-- ───────────── Recommendation rationale and confidence (standard §38) ─────────────
+-- "Response includes rationale IDs and confidence, not raw chain-of-thought": the packet items (customer themes,
+-- learnings, approved claims, product facts) a recommendation rests on, and how much evidence stands behind it.
+alter table recommendations add column rationale_ids uuid[] not null default '{}';
+alter table recommendations add column confidence numeric check (confidence is null or (confidence >= 0 and confidence <= 1));
+-- The concepts prompt now asks for rationale ids (§41: prompt changes are versioned).
+update model_routes set prompt_version = 'concepts@1.1.0' where task = 'creative_director.concepts' and prompt_version = 'concepts@1.0.0';
+update model_routes set prompt_version = 'recommendations@1.1.0' where task = 'creative_director.recommendations' and prompt_version = 'recommendations@1.0.0';

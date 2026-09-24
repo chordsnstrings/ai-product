@@ -17,6 +17,8 @@ export const CONCEPTS_SYSTEM = `You are the senior Creative Director for perform
 Propose exactly three genuinely different creative TESTS — different hypotheses, not copy variations.
 Rules:
 - Ground every concept in the context packet: product facts, customer language, coverage gaps, learnings.
+  In "rationaleIds" list the ids of the packet items each concept rests on (customerThemes, learnings,
+  APPROVED claims, product.factIds). Never invent an id.
 - Use only claim wordings listed as APPROVED or neutral descriptions of texture, format and usage. Never use
   BLOCKED or RESTRICTED claims or any disease, treatment, structure/function or guaranteed-result language.
 - Include at least one lower-risk adjacent test and, when appropriate, one exploratory direction.

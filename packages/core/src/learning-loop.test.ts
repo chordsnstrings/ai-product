@@ -10,7 +10,7 @@ import { purgeWorkspace, scheduleDeletion } from './lifecycle';
 import { mockConcepts } from './mock-intel';
 import { ingestObservations, parsePerformanceCsv } from './performance';
 import { approveForProduction, produceProject } from './production';
-import { generateRecommendations, refreshMaturity } from './recommendations';
+import { generateRecommendations, recommendationsForSku, refreshMaturity } from './recommendations';
 import { generateStoryboard } from './storyboard';
 import { ctxFor, eventContractProblems, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
@@ -127,6 +127,15 @@ describe('learning loop (Phases 4–5)', () => {
     const recs = await ownerPool()`select slot, basis, score from recommendations where week_of = '2026-09-21'`;
     expect(recs.length).toBeGreaterThan(0);
     expect(recs.every((r) => Number(r.score) > 0)).toBe(true);
+    // §38: every recommendation carries rationale ids (resolvable to packet items) and a confidence.
+    const listed = await withTenant(t.workspaceId, (tx) => recommendationsForSku(tx, skuId, { sinceWeek: '2026-09-21' }));
+    expect(listed.length).toBe(recs.length);
+    for (const r of listed) {
+      expect(r.confidence).toBeGreaterThan(0);
+      expect(r.rationaleIds.length).toBeGreaterThan(0);
+      expect(r.rationale.length).toBe(r.rationaleIds.length);
+    }
+    expect(listed.flatMap((r) => r.rationale.map((i) => i.kind))).toContain('fact');
     expect(await generateRecommendations(ctx, skuId, '2026-09-21')).toBe(0); // idempotent per week
     // Every event of the whole loop carries its subject type and required object refs (§36).
     expect(await eventContractProblems(t.workspaceId)).toEqual([]);
