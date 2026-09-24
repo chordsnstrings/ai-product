@@ -18,3 +18,9 @@ alter table provider_jobs add column savings_micros bigint not null default 0 ch
 -- an out-of-stock product is for. Production waits for that intent; a restock clears it.
 alter table skus add column in_stock boolean;
 alter table skus add column stock_intent text check (stock_intent in ('waitlist', 'launch'));
+
+-- ───────────── Offer bonus: an alternate opening hook (§7 bonus entitlements, §8) ─────────────
+-- The version of a one-off ad with the alternate hook its offer promised, delivered with it — or when it couldn't
+-- be made (staff are alerted to make good on it).
+alter table projects add column bonus_hook_creative_id uuid;
+alter table projects add column bonus_hook_failed_at timestamptz;

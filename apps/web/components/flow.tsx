@@ -695,6 +695,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
                 {taste && q.referencePriceMicros ? <span className="ak-strike ak-muted" style={{ marginLeft: 12, fontSize: '0.5em' }}>{usd(q.referencePriceMicros)}</span> : null}
               </p>
               <p className="ak-small ak-muted">{taste ? 'Intro price for your first ad. One-time — no subscription.' : 'One-time — no subscription.'}</p>
+              {taste && v.bonus.offered ? <p className="ak-small" style={{ margin: 0 }}>+ An alternate opening hook, free with this price</p> : null}
               {taste && q.expiresAt ? <OfferExpiry expiresAt={q.expiresAt} serverNow={v.serverNow} onExpire={() => { setExpired(true); refresh(); }} /> : null}
             </div>
             <ul className="ak-small" style={{ margin: 0, paddingLeft: 18 }}>
@@ -1068,7 +1069,8 @@ function useShowAfterPlay() {
 }
 
 export function DeliverFlow({ projectId }: { projectId: string }) {
-  const { data: v, error } = useProject(projectId, useCallback(() => false, []));
+  // Kept live only while the offer's bonus hook is still being made.
+  const { data: v, error } = useProject(projectId, useCallback((x: View | null) => !!x?.bonus.pending, []));
   const after = useShowAfterPlay();
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
   if (v.project.state !== 'COMPLETE') {
@@ -1092,6 +1094,23 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
                 <span className="ak-index">MP4 ↓</span>
               </a>
             ))}
+            {v.bonus.exports.length || v.bonus.pending || v.bonus.failed ? (
+              <>
+                <h2 className="ak-label">Bonus · alternate opening hook</h2>
+                {v.bonus.exports.length ? (
+                  v.bonus.exports.map((e) => (
+                    <a key={e.assetId} className="ak-index-row" href={e.download} download>
+                      <span>{ASPECT[e.aspect] ?? e.aspect} · new first line</span>
+                      <span className="ak-index">MP4 ↓</span>
+                    </a>
+                  ))
+                ) : v.bonus.failed ? (
+                  <p className="ak-small ak-muted">We couldn’t make this one automatically. Our team has been told and will send it to you.</p>
+                ) : (
+                  <p className="ak-small ak-muted">Being made now: the same ad with a different opening line. It appears here in a few minutes.</p>
+                )}
+              </>
+            ) : null}
             {qa.length ? (
               <details>
                 <summary className="ak-small">What we checked</summary>

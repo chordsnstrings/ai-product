@@ -2,7 +2,7 @@ import type { Tx } from '@arkiv/db';
 import { DomainError, OFFER_RULES, PRICES, type Micros, type OfferType } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { emit } from './events';
-import { assignVariantOrNull } from './flags';
+import { assignVariantOrNull, isFlagOn } from './flags';
 
 /**
  * Offer Engine (standard §5, §7; plan 04 L8–L10; plan 05 §6). Deterministic and experimentable — never
@@ -198,11 +198,14 @@ export async function issueTasteOffer(tx: Tx, ctx: TenantContext, projectId: str
     window = v.windowMinutes ?? window;
     price = v.priceMicros ?? price;
   }
+  // The bonus shown is the bonus delivered: an alternate hook only where its rollout flag is on for the workspace.
+  const bonus = { ...((def.bonus as Record<string, unknown>) ?? {}) };
+  if (bonusHooks(bonus) && !(await isFlagOn(tx, 'offer.taste_bonus_hook', ctx.workspaceId))) delete bonus.alternateHook;
   const [o] = await tx`
     insert into offers (workspace_id, definition_code, type, project_id, price_micros, reference_price_micros, starts_at,
       expires_at, bonus, variant, experiment_key)
     values (${ctx.workspaceId}, ${code}, 'TASTE', ${projectId}, ${price}, ${ref}, now(),
-      now() + make_interval(mins => ${window}), ${tx.json(def.bonus as never)}, ${variant}, ${variant ? exp!.key : null})
+      now() + make_interval(mins => ${window}), ${tx.json(bonus as never)}, ${variant}, ${variant ? exp!.key : null})
     on conflict do nothing
     returning *`;
   const offer = o ?? (await tx`select * from offers where type = 'TASTE'`)[0];
@@ -327,6 +330,33 @@ export async function expireOffers(tx: Tx): Promise<number> {
     );
   }
   return r.count;
+}
+
+// ───────────── Bonus entitlements (standard §7: every offer has bonus entitlements; §8 alternate opening hook) ─────────────
+
+/** How many alternate opening hooks an offer's bonus grants (the only bonus the engine delivers; at most one). */
+export function bonusHooks(bonus: unknown): number {
+  const n = Number((bonus as { alternateHook?: unknown } | null)?.alternateHook ?? 0);
+  return Number.isFinite(n) && n >= 1 ? 1 : 0;
+}
+
+/** Bonus entitlements the engine can deliver; staff can't save a bonus nothing would honour. */
+export function validateOfferBonus(bonus: Record<string, unknown>, type: OfferType): void {
+  for (const [k, v] of Object.entries(bonus)) {
+    if (k !== 'alternateHook') throw new DomainError('INVALID', `Unknown bonus “${k}”. The engine delivers: alternateHook (1 = one alternate opening hook).`);
+    if (v !== 0 && v !== 1) throw new DomainError('INVALID', 'alternateHook is 0 or 1 (one alternate opening hook, the low-COGS bonus).');
+    // Issued offers carry their bonus to the purchase; only the Taste offer is issued per workspace.
+    if (v === 1 && type !== 'TASTE') throw new DomainError('INVALID', 'An alternate hook is a bonus of the Taste offer.');
+  }
+}
+
+/** Does this finished one-off ad still owe its offer's bonus alternate hook? */
+export async function bonusHookDue(tx: Tx, projectId: string): Promise<boolean> {
+  const [r] = await tx`select o.bonus, p.bonus_hook_creative_id, p.bonus_hook_failed_at from projects p
+                       join purchases pu on pu.project_id = p.id and pu.workspace_id = p.workspace_id and pu.status = 'paid'
+                       join offers o on o.id = pu.offer_id and o.workspace_id = pu.workspace_id
+                       where p.id = ${projectId} and p.experiment_id is null limit 1`;
+  return !!r && !r.bonus_hook_creative_id && !r.bonus_hook_failed_at && bonusHooks(r.bonus) > 0;
 }
 
 /** Stripe Checkout session expiry (plan 02 B5): Stripe's minimum is 30 min; the offer itself is never extended. */
