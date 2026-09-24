@@ -16,7 +16,7 @@ import { authorize, holdAuthorization, reissueToken, settle, type Purpose } from
 import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { isFlagOn } from './flags';
-import { append, type LedgerUnit } from './ledger';
+import { append, currentPeriodKey, type LedgerUnit } from './ledger';
 import { setting } from './settings';
 import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
@@ -466,7 +466,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       if (!a) {
         await tx`update cost_authorizations set idempotency_key = idempotency_key || ':retired:' || id::text
                  where workspace_id = ${ws} and project_id = ${projectId} and idempotency_key = ${'produce:' + projectId} and status <> 'active'`;
-        const periodKey = unit === 'creative_test' ? ((await tx`select to_char(current_period_start, 'YYYY-MM-DD') as k from subscriptions order by created_at desc limit 1`)[0]?.k ?? null) : null;
+        const periodKey = unit === 'creative_test' ? await currentPeriodKey(tx, ws) : null;
         const r = await authorize(tx, ctx, {
           purpose,
           projectId,

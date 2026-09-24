@@ -172,6 +172,54 @@ describe('ledger + cost governor', () => {
     ).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
   });
 
+  it('caps free-preview COGS per provisional workspace across products, asking for signup (plan 02 §4)', async () => {
+    const t = await makeTenant({ state: 'PROVISIONAL' });
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'PROVISIONAL');
+    const line = { kind: 'llm' as const, provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 10_000, outputTokens: 4_000 };
+    // $0.12 on one product, then $0.12 on a second: each is under the per-SKU cap, together over $0.20.
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'free_preview', skuId: 's1', lines: [line], idempotencyKey: 'a' }));
+    await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'free_preview', skuId: 's2', lines: [line], idempotencyKey: 'b' }))).rejects.toMatchObject({
+      code: 'PAYMENT_REQUIRED',
+      details: { needsAccount: true },
+    });
+    // Another provisional workspace is unaffected.
+    const u = await makeTenant({ state: 'PROVISIONAL' });
+    await withTenant(u.workspaceId, (tx) => authorize(tx, ctxFor(u.workspaceId, u.userId, 'OWNER', 'PROVISIONAL'), { purpose: 'free_preview', skuId: 's2', lines: [line], idempotencyKey: 'a' }));
+  });
+
+  it('two productions racing for the last Creative Test: exactly one reserves, the balance never goes negative (x-races-01)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    await withTenant(t.workspaceId, (tx) => append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 1, idempotencyKey: 'g' }));
+    const line = { kind: 'image' as const, provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 };
+    const results = await Promise.allSettled(
+      ['p1', 'p2'].map((k) => withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'repair', lines: [line], entitlement: { unit: 'creative_test', amount: 1 }, idempotencyKey: k }))),
+    );
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const failed = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(failed.reason).toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    expect(await withTenant(t.workspaceId, (tx) => available(tx, 'creative_test'))).toBe(0);
+  });
+
+  it('a test released after its period expired expires too, instead of rolling over (x-races-08)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const line = { kind: 'image' as const, provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 };
+    const auth = await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 2, periodKey: '2026-08-01', idempotencyKey: 'g' });
+      return authorize(tx, ctx, { purpose: 'repair', lines: [line], entitlement: { unit: 'creative_test', amount: 1, periodKey: '2026-08-01' }, idempotencyKey: 'r' });
+    });
+    await withTenant(t.workspaceId, async (tx) => {
+      expect(await expirePeriod(tx, ctx, '2026-08-01')).toBe(1);
+      expect(await available(tx, 'creative_test')).toBe(0);
+      await settle(tx, ctx, auth.authorizationId, 'released');
+      expect(await available(tx, 'creative_test')).toBe(0);
+      expect((await periodUsage(tx, '2026-08-01')).remaining).toBe(0);
+      // Idempotent: nothing more to expire.
+      expect(await expirePeriod(tx, ctx, '2026-08-01')).toBe(0);
+    });
+  });
+
   it('kill switch stops production', async () => {
     const t = await makeTenant({ plan: 'GROWTH' });
     await ownerPool()`update feature_flags set enabled = true where key = 'kill.renders'`;

@@ -51,7 +51,7 @@ export function tenantRows(tx: Tx, f: TenantFilters, opts: { limit: number; tz: 
         (select coalesce(sum(amount), 0) from ledger_entries where workspace_id = w.id and type = 'PROVIDER_COST_RECORDED' and created_at > now() - interval '30 days')::bigint as cogs30,
         (select coalesce(sum(amount_micros), 0) from purchases where workspace_id = w.id and status = 'paid' and paid_at > now() - interval '30 days')::bigint as rev30,
         (select count(*) from purchases where workspace_id = w.id and status = 'paid' and paid_at > now() - interval '30 days')::int as onetime30,
-        (select to_char(current_period_start, 'YYYY-MM-DD') from subscriptions where workspace_id = w.id and status in ('active','trialing','past_due') order by created_at desc limit 1) as period,
+        (select to_char(current_period_start at time zone 'UTC', 'YYYY-MM-DD') from subscriptions where workspace_id = w.id and status in ('active','trialing','past_due') order by created_at desc limit 1) as period,
         (select coalesce(sum(amount), 0) from ledger_entries where workspace_id = w.id and unit = 'creative_test'
            and type in ('CREDIT_GRANTED','CREDIT_RESERVED','CREDIT_RELEASED','CREDIT_REFUNDED','CREDIT_EXPIRED','CREDIT_ADJUSTED'))::int as tests_available,
         (select least(100, coalesce(sum(coalesce((${weights}->>indicator)::int, 10)), 0)) from (select distinct indicator from risk_flags r where r.workspace_id = w.id and r.resolved_at is null) f)::int as risk_score,

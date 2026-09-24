@@ -183,7 +183,13 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     }
     await withTenant(ws, async (tx) => {
       await step(tx, ws, storyboardId, 'frames', 'done', imagery.cutout && !imagery.cutout.keyed ? `${scenes.length} frames. ${CLEAN_PHOTO_TIP}` : `${scenes.length} frames`);
-      await tx`update storyboards set status = 'ready' where id = ${storyboardId}`;
+      // Superseded meanwhile (another concept chosen, or the storyboard a checkout paid for restored): the frames
+      // are kept, but this storyboard no longer becomes the project's.
+      const [done] = await tx`update storyboards set status = 'ready' where id = ${storyboardId} and status = 'generating' returning id`;
+      if (!done) {
+        await settle(tx, ctx, auth.authorizationId, 'consumed');
+        return;
+      }
       await transition(tx, ctx, projectId, 'STORYBOARD_READY');
       await settle(tx, ctx, auth.authorizationId, 'consumed');
       // Standard §5: the 60-minute Taste window starts only now.
