@@ -4,7 +4,7 @@ import { DomainError, env } from '@arkiv/shared';
 import { clientFingerprint, json, route } from '@/lib/http';
 import { previewContext } from '@/lib/preview-context';
 import { visitorId } from '@/lib/session';
-import { verifyTurnstile } from '@/lib/turnstile';
+import { verifyTurnstile } from '@arkiv/auth';
 
 const uploadedIds = (form: FormData) => [...new Set(form.getAll('assetIds').map(String).filter((x) => /^[0-9a-f-]{36}$/i.test(x)))].slice(0, 6);
 

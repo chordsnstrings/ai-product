@@ -4,9 +4,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, ClaimChip, Field, Input, LinkButton, LockButton, MetadataTable, Rail, SpecimenCard } from '@arkiv/ui';
 import { api, LiveLedger, OfferExpiry, ProvenanceChip, Sheet, StickyCta, usePoll } from '@arkiv/ui/client';
 import { formatDate, formatTime } from '@arkiv/shared/format';
+import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
+import { EmailLinkForm } from './email-link';
+import { registerPasskey } from './profile';
 import type { ProjectView } from '@/lib/views';
 
-type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null } };
+type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null; passkeyPrompt?: boolean } };
 
 const usd = (micros: number) => `$${(micros / 1_000_000).toFixed(micros % 1_000_000 === 0 ? 0 : 2)}`;
 /** Below this photo-quality confidence the P4 screen offers an extra view (plan 03 P4, "only if fidelity confidence is low"). */
@@ -64,6 +67,21 @@ function Shell({ step, children, title, sub }: { step: 1 | 2 | 3 | 4; children: 
       <h1 className="ak-h1" style={{ marginTop: 32 }}>{title}</h1>
       {sub ? <p className="ak-body-l ak-muted" style={{ maxWidth: 640 }}>{sub}</p> : null}
       <div style={{ marginTop: 32 }}>{children}</div>
+    </div>
+  );
+}
+
+/**
+ * A project view that can't load. When the preview was saved to an account from another device (plan 03 P6), this
+ * browser's preview cookie no longer opens it: say so and offer to log in, rather than a bare error.
+ */
+function PreviewUnavailable({ projectId, error }: { projectId: string; error: string }) {
+  const saved = /saved to an account/i.test(error);
+  return (
+    <div className="ak-wrap ak-section" style={{ maxWidth: 520 }}>
+      {saved ? <h1 className="ak-h1">This preview was saved to an account</h1> : null}
+      <Banner tone={saved ? undefined : 'risk'}>{error}</Banner>
+      {saved ? <p style={{ marginTop: 16 }}><LinkButton href={`/login?next=${encodeURIComponent(`/concepts/${projectId}`)}`}>Log in to continue</LinkButton></p> : null}
     </div>
   );
 }
@@ -475,7 +493,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
 
 const RISK: Record<string, string> = { lower_risk: 'Safer bet', adjacent: 'Adjacent', exploratory: 'Exploratory' };
 
-export function ConceptsFlow({ projectId }: { projectId: string }) {
+export function ConceptsFlow({ projectId, providers }: { projectId: string; providers: { google: boolean; apple: boolean } }) {
   const active = useCallback(
     (v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED' || v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active',
     [],
@@ -484,7 +502,7 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
   const [gate, setGate] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
+  if (!v) return error ? <PreviewUnavailable projectId={projectId} error={error} /> : <Loading />;
 
   async function choose(conceptId: string) {
     if (v!.access.provisional) return setGate(conceptId);
@@ -551,50 +569,28 @@ export function ConceptsFlow({ projectId }: { projectId: string }) {
           <button className="ak-textbtn" disabled={!!busy || drafting} onClick={more} aria-live="polite">{busy === 'more' || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
         </p>
       ) : null}
-      <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} />
+      <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} providers={providers} />
     </Shell>
   );
 }
 
-/** P6 save gate: value first, then a light ask — email link or one-tap Google/Apple. Preview is preserved either way. */
-export function SaveGate({ open, onOpenChange, next, productName }: { open: boolean; onOpenChange: (o: boolean) => void; next: string; productName: string }) {
-  const [email, setEmail] = useState('');
-  const [sent, setSent] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [suggestion, setSuggestion] = useState<string | null>(null);
-  async function send(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-    try {
-      const r = await api<{ suggestion: string | null }>('/api/auth/magic', { email, next });
-      setSuggestion(r.suggestion);
-      setSent(true);
-    } catch (x) {
-      setErr((x as Error).message);
-      setSuggestion(((x as { details?: { suggestion?: string } }).details?.suggestion) ?? null);
-    }
-  }
+/**
+ * P6 save gate: value first, then a light ask — email link or one-tap Google/Apple (each shown only when it can be
+ * used). The preview is preserved either way; accepting the Terms is logged with the account (no checkbox).
+ */
+export function SaveGate({ open, onOpenChange, next, productName, providers }: { open: boolean; onOpenChange: (o: boolean) => void; next: string; productName: string; providers: { google: boolean; apple: boolean } }) {
+  const n = encodeURIComponent(next);
   return (
     <Sheet open={open} onOpenChange={onOpenChange} title="Save your work to continue" description={`Your ${productName} catalogue and ideas are kept. No card needed.`}>
-      {sent ? (
-        <div className="ak-stack">
-          <p>Check <strong>{email}</strong> — we sent a sign-in link. It opens right back here.</p>
-          {suggestion ? <p className="ak-small ak-muted">Did you mean {suggestion}?</p> : null}
-          <button className="ak-textbtn" onClick={() => setSent(false)}>Use a different email</button>
-        </div>
-      ) : (
-        <form onSubmit={send} className="ak-stack">
-          <Field label="Work email" error={err ? <>{err}{suggestion ? <> — did you mean <button type="button" className="ak-textbtn" onClick={() => setEmail(suggestion)}>{suggestion}</button>?</> : null}</> : undefined}>
-            <Input type="email" inputMode="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
-          </Field>
-          <Button type="submit" block>Email me a sign-in link</Button>
+      <EmailLinkForm next={next} label="Work email" submitLabel="Email me a sign-in link" ttlMinutes={MAGIC_LINK_TTL_MIN} sentNote="We sent a sign-in link. It opens right back here — or keep this tab open and it will follow along.">
+        {providers.apple || providers.google ? (
           <div className="ak-row" style={{ justifyContent: 'center' }}>
-            <a className="ak-btn ak-btn--secondary" href={`/api/auth/google/start?next=${encodeURIComponent(next)}`}>Continue with Google</a>
-            <a className="ak-btn ak-btn--secondary" href={`/api/auth/apple/start?next=${encodeURIComponent(next)}`}>Continue with Apple</a>
+            {providers.apple ? <a className="ak-btn ak-btn--secondary" href={`/api/auth/apple/start?next=${n}`}>Continue with Apple</a> : null}
+            {providers.google ? <a className="ak-btn ak-btn--secondary" href={`/api/auth/google/start?next=${n}`}>Continue with Google</a> : null}
           </div>
-          <p className="ak-small ak-muted">By continuing you agree to the <a href="/legal/terms">Terms</a> and <a href="/legal/privacy">Privacy Policy</a>.</p>
-        </form>
-      )}
+        ) : null}
+        <p className="ak-small ak-muted">By continuing you agree to the <a href="/legal/terms">Terms</a> and <a href="/legal/privacy">Privacy Policy</a>.</p>
+      </EmailLinkForm>
     </Sheet>
   );
 }
@@ -819,6 +815,7 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
           <Liveness live={v.project.liveness} />
         </>
       )}
+      {!stopped && !waitingPayment ? <div style={{ marginTop: 24 }}><PasskeyPrompt v={v} /></div> : null}
       <div style={{ marginTop: 24 }}><CancelProduction projectId={projectId} v={v} onChange={resume} /></div>
     </Shell>
   );
@@ -1048,6 +1045,63 @@ function FactUpdate({ projectId, update }: { projectId: string; update: { shown:
   );
 }
 
+
+/**
+ * "Sign in faster next time — add a passkey" (plan 06 Phase 3 #8 "Passkeys (offered after first purchase)"; plan 04
+ * L5). Shown after a paid purchase to a signed-in user with no passkey, on a device that supports them; dismissing
+ * it hides it for good.
+ */
+function PasskeyPrompt({ v }: { v: View }) {
+  const [state, setState] = useState<'idle' | 'busy' | 'added' | 'hidden'>('idle');
+  const [err, setErr] = useState<string | null>(null);
+  const supported = typeof window !== 'undefined' && 'PublicKeyCredential' in window;
+  const show = supported && !!v.access.passkeyPrompt && v.purchase?.status === 'paid' && state !== 'hidden';
+  const seen = useRef(false);
+  useEffect(() => {
+    if (!show || seen.current) return;
+    seen.current = true;
+    void api('/api/me/passkey-prompt', { event: 'shown' }).catch(() => {});
+  }, [show]);
+  if (!show) return null;
+  if (state === 'added') return <p className="ak-small" role="status">Passkey added. Next time, sign in with your face, fingerprint or device PIN.</p>;
+  return (
+    <aside className="ak-panel ak-stack" aria-label="Add a passkey">
+      <p style={{ margin: 0 }}><strong>Sign in faster next time — add a passkey.</strong></p>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>Use your face, fingerprint or device PIN instead of waiting for an email.</p>
+      {err ? <p className="ak-error ak-small" role="alert">{err}</p> : null}
+      <div className="ak-row">
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={state === 'busy'}
+          onClick={async () => {
+            setState('busy');
+            setErr(null);
+            try {
+              setState((await registerPasskey('prompt')) ? 'added' : 'idle');
+            } catch (e) {
+              setErr((e as Error).message);
+              setState('idle');
+            }
+          }}
+        >
+          Add a passkey
+        </Button>
+        <button
+          type="button"
+          className="ak-textbtn"
+          onClick={() => {
+            setState('hidden');
+            void api('/api/me/passkey-prompt', { event: 'dismissed' }).catch(() => {});
+          }}
+        >
+          Not now
+        </button>
+      </div>
+    </aside>
+  );
+}
+
 /** M12: the export CTA fades in 1.2s after playback starts (at once under reduced motion; 4s at most). */
 function useShowAfterPlay() {
   const [show, setShow] = useState(false);
@@ -1115,6 +1169,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
             </ol>
             {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
             <LinkButton href="/app/plan">Test 3 ideas a month · see plans</LinkButton>
+            <PasskeyPrompt v={v} />
           </div>
         </div>
       </div>

@@ -1,3 +1,4 @@
+import { passkeyPromptEligible } from '@arkiv/auth';
 import { json, route } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
 import { projectView } from '@/lib/views';
@@ -7,5 +8,6 @@ export const GET = route(async (_req, { params }: { params: Promise<{ id: string
   const { id } = await params;
   const a = await projectAccess(id);
   const v = await projectView(a.ctx.workspaceId, id);
-  return json({ ...v, access: { provisional: a.provisional, signedIn: !!a.user, role: a.ctx.role, workspaceSlug: a.slug || null } });
+  const passkeyPrompt = !!a.user && !a.provisional && v?.purchase?.status === 'paid' && (await passkeyPromptEligible(a.user.id));
+  return json({ ...v, access: { provisional: a.provisional, signedIn: !!a.user, role: a.ctx.role, workspaceSlug: a.slug || null, passkeyPrompt } });
 });
