@@ -33,8 +33,11 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
                 { name: 'note', label: 'Note', max: 300 },
               ]} />
             </SheetButton>
-            <SheetButton label="Upload CSV" title="Upload performance CSV" description="No ad account connection? Export a daily ad report (Ad name, Day, Spend, Impressions, Clicks, Purchases) and upload it here.">
-              <ActionForm slug={slug} action="performance-csv" multipart submit="Upload" fields={[{ name: 'file', label: 'CSV file', type: 'file', accept: '.csv,text/csv', required: true }]} />
+            <SheetButton label="Upload CSV" title="Upload performance CSV" description="No ad account connection? Export a daily ad report (Ad name, Day, Spend, Impressions, Clicks, Purchases) and upload it here — one file per platform, so Meta and TikTok results stay separate.">
+              <ActionForm slug={slug} action="performance-csv" multipart submit="Upload" fields={[
+                { name: 'platform', label: 'Exported from', type: 'select', required: true, options: [{ value: '', label: 'Choose…' }, { value: 'meta', label: 'Meta Ads Manager' }, { value: 'tiktok', label: 'TikTok Ads Manager' }] },
+                { name: 'file', label: 'CSV file', type: 'file', accept: '.csv,text/csv', required: true },
+              ]} />
             </SheetButton>
           </div>
         ) : null}

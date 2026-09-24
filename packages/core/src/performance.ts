@@ -1,5 +1,5 @@
 import { globalTx, withTenant, type Tx } from '@arkiv/db';
-import { DomainError, env } from '@arkiv/shared';
+import { csvContext, DomainError, env, type CsvPlatform } from '@arkiv/shared';
 import {
   ConnectorError,
   decryptToken,
@@ -260,12 +260,26 @@ export async function workspaceForShop(shop: string): Promise<string | null> {
   return (r?.workspace_id as string) ?? null;
 }
 
+/** Header columns only one platform's Ads Manager export has, to catch a CSV uploaded under the wrong platform. */
+const CSV_FINGERPRINTS: Record<CsvPlatform, RegExp> = {
+  meta: /^(reporting starts|reporting ends|amount spent( \(\w+\))?|ad set name|ad set id)$/,
+  tiktok: /^(cost|total cost|ad group name|ad group id|clicks \(destination\)|video views at 75%)$/,
+};
+
 /**
- * Manual import (CSV from Ads Manager) — MERCHANT_IMPORTED context, never mixed with API-attributed data.
+ * Manual import (CSV from Meta or TikTok Ads Manager). The merchant says which platform the export is from; each
+ * platform's rows get their own context (MERCHANT_IMPORTED_META / _TIKTOK) so a variant's Meta and TikTok numbers
+ * are never pooled into one result (§48), and never mixed with API-attributed data (§30). A file whose columns
+ * are the other platform's is refused.
  */
-export function parsePerformanceCsv(csv: string): NormalizedObservation[] {
+export function parsePerformanceCsv(csv: string, platform: CsvPlatform): NormalizedObservation[] {
   const lines = csv.trim().split(/\r?\n/);
   const head = lines.shift()!.split(',').map((h) => h.trim().toLowerCase());
+  const other: CsvPlatform = platform === 'meta' ? 'tiktok' : 'meta';
+  const name = (p: CsvPlatform) => (p === 'meta' ? 'Meta' : 'TikTok');
+  if (head.some((h) => CSV_FINGERPRINTS[other].test(h)) && !head.some((h) => CSV_FINGERPRINTS[platform].test(h))) {
+    throw new DomainError('INVALID', `This looks like a ${name(other)} Ads Manager export. Choose ${name(other)} as the platform, or upload your ${name(platform)} export.`);
+  }
   const col = (row: string[], ...names: string[]) => {
     for (const n of names) {
       const i = head.indexOf(n);
@@ -276,36 +290,40 @@ export function parsePerformanceCsv(csv: string): NormalizedObservation[] {
   return lines.filter(Boolean).map((l) => {
     const r = l.split(',');
     const n = (v: string) => (v ? Number(v.replace(/[$,]/g, '')) : 0);
+    const stated = col(r, 'platform').toLowerCase();
+    if (stated && (/tiktok/.test(stated) ? 'tiktok' : /meta|facebook|instagram/.test(stated) ? 'meta' : platform) !== platform) {
+      throw new DomainError('INVALID', `Row for ${stated} in a ${name(platform)} import. Upload each platform’s export separately.`);
+    }
     return {
-      platform: /tiktok/i.test(col(r, 'platform')) ? 'tiktok' : 'meta',
+      platform,
       accountId: col(r, 'account id', 'account') || 'manual',
       campaignId: col(r, 'campaign id') || null,
       adgroupId: null,
       adId: col(r, 'ad id', 'ad') || col(r, 'ad name'),
       adName: col(r, 'ad name') || null,
-      date: col(r, 'date', 'day', 'reporting starts'),
+      date: col(r, 'date', 'day', 'by day', 'reporting starts'),
       currency: col(r, 'currency') || 'USD',
-      spendMicros: Math.round(n(col(r, 'spend', 'amount spent (usd)', 'amount spent')) * 1e6),
+      spendMicros: Math.round(n(col(r, 'spend', 'amount spent (usd)', 'amount spent', 'cost', 'total cost')) * 1e6),
       impressions: n(col(r, 'impressions')),
       reach: null,
       frequency: null,
-      clicks: n(col(r, 'clicks', 'link clicks')),
+      clicks: n(col(r, 'clicks', 'link clicks', 'clicks (destination)')),
       outboundClicks: null,
-      videoStarts: n(col(r, 'video plays', '3-second video plays')) || null,
+      videoStarts: n(col(r, 'video plays', '3-second video plays', 'video views')) || null,
       video25: null,
       video50: null,
-      video75: n(col(r, 'video plays at 75%')) || null,
+      video75: n(col(r, 'video plays at 75%', 'video views at 75%')) || null,
       video100: null,
       avgWatchMs: null,
       addToCart: null,
       checkout: null,
-      purchases: n(col(r, 'purchases', 'results')),
+      purchases: n(col(r, 'purchases', 'results', 'complete payment', 'conversions')),
       purchaseValueMicros: Math.round(n(col(r, 'purchase value', 'purchases conversion value')) * 1e6),
       attributionModel: 'merchant_import',
       attributionWindow: 'merchant_import',
       optimizationEvent: null,
       campaignType: null,
-      measurementContext: 'MERCHANT_IMPORTED' as const,
+      measurementContext: csvContext(platform),
     };
   });
 }

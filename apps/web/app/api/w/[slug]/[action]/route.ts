@@ -39,7 +39,7 @@ import {
 } from '@arkiv/core';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { DomainError, env, PLANS, type PlanCode } from '@arkiv/shared';
+import { CSV_PLATFORMS, DomainError, env, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, json, route } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
@@ -66,7 +66,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         assertCan(ctx, 'integration.manage');
         if (!(file instanceof File)) throw new DomainError('INVALID', 'Choose a CSV file');
         if (file.size > 10 * 1024 * 1024) throw new DomainError('INVALID', 'CSV must be under 10 MB');
-        const rows = parsePerformanceCsv(await file.text());
+        // Which Ads Manager the export is from: each platform's rows are measured (and learned from) separately.
+        const platform = z.enum(CSV_PLATFORMS, { error: 'Choose whether this export is from Meta or TikTok.' }).parse(form.get('platform'));
+        const rows = parsePerformanceCsv(await file.text(), platform);
         if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
         const r = await t((tx) => ingestObservations(tx, ctx, null, rows));
         return json({ ok: true, ...r });

@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
+import { DomainError, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
@@ -207,10 +207,15 @@ export function withConfounders(state: ExperimentState, confounders: number): Ex
   return confounders > 0 && (state === 'ACTIONABLE' || state === 'DIRECTIONAL') ? 'OPERATIONALLY_CONFOUNDED' : state;
 }
 
+/** A platform-scoped learning never carries to the other platform (§21); a blended one only to other SKUs. */
+export const doNotGeneralizeTo = (platform: 'meta' | 'tiktok' | 'blended'): string[] =>
+  platform === 'meta' ? ['tiktok', 'other_skus'] : platform === 'tiktok' ? ['meta', 'other_skus'] : ['other_skus'];
+
 /** Stands for the merchant's existing ad in a learning; it is never matched across experiments. */
 export const CONTROL_VALUE = 'current control';
 
-const platformOf = (context: string) => (context.startsWith('META') ? 'meta' : context.startsWith('TIKTOK') ? 'tiktok' : 'blended');
+/** From the context the observations were measured in — a CSV import is scoped to the platform it came from. */
+const platformOf = measurementContextPlatform;
 const platformLabel = (p: string) => (p === 'meta' ? 'Meta' : p === 'tiktok' ? 'TikTok' : 'blended data');
 const metricLabel = (m: string) => m.replace('_', ' ');
 const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -463,7 +468,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
             winner_genes, loser_genes, effect, supporting_experiments, confidence, state, do_not_generalize_to, leader_variant_id, history)
           values (${ctx.workspaceId}, ${e.sku_id}, ${d.statement}, ${platform}, ${s.context}, ${s.window}, ${tx.json(d.relevantGenes as never)}, ${d.variable},
             ${tx.json(d.winnerGenes)}, ${tx.json(d.loserGenes)}, ${effect}, ${[experimentId]},
-            ${supports}, ${s.state}, ${platform === 'meta' ? ['tiktok', 'other_skus'] : ['meta', 'other_skus']}, ${s.leader},
+            ${supports}, ${s.state}, ${doNotGeneralizeTo(platform)}, ${s.leader},
             ${tx.json([{ at: now, to: s.state, experimentId, supports, actionable: s.state === 'ACTIONABLE', reason: 'created' }] as never)})
           returning id`;
         revised.add(l!.id as string);

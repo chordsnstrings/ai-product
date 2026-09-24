@@ -72,3 +72,15 @@ begin
 end $$;
 revoke all on function arkiv_anonymize_user_events(uuid, text) from public;
 grant execute on function arkiv_anonymize_user_events(uuid, text) to app_rw, system_rw;
+
+-- ───────────── Merchant CSV imports are per platform (standard §48 data contamination, §30) ─────────────
+-- A Meta export and a TikTok export for the same variant were pooled into one MERCHANT_IMPORTED result and learned
+-- from as "blended". Each platform's rows now have their own context; imported rows are re-labelled from the
+-- platform they were stored under, and derived results in the old context are dropped (recomputed on the next run).
+alter table performance_observations drop constraint performance_observations_measurement_context_check;
+update performance_observations set measurement_context = case platform when 'tiktok' then 'MERCHANT_IMPORTED_TIKTOK' else 'MERCHANT_IMPORTED_META' end
+  where measurement_context = 'MERCHANT_IMPORTED';
+alter table performance_observations add constraint performance_observations_measurement_context_check
+  check (measurement_context in ('META_PAID_ATTRIBUTED', 'TIKTOK_PAID_ATTRIBUTED', 'TIKTOK_GMV_MAX_TOTAL', 'SHOPIFY_BLENDED_ORDER',
+                                 'MERCHANT_IMPORTED_META', 'MERCHANT_IMPORTED_TIKTOK'));
+delete from experiment_results where measurement_context = 'MERCHANT_IMPORTED';
