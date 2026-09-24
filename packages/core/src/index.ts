@@ -61,3 +61,4 @@ export * from './sku-transfer';
 export * from './evals';
 export * from './metrics';
 export * from './reviews';
+export * from './waitlist';

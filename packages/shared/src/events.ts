@@ -91,6 +91,8 @@ export const EventType = [
   // An upload attempt refused before a preview started (plan 05 §4 drop-off drilldown: file too big, unsupported page…).
   'UPLOAD_FAILED',
   'URL_PARSE_FAILED',
+  // Plan 03 P2: an out-of-scope product (not skincare, or SPF/drug) — the visitor left an email for when we support it.
+  'WAITLIST_JOINED',
   'SKU_VALIDATED',
   'SKU_REJECTED',
   'PRODUCT_ANALYZED',
@@ -309,6 +311,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   UPLOAD_COMPLETED: 'sku',
   UPLOAD_FAILED: null,
   URL_PARSE_FAILED: null,
+  WAITLIST_JOINED: null,
   SKU_VALIDATED: 'sku',
   SKU_REJECTED: 'sku',
   PRODUCT_ANALYZED: 'sku',

@@ -174,6 +174,42 @@ function VariantPicker({ projectId, v, onSaved }: { projectId: string; v: View; 
   );
 }
 
+/** Plan 03 P2: an out-of-scope product gets a waitlist email instead (no generation spend). */
+function WaitlistForm({ projectId }: { projectId: string }) {
+  const [email, setEmail] = useState('');
+  const [consent, setConsent] = useState(false);
+  const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
+  const [err, setErr] = useState<string | null>(null);
+  if (state === 'done') return <p role="status" className="ak-body">Thanks — we’ll email {email} if we start supporting products like this. Nothing else.</p>;
+  return (
+    <form
+      className="ak-panel ak-stack"
+      style={{ maxWidth: 480 }}
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setState('busy');
+        setErr(null);
+        try {
+          await api('/api/waitlist', { projectId, email, consent });
+          setState('done');
+        } catch (x) {
+          setErr((x as Error).message);
+          setState('idle');
+        }
+      }}
+    >
+      <label className="ak-label" htmlFor="waitlist-email">Tell me when you support this</label>
+      <input id="waitlist-email" className="ak-input" type="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+      <label className="ak-small" style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} required />
+        <span>Email me once if Arkiv starts making ads for products like this. You can unsubscribe anytime.</span>
+      </label>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      <div><Button size="sm" type="submit" disabled={state === 'busy' || !email || !consent}>{state === 'busy' ? 'Saving…' : 'Join the waitlist'}</Button></div>
+    </form>
+  );
+}
+
 export function AnalysisFlow({ projectId }: { projectId: string }) {
   const active = useCallback((v: View | null) => !v || v.sku.status === 'analyzing' || (v.sku.status === 'active' && v.concepts.length === 0 && v.project.state !== 'NEEDS_USER_ACTION'), []);
   const { data: v, error, refresh, resume } = useProject(projectId, active);
@@ -186,6 +222,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
     return (
       <Shell step={1} title="We can’t make an ad for this product" sub={v.sku.rejectReason ?? 'This product is outside what Arkiv supports.'}>
         <p className="ak-muted">Arkiv is built for cosmetic skincare only — cleansers, serums, moisturisers and similar, not sunscreen/SPF or acne and other OTC treatments. You haven’t been charged anything.</p>
+        <WaitlistForm projectId={projectId} />
         <LinkButton href="/#upload" variant="secondary">Try a different product</LinkButton>
       </Shell>
     );

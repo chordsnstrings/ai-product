@@ -84,3 +84,38 @@ alter table performance_observations add constraint performance_observations_mea
   check (measurement_context in ('META_PAID_ATTRIBUTED', 'TIKTOK_PAID_ATTRIBUTED', 'TIKTOK_GMV_MAX_TOTAL', 'SHOPIFY_BLENDED_ORDER',
                                  'MERCHANT_IMPORTED_META', 'MERCHANT_IMPORTED_TIKTOK'));
 delete from experiment_results where measurement_context = 'MERCHANT_IMPORTED';
+
+-- ───────────── Waitlist for out-of-scope products (plan 03 P2 edge cases) ─────────────
+-- "We're built for skincare…" / "outside V1 scope" → a waitlist email, no generation spend. Global (pre-account
+-- visitors); the app role can only add a row, staff read it.
+create table waitlist (
+  id uuid primary key default gen_random_uuid(),
+  email citext not null,
+  category text not null check (category in ('non_skincare', 'excluded_category')),
+  reason text,
+  product_name text,
+  visitor_id text,
+  consent_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  unique (email, category)
+);
+alter table waitlist enable row level security;
+alter table waitlist force row level security;
+create policy staff_read on waitlist for select to admin_rw using (true);
+create policy system_access on waitlist to system_rw using (true) with check (true);
+do $$ begin execute format('create policy owner_access on waitlist to %I using (true) with check (true)', current_user); end $$;
+-- The app joins through waitlist_join() (dedupe without being able to read who else is on the list).
+create or replace function waitlist_join(p_email citext, p_category text, p_reason text, p_product text, p_visitor text) returns boolean
+language plpgsql volatile security definer set search_path = public as $$
+declare v uuid;
+begin
+  insert into waitlist (email, category, reason, product_name, visitor_id, consent_at)
+  values (p_email, p_category, p_reason, p_product, p_visitor, now())
+  on conflict (email, category) do nothing returning id into v;
+  return v is not null;
+end $$;
+revoke all on function waitlist_join(citext, text, text, text, text) from public;
+grant execute on function waitlist_join(citext, text, text, text, text) to app_rw, system_rw;
+grant select on waitlist to admin_rw;
+grant select, insert, delete on waitlist to system_rw;
+insert into table_registry values ('waitlist', 'global');
