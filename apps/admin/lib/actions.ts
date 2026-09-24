@@ -28,7 +28,15 @@ import {
   evalDatasetFor,
   GOLDEN,
   importAdSpend,
+  importProviderInvoice,
   parseAdSpendCsv,
+  parseProviderInvoiceCsv,
+  publishLanding,
+  resolveAlert,
+  rollbackLanding,
+  saveLandingDraft,
+  setLandingStatus,
+  setOfferExperiment,
   normalizeAllowKey,
   QA_VERDICT_KEY,
   Queues,
@@ -36,7 +44,6 @@ import {
   requestOpsCommand,
   requestOrExecute,
   retryProjectProduction,
-  scanCreativeText,
   scheduleTenantPurge,
   SETTING_DEFAULTS,
   setTenantFlags,
@@ -53,9 +60,9 @@ import {
   type Permission,
   type SettingKey,
 } from '@arkiv/core';
-import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan } from '@arkiv/billing';
+import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
 import { canResendTemplate, sendEmail, type TemplateName } from '@arkiv/email';
-import { DataRequestKind, DomainError, env, newId, RefundReason, StaffRole } from '@arkiv/shared';
+import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
 
@@ -103,22 +110,6 @@ registerExecutor('stripe.assign', async (p, { approver }) => {
   });
   return { outcome: await processStripeEvent(e.id as string) };
 });
-
-// ── Compliance lint for marketing content (plan 05 §5): no unsubstantiated outcome claims, no fake proof ──
-const MARKETING_BANNED = [
-  { re: /\b\d+(\.\d+)?\s*[x×]\s*(roas|return|revenue|sales|conversions?)\b/i, why: 'Customer-result multiples need substantiation.' },
-  { re: /\bguarantee(d|s)?\b/i, why: 'Guarantees are only allowed if they are real, written policies.' },
-  { re: /\b(only|just)\s+\d+\s+(spots?|left|remaining)\b/i, why: 'Scarcity must be real; the system has no such limit.' },
-  { re: /\b(thousands|millions|\d{2,}[,\d]*)\s+(of\s+)?(brands|customers|users)\b/i, why: 'Usage numbers must come from live data, not copy.' },
-  { re: /\b(rated|voted)\s+#?1\b/i, why: 'Rankings need a verifiable source.' },
-];
-function lintMarketing(content: unknown): string[] {
-  const text = JSON.stringify(content);
-  const out = MARKETING_BANNED.filter((b) => b.re.test(text)).map((b) => b.why);
-  const scan = scanCreativeText(text.split(/(?<=[.!?"])\s+/).slice(0, 200), []);
-  if (!scan.ok) out.push(...scan.violations.map((v) => `“${v.text.slice(0, 60)}”: ${v.reason}`));
-  return out;
-}
 
 /** "support, ops" → ['SUPPORT','OPS']; unknown names are rejected rather than silently dropped. */
 function parseRoles(raw: string): StaffRole[] {
@@ -403,6 +394,30 @@ export const ACTIONS = {
   }),
   'billing.stripe_assign': a({ perm: 'billing.unmatched', reauth: true, schema: z.object({ eventId: z.string(), workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'stripe.assign', { eventId: i.eventId, workspaceId: i.workspaceId }, i.reason) }),
   'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched' returning id`; if (!b) throw new DomainError('CONFLICT', 'Event is not unmatched'); await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason, before: { status: 'unmatched' }, after: { status: 'ignored' } }); }) }),
+  /* §7 Disputes: the auto-assembled evidence pack (delivery, exports, consent + IP, receipts) is submitted via Stripe. */
+  'billing.dispute_submit': a({
+    perm: 'billing.manage',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, disputeId: z.string().regex(/^(dp|du)_[A-Za-z0-9_]+$/, 'Dispute ids start with dp_'), note: z.string().max(2000).optional(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const r = await submitDisputeEvidence(tx, i.workspaceId, i.disputeId, s.staffId, i.note ?? null);
+        await audit(tx, s, 'billing.dispute_submit', { type: 'stripe_dispute', id: i.disputeId }, { workspaceId: i.workspaceId, reason: i.reason, after: { fields: Object.keys(r.evidence), exports: r.pack.exports.length, deliveries: r.pack.deliveries.length } });
+        return { message: 'Evidence submitted to Stripe; the dispute is under review.' };
+      }),
+  }),
+  /* §7 Nightly Stripe reconciliation: run it now, or resolve an exception with a reason. */
+  'billing.recon_run': a({ perm: 'billing.unmatched', schema: z.object({ reason: z.string().default('manual reconciliation run') }), run: (s, i) => requestOpsCommand(s, 'stripe.reconcile', {}, i.reason).then(() => ({ message: 'Reconciliation queued; results appear here in a minute.' })) }),
+  'billing.recon_resolve': a({
+    perm: 'billing.unmatched',
+    schema: z.object({ id: uuid, reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`update stripe_recon_exceptions set resolved_at = now(), resolved_by = ${s.staffId}, resolution = ${i.reason} where id = ${i.id} and resolved_at is null returning kind, stripe_id, workspace_id`;
+        if (!b) throw new DomainError('CONFLICT', 'Already resolved.');
+        await audit(tx, s, 'billing.recon_resolve', { type: 'stripe_recon_exception', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, reason: i.reason, before: { kind: b.kind, stripeId: b.stripe_id, open: true }, after: { open: false } });
+      }),
+  }),
   'billing.portal': a({ perm: 'billing.read', schema: z.object({ workspaceId: uuid }), run: async (s, i) => { const [c] = await withAdmin((tx) => tx`select customer_id from stripe_customers where workspace_id = ${i.workspaceId}`); if (!c) throw new DomainError('NOT_FOUND', 'No Stripe customer'); await withAdmin((tx) => audit(tx, s, 'billing.open_stripe', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId })); return { url: billingGateway().live ? `https://dashboard.stripe.com/customers/${c.customer_id}` : `${env().ADMIN_URL}/billing?customer=${c.customer_id}` }; } }),
 
   /* ── Rates ── */
@@ -432,6 +447,33 @@ export const ACTIONS = {
 
   /* ── Providers & routes ── */
   'route.circuit': a({ perm: 'providers.circuit', schema: z.object({ task: z.string(), open: z.boolean(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select circuit_open from model_routes where task = ${i.task}`; await tx`update model_routes set circuit_open = ${i.open}, updated_at = now() where task = ${i.task}`; await audit(tx, s, i.open ? 'route.circuit_open' : 'route.circuit_close', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: { circuit_open: i.open } }); }) }),
+  /* §10 Provider registry: status, region, concurrency limit, per-request timeout and retry policy (the Model
+     Gateway reads them on every call). Secret values are never shown or set here. */
+  'provider.update': a({
+    perm: 'providers.manage',
+    reauth: true,
+    schema: z.object({
+      name: z.string().min(2).max(40),
+      status: z.enum(['active', 'degraded', 'disabled']),
+      region: z.string().trim().max(40).optional(),
+      concurrencyLimit: z.number().int().min(1).max(500),
+      timeoutMs: z.number().int().min(1000).max(3_600_000),
+      retryAttempts: z.number().int().min(1).max(10),
+      retryBackoffMs: z.number().int().min(0).max(60_000),
+      notes: z.string().max(500).optional(),
+      reason,
+    }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select status, region, concurrency_limit, timeout_ms, retry_attempts, retry_backoff_ms, notes from providers where name = ${i.name} for update`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Unknown provider');
+        await tx`update providers set status = ${i.status}, region = ${i.region || null}, concurrency_limit = ${i.concurrencyLimit}, timeout_ms = ${i.timeoutMs},
+                   retry_attempts = ${i.retryAttempts}, retry_backoff_ms = ${i.retryBackoffMs}, notes = coalesce(${i.notes ?? null}, notes), updated_by = ${s.staffId}, updated_at = now()
+                 where name = ${i.name}`;
+        await audit(tx, s, 'provider.update', { type: 'provider', id: i.name }, { reason: i.reason, before: b, after: { status: i.status, region: i.region ?? null, concurrency_limit: i.concurrencyLimit, timeout_ms: i.timeoutMs, retry_attempts: i.retryAttempts, retry_backoff_ms: i.retryBackoffMs } });
+        return { message: i.status === 'disabled' ? `${i.name} disabled: calls are refused (approved fallbacks take over).` : `${i.name} updated; new calls use these settings.` };
+      }),
+  }),
   'route.update': a({
     perm: 'routes.manage',
     reauth: true,
@@ -586,28 +628,59 @@ export const ACTIONS = {
   }),
 
   /* ── Growth: landing pages, offers, testimonials ── */
+  /* §5 Landing pages: structured blocks only. Save writes the versioned draft (lint runs); publish re-checks lint,
+     example assets and testimonial consent before the draft becomes the live copy; rollback does the same. */
   'lp.save': a({
     perm: 'growth.manage',
-    schema: z.object({ slug: z.string().regex(/^[a-z0-9-]{2,40}$/), archetype: z.string().min(2), content: z.record(z.string(), z.unknown()), variants: z.array(z.object({ key: z.string().min(1), weight: z.number().finite().positive('Variant weights must be greater than 0'), content: z.record(z.string(), z.unknown()) })).default([]), utmMatch: z.string().default('') }),
+    schema: z.object({
+      slug: z.string().regex(/^[a-z0-9-]{2,40}$/, 'Slugs are 2–40 lowercase letters, digits and -'),
+      archetype: z.string().min(2).max(40),
+      content: z.record(z.string(), z.unknown()),
+      variants: z.array(z.unknown()).max(5).default([]),
+      utmMatch: z.string().max(400).default(''),
+      primaryMetric: z.enum(LandingPrimaryMetric).optional(),
+      minSample: z.number().int().min(100).max(100_000).optional(),
+    }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        const lint = lintMarketing([i.content, i.variants]);
-        if (lint.length) throw new DomainError('GATE_BLOCKED', `Compliance lint: ${lint.join(' ')}`);
-        const [before] = await tx`select * from landing_pages where slug = ${i.slug} for update`;
-        const utm = i.utmMatch.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
-        if (before) {
-          await tx`update landing_pages set archetype = ${i.archetype}, content = ${tx.json(i.content as never)}, variants = ${tx.json(i.variants as never)}, utm_match = ${utm},
-                     version = version + 1, history = history || ${tx.json([{ version: before.version, content: before.content, variants: before.variants, at: new Date().toISOString(), by: s.email }] as never)},
-                     published_at = case when status = 'live' then now() else published_at end, updated_at = now() where slug = ${i.slug}`;
-        } else {
-          await tx`insert into landing_pages (slug, archetype, status, content, variants, utm_match) values (${i.slug}, ${i.archetype}, 'draft', ${tx.json(i.content as never)}, ${tx.json(i.variants as never)}, ${utm})`;
-        }
-        await audit(tx, s, 'lp.save', { type: 'landing_page', id: i.slug }, { before: before?.content ?? null, after: i.content });
-        return { message: before ? `Saved v${Number(before.version) + 1}` : 'Draft created' };
+        const utm = [...new Set(i.utmMatch.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean))];
+        const [cur] = await tx`select experiment from landing_pages where slug = ${i.slug}`;
+        const base = { primaryMetric: 'upload_start', minSample: 400, ...((cur?.experiment as object) ?? {}) } as { primaryMetric: 'upload_start' | 'taste_cvr'; minSample: number };
+        const experiment = i.primaryMetric || i.minSample ? { primaryMetric: i.primaryMetric ?? base.primaryMetric, minSample: i.minSample ?? base.minSample } : undefined;
+        const r = await saveLandingDraft(tx, s, { slug: i.slug, archetype: i.archetype, content: i.content, variants: i.variants, utmMatch: utm, experiment });
+        return { message: r.created ? 'Draft created. Preview it, then publish.' : `Draft v${r.version} saved. Review the changes and publish when ready.` };
       }),
   }),
-  'lp.status': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), status: z.enum(['draft', 'live', 'paused']) }), run: (s, i) => withAdmin(async (tx) => { if (i.slug === 'default' && i.status !== 'live') throw new DomainError('CONFLICT', 'The default page must stay live (paused pages redirect to it).'); const [b] = await tx`select status from landing_pages where slug = ${i.slug} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Page not found'); await tx`update landing_pages set status = ${i.status}, published_at = case when ${i.status} = 'live' then now() else published_at end where slug = ${i.slug}`; await audit(tx, s, 'lp.status', { type: 'landing_page', id: i.slug }, { before: { status: b.status }, after: { status: i.status } }); }) }),
-  'lp.rollback': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), version: z.number().int() }), run: (s, i) => withAdmin(async (tx) => { const [p] = await tx`select history, content, version from landing_pages where slug = ${i.slug} for update`; const h = (p?.history as { version: number; content: unknown; variants: unknown }[]) ?? []; const v = h.find((x) => x.version === i.version); if (!v) throw new DomainError('NOT_FOUND', 'Version not found'); await tx`update landing_pages set content = ${tx.json(v.content as never)}, variants = ${tx.json(v.variants as never)}, version = version + 1, history = history || ${tx.json([{ version: p!.version, content: p!.content, at: new Date().toISOString(), by: s.email }] as never)} where slug = ${i.slug}`; await audit(tx, s, 'lp.rollback', { type: 'landing_page', id: i.slug }, { after: { toVersion: i.version } }); }) }),
+  'lp.publish': a({ perm: 'growth.manage', schema: z.object({ slug: z.string() }), run: (s, i) => withAdmin(async (tx) => ({ message: `v${(await publishLanding(tx, s, i.slug)).version} is live.` })) }),
+  'lp.status': a({
+    perm: 'growth.manage',
+    schema: z.object({ slug: z.string(), status: z.enum(['draft', 'live', 'paused']) }),
+    // "live" is a publish: it runs the same checks (never a bypass of the lint).
+    run: (s, i) => withAdmin(async (tx) => (i.status === 'live' ? { message: `v${(await publishLanding(tx, s, i.slug)).version} is live.` } : (await setLandingStatus(tx, s, i.slug, i.status), { message: i.status === 'paused' ? 'Paused: visitors are redirected to the default page with their UTMs.' : 'Moved back to draft.' }))),
+  }),
+  'lp.rollback': a({
+    perm: 'growth.manage',
+    schema: z.object({ slug: z.string(), version: z.number().int() }),
+    run: (s, i) => withAdmin(async (tx) => { const r = await rollbackLanding(tx, s, i.slug, i.version); return { message: r.published ? `Rolled back: v${i.version} is live again as v${r.version}.` : `v${i.version} restored as draft v${r.version}.` }; }),
+  }),
+  /* §8 Provider invoice reconciliation: the monthly invoice CSV, matched to recorded provider cost. */
+  'provider_invoice.import': a({
+    perm: 'cogs.reconcile',
+    schema: z.object({ provider: z.enum(['anthropic', 'byteplus', 'minimax']), csv: z.string().min(10).max(2_000_000), reason: z.string().max(200).optional() }),
+    run: async (s, i) => {
+      const lines = parseProviderInvoiceCsv(i.csv);
+      const batchId = newId();
+      return withAdmin(async (tx) => {
+        const n = await importProviderInvoice(tx, i.provider, lines, { staffId: s.staffId, batchId });
+        const total = lines.reduce((t, l) => t + l.amountMicros, 0);
+        const months = [...new Set(lines.map((l) => l.period.slice(0, 7)))].sort();
+        await audit(tx, s, 'provider_invoice.import', { type: 'provider_invoice', id: batchId }, { reason: i.reason ?? null, after: { provider: i.provider, lines: lines.length, stored: n, totalMicros: total, months } });
+        return { message: `Imported ${n} ${i.provider} line${n === 1 ? '' : 's'} (${months.join(', ')}), $${(total / 1e6).toLocaleString('en-US', { maximumFractionDigits: 2 })} in total.` };
+      });
+    },
+  }),
+  /* §1 Pulse: platform alerts raised by sweeps and webhooks are acknowledged with what was done. */
+  'alert.resolve': a({ perm: 'alerts.manage', schema: z.object({ id: uuid, reason }), run: (s, i) => withAdmin((tx) => resolveAlert(tx, s, i.id, i.reason)) }),
   /* §4 CAC: ad spend imported as CSV in V1 (date, source, campaign, ad id, spend in USD). */
   'adspend.import': a({
     perm: 'adspend.manage',
@@ -666,7 +739,33 @@ export const ACTIONS = {
         return { message: `Created ${i.code} as ${i.type.toLowerCase()} v${v!.v}. New customers get it once it’s the latest active eligible version.` };
       }),
   }),
-  'offer.active': a({ perm: 'offers.manage', schema: z.object({ code: z.string(), active: z.boolean() }), run: (s, i) => withAdmin(async (tx) => { if (!i.active) { const refs = await tx`select code from offer_definitions where reference_code = ${i.code} and active`; if (refs.length) throw new DomainError('CONFLICT', `Active offers anchor to this price: ${refs.map((r) => r.code).join(', ')}. Pause them first.`); } const [b] = await tx`select active from offer_definitions where code = ${i.code} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Offer not found'); await tx`update offer_definitions set active = ${i.active}, updated_at = now() where code = ${i.code}`; await audit(tx, s, 'offer.active', { type: 'offer', id: i.code }, { before: { active: b.active }, after: { active: i.active } }); }) }),
+  'offer.active': a({
+    perm: 'offers.manage',
+    schema: z.object({ code: z.string(), active: z.boolean() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        if (!i.active) {
+          const refs = await tx`select code from offer_definitions where reference_code = ${i.code} and active`;
+          if (refs.length) throw new DomainError('CONFLICT', `Active offers anchor to this price: ${refs.map((r) => r.code).join(', ')}. Pause them first.`);
+        }
+        const [b] = await tx`select active, paused_reason, stripe_price_id, stripe_price_archived_at from offer_definitions where code = ${i.code} for update`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Offer not found');
+        // §6: an offer whose Stripe Price was archived can't be charged; a new version with a live Price replaces it.
+        if (i.active && b.stripe_price_archived_at) throw new DomainError('CONFLICT', `Its Stripe Price ${b.stripe_price_id as string} is archived. Restore it in Stripe or create a new version with a live Price.`);
+        await tx`update offer_definitions set active = ${i.active}, paused_reason = case when ${i.active} then null else paused_reason end, updated_at = now() where code = ${i.code}`;
+        await audit(tx, s, 'offer.active', { type: 'offer', id: i.code }, { before: { active: b.active, pausedReason: b.paused_reason }, after: { active: i.active } });
+      }),
+  }),
+  /* §6 Experiments: variants (price, timer), allocation and guardrails; the guardrail sweep stops a degrading one. */
+  'offer.experiment': a({
+    perm: 'offers.manage',
+    schema: z.object({ code: z.string(), experiment: z.record(z.string(), z.unknown()).nullable(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const exp = await setOfferExperiment(tx, s, i.code, i.experiment as never, i.reason);
+        return { message: exp ? `Experiment ${exp.key} running on ${i.code} (${exp.variants.map((v) => `${v.key} ${v.weight}`).join(' / ')}).` : 'Experiment stopped; new offers use the base price and window.' };
+      }),
+  }),
   'testimonial.create': a({ perm: 'growth.manage', schema: z.object({ quote: z.string().min(10).max(400), personName: z.string().min(2), brandName: z.string().optional(), consentDocument: z.string().min(5), consentGivenAt: z.string() }), run: (s, i) => withAdmin(async (tx) => { const [t] = await tx`insert into testimonials (quote, person_name, brand_name, consent_document, consent_given_at) values (${i.quote}, ${i.personName}, ${i.brandName ?? null}, ${i.consentDocument}, ${i.consentGivenAt}) returning id`; await audit(tx, s, 'testimonial.create', { type: 'testimonial', id: t!.id as string }, { after: i }); }) }),
   'testimonial.revoke': a({ perm: 'growth.manage', schema: z.object({ id: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select revoked_at from testimonials where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Testimonial not found'); await tx`update testimonials set revoked_at = now() where id = ${i.id}`; await audit(tx, s, 'testimonial.revoke', { type: 'testimonial', id: i.id }, { before: b, after: { revoked_at: 'now' } }); }) }),
 

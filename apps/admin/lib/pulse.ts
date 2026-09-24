@@ -8,6 +8,9 @@ export const SLA_HOURS: Record<string, number> = {
   'Data requests': 30 * 24, // statutory 45 days (CCPA); we answer within 30
   'Abuse signals (24h)': 24,
   Approvals: 24,
+  // Raised by sweeps and webhooks that changed something on their own (offer auto-paused, experiment stopped…).
+  'Platform alerts': 24,
+  'Stripe reconciliation': 48,
 };
 
 export function slaBreach(queue: string, open: number, oldest: Date | string | null, now = Date.now()): boolean {

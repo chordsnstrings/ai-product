@@ -420,3 +420,86 @@ describe('ad spend import (plan 05 §4 CAC)', () => {
     await expect(act(g, 'adspend.import', { csv: 'date,campaign,spend\nnot-a-date,x,1', source: 'meta' })).rejects.toThrow(/Line 2/);
   });
 });
+
+describe('growth and finance consoles (plan 05 §5–§10)', () => {
+  it('landing pages: status → live is a publish (checked), rollback keeps variants, and only GROWTH edits', async () => {
+    const g = await staff(['GROWTH']);
+    const slug = `act-${newId().slice(-8)}`;
+    try {
+      expect(() => assertStaff({ roles: ['FINANCE'] }, ACTIONS['lp.publish'].perm)).toThrow(/role/);
+      const base = { label: 'Skincare · Ad testing', headline: 'Texture ads for your serum', sub: 'Three ideas in a minute.', visualAssetId: null, visualCaption: '' };
+      const content = { hero: base, proof: { text: 'Built only for skincare brands', liveCounter: true, testimonialIds: [] }, howItWorks: [{ title: 'One', body: 'a' }, { title: 'Two', body: 'b' }, { title: 'Three', body: 'c' }], gallery: { items: [] }, faq: [{ q: 'What does it cost?', a: 'Free to start.' }], cta: { label: 'Start free', assurance: 'No card' } };
+      await expect(act(g, 'lp.save', { slug, archetype: 'general', content: { ...content, hero: { ...base, headline: 'Brands see 3x ROAS' } }, variants: [], utmMatch: '' })).rejects.toThrow(/Compliance lint/);
+      await act(g, 'lp.save', { slug, archetype: 'general', content, variants: [{ key: 'b', weight: 1, content: { hero: { headline: 'Launch your serum with a tested ad' } } }], utmMatch: 'serum', primaryMetric: 'taste_cvr', minSample: 300 });
+      expect(String((await act(g, 'lp.status', { slug, status: 'live' })).message)).toMatch(/v1 is live/);
+      await act(g, 'lp.save', { slug, archetype: 'general', content, variants: [], utmMatch: 'serum' });
+      await act(g, 'lp.publish', { slug });
+      expect(String((await act(g, 'lp.rollback', { slug, version: 1 })).message)).toMatch(/v1 is live again as v3/);
+      const [p] = await ownerPool()`select status, live_version, live_variants, experiment, utm_match from landing_pages where slug = ${slug}`;
+      expect(p).toMatchObject({ status: 'live', live_version: 3, experiment: { primaryMetric: 'taste_cvr', minSample: 300 }, utm_match: ['serum'] });
+      expect((p!.live_variants as { key: string }[]).map((v) => v.key)).toEqual(['b']);
+      expect(String((await act(g, 'lp.status', { slug, status: 'paused' })).message)).toMatch(/redirected/);
+    } finally {
+      await ownerPool()`delete from landing_pages where slug = ${slug}`;
+    }
+  });
+
+  it('offers: experiments are started and stopped by GROWTH/FINANCE; an archived Stripe Price blocks reactivation', async () => {
+    const g = await staff(['GROWTH']);
+    try {
+      expect(() => assertStaff({ roles: ['SUPPORT'] }, ACTIONS['offer.experiment'].perm)).toThrow(/role/);
+      const r = await act(g, 'offer.experiment', { code: 'TASTE_19', experiment: { key: 'timer-test-1', variants: [{ key: 't30', weight: 1, windowMinutes: 30 }, { key: 't60', weight: 1, windowMinutes: 60 }], guardrails: { maxRefundRate: 0.1 } }, reason: 'does a shorter timer convert better?' });
+      expect(String(r.message)).toMatch(/timer-test-1 running/);
+      expect(String((await act(g, 'offer.experiment', { code: 'TASTE_19', experiment: null, reason: 'enough data' })).message)).toMatch(/stopped/);
+      await ownerPool()`update offer_definitions set active = false, stripe_price_id = 'price_gone', stripe_price_archived_at = now(), paused_reason = 'Stripe Price price_gone archived' where code = 'TASTE_19'`;
+      await expect(act(g, 'offer.active', { code: 'TASTE_19', active: true })).rejects.toThrow(/archived/);
+      await ownerPool()`update offer_definitions set stripe_price_archived_at = null where code = 'TASTE_19'`;
+      await act(g, 'offer.active', { code: 'TASTE_19', active: true });
+      const [o] = await ownerPool()`select active, paused_reason from offer_definitions where code = 'TASTE_19'`;
+      expect(o).toEqual({ active: true, paused_reason: null });
+    } finally {
+      await ownerPool()`update offer_definitions set active = true, stripe_price_id = null, stripe_price_archived_at = null, paused_reason = null, experiment = null, experiment_history = '[]' where code = 'TASTE_19'`;
+    }
+  });
+
+  it('finance: provider invoices, reconciliation runs and exceptions, dispute evidence need FINANCE (🔐 to submit)', async () => {
+    const fin = await staff(['FINANCE']);
+    for (const name of ['provider_invoice.import', 'billing.recon_run', 'billing.recon_resolve', 'billing.dispute_submit'] as const) {
+      expect(() => assertStaff({ roles: ['GROWTH'] }, ACTIONS[name].perm), name).toThrow(/role/);
+    }
+    expect(ACTIONS['billing.dispute_submit'].reauth).toBe(true);
+    const month = new Date().toISOString().slice(0, 7);
+    expect(String((await act(fin, 'provider_invoice.import', { provider: 'minimax', csv: `month,model,amount\n${month},speech-2.8-hd,12.50` })).message)).toMatch(/Imported 1 minimax line/);
+    await act(fin, 'billing.recon_run', {});
+    const [cmd] = await ownerPool()`select kind from ops_commands`;
+    expect(cmd!.kind).toBe('stripe.reconcile');
+    const [run] = await ownerPool()`insert into stripe_recon_runs (status) values ('completed') returning id`;
+    const [e] = await ownerPool()`insert into stripe_recon_exceptions (run_id, kind, stripe_id) values (${run!.id}, 'charge_unmatched', 'ch_x') returning id`;
+    await act(fin, 'billing.recon_resolve', { id: e!.id, reason: 'test charge made in the dashboard' });
+    await expect(act(fin, 'billing.recon_resolve', { id: e!.id, reason: 'again please' })).rejects.toThrow(/Already resolved/);
+    const audits = await ownerPool()`select action from admin_audit_log where staff_id = ${fin.staffId} order by id`;
+    expect(audits.map((a) => a.action)).toEqual(['provider_invoice.import', 'ops.stripe.reconcile', 'billing.recon_resolve']);
+  });
+
+  it('providers: the registry is edited with a reason (🔐, audited); Pulse alerts are resolved by operating roles', async () => {
+    const eng = await staff(['ENGINEERING']);
+    try {
+      expect(ACTIONS['provider.update'].reauth).toBe(true);
+      expect(() => assertStaff({ roles: ['GROWTH'] }, ACTIONS['provider.update'].perm)).toThrow(/role/);
+      await act(eng, 'provider.update', { name: 'minimax', status: 'degraded', region: 'global', concurrencyLimit: 4, timeoutMs: 30000, retryAttempts: 2, retryBackoffMs: 250, reason: 'provider incident #12' });
+      const [p] = await ownerPool()`select status, concurrency_limit, timeout_ms, retry_attempts, updated_by from providers where name = 'minimax'`;
+      expect(p).toEqual({ status: 'degraded', concurrency_limit: 4, timeout_ms: 30000, retry_attempts: 2, updated_by: eng.staffId });
+      const [a] = await ownerPool()`select before, after, reason from admin_audit_log where action = 'provider.update'`;
+      expect(a).toMatchObject({ reason: 'provider incident #12', before: { status: 'active' }, after: { status: 'degraded' } });
+      await expect(act(eng, 'provider.update', { name: 'nope', status: 'active', concurrencyLimit: 1, timeoutMs: 1000, retryAttempts: 1, retryBackoffMs: 0, reason: 'typo test' })).rejects.toThrow(/Unknown provider/);
+
+      expect(() => assertStaff({ roles: ['ANALYST'] }, ACTIONS['alert.resolve'].perm)).toThrow(/role/);
+      const [al] = await ownerPool()`insert into platform_alerts (kind, subject_type, subject_id, message) values ('offer.stripe_price_archived', 'offer', 'TASTE_19', 'paused') returning id`;
+      await act(eng, 'alert.resolve', { id: al!.id, reason: 'new version created' });
+      const [r] = await ownerPool()`select resolved_by, resolution from platform_alerts where id = ${al!.id}`;
+      expect(r).toEqual({ resolved_by: eng.staffId, resolution: 'new version created' });
+    } finally {
+      await ownerPool()`update providers set status = 'active', region = 'global', concurrency_limit = 8, timeout_ms = 60000, retry_attempts = 3, retry_backoff_ms = 500, updated_by = null where name = 'minimax'`;
+    }
+  });
+});
