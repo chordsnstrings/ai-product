@@ -6,6 +6,7 @@ import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { buildContext, customerPhrasesPart, gateProposal, isIngredientLed, UNVERIFIED_INGREDIENTS_REASON } from './creative-director';
 import { emit } from './events';
+import { stockState } from './stock';
 import { meaningfulCoverage } from './genome';
 import { ConceptSet, type Proposal } from './intel-schemas';
 import { mockConcepts } from './mock-intel';
@@ -305,6 +306,12 @@ export async function scoringContext(tx: Tx, skuId: string) {
   return out;
 }
 
+/** What recommendations for an out-of-stock product are for, as the merchant stated (§42). */
+const STOCK_INTENT_BRIEF = {
+  waitlist: 'The product is out of stock. The merchant is running ads for a waitlist: every experiment must drive waitlist sign-ups (never "buy now", price or delivery promises).',
+  launch: 'The product is out of stock ahead of a (re)launch. Every experiment must build launch anticipation and capture interest (never "buy now", price or delivery promises).',
+} as const;
+
 export function weekOf(d = new Date()): string {
   const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const dow = (x.getUTCDay() + 6) % 7; // Monday = 0
@@ -335,6 +342,11 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
   const ws = ctx.workspaceId;
   const existing = await withTenant(ws, (tx) => tx`select id from recommendations where sku_id = ${skuId} and week_of = ${week}`);
   if (existing.length) return 0; // idempotent per week
+  // §42: an out-of-stock product gets recommendations only once the merchant says it's for a waitlist or launch —
+  // and then they are for that.
+  const stock = await withTenant(ws, (tx) => stockState(tx, skuId));
+  if (stock.needsIntent) return 0;
+  const stockPart = stock.inStock === false && stock.intent ? { type: 'text' as const, text: STOCK_INTENT_BRIEF[stock.intent] } : null;
   const { productContext, packet, packetIds, ingredientsVerified, names, phrases, prohibited } = await withTenant(ws, (tx) => buildContext(tx, skuId));
   const sc = { ...(await withTenant(ws, (tx) => scoringContext(tx, skuId))), ingredientsVerified };
   const auth = await withTenant(ws, async (tx) =>
@@ -354,6 +366,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
         content: [
           { type: 'text', text: `Context packet:\n${JSON.stringify(packet)}` },
           ...(phrasePart ? [phrasePart] : []),
+          ...(stockPart ? [stockPart] : []),
           { type: 'text', text: `Weekly planning (${week}). Basis: ${sc.basis}. SKU maturity: ${sc.maturity}. Candidate set ${b} of 2 — make these different from set 1.` },
         ],
         schema: ConceptSet,

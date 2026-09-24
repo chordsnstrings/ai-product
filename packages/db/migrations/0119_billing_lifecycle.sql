@@ -12,3 +12,9 @@ alter table subscriptions add column status_event_at timestamptz;
 -- and ceilings keep using the list price; a provider job records its realized cost in actual_micros and the
 -- difference to the list price here, so savings are reported, never assumed.
 alter table provider_jobs add column savings_micros bigint not null default 0 check (savings_micros >= 0);
+
+-- ───────────── Out of stock (§42) ─────────────
+-- What the store says about availability (null = unknown, never assumed out), and what the merchant says an ad for
+-- an out-of-stock product is for. Production waits for that intent; a restock clears it.
+alter table skus add column in_stock boolean;
+alter table skus add column stock_intent text check (stock_intent in ('waitlist', 'launch'));

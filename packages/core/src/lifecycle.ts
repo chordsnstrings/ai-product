@@ -322,7 +322,7 @@ export async function computeRisk(tx: Tx, workspaceId: string): Promise<RiskSign
                         where workspace_id = ${ws} and provider in ('meta','tiktok') and status in ('revoked','degraded','disconnected')`;
   if (disc.length) out.push({ indicator: 'ad_account_disconnected', evidence: { accounts: disc.map((d) => `${d.provider}:${d.status}`), since: disc.map((d) => d.updated_at).sort()[0] } });
 
-  const oos = await tx`select catalogue_no, updated_at from skus where workspace_id = ${ws} and status = 'out_of_stock' order by catalogue_no`;
+  const oos = await tx`select catalogue_no, updated_at from skus where workspace_id = ${ws} and (status = 'out_of_stock' or (in_stock = false and status <> 'archived')) order by catalogue_no`;
   if (oos.length) out.push({ indicator: 'stockout', evidence: { skus: oos.map((s) => Number(s.catalogue_no)), since: oos.map((s) => s.updated_at).sort()[0] } });
 
   const periods = await tx`select period_key,

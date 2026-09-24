@@ -59,6 +59,23 @@ export default async function Product({ params, searchParams }: { params: Promis
           <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/map?sku=${skuId}`}>Map</Link>
         </div>
       </div>
+      {d.sku.in_stock === false ? (
+        <div className="ak-banner ak-banner--warn" role="status" style={{ marginTop: 16 }}>
+          <p style={{ margin: 0 }}>
+            <strong>Out of stock at your store.</strong>{' '}
+            {d.sku.stock_intent
+              ? `Ads for it are made for your ${d.sku.stock_intent === 'waitlist' ? 'waitlist' : 'launch'}: they build interest, never “buy now”.`
+              : 'An ad can’t sell it right now, so production and recommendations wait. If the ad is for a waitlist or a relaunch, say so.'}
+          </p>
+          {canEdit ? (
+            <div className="ak-row" style={{ marginTop: 8 }}>
+              {d.sku.stock_intent !== 'waitlist' ? <ActionButton slug={slug} action="stock-intent" body={{ skuId, intent: 'waitlist' }} size="sm">It’s for a waitlist</ActionButton> : null}
+              {d.sku.stock_intent !== 'launch' ? <ActionButton slug={slug} action="stock-intent" body={{ skuId, intent: 'launch' }} size="sm">It’s for a launch</ActionButton> : null}
+              {d.sku.stock_intent ? <ActionButton slug={slug} action="stock-intent" body={{ skuId, intent: null }} size="sm">Hold ads until restocked</ActionButton> : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       <nav className="ak-row" style={{ margin: '24px 0', borderBottom: '1px solid var(--rule)' }} aria-label="Product sections">
         {TABS.map((t) => (
           <Link key={t} href={`?tab=${t}`} aria-current={t === tab ? 'page' : undefined} className="ak-textbtn" style={{ paddingBottom: 8, borderBottom: t === tab ? '1px solid var(--ink)' : '1px solid transparent' }}>

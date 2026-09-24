@@ -42,6 +42,8 @@ import {
   saveIntegration,
   scheduleDeletion,
   setExperimentState,
+  setStockIntent,
+  STOCK_INTENTS,
   transferOwnership,
   updateBrandBrain,
   weekOf,
@@ -202,6 +204,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const n = i.key.includes('price') ? Number(i.value.replace(/[^0-9.]/g, '')) : null;
       await t((tx) => decideFact(tx, ctx, i.skuId, i.key, n != null && n > 0 ? { number: n } : { text: i.value }));
       return json({ ok: true });
+    }
+    case 'stock-intent': {
+      const i = await body(req, z.object({ skuId: uuid, intent: z.enum(STOCK_INTENTS).nullable() }));
+      return json({ ok: true, ...(await t((tx) => setStockIntent(tx, ctx, i.skuId, i.intent))) });
     }
     case 'fact-confirm': {
       const i = await body(req, z.object({ skuId: uuid, factIds: z.array(uuid).min(1).max(50) }));

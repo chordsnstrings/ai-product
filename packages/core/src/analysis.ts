@@ -17,6 +17,7 @@ import { mockExtraction } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
 import { weekOf } from './recommendations';
+import { refreshStock } from './stock';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
 import { recordVariants } from './sku-variants';
@@ -209,6 +210,8 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
                      where p.id = ${projectId} and v.sku_id = ${skuId} and v.external_id = ${extracted!.selectedVariantId} and v.workspace_id = p.workspace_id`;
           }
         }
+        // §42: availability as the page states it when it lists no variants (theirs decided above).
+        await refreshStock(tx, ctx, skuId, extracted!.inStock ?? null);
         await step(tx, ws, skuId, 'read_page', 'done', extracted!.name ? `Found “${extracted!.name}”` : 'Page read');
         // One SKU per store product (§42 "Duplicate import"): a product already in the catalogue keeps its SKU as
         // the match; this import stays unlinked rather than competing for it.

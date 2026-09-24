@@ -7,6 +7,7 @@ import { hashRequest } from './idempotency';
 import { currentPeriodKey } from './ledger';
 import { planProjectRun } from './production';
 import { estimate } from './rates';
+import { OUT_OF_STOCK_COPY, stockState } from './stock';
 
 /** How long a render quote can be approved against. */
 export const RENDER_QUOTE_MINUTES = 15;
@@ -81,7 +82,13 @@ export async function renderQuote(tx: Tx, ctx: TenantContext, experimentId: stri
   }
   const entitlementAvailable = !(blocked?.code === 'PAYMENT_REQUIRED');
   const withinCeiling = q.est.totalMicros <= ceiling;
-  const blockedReason = blocked
+  // §42: an out-of-stock product is flagged here, before production (approval refuses it until the merchant says
+  // the ad is for a waitlist or launch).
+  const [sku] = await tx`select sku_id from projects where id = ${projectId}`;
+  const outOfStock = sku ? (await stockState(tx, sku.sku_id as string)).needsIntent : false;
+  const blockedReason = outOfStock
+    ? OUT_OF_STOCK_COPY
+    : blocked
     ? blocked.code === 'PAYMENT_REQUIRED'
       ? 'No Creative Tests left this period. Upgrade or wait for your plan to renew.'
       : blocked.code === 'GATE_BLOCKED'
