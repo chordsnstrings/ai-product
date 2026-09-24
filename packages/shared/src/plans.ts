@@ -65,6 +65,11 @@ export const COST_LIMITS = {
   RETRY_RESERVE_FRACTION: 0.25,
   /** Daily anomaly guard = multiple of expected daily COGS (plan 02 §4). */
   DAILY_ANOMALY_MULTIPLE: 3,
+  /**
+   * Markup floor (standard §33/§37): minimum variable margin of entitlement-bearing work. The Creative Test
+   * ceiling keeps Scale (~$12.44 per test) just above it (standard §5: "above ~30% variable margin").
+   */
+  MIN_VARIABLE_MARGIN: 0.3,
 } as const;
 
 export const OFFER_RULES = {

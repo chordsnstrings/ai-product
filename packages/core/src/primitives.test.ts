@@ -5,7 +5,7 @@ import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { usd, type Role } from '@arkiv/shared';
 import { can } from './authz';
 import type { TenantContext } from './context';
-import { authorize, consumeAuthorization, estimateCost, settle, sweepExpiredAuthorizations } from './cost-governor';
+import { authorize, consumeAuthorization, estimateCost, marginDecision, revenuePerUnit, settle, sweepExpiredAuthorizations } from './cost-governor';
 import { idempotent } from './idempotency';
 import { append, available, balances, expirePeriod, periodUsage } from './ledger';
 import { llmJson } from './model-gateway';
@@ -123,6 +123,42 @@ describe('ledger + cost governor', () => {
         }),
       ),
     ).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+  });
+
+  it('refuses entitlement work that costs more than the markup floor allows (§33, §37)', async () => {
+    const t = await makeTenant({ plan: 'SCALE', state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const video = (seconds: number) => [{ kind: 'video' as const, provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds, resolution: '720p' as const }];
+    await withTenant(t.workspaceId, (tx) => append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 5, idempotencyKey: 'g:floor' }));
+    // Scale: $199 / 16 = $12.4375 per Creative Test → at most $8.70 of variable cost at a 30% floor.
+    expect(await withTenant(t.workspaceId, (tx) => revenuePerUnit(tx, 'SCALE', 'creative_test', null))).toBe(12_437_500);
+    const long = await withTenant(t.workspaceId, (tx) => estimateCost(tx, video(40)));
+    expect(long.totalMicros).toBeGreaterThan(8_706_250);
+    // Premium work has no standard ceiling: the floor is what bounds it.
+    await expect(
+      withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'premium', lines: video(40), entitlement: { unit: 'creative_test', amount: 1 }, idempotencyKey: 'prem-1' })),
+    ).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { reason: 'markup_floor', revenueMicros: 12_437_500, maxCostMicros: 8_706_250 } });
+    // Two tests' worth of entitlement cover it; the decision is stored with the estimate.
+    const ok = await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'premium', lines: video(40), entitlement: { unit: 'creative_test', amount: 2 }, idempotencyKey: 'prem-2' }));
+    const [a] = await ownerPool()`select estimate->'margin' as margin from cost_authorizations where id = ${ok.authorizationId}`;
+    expect(a!.margin).toMatchObject({ ok: true, revenueMicros: 24_875_000, floor: 0.3 });
+    // Premium and repair work are never authorized without a priced entitlement.
+    for (const purpose of ['premium', 'repair'] as const) {
+      await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose, lines: video(5), idempotencyKey: `unpriced-${purpose}` }))).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { reason: 'unpriced' } });
+    }
+  });
+
+  it('values a Taste at what was paid, or at the live offer price for an unpaid credit', async () => {
+    const t = await makeTenant();
+    const [p] = await ownerPool()`insert into skus (workspace_id, catalogue_no, name) values (${t.workspaceId}, 1, 'S') returning id`;
+    const [proj] = await ownerPool()`insert into projects (workspace_id, sku_id, kind, state, created_by) values (${t.workspaceId}, ${p!.id}, 'preview', 'STORYBOARD_APPROVED', 'x') returning id`;
+    expect(await withTenant(t.workspaceId, (tx) => revenuePerUnit(tx, null, 'taste', proj!.id as string))).toBe(19_000_000);
+    await ownerPool()`insert into purchases (workspace_id, kind, project_id, amount_micros, stripe_checkout_session_id, created_by, status, paid_at)
+                      values (${t.workspaceId}, 'taste', ${proj!.id}, 5000000, 'cs_disc', 'user:x', 'paid', now())`;
+    const d = await withTenant(t.workspaceId, (tx) => marginDecision(tx, null, 'taste', 1, proj!.id as string, 4_000_000));
+    expect(d).toMatchObject({ ok: false, revenueMicros: 5_000_000, maxCostMicros: 3_500_000 });
+    // Without a plan, a Creative Test is valued at the cheapest per-test price of any plan.
+    expect(await withTenant(t.workspaceId, (tx) => revenuePerUnit(tx, null, 'creative_test', null))).toBe(12_437_500);
   });
 
   it('enforces the free preview cap per SKU', async () => {
