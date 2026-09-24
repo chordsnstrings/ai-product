@@ -44,14 +44,21 @@ export class AnthropicLlm implements LlmProvider {
         messages: [{ role: 'user', content }],
       });
 
+      // A declined, truncated or unparseable answer was still generated — and billed (partial provider billing).
+      const billed = {
+        tokens: {
+          input: response.usage.input_tokens + (response.usage.cache_read_input_tokens ?? 0) + (response.usage.cache_creation_input_tokens ?? 0),
+          output: response.usage.output_tokens,
+        },
+      };
       if (response.stop_reason === 'refusal') {
-        throw new ProviderError(this.name, `model declined (${response.stop_details?.category ?? 'unspecified'})`, false, 'refusal');
+        throw new ProviderError(this.name, `model declined (${response.stop_details?.category ?? 'unspecified'})`, false, 'refusal', billed);
       }
       if (response.stop_reason === 'max_tokens') {
-        throw new ProviderError(this.name, 'output truncated at max_tokens', true, 'invalid');
+        throw new ProviderError(this.name, 'output truncated at max_tokens', true, 'invalid', billed);
       }
       const parsed = response.parsed_output as T | null;
-      if (parsed == null) throw new ProviderError(this.name, 'structured output failed to parse', true, 'invalid');
+      if (parsed == null) throw new ProviderError(this.name, 'structured output failed to parse', true, 'invalid', billed);
       return {
         data: req.schema.parse(parsed),
         usage: {

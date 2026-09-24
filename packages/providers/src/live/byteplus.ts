@@ -185,7 +185,10 @@ export class SeedanceVideo implements VideoProvider {
       if (!url) return { status: 'failed', error: 'succeeded without video_url', rawMeta };
       return { status: 'succeeded', bytes: await download(url), modelVersion: r.model, rawMeta };
     }
-    return { status: r.status, error: r.error?.message, rawMeta };
+    // A task that failed after generating reports the seconds it produced (billed); anything else bills nothing.
+    const usage = r.usage as { duration?: number; video_duration?: number } | undefined;
+    const seconds = Number(usage?.duration ?? usage?.video_duration ?? 0);
+    return { status: r.status, error: r.error?.message, rawMeta, ...(r.status === 'failed' && seconds > 0 ? { outputSeconds: seconds } : {}) };
   }
   async cancel(id: string): Promise<void> {
     await this.ark.call(`contents/generations/tasks/${encodeURIComponent(id)}`, 'DELETE');

@@ -4,6 +4,7 @@ import { DomainError, providerVoiceId, sleep, SUBJECT_REF, type EventRefs, type 
 import {
   providers,
   ProviderError,
+  type BilledUnits,
   type ContentPart,
   type ImageResult,
   type LlmJsonResult,
@@ -160,8 +161,38 @@ function withTimeout<T>(p: Promise<T>, ms: number, provider: string): Promise<T>
 }
 
 /** A provider request under the registry's policy: per-request timeout and bounded transient retries. */
-const request = <T>(started: { route: Route; policy: ProviderPolicy }, fn: () => Promise<T>) =>
-  withTransientRetry(() => withTimeout(fn(), started.policy.timeoutMs, started.route.provider), started.policy.retryAttempts, started.policy.retryBackoffMs);
+const request = <T>(started: { route: Route; policy: ProviderPolicy; billed?: BilledUnits[] }, fn: () => Promise<T>) =>
+  withTransientRetry(
+    async () => {
+      try {
+        return await withTimeout(fn(), started.policy.timeoutMs, started.route.provider);
+      } catch (e) {
+        // An attempt that failed after the provider billed it (partial provider billing) is booked on the job,
+        // whether or not a retry then succeeds.
+        noteBilled(started, e);
+        throw e;
+      }
+    },
+    started.policy.retryAttempts,
+    started.policy.retryBackoffMs,
+  );
+
+/** Record what a failed attempt was billed for (see BilledUnits), once per error. */
+function noteBilled(started: { billed?: BilledUnits[] }, e: unknown) {
+  if (!(e instanceof ProviderError) || !e.billed || noted.has(e)) return;
+  noted.add(e);
+  (started.billed ??= []).push(e.billed);
+}
+const noted = new WeakSet<object>();
+
+/** A billed failure's units as a cost line of the call's own kind, route and model (null when they don't apply). */
+export function billedLine(line: CostLine, u: BilledUnits): CostLine | null {
+  if (line.kind === 'llm' && u.tokens) return { ...line, inputTokens: u.tokens.input, outputTokens: u.tokens.output, cachedTokens: 0 };
+  if (line.kind === 'video' && u.seconds) return { ...line, seconds: u.seconds, retryReserve: false };
+  if (line.kind === 'tts' && u.chars) return { ...line, chars: u.chars };
+  if (line.kind === 'image' && u.images) return { ...line, images: u.images };
+  return null;
+}
 
 /**
  * How customer copy names the service behind a task (standard §8: no provider names, job IDs or token counts
@@ -217,6 +248,8 @@ function subjectRefs(subject: CallMeta['subject']): EventRefs {
 }
 
 interface Started {
+  /** Units billed by failed attempts of this call (partial provider billing), booked when the job closes. */
+  billed?: BilledUnits[];
   route: Route;
   /** The routed template's text, when the call names a template family. */
   system: string | null;
@@ -303,7 +336,7 @@ type Outcome =
  */
 async function finish(
   meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>,
-  started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'> & { route?: Pick<Route, 'task' | 'provider' | 'pinnedVersion'> },
+  started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'> & Partial<Pick<Started, 'line' | 'billed'>> & { route?: Pick<Route, 'task' | 'provider' | 'pinnedVersion'> },
   outcome: Outcome,
 ): Promise<boolean> {
   const closed = await closeJob(meta, started, outcome);
@@ -336,13 +369,21 @@ async function raiseVersionDrift(r: Pick<Route, 'task' | 'provider' | 'pinnedVer
   );
 }
 
-async function closeJob(meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>, started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'>, outcome: Outcome): Promise<boolean> {
+async function closeJob(
+  meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>,
+  started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'> & Partial<Pick<Started, 'line' | 'billed'>>,
+  outcome: Outcome,
+): Promise<boolean> {
   return withTenant(meta.ctx.workspaceId, async (tx) => {
     const rates = await loadRates(tx);
     const line = outcome.ok ? outcome.actualLine : outcome.billedLine;
-    const actual = outcome.actualMicros ?? (line ? actualCost(rates, line) : 0);
+    // What failed attempts were billed for (a refusal after generating, a render rejected after it rendered) is
+    // real spend: recorded as provider cost even though the call failed and the customer is not charged (§37).
+    const billed = started.line ? (started.billed ?? []).map((u) => billedLine(started.line!, u)).filter((l): l is CostLine => !!l) : [];
+    const billedMicros = billed.reduce((s, l) => s + actualCost(rates, l), 0);
+    const actual = (outcome.actualMicros ?? (line ? actualCost(rates, line) : 0)) + billedMicros;
     // The failure class is kept on the job: the circuit breaker counts outage-class failures per route (plan 05 §10).
-    const extra = { ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}), ...(outcome.ok ? {} : { errorKind: outcome.errorKind }) };
+    const extra = { ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}), ...(outcome.ok ? {} : { errorKind: outcome.errorKind }), ...(billed.length ? { billedOnFailure: billed.map(unitsOf) } : {}) };
     const raw = outcome.rawMeta || Object.keys(extra).length ? { ...(outcome.rawMeta ?? {}), ...extra } : null;
     const [closed] = await tx`
       update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual},
@@ -643,8 +684,11 @@ async function videoOnce(call: VideoCall, p: ProviderSet): Promise<{ bytes: Buff
       await sleep(call.pollMs ?? (process.env.NODE_ENV === 'test' ? 20 : 5000));
     }
     if (res.status !== 'succeeded' || !res.bytes) {
-      // Provider failures are not billed to the customer; we record zero unless the provider bills partially.
-      throw new ProviderError(started.route.provider, res.error ?? `video ${res.status}`, false, /moderation/i.test(res.error ?? '') ? 'moderation' : 'server');
+      // Provider failures are not billed to the customer; seconds the provider generated (and bills) before the
+      // task failed are booked as our cost.
+      const err = new ProviderError(started.route.provider, res.error ?? `video ${res.status}`, false, /moderation/i.test(res.error ?? '') ? 'moderation' : 'server', res.outputSeconds ? { seconds: res.outputSeconds } : undefined);
+      noteBilled(started, err);
+      throw err;
     }
     await finish(call, started, {
       ok: true,
@@ -806,7 +850,9 @@ export async function reconcileProviderJobs(opts: { limit?: number } = {}): Prom
       continue;
     }
     if (res.status === 'failed' || res.status === 'cancelled') {
-      if (await finish(meta, started, { ok: false, error: res.error ?? `video ${res.status}`, errorKind: /moderation/i.test(res.error ?? '') ? 'moderation' : 'server', latencyMs, rawMeta: res.rawMeta })) out.failed++;
+      // Seconds the provider generated before the task failed are billed: booked like a live call would.
+      const billed = planned && planned.kind === 'video' && res.outputSeconds ? { line: planned, billed: [{ seconds: res.outputSeconds }] } : {};
+      if (await finish(meta, { ...started, ...billed }, { ok: false, error: res.error ?? `video ${res.status}`, errorKind: /moderation/i.test(res.error ?? '') ? 'moderation' : 'server', latencyMs, rawMeta: res.rawMeta })) out.failed++;
       continue;
     }
     if (j.expired) {

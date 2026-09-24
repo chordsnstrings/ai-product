@@ -73,6 +73,37 @@ describe('provider job events (standard §37 usage ledger; arch-05)', () => {
   });
 });
 
+describe('partial provider billing (plan 06 Phase 3 tests; standard §37 all spend accounted)', () => {
+  it('a failed call the provider still billed books its cost on the job and in the ledger', async () => {
+    const t = await makeTenant();
+    const { ctx, token, authorizationId } = await tokenFor(t.workspaceId, t.userId);
+    await expect(ask(ctx, token, 'Check this [[fail:partial]]')).rejects.toMatchObject({ kind: 'server', billed: { tokens: { output: 400 } } });
+    const [job] = await ownerPool()`select id, status, actual_micros, raw_meta from provider_jobs where workspace_id = ${t.workspaceId}`;
+    expect(job).toMatchObject({ status: 'failed' });
+    expect(Number(job!.actual_micros)).toBeGreaterThan(0);
+    expect(job!.raw_meta).toMatchObject({ errorKind: 'server', billedOnFailure: [{ kind: 'llm', outputTokens: 400 }] });
+    const [cost] = await ownerPool()`select amount from ledger_entries where workspace_id = ${t.workspaceId} and type = 'PROVIDER_COST_RECORDED' and authorization_id = ${authorizationId}`;
+    expect(Number(cost!.amount)).toBe(Number(job!.actual_micros));
+    const [ev] = await ownerPool()`select payload from events where workspace_id = ${t.workspaceId} and type = 'PROVIDER_JOB_FAILED'`;
+    expect(ev!.payload).toMatchObject({ actualMicros: Number(job!.actual_micros) });
+    // A plain failure is still booked at zero.
+    await expect(ask(ctx, token, 'Check this [[fail:invalid]]')).rejects.toMatchObject({ kind: 'invalid' });
+    const [plain] = await ownerPool()`select actual_micros from provider_jobs where workspace_id = ${t.workspaceId} and error like '%injected invalid%'`;
+    expect(Number(plain!.actual_micros)).toBe(0);
+  });
+
+  it('a render that failed after generating is booked at the seconds it rendered', async () => {
+    const t = await makeTenant();
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId, 'video.scene', 'video');
+    const e = await generateVideo({ ctx, token, task: 'video.scene', subject: null, prompt: 'hands [[fail:partial]]', references: [], seconds: 5, resolution: '720p', ratio: '9:16' }).catch((x) => x);
+    expect(e).toMatchObject({ billed: { seconds: 5 } });
+    const [job] = await ownerPool()`select status, actual_micros, estimate_micros from provider_jobs where workspace_id = ${t.workspaceId}`;
+    expect(job!.status).toBe('failed');
+    // Five generated seconds are what a successful five-second render costs.
+    expect(Number(job!.actual_micros)).toBe(Number(job!.estimate_micros));
+  });
+});
+
 describe('pinned provider versions (standard §48; arch-35)', () => {
   it('sends the pinned version on the stable arm, and never pins a canary on another model', async () => {
     const llm = new RecordingLlm();

@@ -85,6 +85,7 @@ export interface VideoPoll {
   bytes?: Buffer;
   error?: string;
   modelVersion?: string;
+  /** Seconds of video generated — billed by the provider, also on a failed task that generated some. */
   outputSeconds?: number;
   rawMeta?: RawMeta;
 }
@@ -147,12 +148,26 @@ export interface SegmentationProvider {
   removeBackground(req: SegmentationRequest): Promise<SegmentationResult>;
 }
 
+/**
+ * What a provider billed for a call that still failed (plan 06 Phase 3 "partial provider billing"; standard §37 all
+ * spend is accounted): a refusal or truncated answer after tokens were generated, a render moderated or failed after
+ * generating seconds of video. The gateway books it as the job's actual cost.
+ */
+export interface BilledUnits {
+  seconds?: number;
+  tokens?: { input: number; output: number };
+  chars?: number;
+  images?: number;
+}
+
 export class ProviderError extends Error {
   constructor(
     public readonly provider: string,
     message: string,
     public readonly retryable: boolean,
     public readonly kind: 'rate_limit' | 'server' | 'invalid' | 'auth' | 'moderation' | 'refusal' | 'timeout' | 'unknown' = 'unknown',
+    /** Units the provider billed although the call failed (absent: nothing billed). */
+    public readonly billed?: BilledUnits,
   ) {
     super(`[${provider}] ${message}`);
     this.name = 'ProviderError';
