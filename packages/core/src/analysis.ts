@@ -16,7 +16,7 @@ import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
-import { weekOf } from './recommendations';
+import { WEEKLY_RECOMMENDATION_SKUS, weekOf } from './recommendations';
 import { refreshStock } from './stock';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
@@ -398,7 +398,11 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       await tx`update skus set status = 'active' where id = ${skuId}`;
       // A subscriber's new SKU gets its first recommended experiments now (standard §9 "Day 1-2"), not on the
       // next Monday's weekly run.
-      const [sub] = await tx`select 1 from workspaces where id = ${ws} and state = 'ACTIVE_PAID' and plan_code is not null`;
+      // Only a SKU the weekly run covers (its first WEEKLY_RECOMMENDATION_SKUS active products): a store import of
+      // hundreds of products doesn't start hundreds of paid recommendation runs.
+      const [sub] = await tx`select 1 from workspaces w where w.id = ${ws} and w.state = 'ACTIVE_PAID' and w.plan_code is not null
+                               and (select count(*) from skus o where o.workspace_id = w.id and o.status = 'active' and o.id <> ${skuId}
+                                      and o.catalogue_no < (select catalogue_no from skus where id = ${skuId})) < ${WEEKLY_RECOMMENDATION_SKUS}`;
       if (sub) {
         const week = weekOf();
         await enqueue(tx, ws, Queues.weeklyRecommendations, { week, skuId }, { singletonKey: `recs:${ws}:${skuId}:${week}` });

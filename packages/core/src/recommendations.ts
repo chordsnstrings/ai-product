@@ -306,6 +306,9 @@ export async function scoringContext(tx: Tx, skuId: string) {
   return out;
 }
 
+/** How many of a workspace's active SKUs (by catalogue number) the weekly recommendation run covers. */
+export const WEEKLY_RECOMMENDATION_SKUS = 30;
+
 /** What recommendations for an out-of-stock product are for, as the merchant stated (§42). */
 const STOCK_INTENT_BRIEF = {
   waitlist: 'The product is out of stock. The merchant is running ads for a waitlist: every experiment must drive waitlist sign-ups (never "buy now", price or delivery promises).',

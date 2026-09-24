@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
-import { analyzeProduct, ingestBytes, Queues, startPreview, weekOf } from '@arkiv/core';
+import { analyzeProduct, ingestBytes, Queues, startPreview, WEEKLY_RECOMMENDATION_SKUS, weekOf } from '@arkiv/core';
 import { ctxFor, productPhoto } from '@arkiv/core/testing';
 import { runJob } from './handlers';
 
@@ -9,8 +9,12 @@ import { runJob } from './handlers';
 beforeEach(truncateAll);
 afterAll(closeAll);
 
-async function analysedSku(state: 'ACTIVE_PAID' | 'ACTIVE_FREE', plan: string | undefined) {
+async function analysedSku(state: 'ACTIVE_PAID' | 'ACTIVE_FREE', plan: string | undefined, existingActive = 0) {
   const t = await makeTenant({ state, plan });
+  for (let i = 1; i <= existingActive; i++) {
+    await ownerPool()`insert into skus (workspace_id, catalogue_no, name, status) values (${t.workspaceId}, ${i}, ${`Existing ${i}`}, 'active')`;
+  }
+  if (existingActive) await ownerPool()`update workspaces set next_catalogue_no = ${existingActive + 1} where id = ${t.workspaceId}`;
   const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', state);
   const asset = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctx, await productPhoto(), 'product_photo', null));
   const { skuId, projectId } = await withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [asset.id] }));
@@ -28,6 +32,11 @@ describe('first recommendations', () => {
     expect(n).toBeGreaterThan(0);
     const [r] = await ownerPool()`select count(distinct sku_id)::int as skus, count(*)::int as n from recommendations where workspace_id = ${t.workspaceId}`;
     expect(r).toMatchObject({ skus: 1 });
+  }, 60_000);
+
+  it('a SKU beyond the catalogue the weekly run covers queues nothing (a big import is not hundreds of paid runs)', async () => {
+    const { t } = await analysedSku('ACTIVE_PAID', 'GROWTH', WEEKLY_RECOMMENDATION_SKUS);
+    expect(await ownerPool()`select 1 from outbox where workspace_id = ${t.workspaceId} and queue = ${Queues.weeklyRecommendations}`).toHaveLength(0);
   }, 60_000);
 
   it('a free workspace’s SKU queues nothing (recommendations are a plan feature)', async () => {
