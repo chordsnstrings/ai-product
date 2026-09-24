@@ -676,3 +676,32 @@ describe('prompts, evals and golden sets (plan 05 §11)', () => {
     }
   });
 });
+
+describe('integrations health actions (plan 05 §16)', () => {
+  it('an API-version switch flag needs a passing contract run; app status is recorded and audited', async () => {
+    const eng = await staff(['ENGINEERING']);
+    await act(eng, 'flag.create', { key: 'api.meta_version.v24_0', description: 'Switch Meta adapter to v24.0', owner: 'eng', kind: 'boolean' });
+    try {
+      await expect(act(eng, 'flag.set', { key: 'api.meta_version.v24_0', enabled: true, reason: 'sunset of v23' })).rejects.toThrow(/No contract test run/);
+      await ownerPool()`insert into contract_test_runs (provider, api_version, suite, passed, total) values ('meta', 'v24.0', 'connectors', true, 6)`;
+      await act(eng, 'flag.set', { key: 'api.meta_version.v24_0', enabled: true, reason: 'sunset of v23' });
+      const [f] = await ownerPool()`select enabled from feature_flags where key = 'api.meta_version.v24_0'`;
+      expect(f!.enabled).toBe(true);
+    } finally {
+      await ownerPool()`delete from feature_flags where key = 'api.meta_version.v24_0'`;
+    }
+    const ops = await staff(['OPS']);
+    const [orig] = await ownerPool()`select value from platform_settings where key = 'integrations.app_status'`;
+    try {
+      await act(ops, 'integration.app_status', { provider: 'meta', status: 'in_review', note: 'ads_read advanced access submitted' });
+      const [st] = await ownerPool()`select value from platform_settings where key = 'integrations.app_status'`;
+      const v = st!.value as Record<string, { status: string }>;
+      expect(v.meta).toMatchObject({ status: 'in_review', note: 'ads_read advanced access submitted' });
+      expect(v.tiktok).toMatchObject({ status: 'unknown' });
+      const [a] = await ownerPool()`select after from admin_audit_log where action = 'integration.app_status'`;
+      expect(a!.after).toMatchObject({ status: 'in_review' });
+    } finally {
+      await ownerPool()`update platform_settings set value = ${ownerPool().json(orig!.value as never)} where key = 'integrations.app_status'`;
+    }
+  });
+});

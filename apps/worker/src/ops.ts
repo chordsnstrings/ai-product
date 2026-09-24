@@ -1,6 +1,6 @@
 import type { PgBoss } from 'pg-boss';
 import { ownerPool, withSystem, withTenant } from '@arkiv/db';
-import { cancelProduction, DATASETS, JOB_HOLD_STATES, loadCases, Queues, runDeterministicEval, runModelEval, type TenantContext } from '@arkiv/core';
+import { cancelProduction, DATASETS, JOB_HOLD_STATES, loadCases, Queues, runDeterministicEval, runModelEval, verifyShopifyWebhooks, type TenantContext } from '@arkiv/core';
 import { reconcileStripe } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 
@@ -84,9 +84,8 @@ export async function processOpsCommands(boss: PgBoss): Promise<number> {
           result = await reconcileStripe();
           break;
         case 'integration.verify_webhooks': {
-          // Shopify registrations are verified per shop with its token; without app credentials we only report scope.
-          const [n] = await withSystem((tx) => tx`select count(*)::int as n from shopify_shops`);
-          result = { shops: n!.n, verified: process.env.SHOPIFY_API_KEY ? 'queued per shop' : 'skipped: Shopify app not configured' };
+          // Each shop's registrations are listed with its own token and missing topics re-registered (plan 05 §16).
+          result = await verifyShopifyWebhooks();
           break;
         }
         default:

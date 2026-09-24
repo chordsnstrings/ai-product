@@ -29,6 +29,7 @@ import {
   sweepOfferGuardrails,
   sweepProvisional,
   sweepPreviewCogsOutliers,
+  verifyShopifyWebhooks,
   sweepRateLimits,
   sweepRetention,
   weekOf,
@@ -79,6 +80,8 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   },
   // Plan 05 §15: free-preview COGS outliers become abuse signals (once a day per workspace).
   'abuse-cogs-outliers': { cron: '20 * * * *', run: () => withSystem((tx) => sweepPreviewCogsOutliers(tx)) },
+  // Plan 05 §16: Shopify webhook registrations verified (and missing topics re-registered) nightly.
+  'verify-shopify-webhooks': { cron: '40 3 * * *', run: () => verifyShopifyWebhooks() },
   'sweep-authorizations': { cron: '* * * * *', run: () => withSystem((tx) => sweepExpiredAuthorizations(tx)) },
   'sweep-offers': { cron: '* * * * *', run: () => withSystem((tx) => expireOffers(tx)) },
   // L8/L20: a single honest reminder 15 minutes before the Taste window closes; then T+24h and T+3d nudges.

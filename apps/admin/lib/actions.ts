@@ -35,6 +35,7 @@ import {
   evalDatasetFor,
   jobErrorClass,
   assertCandidatePrompt,
+  assertContractTestsPass,
   addGoldenCase,
   retireGoldenCase,
   DATASETS,
@@ -714,6 +715,20 @@ export const ACTIONS = {
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),
   'dlq.requeue': a({ perm: 'jobs.manage', reauth: true, schema: z.object({ queue: z.string(), limit: z.number().int().min(1).max(1000).default(100), reason }), run: (s, i) => requestOpsCommand(s, 'dlq.requeue', { queue: i.queue, limit: i.limit }, i.reason).then(() => ({ message: 'Redrive queued' })) }),
 
+  /* §16 platform app status (Meta app review, TikTok app, Shopify listing): recorded by staff, shown on the page. */
+  'integration.app_status': a({
+    perm: 'integrations.manage',
+    schema: z.object({ provider: z.enum(['meta', 'tiktok', 'shopify']), status: z.enum(['unknown', 'in_review', 'approved', 'live', 'rejected', 'suspended', 'action_required']), note: z.string().max(300).optional() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select value from platform_settings where key = 'integrations.app_status' for update`;
+        const before = ((b?.value as Record<string, unknown> | null) ?? {}) as Record<string, unknown>;
+        const after = { ...before, [i.provider]: { status: i.status, note: i.note ?? null, updatedAt: new Date().toISOString(), by: s.email } };
+        await tx`insert into platform_settings (key, value, updated_by) values ('integrations.app_status', ${tx.json(after as never)}, ${s.staffId})
+                 on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'integration.app_status', { type: 'setting', id: 'integrations.app_status' }, { before: before[i.provider] ?? null, after: after[i.provider] });
+      }),
+  }),
   'integration.verify': a({ perm: 'integrations.manage', schema: z.object({}), run: (s) => requestOpsCommand(s, 'integration.verify_webhooks', {}, 'nightly check run manually').then(() => ({ message: 'Verification queued' })) }),
 
   /* ── QA review (content → break-glass) ── */
@@ -1102,6 +1117,8 @@ export const ACTIONS = {
       return withAdmin(async (tx) => {
         const [b] = await tx`select enabled, rules from feature_flags where key = ${i.key}`;
         if (!b) throw new DomainError('NOT_FOUND', 'Unknown flag');
+        // An API-version switch needs a passing contract test run on that version first (plan 05 §16, standard §51).
+        await assertContractTestsPass(tx, i.key, i.enabled && !b.enabled);
         await tx`update feature_flags set enabled = ${i.enabled}, rules = ${tx.json((i.rules ?? b.rules) as never)}, updated_at = now() where key = ${i.key}`;
         await audit(tx, s, 'flag.set', { type: 'flag', id: i.key }, { reason: i.reason, before: b, after: { enabled: i.enabled, rules: i.rules } });
       });

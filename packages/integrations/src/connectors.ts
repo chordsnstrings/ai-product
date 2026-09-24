@@ -57,6 +57,30 @@ export interface NormalizedObservation {
   sourceTimezone?: string | null;
 }
 
+// ───────────── Connector policies (plan 05 §16, standard §31) ─────────────
+
+/** Platform API versions this build calls. Staff track their deprecation/sunset dates (setting integrations.api_versions). */
+export const API_VERSIONS = { shopify: '2026-07', meta: 'v23.0', tiktok: 'v1.3' } as const;
+export type ConnectorProvider = keyof typeof API_VERSIONS;
+
+export interface ConnectorPolicy {
+  label: string;
+  /**
+   * Freshness policy (standard §31): a connection whose last successful sync is older than this is stale. Ad
+   * platforms sync daily, so two days means a missed sync; the Shopify catalogue changes slowly and is also pushed
+   * by webhooks.
+   */
+  freshnessHours: number;
+  /** Scopes we ask for at authorization (read-only, minimum; §27). Empty when the platform sets them per app. */
+  requestedScopes: readonly string[];
+}
+
+/** Scopes requested but not granted (a partial-scope connection, §47). */
+export function missingScopes(provider: ConnectorProvider, granted: readonly string[] | null | undefined): string[] {
+  const have = new Set((granted ?? []).map((g) => g.trim()));
+  return CONNECTOR_POLICY[provider].requestedScopes.filter((s) => !have.has(s));
+}
+
 const num = (v: unknown) => (v == null || v === '' ? 0 : Number(v));
 const numOrNull = (v: unknown) => (v == null || v === '' ? null : Number(v));
 const micros = (v: unknown) => Math.round(num(v) * 1_000_000);
@@ -127,6 +151,78 @@ export async function shopifyExchangeCode(shop: string, code: string): Promise<{
   return { accessToken: j.access_token, scopes: j.scope.split(',') };
 }
 
+// ───────────── Shopify webhook registrations (plan 05 §16 "verified nightly") ─────────────
+// App-specific topics we register per shop through the Admin API. The mandatory privacy topics
+// (customers/data_request, customers/redact, shop/redact) are configured on the app itself, not per shop.
+export const SHOPIFY_WEBHOOK_TOPICS = ['app/uninstalled', 'products/create', 'products/update'] as const;
+
+export interface ShopifyWebhook {
+  id: string;
+  topic: string;
+  address: string;
+}
+
+export interface ShopifyWebhookClient {
+  list(shop: string, token: string): Promise<ShopifyWebhook[]>;
+  create(shop: string, token: string, topic: string, address: string): Promise<ShopifyWebhook>;
+}
+
+async function shopifyRest<T>(shop: string, token: string, path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+  const r = await fetch(`https://${shop}/admin/api/${API_VERSIONS.shopify}/${path}`, {
+    method: init.method ?? 'GET',
+    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+  if (r.status === 401 || r.status === 403) throw new ConnectorError('shopify', 'auth_revoked', 'access revoked');
+  if (r.status === 429) throw new ConnectorError('shopify', 'rate_limited', 'throttled', Number(r.headers.get('retry-after') ?? 2));
+  if (!r.ok) throw new ConnectorError('shopify', 'invalid', `webhooks API ${r.status}`);
+  return (await r.json()) as T;
+}
+
+export const liveShopifyWebhooks: ShopifyWebhookClient = {
+  async list(shop, token) {
+    const j = await shopifyRest<{ webhooks?: { id: number | string; topic: string; address: string }[] }>(shop, token, 'webhooks.json?limit=250');
+    return (j.webhooks ?? []).map((w) => ({ id: String(w.id), topic: w.topic, address: w.address }));
+  },
+  async create(shop, token, topic, address) {
+    const j = await shopifyRest<{ webhook: { id: number | string; topic: string; address: string } }>(shop, token, 'webhooks.json', { method: 'POST', body: { webhook: { topic, address, format: 'json' } } });
+    return { id: String(j.webhook.id), topic: j.webhook.topic, address: j.webhook.address };
+  },
+};
+
+/** In-memory registrations for local/mock mode and tests (per process). */
+export function mockShopifyWebhooks(seed: Record<string, ShopifyWebhook[]> = {}): ShopifyWebhookClient & { registrations: Map<string, ShopifyWebhook[]> } {
+  const registrations = new Map(Object.entries(seed));
+  let n = 0;
+  return {
+    registrations,
+    async list(shop) {
+      return [...(registrations.get(shop) ?? [])];
+    },
+    async create(shop, _token, topic, address) {
+      const w = { id: `mock-${++n}`, topic, address };
+      registrations.set(shop, [...(registrations.get(shop) ?? []), w]);
+      return w;
+    },
+  };
+}
+
+let webhookClient: ShopifyWebhookClient | null = null;
+/** The live client, or the in-memory mock in PROVIDERS_MODE=mock (tests can inject their own). */
+export function shopifyWebhookClient(): ShopifyWebhookClient {
+  if (!webhookClient) webhookClient = env().PROVIDERS_MODE === 'mock' ? mockShopifyWebhooks() : liveShopifyWebhooks;
+  return webhookClient;
+}
+export function setShopifyWebhookClient(c: ShopifyWebhookClient | null) {
+  webhookClient = c;
+}
+
+/** Required topics not registered to our address. */
+export function missingShopifyWebhooks(existing: ShopifyWebhook[], address: string): string[] {
+  const ok = new Set(existing.filter((w) => w.address === address).map((w) => w.topic));
+  return SHOPIFY_WEBHOOK_TOPICS.filter((t) => !ok.has(t));
+}
+
 export interface ShopifyProduct {
   id: string;
   title: string;
@@ -160,7 +256,7 @@ const PRODUCTS_QUERY = `query Products($cursor: String) {
 }`;
 
 export async function shopifyFetchProducts(shop: string, token: string, cursor: string | null): Promise<{ products: ShopifyProduct[]; next: string | null; currency: string | null; timezone: string | null }> {
-  const r = await fetch(`https://${shop}/admin/api/2026-07/graphql.json`, {
+  const r = await fetch(`https://${shop}/admin/api/${API_VERSIONS.shopify}/graphql.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
     body: JSON.stringify({ query: PRODUCTS_QUERY, variables: { cursor } }),
@@ -197,11 +293,11 @@ export function normalizeShopifyProduct(n: Record<string, unknown>): ShopifyProd
 
 // ───────────── Meta Marketing API (§29) ─────────────
 export const META_SCOPES = ['ads_read'];
-export const META_API = 'https://graph.facebook.com/v23.0';
+export const META_API = `https://graph.facebook.com/${API_VERSIONS.meta}`;
 
 export function metaAuthUrl(state: string) {
   const q = new URLSearchParams({ client_id: env().META_APP_ID ?? 'dev', redirect_uri: `${env().APP_URL}/api/integrations/meta/callback`, state, scope: META_SCOPES.join(','), response_type: 'code' });
-  return `https://www.facebook.com/v23.0/dialog/oauth?${q}`;
+  return `https://www.facebook.com/${API_VERSIONS.meta}/dialog/oauth?${q}`;
 }
 
 export const META_INSIGHT_FIELDS = [
@@ -282,7 +378,7 @@ export async function metaFetchInsights(token: string, accountId: string, since:
 }
 
 // ───────────── TikTok API for Business (§30) ─────────────
-export const TIKTOK_API = 'https://business-api.tiktok.com/open_api/v1.3';
+export const TIKTOK_API = `https://business-api.tiktok.com/open_api/${API_VERSIONS.tiktok}`;
 
 export function tiktokAuthUrl(state: string) {
   const q = new URLSearchParams({ app_id: env().TIKTOK_APP_ID ?? 'dev', state, redirect_uri: `${env().APP_URL}/api/integrations/tiktok/callback` });
@@ -411,3 +507,11 @@ export async function tiktokAdvertiserInfo(token: string, advertiserIds: string[
   }
   return out;
 }
+
+/** Per-connector policy (the scope lists are defined with each connector above). */
+export const CONNECTOR_POLICY: Record<ConnectorProvider, ConnectorPolicy> = {
+  shopify: { label: 'Shopify', freshnessHours: 7 * 24, requestedScopes: SHOPIFY_SCOPES },
+  meta: { label: 'Meta', freshnessHours: 48, requestedScopes: META_SCOPES },
+  // TikTok permissions are granted per app in the TikTok developer portal, not requested per authorization.
+  tiktok: { label: 'TikTok', freshnessHours: 48, requestedScopes: [] },
+};
