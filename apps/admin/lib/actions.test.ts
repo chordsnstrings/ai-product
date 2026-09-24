@@ -387,3 +387,22 @@ describe('tenant billing tab actions (plan 05 §2.2 Billing)', () => {
     expect(await ownerPool()`select 1 from outbox where queue = 'transfer-sku' and workspace_id = ${from.workspaceId}`).toHaveLength(1);
   });
 });
+
+describe('users module actions (plan 05 §3)', () => {
+  it('resend verification and send sign-in link email the user a fresh link, never staff, and are audited', async () => {
+    const sup = await staff(['SUPPORT']);
+    const [u] = await ownerPool()`insert into users (email) values ('unverified@brand.com') returning id`;
+    devOutbox.length = 0;
+    const r = await act(sup, 'user.resend_verification', { userId: u!.id, reason: 'Ticket #21: never got the email' });
+    expect(String(r.message)).toMatch(/Verification link sent/);
+    expect(devOutbox.map((m) => [m.template, m.to])).toEqual([['magic_link', 'unverified@brand.com']]);
+    await ownerPool()`update users set email_verified_at = now() where id = ${u!.id}`;
+    await expect(act(sup, 'user.resend_verification', { userId: u!.id, reason: 'again please' })).rejects.toThrow(/already verified/);
+    await act(sup, 'user.send_login_link', { userId: u!.id, reason: 'Ticket #22: can’t sign in' });
+    expect(devOutbox.filter((m) => m.template === 'magic_link').every((m) => m.to === 'unverified@brand.com')).toBe(true);
+    const audits = await ownerPool()`select action, target_id from admin_audit_log where staff_id = ${sup.staffId} order by id`;
+    expect(audits.map((a) => a.action)).toEqual(['user.resend_verification', 'user.send_login_link']);
+    await ownerPool()`update users set locked_at = now() where id = ${u!.id}`;
+    await expect(act(sup, 'user.send_login_link', { userId: u!.id, reason: 'locked user' })).rejects.toThrow(/locked/);
+  });
+});

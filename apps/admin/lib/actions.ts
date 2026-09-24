@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
-import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
+import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
   actOnBehalf,
   addTenantNote,
@@ -128,6 +128,16 @@ function parseRoles(raw: string): StaffRole[] {
 
 async function ownerEmails(workspaceId: string) {
   return withAdmin((tx) => tx`select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${workspaceId} and m.role in ('OWNER','ADMIN')`).then((r) => r.map((x) => x.email as string));
+}
+
+async function sendUserLoginLink(s: StaffUser, userId: string, why: string, verification: boolean) {
+  const [u] = await withAdmin((tx) => tx`select email, email_verified_at, locked_at, deleted_at from users where id = ${userId}`);
+  if (!u || u.deleted_at) throw new DomainError('NOT_FOUND', 'User not found');
+  if (u.locked_at) throw new DomainError('CONFLICT', 'This account is locked. Unlock it first.');
+  if (verification && u.email_verified_at) throw new DomainError('CONFLICT', 'This address is already verified. Send a sign-in link instead.');
+  await requestMagicLink({ email: u.email as string, purpose: 'login' });
+  await withAdmin((tx) => audit(tx, s, verification ? 'user.resend_verification' : 'user.send_login_link', { type: 'user', id: userId }, { reason: why }));
+  return { message: verification ? 'Verification link sent; opening it confirms the address.' : 'Sign-in link sent to the user’s inbox (valid 15 minutes).' };
 }
 
 /** Customer-app link inside the workspace (plan 02 M11): email buttons land on the page they name. */
@@ -335,6 +345,11 @@ export const ACTIONS = {
   /* ── Users ── */
   'user.lock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select locked_at, locked_reason from users where id = ${i.userId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'User not found'); await tx`update users set locked_at = now(), locked_reason = ${i.reason} where id = ${i.userId}`; const ended = await tx`update sessions set revoked_at = now() where user_id = ${i.userId} and revoked_at is null returning id`; await audit(tx, s, 'user.lock', { type: 'user', id: i.userId }, { reason: i.reason, before: b, after: { locked: true, sessionsRevoked: ended.length } }); }) }),
   'user.unlock': a({ perm: 'users.lock', reauth: true, schema: z.object({ userId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select locked_at, locked_reason from users where id = ${i.userId} for update`; if (!b) throw new DomainError('NOT_FOUND', 'User not found'); await tx`update users set locked_at = null, locked_reason = null where id = ${i.userId}`; await audit(tx, s, 'user.unlock', { type: 'user', id: i.userId }, { reason: i.reason, before: b, after: { locked_at: null, locked_reason: null } }); }) }),
+  /* §3 Users "resend verification, trigger password reset email": sign-in is passwordless, so both send the user a
+     fresh single-use sign-in link (opening it verifies the address). Staff never see or set a credential; the link
+     goes only to the user's own inbox, under the normal per-address rate limit. */
+  'user.resend_verification': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: (s, i) => sendUserLoginLink(s, i.userId, i.reason, true) }),
+  'user.send_login_link': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: (s, i) => sendUserLoginLink(s, i.userId, i.reason, false) }),
   'user.force_logout': a({ perm: 'users.read', schema: z.object({ userId: uuid, reason }), run: async (s, i) => { await revokeAllSessions(i.userId); await withAdmin((tx) => audit(tx, s, 'user.force_logout', { type: 'user', id: i.userId }, { reason: i.reason })); } }),
 
   /* ── Billing ── */

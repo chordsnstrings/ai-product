@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { SignJWT, createRemoteJWKSet, importPKCS8, jwtVerify } from 'jose';
 import { globalTx } from '@arkiv/db';
 import { DomainError, env } from '@arkiv/shared';
+import { recordLoginFailure, type LoginMeta } from './login-attempts';
 import { createSession, findOrCreateUser } from './sessions';
 
 /**
@@ -50,7 +51,19 @@ async function appleClientSecret() {
     .sign(key);
 }
 
-export async function finishOAuth(p: Provider, params: { code: string; state: string; user?: string | null }, meta: { ip?: string | null; userAgent?: string | null }) {
+/** OAuth callback. A refused sign-in is recorded as a failed attempt (plan 05 §3), with the email once known. */
+export async function finishOAuth(p: Provider, params: { code: string; state: string; user?: string | null }, meta: LoginMeta) {
+  let email: string | null = null;
+  try {
+    return await finish(p, params, meta, (e) => (email = e));
+  } catch (e) {
+    const reason = e instanceof DomainError ? e.message : 'Sign-in failed at the provider.';
+    await recordLoginFailure(p, { email }, reason, meta, /locked/i.test(reason) ? 'locked' : 'failed');
+    throw e;
+  }
+}
+
+async function finish(p: Provider, params: { code: string; state: string; user?: string | null }, meta: LoginMeta, seen: (email: string) => void) {
   const [st] = await globalTx((tx) => tx`delete from oauth_states where state = ${params.state} and provider = ${p} and expires_at > now() returning *`);
   if (!st) throw new DomainError('INVALID', 'Sign-in expired. Please try again.');
   const body = new URLSearchParams({
@@ -70,6 +83,7 @@ export async function finishOAuth(p: Provider, params: { code: string; state: st
   });
   if (payload.nonce !== st.nonce) throw new DomainError('INVALID', 'Sign-in could not be verified.');
   const email = String(payload.email ?? '');
+  if (email) seen(email);
   const verified = payload.email_verified === true || payload.email_verified === 'true';
   if (!email || !verified) throw new DomainError('INVALID', 'Your account email isn’t verified with the provider.');
   let name: string | null = (payload.name as string) ?? null;

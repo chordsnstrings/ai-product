@@ -9,6 +9,7 @@ import {
 } from '@simplewebauthn/server';
 import { globalTx } from '@arkiv/db';
 import { DomainError, env } from '@arkiv/shared';
+import { recordLoginFailure, type LoginMeta } from './login-attempts';
 import { createSession } from './sessions';
 
 /** Passkeys (WebAuthn), offered after the first purchase (plan 04 L5). Challenges live in oauth_states. */
@@ -59,18 +60,35 @@ export async function passkeyLoginOptions() {
   return { flow, options: opts };
 }
 
-export async function verifyPasskeyLogin(flow: string, response: AuthenticationResponseJSON, meta: { ip?: string | null; userAgent?: string | null }) {
+/** Passkey sign-in. A refused attempt is recorded as a failed sign-in (plan 05 §3) against the passkey's owner. */
+export async function verifyPasskeyLogin(flow: string, response: AuthenticationResponseJSON, meta: LoginMeta) {
+  let userId: string | null = null;
+  try {
+    return await verifyPasskey(flow, response, meta, (u) => (userId = u));
+  } catch (e) {
+    const reason = e instanceof DomainError ? e.message : 'Passkey could not be verified.';
+    await recordLoginFailure('passkey', { userId }, reason, meta, /locked/i.test(reason) ? 'locked' : 'failed');
+    throw e;
+  }
+}
+
+async function verifyPasskey(flow: string, response: AuthenticationResponseJSON, meta: LoginMeta, seen: (userId: string) => void) {
   const expectedChallenge = await takeChallenge(`auth:${flow}`);
   const [pk] = await globalTx((tx) => tx`select * from passkeys where credential_id = ${response.id}`);
   if (!pk) throw new DomainError('INVALID', 'Unknown passkey.');
+  seen(pk.user_id as string);
   const v = await verifyAuthenticationResponse({
     response,
     expectedChallenge,
     expectedOrigin: rp().origin,
     expectedRPID: rp().rpID,
     credential: { id: pk.credential_id as string, publicKey: new Uint8Array(pk.public_key as Buffer), counter: Number(pk.counter), transports: (pk.transports as never) ?? undefined },
-  });
+  }).catch(() => ({ verified: false }) as Awaited<ReturnType<typeof verifyAuthenticationResponse>>);
   if (!v.verified) throw new DomainError('INVALID', 'Passkey could not be verified.');
+  // A locked account can't sign in with a passkey either.
+  const [u] = await globalTx((tx) => tx`select locked_at, deleted_at from users where id = ${pk.user_id as string}`);
+  if (u?.locked_at) throw new DomainError('FORBIDDEN', 'This account is locked. Contact support.');
+  if (!u || u.deleted_at) throw new DomainError('FORBIDDEN', 'This account was deleted.');
   await globalTx((tx) => tx`update passkeys set counter = ${v.authenticationInfo.newCounter}, last_used_at = now() where id = ${pk.id}`);
   const s = await createSession(pk.user_id as string, meta);
   return { ...s, userId: pk.user_id as string };

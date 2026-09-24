@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { globalTx, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
+import type { LoginMeta } from './login-attempts';
 
 /**
  * Server-side sessions in Postgres (decided: in-house auth). Cookie holds a random token; DB holds its hash.
@@ -19,11 +20,12 @@ export interface SessionUser {
   createdAt: string;
 }
 
-export async function createSession(userId: string, meta: { ip?: string | null; userAgent?: string | null } = {}, tx?: Tx): Promise<{ token: string; expiresAt: Date }> {
+export async function createSession(userId: string, meta: LoginMeta = {}, tx?: Tx): Promise<{ token: string; expiresAt: Date }> {
   const token = randomBytes(32).toString('base64url');
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400_000);
-  const run = (t: Tx) => t`insert into sessions (user_id, token_hash, expires_at, ip, user_agent)
-                            values (${userId}, ${hash(token)}, ${expiresAt}, ${meta.ip ?? null}, ${meta.userAgent?.slice(0, 300) ?? null})`;
+  // The edge's city/region/country, shown to staff next to the IP (plan 05 §3 "sessions (device, IP city…)").
+  const run = (t: Tx) => t`insert into sessions (user_id, token_hash, expires_at, ip, user_agent, geo)
+                            values (${userId}, ${hash(token)}, ${expiresAt}, ${meta.ip ?? null}, ${meta.userAgent?.slice(0, 300) ?? null}, ${meta.geo ? t.json(meta.geo as never) : null})`;
   if (tx) await run(tx);
   else await globalTx(run);
   return { token, expiresAt };
