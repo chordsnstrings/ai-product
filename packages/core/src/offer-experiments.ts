@@ -15,9 +15,20 @@ import { assertVariantWeights } from './flags';
 const key = z.string().trim().regex(/^[a-z0-9][a-z0-9_.-]{2,39}$/, 'Keys are 3–40 lowercase letters, digits, . _ -');
 const rate = z.number().min(0).max(1);
 
+/**
+ * The metric an experiment is judged on, registered before it starts (plan 04 L22 "pre-registered metrics"):
+ *  - paid_conversion: offers paid ÷ offers issued (storyboard with the offer → paid Taste, the S7→S8 step);
+ *  - checkout_rate: offers whose checkout was opened ÷ offers issued.
+ */
+export const OFFER_METRICS = ['paid_conversion', 'checkout_rate'] as const;
+export type OfferMetric = (typeof OFFER_METRICS)[number];
+
 export const OfferExperimentInput = z
   .object({
     key,
+    /** Pre-registered: the metric the experiment is read on, and the offers each variant needs before it is read. */
+    primaryMetric: z.enum(OFFER_METRICS).default('paid_conversion'),
+    minSamplePerVariant: z.number().int().min(10).max(1_000_000).default(100),
     variants: z
       .array(
         z
@@ -46,18 +57,30 @@ export const OfferExperimentInput = z
       .refine((g) => g.maxRefundRate !== undefined || g.maxDisputeRate !== undefined || g.maxSupportRate !== undefined, 'Set at least one guardrail threshold.'),
   })
   .strict();
-export type OfferExperiment = z.infer<typeof OfferExperimentInput> & { startedAt?: string; startedBy?: string };
+/** As stored: experiments started before pre-registration existed carry no metric (read as paid conversion). */
+export type OfferExperiment = Omit<z.infer<typeof OfferExperimentInput>, 'primaryMetric' | 'minSamplePerVariant'> & {
+  primaryMetric?: OfferMetric;
+  minSamplePerVariant?: number;
+  startedAt?: string;
+  startedBy?: string;
+};
 
 export interface OfferVariantResult {
   variant: string;
   issued: number;
   redeemed: number;
   expired: number;
+  /** Offers whose checkout was opened at least once. */
+  checkoutStarted: number;
   paid: number;
   refunded: number;
   disputed: number;
   support: number;
   conversion: number | null;
+  /** Checkout opened ÷ issued. */
+  checkoutRate: number | null;
+  /** Paid ÷ issued. */
+  paidConversion: number | null;
   refundRate: number | null;
   disputeRate: number | null;
   supportRate: number | null;
@@ -70,9 +93,11 @@ export interface OfferVariantResult {
 export async function offerExperimentResults(tx: Tx, code: string, experimentKey: string): Promise<OfferVariantResult[]> {
   const rows = await tx`
     select o.variant,
-      count(*)::int as issued,
-      count(*) filter (where o.status = 'redeemed')::int as redeemed,
-      count(*) filter (where o.status = 'expired')::int as expired,
+      -- Distinct offers: an offer whose checkout was opened more than once has several purchase rows.
+      count(distinct o.id)::int as issued,
+      count(distinct o.id) filter (where o.status = 'redeemed')::int as redeemed,
+      count(distinct o.id) filter (where o.status = 'expired')::int as expired,
+      count(distinct o.id) filter (where p.id is not null)::int as checkout_started,
       count(distinct p.id) filter (where p.status in ('paid', 'refunded'))::int as paid,
       count(distinct p.id) filter (where p.status = 'refunded' or p.refunded_micros > 0)::int as refunded,
       count(distinct p.id) filter (where exists (select 1 from stripe_disputes d where d.workspace_id = p.workspace_id and d.payment_intent_id = p.stripe_payment_intent_id))::int as disputed,
@@ -91,16 +116,69 @@ export async function offerExperimentResults(tx: Tx, code: string, experimentKey
       issued: n('issued'),
       redeemed: n('redeemed'),
       expired: n('expired'),
+      checkoutStarted: n('checkout_started'),
       paid: n('paid'),
       refunded: n('refunded'),
       disputed: n('disputed'),
       support: n('support'),
       conversion: ratio(n('redeemed'), n('issued')),
+      checkoutRate: ratio(n('checkout_started'), n('issued')),
+      paidConversion: ratio(n('paid'), n('issued')),
       refundRate: ratio(n('refunded'), n('paid')),
       disputeRate: ratio(n('disputed'), n('paid')),
       supportRate: ratio(n('support'), n('issued')),
     };
   });
+}
+
+export interface OfferReadout {
+  metric: OfferMetric;
+  minSamplePerVariant: number;
+  /** Every variant has reached its pre-registered sample. */
+  ready: boolean;
+  variants: { variant: string; n: number; value: number | null; diff: number | null; low: number | null; high: number | null }[];
+  /** The variant ahead on the metric with a 95% interval against the first variant that excludes zero; null otherwise. */
+  leader: string | null;
+  note: string;
+}
+
+/**
+ * Read an experiment on its pre-registered metric (plan 04 L22): nothing is called before every variant has its
+ * minimum sample, and a difference counts only when its 95% interval (two proportions, normal approximation)
+ * against the first variant excludes zero. Guardrails are judged separately (guardrailBreach).
+ */
+export function offerExperimentReadout(results: readonly OfferVariantResult[], exp: Pick<OfferExperiment, 'primaryMetric' | 'minSamplePerVariant' | 'variants'>): OfferReadout {
+  const metric = exp.primaryMetric ?? 'paid_conversion';
+  const minN = exp.minSamplePerVariant ?? 100;
+  const byKey = new Map(results.map((r) => [r.variant, r]));
+  const rows = exp.variants.map((v) => {
+    const r = byKey.get(v.key);
+    const n = r?.issued ?? 0;
+    const x = r ? (metric === 'checkout_rate' ? r.checkoutStarted : r.paid) : 0;
+    return { variant: v.key, n, x, value: n ? x / n : null };
+  });
+  const ready = rows.length > 1 && rows.every((r) => r.n >= minN);
+  const base = rows[0]!;
+  const variants = rows.map((r, i) => {
+    if (i === 0 || !ready || r.value === null || base.value === null) return { variant: r.variant, n: r.n, value: r.value, diff: null, low: null, high: null };
+    const diff = r.value - base.value;
+    const se = Math.sqrt((r.value * (1 - r.value)) / r.n + (base.value * (1 - base.value)) / base.n);
+    return { variant: r.variant, n: r.n, value: r.value, diff, low: diff - 1.96 * se, high: diff + 1.96 * se };
+  });
+  let leader: string | null = null;
+  if (ready) {
+    const better = variants.filter((v) => v.low !== null && v.low > 0).sort((a, b) => b.diff! - a.diff!);
+    const worse = variants.filter((v) => v.high !== null && v.high < 0);
+    if (better.length) leader = better[0]!.variant;
+    else if (worse.length === variants.length - 1) leader = base.variant;
+  }
+  const short = rows.filter((r) => r.n < minN);
+  const note = !ready
+    ? `Collecting: ${short.map((r) => `${r.variant} ${r.n}/${minN}`).join(', ')} offers before ${metric.replace('_', ' ')} is read.`
+    : leader
+      ? `${leader} leads on ${metric.replace('_', ' ')} (95% interval excludes no difference).`
+      : `No variant differs on ${metric.replace('_', ' ')} beyond noise yet.`;
+  return { metric, minSamplePerVariant: minN, ready, variants, leader, note };
 }
 
 /** The first guardrail a variant breaches (judged only past the minimum sample), or null. */

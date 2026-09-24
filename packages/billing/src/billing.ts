@@ -102,8 +102,16 @@ export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projec
              on conflict (stripe_checkout_session_id) do nothing`;
   }
   await emit(tx, ctx, 'CHECKOUT_STARTED', { type: 'project', id: projectId }, { kind, priceMicros: quote.priceMicros });
-  await recordFunnel('CHECKOUT_STARTED', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind } }, tx);
+  // The offer and its experiment variant (plan 04 L22): the funnel reads each variant's checkout and paid rates.
+  await recordFunnel('CHECKOUT_STARTED', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind, ...(await offerProps(tx, ctx.workspaceId, quote.offerId, quote.definitionCode ?? null)) } }, tx);
   return { sessionId: session.id, clientSecret: session.clientSecret, url: session.url, quote };
+}
+
+/** Funnel props naming the offer (definition code) and its experiment variant, when there is an offer. */
+async function offerProps(tx: Tx, workspaceId: string, offerId: string | null, fallbackCode: string | null): Promise<Record<string, string | null>> {
+  if (!offerId) return fallbackCode ? { offer: fallbackCode } : {};
+  const [o] = await tx`select definition_code, variant, experiment_key from offers where id = ${offerId} and workspace_id = ${workspaceId}`;
+  return o ? { offer: o.definition_code as string, offerVariant: (o.variant as string | null) ?? null, offerExperiment: (o.experiment_key as string | null) ?? null } : {};
 }
 
 /**
@@ -706,7 +714,7 @@ async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkou
     });
   }
   await emit(tx, ctx, 'TASTE_PAID', { type: 'project', id: projectId }, { kind: unit, amountMicros: Number(pu.amount_micros) });
-  await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind: unit } }, tx);
+  await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind: unit, ...(await offerProps(tx, ctx.workspaceId, (pu.offer_id as string | null) ?? null, null)) } }, tx);
   await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'receipt', purchaseId: pu.id }, { singletonKey: `receipt:${pu.id}` });
   return 'processed';
 }

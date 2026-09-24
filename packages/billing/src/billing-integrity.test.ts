@@ -341,6 +341,9 @@ describe('one-off payments (plan 02 B4/B9, M9)', () => {
     expect(offer).toMatchObject({ type: 'TASTE', project_id: projectId });
     const co = await withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }));
     expect(co.quote.kind).toBe('taste');
+    // The funnel names the offer (and its experiment variant, none here) for per-variant readouts (plan 04 L22).
+    const [f] = await ownerPool()`select props from funnel_events where workspace_id = ${t.workspaceId} and type = 'CHECKOUT_STARTED'`;
+    expect(f!.props).toMatchObject({ kind: 'taste', offer: 'TASTE_19', offerVariant: null });
   }, 90_000);
 
   it('a refund booked as fraudulent flags the purchase (its downloads are refused)', async () => {
