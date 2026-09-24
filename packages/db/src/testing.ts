@@ -13,6 +13,7 @@ const REFERENCE_TABLES = new Set([
   'feature_flags',
   'platform_settings',
   'landing_pages',
+  'providers',
 ]);
 
 export async function truncateAll(): Promise<void> {

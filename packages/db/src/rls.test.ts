@@ -38,6 +38,7 @@ describe('RLS coverage (plan 02 §8.1)', () => {
       purge_certificates: 'written by the purge job after the workspace is gone; staff/system only',
       rights_cases: 'staff rights/takedown cases; staff only',
       admin_audit_log: 'append-only staff audit log; admin_rw only',
+      stripe_recon_exceptions: 'nightly Stripe reconciliation differences; system writes, staff read',
     };
     const rows = await ownerPool()<{ table_name: string; kind: string | null; rls: boolean; forced: boolean; policies: string[]; app_select: boolean; app_update: boolean; app_delete: boolean }[]>`
       select t.table_name, r.kind, c.relrowsecurity as rls, c.relforcerowsecurity as forced,
