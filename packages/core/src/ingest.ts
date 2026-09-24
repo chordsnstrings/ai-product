@@ -1,47 +1,17 @@
-import { lookup } from 'node:dns/promises';
-import net from 'node:net';
 import { DomainError } from '@arkiv/shared';
+import { assertPublicUrl, guardedRequest, type NetGuard } from './net-guard';
+
+export { assertPublicUrl, isPublicAddress, type NetGuard } from './net-guard';
 
 /**
  * Product URL import (standard §8, §28, §42). Structured commerce data (Shopify product JSON, JSON-LD) is
- * preferred over LLM extraction (§16). All fetched text is untrusted data.
+ * preferred over LLM extraction (§16). All fetched text is untrusted data. Every fetch goes through the SSRF
+ * guard (net-guard.ts): public addresses only, each redirect hop re-checked, streamed size caps.
  */
 
 const MAX_BYTES = 3 * 1024 * 1024;
-const TIMEOUT_MS = 10_000;
-const MAX_REDIRECTS = 4;
-
-function isPrivateIp(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number) as [number, number];
-    return (
-      a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224
-    );
-  }
-  const v = ip.toLowerCase();
-  return v === '::1' || v === '::' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe80') ||
-    v.startsWith('::ffff:') && isPrivateIp(v.replace('::ffff:', ''));
-}
-
-/** SSRF guard: only http(s) to public addresses, re-checked on every redirect hop. */
-export async function assertPublicUrl(raw: string): Promise<URL> {
-  let url: URL;
-  try {
-    url = new URL(raw.trim());
-  } catch {
-    throw new DomainError('INVALID', 'That doesn’t look like a web address.');
-  }
-  if (!['http:', 'https:'].includes(url.protocol)) throw new DomainError('INVALID', 'Only http(s) links are supported.');
-  if (url.username || url.password) throw new DomainError('INVALID', 'Links with credentials are not supported.');
-  if (url.port && !['80', '443', ''].includes(url.port)) throw new DomainError('INVALID', 'Unsupported port.');
-  const host = url.hostname.replace(/^\[|\]$/g, '');
-  if (/^(localhost|.*\.local|.*\.internal)$/i.test(host)) throw new DomainError('INVALID', 'That address is not reachable.');
-  const addrs = net.isIP(host) ? [{ address: host }] : await lookup(host, { all: true }).catch(() => []);
-  if (!addrs.length) throw new DomainError('INVALID', 'We couldn’t reach that site.');
-  if (addrs.some((a) => isPrivateIp(a.address))) throw new DomainError('INVALID', 'That address is not reachable.');
-  return url;
-}
+/** Product photos downloaded from a page (og:image, JSON-LD, variant images). */
+export const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 
 export interface FetchedPage {
   finalUrl: string;
@@ -50,51 +20,10 @@ export interface FetchedPage {
   body: string;
 }
 
-export async function safeFetch(raw: string, accept = 'text/html,application/json'): Promise<FetchedPage> {
-  let url = await assertPublicUrl(raw);
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        redirect: 'manual',
-        signal: ctrl.signal,
-        headers: { Accept: accept, 'User-Agent': 'ArkivBot/1.0 (+product import; merchant-initiated)' },
-      });
-    } catch (e) {
-      clearTimeout(t);
-      throw new DomainError('UNAVAILABLE', (e as Error).name === 'AbortError' ? 'The page took too long to respond.' : 'We couldn’t reach that page.');
-    }
-    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
-      clearTimeout(t);
-      url = await assertPublicUrl(new URL(res.headers.get('location')!, url).toString());
-      continue;
-    }
-    const reader = res.body?.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    if (reader) {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.byteLength;
-        if (size > MAX_BYTES) {
-          ctrl.abort();
-          break;
-        }
-        chunks.push(value);
-      }
-    }
-    clearTimeout(t);
-    return {
-      finalUrl: url.toString(),
-      status: res.status,
-      contentType: res.headers.get('content-type') ?? '',
-      body: Buffer.concat(chunks).toString('utf8'),
-    };
-  }
-  throw new DomainError('UNAVAILABLE', 'Too many redirects.');
+/** A page or JSON document; a body past the cap is cut off there (enough to read a product page). */
+export async function safeFetch(raw: string, accept = 'text/html,application/json', opts: { guard?: NetGuard; maxBytes?: number } = {}): Promise<FetchedPage> {
+  const r = await guardedRequest(raw, { accept, maxBytes: opts.maxBytes ?? MAX_BYTES, guard: opts.guard });
+  return { finalUrl: r.finalUrl, status: r.status, contentType: r.contentType, body: r.body.toString('utf8') };
 }
 
 /** One sellable variant (size, shade…) with its own price, availability and image (§42 "Variants / sizes"). */
@@ -328,8 +257,8 @@ export function parseProductHtml(html: string, pageUrl: string): ExtractedProduc
 }
 
 /** Full import: try Shopify JSON first (canonical commerce data), then the page. */
-export async function importProductUrl(raw: string): Promise<ExtractedProduct> {
-  const url = await assertPublicUrl(raw);
+export async function importProductUrl(raw: string, opts: { guard?: NetGuard } = {}): Promise<ExtractedProduct> {
+  const url = await assertPublicUrl(raw, opts.guard);
   if (/amazon\.|walmart\.|ebay\./i.test(url.hostname)) {
     throw new DomainError('INVALID', 'Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.');
   }
@@ -337,10 +266,10 @@ export async function importProductUrl(raw: string): Promise<ExtractedProduct> {
   const selectedVariantId = url.searchParams.get('variant') ?? undefined;
   let shopify: Partial<ExtractedProduct> | null = null;
   if (sj) {
-    const r = await safeFetch(sj, 'application/json').catch(() => null);
+    const r = await safeFetch(sj, 'application/json', opts).catch(() => null);
     if (r && r.status === 200 && r.contentType.includes('json')) shopify = parseShopifyProduct(r.body);
   }
-  const page = await safeFetch(url.toString()).catch((e) => {
+  const page = await safeFetch(url.toString(), undefined, opts).catch((e) => {
     if (shopify) return null;
     throw e;
   });
@@ -363,13 +292,15 @@ export async function importProductUrl(raw: string): Promise<ExtractedProduct> {
   return parsed;
 }
 
-export async function fetchImage(url: string): Promise<Buffer | null> {
+/**
+ * Download a product image from an untrusted page. Null when it is unreachable, blocked by the SSRF guard, not an
+ * image, or larger than the cap (the download stops at the cap instead of buffering the whole body).
+ */
+export async function fetchImage(url: string, opts: { guard?: NetGuard; maxBytes?: number } = {}): Promise<Buffer | null> {
   try {
-    await assertPublicUrl(url);
-    const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
-    if (!res.ok || !(res.headers.get('content-type') ?? '').startsWith('image/')) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    return buf.length > 15 * 1024 * 1024 ? null : buf;
+    const r = await guardedRequest(url, { accept: 'image/*', maxBytes: opts.maxBytes ?? MAX_IMAGE_BYTES, guard: opts.guard });
+    if (r.status < 200 || r.status >= 300 || r.truncated || !r.contentType.toLowerCase().startsWith('image/')) return null;
+    return r.body;
   } catch {
     return null;
   }

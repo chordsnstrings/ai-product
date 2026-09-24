@@ -1,13 +1,134 @@
-import { describe, expect, it } from 'vitest';
-import { assertPublicUrl, parseProductHtml, parseShopifyProduct, shopifyJsonUrl } from './ingest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import zlib from 'node:zlib';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { assertPublicUrl, fetchImage, parseProductHtml, parseShopifyProduct, safeFetch, shopifyJsonUrl } from './ingest';
+import { isPublicAddress, type NetGuard } from './net-guard';
 
 describe('SSRF guard', () => {
-  it.each(['http://127.0.0.1/admin', 'http://10.0.0.5', 'http://169.254.169.254/latest/meta-data', 'http://[::1]/', 'http://localhost:3000', 'file:///etc/passwd', 'http://user:pw@example.com', 'http://example.com:5432/'])(
-    'rejects %s',
-    async (u) => {
-      await expect(assertPublicUrl(u)).rejects.toMatchObject({ code: 'INVALID' });
-    },
-  );
+  it.each([
+    'http://127.0.0.1/admin',
+    'http://10.0.0.5',
+    'http://169.254.169.254/latest/meta-data',
+    'http://[::1]/',
+    'http://localhost:3000',
+    'http://app.localhost/',
+    'file:///etc/passwd',
+    'http://user:pw@example.com',
+    'http://example.com:5432/',
+    // IPv4 carried inside IPv6 literals, and alternative IPv4 spellings.
+    'http://[::ffff:127.0.0.1]/',
+    'http://[::ffff:a00:1]/',
+    'http://[::7f00:1]/',
+    'http://[::ffff:0:a9fe:a9fe]/',
+    'http://[64:ff9b::a9fe:a9fe]/',
+    'http://[2002:a00:1::]/',
+    'http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/', // Teredo
+    'http://[fec0::1]/',
+    'http://[fd00::1]/',
+    'http://[fe80::1]/',
+    'http://[ff02::1]/',
+    'http://[2001:db8::1]/',
+    'http://198.18.0.1/',
+    'http://192.0.0.1/',
+    'http://192.0.2.1/',
+    'http://100.64.0.1/',
+    'http://0x7f000001/',
+    'http://2130706433/',
+    'http://0177.0.0.1/',
+    'http://0/',
+    'http://255.255.255.255/',
+  ])('rejects %s', async (u) => {
+    await expect(assertPublicUrl(u)).rejects.toMatchObject({ code: 'INVALID' });
+  });
+
+  it('allows public unicast addresses, including IPv4 carried in IPv6', () => {
+    for (const ip of ['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111', '::ffff:8.8.8.8', '64:ff9b::808:808', '2002:808:808::1']) expect(isPublicAddress(ip), ip).toBe(true);
+    for (const ip of ['::', '::1', '::ffff:10.0.0.1', '172.16.5.4', '172.31.255.255', '224.0.0.1', 'not-an-ip', '3fff::1']) expect(isPublicAddress(ip), ip).toBe(false);
+    expect(isPublicAddress('172.32.0.1')).toBe(true);
+  });
+});
+
+describe('SSRF guard on real requests (redirects, rebinding, size caps)', () => {
+  let server: http.Server;
+  let port = 0;
+  const hits: string[] = [];
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      hits.push(req.url ?? '');
+      const u = new URL(req.url ?? '/', 'http://x');
+      if (u.pathname === '/to-loopback') return void res.writeHead(302, { location: `http://127.0.0.1:${port}/secret` }).end();
+      if (u.pathname === '/to-metadata') return void res.writeHead(302, { location: 'http://169.254.169.254/latest/meta-data' }).end();
+      if (u.pathname === '/to-internal-name') return void res.writeHead(302, { location: `http://intranet.example:${port}/secret` }).end();
+      if (u.pathname === '/to-page') return void res.writeHead(301, { location: '/page' }).end();
+      if (u.pathname === '/page') return void res.writeHead(200, { 'content-type': 'text/html' }).end('<title>ok</title>');
+      if (u.pathname === '/image.png') return void res.writeHead(200, { 'content-type': 'image/png' }).end(Buffer.alloc(1000, 1));
+      if (u.pathname === '/not-image') return void res.writeHead(200, { 'content-type': 'text/html' }).end('<html></html>');
+      if (u.pathname === '/endless.png') {
+        // Streams until the client hangs up: only a streaming cap stops it.
+        res.writeHead(200, { 'content-type': 'image/png' });
+        const chunk = Buffer.alloc(64 * 1024, 7);
+        const pump = () => {
+          while (!res.destroyed && res.write(chunk));
+          if (!res.destroyed) res.once('drain', pump);
+        };
+        res.on('close', () => hits.push('closed:endless'));
+        return void pump();
+      }
+      if (u.pathname === '/bomb') {
+        res.writeHead(200, { 'content-type': 'text/html', 'content-encoding': 'gzip' });
+        return void res.end(zlib.gzipSync(Buffer.alloc(50 * 1024 * 1024, 0x61)));
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' }).end('secret');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    port = (server.address() as AddressInfo).port;
+  });
+  afterAll(() => new Promise<void>((r) => server.close(() => r())));
+
+  /** `shop.test` stands in for a public store (served locally); every other name and literal gets the real policy. */
+  const guard = (resolve: (host: string) => string[]): NetGuard => ({
+    resolve: async (host) => resolve(host).map((address) => ({ address, family: address.includes(':') ? 6 : 4 })),
+    allowAddress: (address, host) => host === 'shop.test' || isPublicAddress(address),
+    allowPort: () => true,
+  });
+  const names = guard((h) => (h === 'shop.test' ? ['127.0.0.1'] : h === 'intranet.example' ? ['10.1.2.3'] : []));
+  const shop = (path: string) => `http://shop.test:${port}${path}`;
+
+  it('follows a redirect between public pages', async () => {
+    const page = await safeFetch(shop('/to-page'), undefined, { guard: names });
+    expect(page).toMatchObject({ status: 200, body: '<title>ok</title>', finalUrl: shop('/page') });
+  });
+
+  it.each(['/to-loopback', '/to-metadata', '/to-internal-name'])('refuses a redirect into a private range (%s)', async (path) => {
+    hits.length = 0;
+    await expect(safeFetch(shop(path), undefined, { guard: names })).rejects.toMatchObject({ code: 'INVALID' });
+    expect(await fetchImage(shop(path), { guard: names })).toBeNull();
+    expect(hits.filter((h) => h === '/secret')).toEqual([]);
+  });
+
+  it('refuses at connect time a name that re-resolves to a private address after the check (DNS rebinding)', async () => {
+    hits.length = 0;
+    let calls = 0;
+    const rebinding = guard((h) => (h === 'rebind.example' ? [calls++ === 0 ? '8.8.8.8' : '127.0.0.1'] : []));
+    await expect(safeFetch(`http://rebind.example:${port}/secret`, undefined, { guard: rebinding })).rejects.toMatchObject({ code: 'INVALID' });
+    expect(calls).toBe(2); // checked, then resolved again by the socket — and refused there
+    expect(hits).toEqual([]);
+  });
+
+  it('downloads images only when they are images and under the cap, stopping an endless body at the cap', async () => {
+    expect((await fetchImage(shop('/image.png'), { guard: names }))?.length).toBe(1000);
+    expect(await fetchImage(shop('/not-image'), { guard: names })).toBeNull();
+    hits.length = 0;
+    expect(await fetchImage(shop('/endless.png'), { guard: names, maxBytes: 1024 * 1024 })).toBeNull();
+    await expect.poll(() => hits.includes('closed:endless')).toBe(true);
+  });
+
+  it('caps a page body after decompression (a gzip bomb stops at the cap)', async () => {
+    const page = await safeFetch(shop('/bomb'), undefined, { guard: names, maxBytes: 1024 * 1024 });
+    expect(page.body.length).toBe(1024 * 1024);
+    expect(page.body.slice(0, 3)).toBe('aaa');
+  });
 });
 
 describe('product page parsing (fixtures)', () => {
