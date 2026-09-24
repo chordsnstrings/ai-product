@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, PROVISIONAL, newId, type ProjectState } from '@arkiv/shared';
+import { DomainError, FREE_EXPLORATION, PROVISIONAL, newId, type ProjectState } from '@arkiv/shared';
 import { allowKey, isAllowlisted } from './allowlist';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
@@ -14,7 +14,7 @@ import { fetchImage, importProductUrl, type ExtractedProduct } from './ingest';
 import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
-import { enqueue, priorityFor, queueFor, Queues } from './outbox';
+import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
 import { isTerminal, transition } from './projects';
@@ -54,6 +54,12 @@ export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPrevi
       // Staff-allowlisted evaluators (agencies, photographers) get a higher, still bounded, allowance (plan 05 §15).
       const allowed = n!.n < PROVISIONAL.ALLOWLISTED_MAX_SKUS && (await isAllowlisted(tx, [allowKey.ws(ctx.workspaceId), allowKey.ip(input.ip)]));
       if (!allowed) throw new DomainError('PAYMENT_REQUIRED', 'Save your work to add more products.', { needsAccount: true });
+    }
+  } else if (isFreeTier(ctx)) {
+    // Signed in but not paying: a few new products a day (standard §5 bounded free preview COGS).
+    const [n] = await tx`select count(*)::int as n from skus where created_at > now() - interval '24 hours'`;
+    if (n!.n >= FREE_EXPLORATION.SKUS_PER_DAY) {
+      throw new DomainError('PAYMENT_REQUIRED', `Free accounts can add ${FREE_EXPLORATION.SKUS_PER_DAY} products a day. Produce an ad from one of them, or come back tomorrow.`, { freeLimit: 'skus_per_day' });
     }
   }
   const skuId = newId();
@@ -378,6 +384,8 @@ export async function requestConcepts(tx: Tx, ctx: TenantContext, projectId: str
   const batch = Number(b!.b) + 1;
   if (ctx.workspaceState === 'PROVISIONAL' && batch > 1 + PROVISIONAL.MAX_CONCEPT_REGENERATIONS)
     throw new DomainError('PAYMENT_REQUIRED', 'Save your work to see more ideas.', { needsAccount: true });
+  if (ctx.workspaceState !== 'PROVISIONAL' && isFreeTier(ctx) && batch > FREE_EXPLORATION.CONCEPT_BATCHES_PER_SKU)
+    throw new DomainError('PAYMENT_REQUIRED', 'Produce this one to keep exploring — you’ve seen all the free ideas for this product.', { freeLimit: 'concept_batches' });
   await tx`insert into progress_steps (workspace_id, subject_id, step_key, label, status, started_at, position)
            values (${ctx.workspaceId}, ${projectId}, ${conceptStepKey(batch)}, 'Drafting three more ideas', 'pending', now(), 0)
            on conflict (workspace_id, subject_id, step_key) do update set status = 'pending', detail = null, started_at = now(), completed_at = null`;

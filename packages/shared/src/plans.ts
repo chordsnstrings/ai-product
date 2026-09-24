@@ -77,6 +77,22 @@ export const OFFER_RULES = {
   STRIPE_MIN_SESSION_MINUTES: 30,
 } as const;
 
+/**
+ * Pre-purchase exploration for signed-in workspaces that have not paid (standard §5 free preview: analysis,
+ * three concepts, a storyboard preview, "target preview COGS <= $0.20"). Signing up unlocks more exploration
+ * than a provisional workspace, but still bounded per SKU and per day, and by a cumulative per-SKU cost cap.
+ */
+export const FREE_EXPLORATION = {
+  /** New products a day. */
+  SKUS_PER_DAY: 3,
+  /** Concept batches per product, including the first three ideas. */
+  CONCEPT_BATCHES_PER_SKU: 4,
+  /** Storyboards drawn per product (each chosen concept draws one). */
+  STORYBOARDS_PER_SKU: 3,
+  /** Cumulative pre-purchase generation spend per product (storyboards, frames, extra concepts). */
+  SKU_COGS_CAP: usd(1.5),
+} as const;
+
 export const PROVISIONAL = {
   TTL_DAYS: 7,
   MAX_SKUS: 3,

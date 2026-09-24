@@ -2,7 +2,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { ProviderError, type LlmJsonRequest, type LlmProvider } from '@arkiv/providers';
-import { analyzeProduct, ANALYSIS_FAILED_COPY, failAnalysis, retryAnalysis, startPreview } from './analysis';
+import { FREE_EXPLORATION } from '@arkiv/shared';
+import { analyzeProduct, ANALYSIS_FAILED_COPY, failAnalysis, generateConceptBatch, requestConcepts, retryAnalysis, startPreview } from './analysis';
+import { authorize, estimateCost } from './cost-governor';
+import { selectConcept } from './storyboard';
 import { buildContext, gateProposal, verifiedIngredients } from './creative-director';
 import { mockConcepts } from './mock-intel';
 import { decideFact, recordFacts } from './product-truth';
@@ -127,4 +130,50 @@ describe('missing ingredient list (§42)', () => {
     expect(after.packet.product.keyIngredients).toEqual(['Niacinamide', 'Zinc PCA']);
     expect(verifiedIngredients(after.facts)).toEqual({ list: ['Niacinamide', 'Zinc PCA'], verified: true });
   }, 60_000);
+});
+
+describe('bounded free exploration for signed-in, non-paying workspaces (standard §5)', () => {
+  it('limits new products a day, concept batches and storyboards per product, with a friendly prompt', async () => {
+    const { t, ctx, skuId, projectId } = await preview();
+    await analyzeProduct(ctx, skuId, projectId);
+    // Products a day: this workspace already added one today.
+    for (let i = 1; i < FREE_EXPLORATION.SKUS_PER_DAY; i++) {
+      const a = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctx, await productPhoto(), 'product_photo', null));
+      await withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [a.id] }));
+    }
+    const extra = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctx, await productPhoto(), 'product_photo', null));
+    await expect(withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [extra.id] }))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED', details: { freeLimit: 'skus_per_day' } });
+
+    // Concept batches per product (the first three ideas are batch 1).
+    for (let b = 2; b <= FREE_EXPLORATION.CONCEPT_BATCHES_PER_SKU; b++) {
+      await withTenant(t.workspaceId, (tx) => requestConcepts(tx, ctx, projectId));
+      await generateConceptBatch(ctx, projectId, b);
+    }
+    await expect(withTenant(t.workspaceId, (tx) => requestConcepts(tx, ctx, projectId))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED', details: { freeLimit: 'concept_batches' } });
+
+    // Storyboards per product: each chosen concept draws one.
+    const concepts = await ownerPool()`select id from concepts where project_id = ${projectId} order by batch, idx`;
+    for (const c of concepts.slice(0, FREE_EXPLORATION.STORYBOARDS_PER_SKU)) await withTenant(t.workspaceId, (tx) => selectConcept(tx, ctx, projectId, c.id as string));
+    const next = concepts[FREE_EXPLORATION.STORYBOARDS_PER_SKU]!;
+    await expect(withTenant(t.workspaceId, (tx) => selectConcept(tx, ctx, projectId, next.id as string))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED', details: { freeLimit: 'storyboards' } });
+    // Paying workspaces are not held to the free limits.
+    await ownerPool()`update workspaces set state = 'ACTIVE_PAID' where id = ${t.workspaceId}`;
+    const paid = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
+    await withTenant(t.workspaceId, (tx) => selectConcept(tx, paid, projectId, next.id as string));
+  }, 120_000);
+
+  it('caps cumulative pre-purchase generation spend per product, whatever the path', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
+    const line = { kind: 'image' as const, provider: 'byteplus', model: 'seedream-5-0-pro', images: 1 };
+    const each = (await withTenant(t.workspaceId, (tx) => estimateCost(tx, [line]))).totalMicros;
+    const fits = Math.floor(FREE_EXPLORATION.SKU_COGS_CAP / each);
+    // Settled spend counts at what was spent; another SKU has its own budget.
+    await ownerPool()`insert into cost_authorizations (workspace_id, purpose, token_hash, idempotency_key, rate_table_versions, estimate, max_cost_micros, spent_micros, status, expires_at)
+                      values (${t.workspaceId}, 'storyboard', 'x', 'prior', '{}', ${ownerPool().json({ skuId: 'sku-a' })}, ${each * fits}, ${each * fits}, 'settled', now())`;
+    await expect(withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'storyboard', skuId: 'sku-a', lines: [line], idempotencyKey: 'more' }))).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { reason: 'free_exploration_cap' } });
+    await withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'storyboard', skuId: 'sku-b', lines: [line], idempotencyKey: 'other-sku' }));
+    // A paying workspace explores without the free cap.
+    await withTenant(t.workspaceId, (tx) => authorize(tx, { ...ctx, workspaceState: 'ACTIVE_PAID' }, { purpose: 'storyboard', skuId: 'sku-a', lines: [line], idempotencyKey: 'paid' }));
+  });
 });

@@ -72,7 +72,7 @@ export async function clusterThemes(ctx: TenantContext, skuId: string) {
                                                  order by observed_at desc nulls last limit 400`);
   if (signals.length < 3) return 0;
   const auth = await withTenant(ws, async (tx) =>
-    authorize(tx, ctx, { purpose: 'storyboard', lines: await routedLines(tx, ws, [{ task: 'customer_language.themes', kind: 'llm', inputTokens: 30_000, outputTokens: 2_000 }]), idempotencyKey: `themes:${skuId}:${signals.length}:${new Date().toISOString().slice(0, 10)}` }),
+    authorize(tx, ctx, { purpose: 'storyboard', skuId, lines: await routedLines(tx, ws, [{ task: 'customer_language.themes', kind: 'llm', inputTokens: 30_000, outputTokens: 2_000 }]), idempotencyKey: `themes:${skuId}:${signals.length}:${new Date().toISOString().slice(0, 10)}` }),
   );
   try {
     const texts = signals.map((s) => s.text as string);

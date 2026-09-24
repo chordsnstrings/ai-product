@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError } from '@arkiv/shared';
+import { DomainError, FREE_EXPLORATION } from '@arkiv/shared';
 import { compositeProduct, productionBackdrop } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
@@ -14,7 +14,7 @@ import { projectVisitor, recordFunnel } from './funnel';
 import type { StoryboardPlan } from './intel-schemas';
 import { generateImage, routedLines } from './model-gateway';
 import { issueTasteOffer } from './offers';
-import { enqueue, priorityFor, queueFor, Queues } from './outbox';
+import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { sceneClaimIds } from './production';
 import { transition } from './projects';
@@ -42,6 +42,13 @@ export async function selectConcept(tx: Tx, ctx: TenantContext, projectId: strin
   if (p.selected_concept_id === conceptId && p.storyboard_id) return { storyboardId: p.storyboard_id as string, replayed: true };
   if (['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA', 'COMPLETE'].includes(p.state as string))
     throw new DomainError('CONFLICT', 'This ad is already in production.');
+  if (isFreeTier(ctx)) {
+    // Each chosen concept draws a new storyboard: bounded per product before a purchase (standard §5).
+    const [n] = await tx`select count(*)::int as n from storyboards sb join projects pr on pr.id = sb.project_id where pr.sku_id = ${c.sku_id}`;
+    if (n!.n >= FREE_EXPLORATION.STORYBOARDS_PER_SKU) {
+      throw new DomainError('PAYMENT_REQUIRED', 'Produce this one to keep exploring — you’ve drawn all the free storyboards for this product.', { freeLimit: 'storyboards' });
+    }
+  }
   await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: conceptId } });
   const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${conceptId}, 'generating') returning id`;
   await tx`update storyboards set status = 'superseded' where project_id = ${projectId} and id <> ${sb!.id} and status in ('ready','generating')`;
@@ -81,6 +88,7 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     authorize(tx, ctx, {
       purpose: 'storyboard',
       projectId,
+      skuId,
       lines: await routedLines(tx, ws, [
         { task: 'creative_director.storyboard', kind: 'llm', inputTokens: 5_000, outputTokens: 2_500 },
         { task: 'image.storyboard_frame', kind: 'image', images: MAX_GENERATED_FRAMES },
@@ -295,7 +303,7 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
       const a = await authorizeOrTakeOver(
         tx,
         ctx,
-        { purpose: 'storyboard', projectId: info.s.project_id as string, lines: await routedLines(tx, ws, [{ task: 'image.storyboard_frame', kind: 'image', images: 1 }]), idempotencyKey: `frame:${sceneId}:${version}` },
+        { purpose: 'storyboard', projectId: info.s.project_id as string, skuId: info.s.sku_id as string, lines: await routedLines(tx, ws, [{ task: 'image.storyboard_frame', kind: 'image', images: 1 }]), idempotencyKey: `frame:${sceneId}:${version}` },
         FRAME_REQUEST_STALE_MINUTES,
       );
       await step(tx, ws, sceneId, key, 'active');

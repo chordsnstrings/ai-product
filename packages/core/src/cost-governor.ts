@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { Tx } from '@arkiv/db';
-import { COST_LIMITS, DomainError, PLANS, PRICES, type Micros, type PlanCode } from '@arkiv/shared';
+import { COST_LIMITS, DomainError, FREE_EXPLORATION, PLANS, PRICES, type Micros, type PlanCode } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { append, available, providerSpendSince, type LedgerUnit } from './ledger';
 import { estimate as priceEstimate, loadRates, type CostLine, type Estimate } from './rates';
 import { isFlagOn } from './flags';
+import { isFreeTier } from './outbox';
 import { HEARTBEAT_STALE_MS } from './progress';
 import { setting } from './settings';
 
@@ -148,6 +149,24 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
         estimateMicros: est.totalMicros,
         priorMicros: prior,
         purpose: input.purpose,
+      });
+    }
+  }
+
+  // 1a. Pre-purchase exploration is cumulative per SKU for workspaces that have not paid (standard §5): every
+  //     storyboard, frame and extra concept batch for the product counts (active holds at their ceiling).
+  if (input.purpose === 'storyboard' && input.skuId && isFreeTier(ctx)) {
+    const [r] = await tx`select coalesce(sum(case when status = 'active' then max_cost_micros else spent_micros end), 0)::bigint as n
+                         from cost_authorizations
+                         where purpose = 'storyboard' and estimate->>'skuId' = ${input.skuId} and status in ('active','settled')`;
+    const prior = Number(r!.n);
+    if (prior + est.totalMicros > FREE_EXPLORATION.SKU_COGS_CAP) {
+      throw new DomainError('GATE_BLOCKED', 'You’ve explored this product as far as the free preview goes. Produce this one to keep exploring.', {
+        ceilingMicros: FREE_EXPLORATION.SKU_COGS_CAP,
+        estimateMicros: est.totalMicros,
+        priorMicros: prior,
+        purpose: input.purpose,
+        reason: 'free_exploration_cap',
       });
     }
   }
