@@ -34,7 +34,9 @@ export class AnthropicLlm implements LlmProvider {
     });
 
     try {
-      const response = await this.client.messages.parse({
+      // create (not parse): the stop reason is checked before the answer is read, so a refusal or a truncated
+      // answer is classified as such instead of surfacing as a JSON parse error.
+      const response = await this.client.messages.create({
         model: req.model,
         max_tokens: req.maxTokens ?? 16000,
         // Static prompt first and cached; tenant data only ever appears in `messages`.
@@ -57,10 +59,17 @@ export class AnthropicLlm implements LlmProvider {
       if (response.stop_reason === 'max_tokens') {
         throw new ProviderError(this.name, 'output truncated at max_tokens', true, 'invalid', billed);
       }
-      const parsed = response.parsed_output as T | null;
-      if (parsed == null) throw new ProviderError(this.name, 'structured output failed to parse', true, 'invalid', billed);
+      const text = response.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new ProviderError(this.name, 'structured output failed to parse', true, 'invalid', billed);
+      }
+      const checked = req.schema.safeParse(parsed);
+      if (!checked.success) throw new ProviderError(this.name, `structured output does not match the schema: ${checked.error.message.slice(0, 200)}`, true, 'invalid', billed);
       return {
-        data: req.schema.parse(parsed),
+        data: checked.data,
         usage: {
           inputTokens:
             response.usage.input_tokens +
