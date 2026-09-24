@@ -44,6 +44,8 @@ export * from './qa';
 export * from './qa-metrics';
 export * from './variants';
 export * from './experiments';
+export * from './fatigue';
+export * from './anomalies';
 export * from './statistics';
 export * from './recommendations';
 export * from './performance';

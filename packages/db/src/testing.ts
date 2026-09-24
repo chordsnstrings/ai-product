@@ -14,6 +14,7 @@ const REFERENCE_TABLES = new Set([
   'platform_settings',
   'landing_pages',
   'providers',
+  'fx_rates',
 ]);
 
 export async function truncateAll(): Promise<void> {

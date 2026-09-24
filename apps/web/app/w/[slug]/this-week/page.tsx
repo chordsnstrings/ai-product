@@ -4,6 +4,7 @@ import { withTenant } from '@arkiv/db';
 import { balances, resolveRationale, weekOf, type RationaleItem } from '@arkiv/core';
 import { Banner, Empty, LinkButton, SignalChip } from '@arkiv/ui';
 import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
+import { ConnectAdsCard } from '@/components/connect-ads-card';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'This Week · Arkiv' };
@@ -73,7 +74,12 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
     const acceptedRecent = await tx`select count(*)::int as n from recommendations where status = 'accepted' and created_at > now() - interval '21 days'`;
     const [sub] = await tx`select plan_code from subscriptions where status in ('active','trialing','past_due') limit 1`;
     const rationale = await resolveRationale(tx, recs.flatMap((r) => (r.rationale_ids as string[]) ?? []));
-    return { skus, recs, jobs, changes, rationale, bal: await balances(tx), ignored: dismissedStreak[0]!.n >= 6 && acceptedRecent[0]!.n === 0, sub };
+    // §48: no ad account connected → the plan is context-limited; show what connecting unlocks.
+    const [ads] = await tx`select count(*)::int as n from integrations where provider in ('meta','tiktok') and status <> 'disconnected'`;
+    // §45: automatically detected sales spikes wait for the merchant's confirmation before they confound anything.
+    const pending = await tx`select c.id, c.kind, c.note, c.starts_at, s.name from confounders c left join skus s on s.id = c.sku_id
+                             where c.status = 'pending_confirmation' order by c.starts_at desc limit 5`;
+    return { skus, recs, jobs, changes, rationale, bal: await balances(tx), ignored: dismissedStreak[0]!.n >= 6 && acceptedRecent[0]!.n === 0, sub, adAccounts: ads!.n as number, pending };
   });
   const canCreate = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
 
@@ -99,6 +105,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
         <Banner tone="warn">You’ve used this month’s Creative Tests. <Link href={`/w/${slug}/settings/billing`}>Upgrade your plan</Link> or wait for the renewal.</Banner>
       ) : null}
       {!data.sub ? <Banner>Recommendations are free to read. <Link href="/app/plan">Choose a plan</Link> to produce them as Creative Tests.</Banner> : null}
+      {data.adAccounts === 0 ? <div style={{ marginTop: 16 }}><ConnectAdsCard slug={slug} userKey={w.user?.id ?? w.ctx.actor.id} /></div> : null}
       {data.ignored ? <Banner>We noticed you’ve passed on recent suggestions. Are these the wrong kind of tests? <a href="mailto:support@arkiv.app?subject=Recommendations">Tell us in one line</a>.</Banner> : null}
 
       {data.recs.length === 0 ? (
@@ -110,7 +117,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
             return (
               <article key={r.id as string} className="ak-card">
                 <div className="ak-between"><span className="ak-index">No. {String(r.catalogue_no).padStart(3, '0')} · {r.sku_name as string}</span></div>
-                <p className="ak-label" style={{ marginTop: 12 }}>{SLOT[r.slot as string]}</p>
+                <p className="ak-label" style={{ marginTop: 12 }}>{r.kind === 'refresh' ? 'Refresh · your winner is wearing out' : SLOT[r.slot as string]}</p>
                 <h2 className="ak-h2 ak-serif">“{p.hookOptions[0]}”</h2>
                 <p className="ak-small">{p.hypothesis}</p>
                 <dl className="ak-meta ak-small">
@@ -151,7 +158,21 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
 
       <section className="ak-section">
         <h2 className="ak-label">What changed</h2>
-        {data.changes.length === 0 ? (
+        {data.pending.map((c) => (
+          <div key={c.id as string} className="ak-index-row">
+            <span>
+              {c.name ? `${c.name as string}: ` : ''}{(c.note as string) ?? 'Unusual sales day'}
+              <span className="ak-small ak-muted" style={{ display: 'block' }}>Detected automatically · if it was a mention or promotion, we’ll keep that day out of your test results.</span>
+            </span>
+            {canCreate ? (
+              <span className="ak-row">
+                <ActionButton slug={slug} action="confounder-decide" body={{ id: c.id, decision: 'confirm' }} variant="text">It happened</ActionButton>
+                <ActionButton slug={slug} action="confounder-decide" body={{ id: c.id, decision: 'dismiss' }} variant="text">Not an event</ActionButton>
+              </span>
+            ) : null}
+          </div>
+        ))}
+        {data.changes.length === 0 && data.pending.length === 0 ? (
           <p className="ak-muted ak-small">Nothing significant in the last two weeks. We only list changes that should affect what you test.</p>
         ) : (
           data.changes.map((c, i) => (

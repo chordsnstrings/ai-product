@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withTenant, globalTx } from '@arkiv/db';
-import { saveIntegration } from '@arkiv/core';
+import { saveIntegration, stashPendingConnection } from '@arkiv/core';
 import { metaExchangeCode, shopifyExchangeCode, tiktokExchangeCode, verifyShopifyQuery, verifyState } from '@arkiv/integrations';
 import { env, type Role, type WorkspaceState } from '@arkiv/shared';
 import { currentUser } from '@/lib/session';
@@ -32,13 +32,18 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
     if (!q.code && !q.auth_code) return back(st.slug!, q.error_description ?? 'Connection cancelled.');
     const r = provider === 'meta' ? await metaExchangeCode(q.code!) : await tiktokExchangeCode(q.auth_code ?? q.code!);
     if (!r.accounts.length) return back(st.slug!, 'No ad accounts found on that login.');
-    // Connect every readable account (read-only scope); each syncs independently.
-    for (const a of r.accounts.slice(0, 10)) {
+    const label = provider === 'meta' ? 'Meta' : 'TikTok';
+    if (r.accounts.length === 1) {
+      const a = r.accounts[0]!;
       await withTenant(ctx.workspaceId, (tx) =>
         saveIntegration(tx, ctx, { provider: provider as 'meta' | 'tiktok', externalAccountId: a.id, displayName: a.name, token: r.accessToken, scopes: ['ads_read'], currency: a.currency, timezone: a.timezone, platformUserId: r.platformUserId }),
       );
+      return back(st.slug!, `${label} connected (${a.name}). First sync running.`);
     }
-    return back(st.slug!, `${provider === 'meta' ? 'Meta' : 'TikTok'} connected (${r.accounts.length} account${r.accounts.length > 1 ? 's' : ''}). First sync running.`);
+    // Several readable accounts (an agency login can read other brands'): nothing is connected until the merchant
+    // picks which belong to this workspace (§47 "Wrong ad account selected").
+    const pendingId = await withTenant(ctx.workspaceId, (tx) => stashPendingConnection(tx, ctx, provider as 'meta' | 'tiktok', r.accessToken, r.accounts, r.platformUserId));
+    return NextResponse.redirect(`${env().APP_URL}/w/${st.slug}/settings/integrations?${new URLSearchParams({ pick: pendingId })}`, 303);
   } catch (e) {
     return back(st.slug!, e instanceof Error ? e.message : 'Connection failed.');
   }

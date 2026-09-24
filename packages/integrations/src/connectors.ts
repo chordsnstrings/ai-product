@@ -48,6 +48,13 @@ export interface NormalizedObservation {
   optimizationEvent: string | null;
   campaignType: string | null;
   measurementContext: MeasurementContext;
+  /**
+   * Publisher platform × position (e.g. `instagram:reels`), or 'all' when the source has no placement breakdown.
+   * Placements are stored separately and only aggregated under a compatible context (§45).
+   */
+  placement?: string;
+  /** IANA timezone the source reports daily dates in (§47); defaults to the connection's timezone. */
+  sourceTimezone?: string | null;
 }
 
 const num = (v: unknown) => (v == null || v === '' ? 0 : Number(v));
@@ -143,6 +150,7 @@ export interface ShopifyProduct {
 }
 
 const PRODUCTS_QUERY = `query Products($cursor: String) {
+  shop { currencyCode ianaTimezone }
   products(first: 50, after: $cursor) {
     pageInfo { hasNextPage endCursor }
     nodes { id title description status vendor updatedAt
@@ -151,7 +159,7 @@ const PRODUCTS_QUERY = `query Products($cursor: String) {
   }
 }`;
 
-export async function shopifyFetchProducts(shop: string, token: string, cursor: string | null): Promise<{ products: ShopifyProduct[]; next: string | null }> {
+export async function shopifyFetchProducts(shop: string, token: string, cursor: string | null): Promise<{ products: ShopifyProduct[]; next: string | null; currency: string | null; timezone: string | null }> {
   const r = await fetch(`https://${shop}/admin/api/2026-07/graphql.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
@@ -159,9 +167,14 @@ export async function shopifyFetchProducts(shop: string, token: string, cursor: 
   });
   if (r.status === 401 || r.status === 403) throw new ConnectorError('shopify', 'auth_revoked', 'access revoked');
   if (r.status === 429) throw new ConnectorError('shopify', 'rate_limited', 'throttled', Number(r.headers.get('retry-after') ?? 2));
-  const j = (await r.json()) as { data?: { products: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: Record<string, unknown>[] } }; errors?: unknown };
+  const j = (await r.json()) as { data?: { shop?: { currencyCode?: string; ianaTimezone?: string }; products: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: Record<string, unknown>[] } }; errors?: unknown };
   if (!j.data) throw new ConnectorError('shopify', 'schema_changed', `unexpected response: ${JSON.stringify(j.errors).slice(0, 200)}`);
-  return { products: j.data.products.nodes.map(normalizeShopifyProduct), next: j.data.products.pageInfo.hasNextPage ? j.data.products.pageInfo.endCursor : null };
+  return {
+    products: j.data.products.nodes.map(normalizeShopifyProduct),
+    next: j.data.products.pageInfo.hasNextPage ? j.data.products.pageInfo.endCursor : null,
+    currency: j.data.shop?.currencyCode ?? null,
+    timezone: j.data.shop?.ianaTimezone ?? null,
+  };
 }
 
 export function normalizeShopifyProduct(n: Record<string, unknown>): ShopifyProduct {
@@ -196,6 +209,15 @@ export const META_INSIGHT_FIELDS = [
   'frequency', 'clicks', 'outbound_clicks', 'video_play_actions', 'video_p25_watched_actions', 'video_p50_watched_actions',
   'video_p75_watched_actions', 'video_p100_watched_actions', 'video_avg_time_watched_actions', 'actions', 'action_values', 'optimization_goal', 'objective',
 ];
+/** Placement breakdown (§45 "store placement/campaign observations separately"). */
+export const META_BREAKDOWNS = ['publisher_platform', 'platform_position'];
+
+/** `publisher_platform:platform_position`, lower-cased; 'all' when the row has no breakdown. */
+export function metaPlacement(r: Record<string, unknown>): string {
+  const pub = typeof r.publisher_platform === 'string' ? r.publisher_platform.trim().toLowerCase() : '';
+  const pos = typeof r.platform_position === 'string' ? r.platform_position.trim().toLowerCase() : '';
+  return pub ? (pos ? `${pub}:${pos}` : pub) : 'all';
+}
 
 type MetaAction = { action_type: string; value: string };
 const actionVal = (arr: unknown, type: string) => num(((arr as MetaAction[]) ?? []).find((a) => a.action_type === type)?.value);
@@ -232,6 +254,7 @@ export function normalizeMetaInsight(r: Record<string, unknown>, attributionWind
     optimizationEvent: (r.optimization_goal as string) ?? null,
     campaignType: (r.objective as string) ?? null,
     measurementContext: 'META_PAID_ATTRIBUTED',
+    placement: metaPlacement(r),
   };
 }
 
@@ -243,6 +266,7 @@ export async function metaFetchInsights(token: string, accountId: string, since:
     fields: META_INSIGHT_FIELDS.join(','),
     time_range: JSON.stringify({ since, until }),
     action_attribution_windows: JSON.stringify(['7d_click', '1d_view']),
+    breakdowns: META_BREAKDOWNS.join(','),
     limit: '200',
   });
   if (after) q.set('after', after);
@@ -362,5 +386,28 @@ export async function tiktokExchangeCode(authCode: string): Promise<{ accessToke
   });
   const j = (await r.json()) as { code: number; message: string; data?: { access_token: string; advertiser_ids: string[] } };
   if (j.code !== 0 || !j.data) throw new ConnectorError('tiktok', 'auth_revoked', j.message);
-  return { accessToken: j.data.access_token, platformUserId: null, accounts: j.data.advertiser_ids.map((id) => ({ id, name: `Advertiser ${id}`, currency: null, timezone: null })) };
+  const info = await tiktokAdvertiserInfo(j.data.access_token, j.data.advertiser_ids).catch(() => new Map<string, Partial<AdAccount>>());
+  return {
+    accessToken: j.data.access_token,
+    platformUserId: null,
+    accounts: j.data.advertiser_ids.map((id) => ({ id, name: info.get(id)?.name ?? `Advertiser ${id}`, currency: info.get(id)?.currency ?? null, timezone: info.get(id)?.timezone ?? null })),
+  };
+}
+
+/**
+ * Advertiser name, currency and reporting timezone (§47 "store native currency", "retain source timezone"). Reports
+ * are in the advertiser's currency and timezone, so both are kept with the connection.
+ */
+export async function tiktokAdvertiserInfo(token: string, advertiserIds: string[]): Promise<Map<string, Partial<AdAccount>>> {
+  const out = new Map<string, Partial<AdAccount>>();
+  for (let i = 0; i < advertiserIds.length; i += 100) {
+    const q = new URLSearchParams({ advertiser_ids: JSON.stringify(advertiserIds.slice(i, i + 100)), fields: JSON.stringify(['advertiser_id', 'name', 'currency', 'timezone', 'display_timezone']) });
+    const r = await fetch(`${TIKTOK_API}/advertiser/info/?${q}`, { headers: { 'Access-Token': token } });
+    const j = (await r.json()) as { code: number; data?: { list?: { advertiser_id: string; name?: string; currency?: string; timezone?: string; display_timezone?: string }[] } };
+    if (j.code !== 0) continue;
+    for (const a of j.data?.list ?? []) {
+      out.set(String(a.advertiser_id), { name: a.name || undefined, currency: a.currency || null, timezone: a.display_timezone || a.timezone || null });
+    }
+  }
+  return out;
 }

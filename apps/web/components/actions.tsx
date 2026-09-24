@@ -49,6 +49,8 @@ export interface Field {
   max?: number;
   accept?: string;
   hint?: string;
+  /** Checkbox values ticked at first (all of them when omitted). */
+  checked?: string[];
 }
 
 /** Small declarative form → workspace action (JSON, or multipart when a file field is present). */
@@ -104,7 +106,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
           ) : f.type === 'checkboxes' ? (
             <span className="ak-row">
               {f.options?.map((o) => (
-                <label key={o.value} className="ak-check"><input type="checkbox" name={f.name} value={o.value} defaultChecked /> {o.label}</label>
+                <label key={o.value} className="ak-check"><input type="checkbox" name={f.name} value={o.value} defaultChecked={f.checked ? f.checked.includes(o.value) : true} /> {o.label}</label>
               ))}
             </span>
           ) : (

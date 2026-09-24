@@ -13,6 +13,7 @@ import {
   systemContext,
   type TenantContext,
   createSkuReview,
+  detectSalesAnomalies,
   duePurges,
   dueSkuReviews,
   evaluateCanaries,
@@ -253,6 +254,19 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
         for (const w of ws) await enqueueFor(tx, w.id as string, 'send-email', { template: 'friday_summary' }, `friday:${w.id}:${weekOf()}`);
         return ws.length;
       }),
+  },
+  // §45 "External viral event drives sales": a sales spike without more ad delivery becomes a candidate
+  // viral-event confounder the merchant confirms or dismisses on This Week. Each workspace is read in its own
+  // tenant transaction; the fan-out query names nothing but workspace ids.
+  'sales-anomalies': {
+    cron: '20 6 * * *',
+    run: async () => {
+      const ws = await withSystem((tx) => tx`select distinct o.workspace_id from performance_observations o join workspaces w on w.id = o.workspace_id
+                                             where o.date >= current_date - 3 and o.superseded_at is null and w.state in ('ACTIVE_PAID','PAST_DUE','ACTIVE_FREE')`);
+      let n = 0;
+      for (const w of ws) n += await withTenant(w.workspace_id as string, (tx) => detectSalesAnomalies(tx, sysCtx(w.workspace_id as string, 'sales-anomalies')));
+      return n;
+    },
   },
   'risk-flags': {
     cron: '30 7 * * *',

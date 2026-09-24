@@ -3,7 +3,8 @@ import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
 import { measurementContextLabel } from '@arkiv/shared';
 import { Empty, SignalChip } from '@arkiv/ui';
-import { ActionForm, SheetButton } from '@/components/actions';
+import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
+import { ConnectAdsCard } from '@/components/connect-ads-card';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Results · Arkiv' };
@@ -16,6 +17,11 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
     exps: await tx`select e.id, e.hypothesis, e.state, e.mode, e.created_at, s.name, s.catalogue_no from experiments e join skus s on s.id = e.sku_id order by e.created_at desc limit 100`,
     learnings: await tx`select l.statement, l.state, l.scope_platform, l.measurement_context, l.confidence, l.confounded, s.name from learnings l join skus s on s.id = l.sku_id order by l.last_revalidated_at desc limit 30`,
     skus: await tx`select id, name from skus where status = 'active' order by catalogue_no`,
+    adAccounts: (await tx`select count(*)::int as n from integrations where provider in ('meta','tiktok') and status <> 'disconnected'`)[0]!.n as number,
+    tz: (await tx`select timezone from workspaces where id = ${w.ctx.workspaceId}`)[0]?.timezone as string | undefined,
+    // Operational signals of the last 60 days (§45): merchant-marked and automatic, with their source.
+    signals: await tx`select c.id, c.kind, c.source, c.status, c.starts_at, c.ends_at, c.note, s.name from confounders c left join skus s on s.id = c.sku_id
+                      where c.status <> 'dismissed' and coalesce(c.ends_at, now()) > now() - interval '60 days' order by c.starts_at desc limit 20`,
   }));
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
   return (
@@ -37,11 +43,13 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
               <ActionForm slug={slug} action="performance-csv" multipart submit="Upload" fields={[
                 { name: 'platform', label: 'Exported from', type: 'select', required: true, options: [{ value: '', label: 'Choose…' }, { value: 'meta', label: 'Meta Ads Manager' }, { value: 'tiktok', label: 'TikTok Ads Manager' }] },
                 { name: 'file', label: 'CSV file', type: 'file', accept: '.csv,text/csv', required: true },
+                { name: 'timezone', label: 'Ad account timezone', defaultValue: d.tz ?? '', placeholder: 'e.g. America/New_York', max: 64, hint: 'The timezone your ad account reports days in, so each day lines up with stock-outs and price changes.' },
               ]} />
             </SheetButton>
           </div>
         ) : null}
       </div>
+      {d.adAccounts === 0 ? <div style={{ marginTop: 24 }}><ConnectAdsCard slug={slug} userKey={w.user?.id ?? w.ctx.actor.id} /></div> : null}
       {d.exps.length === 0 ? (
         <Empty title="No tests yet" body="Approve a recommendation on This Week to start your first Creative Test." />
       ) : (
@@ -57,6 +65,29 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
           ))}
         </div>
       )}
+      {d.signals.length ? (
+        <section className="ak-section">
+          <h2 className="ak-label">Things that affect results</h2>
+          {d.signals.map((c) => (
+            <div key={c.id as string} className="ak-index-row">
+              <span>
+                {String(c.kind).replace(/_/g, ' ')}{c.name ? ` · ${c.name as string}` : ' · all products'}{c.note ? ` — ${c.note as string}` : ''}
+                <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                  {new Date(c.starts_at as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}{c.ends_at ? ` – ${new Date(c.ends_at as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}` : ' – ongoing'}
+                  {' · '}{c.source === 'automatic' ? 'detected automatically' : c.source === 'staff' ? 'marked by Arkiv' : 'marked by your team'}
+                  {c.status === 'pending_confirmation' ? ' · waiting for your confirmation' : ''}
+                </span>
+              </span>
+              {canEdit ? (
+                <span className="ak-row">
+                  {c.status === 'pending_confirmation' ? <ActionButton slug={slug} action="confounder-decide" body={{ id: c.id, decision: 'confirm' }} variant="text">It happened</ActionButton> : null}
+                  <ActionButton slug={slug} action="confounder-decide" body={{ id: c.id, decision: 'dismiss' }} variant="text" confirm="Dismiss this? The affected tests are read again without it.">Dismiss</ActionButton>
+                </span>
+              ) : null}
+            </div>
+          ))}
+        </section>
+      ) : null}
       <section className="ak-section">
         <h2 className="ak-label">What your tests have taught you</h2>
         {d.learnings.length === 0 ? (

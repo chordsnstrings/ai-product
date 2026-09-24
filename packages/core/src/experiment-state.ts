@@ -127,16 +127,51 @@ export async function confoundRunning(tx: Tx, ctx: Pick<TenantContext, 'workspac
  * marks running tests so their results can't be read as clean.
  */
 export async function onMaterialProductChange(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, skuId: string, key: string) {
-  if (key !== 'price') return;
+  // A price change, or a compare-at ("was") price appearing, changing or ending — a promotion (§48).
+  const kind = key === 'price' ? 'price_change' : key === 'compare_at_price' ? 'offer_change' : null;
+  if (!kind) return;
+  const what = kind === 'price_change' ? 'price changed' : 'promotion (compare-at price) changed';
   // The changeover itself is the confounded period: readings either side of it are not one comparable test.
-  await tx`insert into confounders (workspace_id, sku_id, kind, starts_at, ends_at, note, source, created_by)
-           values (${ctx.workspaceId}, ${skuId}, 'price_change', now(), now() + interval '1 day', 'price changed in product facts', 'automatic', ${actorString(ctx)})`;
-  await confoundRunning(tx, ctx, skuId, 'price_change');
+  await recordAutomaticConfounder(tx, ctx, { skuId, kind, endsAt: 'P1D', note: `${what} in product facts`, detail: { key } });
   const now = new Date().toISOString();
   const ls = await tx`select id, state from learnings where sku_id = ${skuId} and state in ('DIRECTIONAL','ACTIONABLE') for update`;
   for (const l of ls) {
     await tx`update learnings set state = 'WEAKENING', last_revalidated_at = now(),
-               history = history || ${tx.json([{ at: now, from: l.state, to: 'WEAKENING', reason: 'price changed' }] as never)} where id = ${l.id}`;
-    await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { from: l.state, to: 'WEAKENING', reason: 'price changed' }, { skuId });
+               history = history || ${tx.json([{ at: now, from: l.state, to: 'WEAKENING', reason: what }] as never)} where id = ${l.id}`;
+    await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { from: l.state, to: 'WEAKENING', reason: what }, { skuId });
   }
+}
+
+/**
+ * An automatic operational confounder (§45 "merchant or automated signal marks affected date range"; §48 price or
+ * promotion changes "create an operational-confounder window"). An active one marks the SKU's running tests at
+ * once and recomputes them; a candidate ('pending_confirmation', e.g. a detected sales spike) waits for the
+ * merchant and confounds nothing until confirmed. `endsAt` 'P1D' = one day from the start; null = still ongoing.
+ * An ongoing automatic confounder of the same kind on the SKU is not opened twice.
+ */
+export async function recordAutomaticConfounder(
+  tx: Tx,
+  ctx: Pick<TenantContext, 'workspaceId' | 'actor'>,
+  input: { skuId: string | null; kind: string; startsAt?: string | null; endsAt?: string | 'P1D' | null; note: string; detail?: Record<string, unknown>; status?: 'active' | 'pending_confirmation' },
+): Promise<string | null> {
+  if (input.endsAt === null || input.endsAt === undefined) {
+    const [open] = await tx`select id from confounders where source = 'automatic' and kind = ${input.kind} and sku_id is not distinct from ${input.skuId}::uuid
+                            and ends_at is null and status <> 'dismissed' limit 1`;
+    if (open) return null;
+  }
+  const status = input.status ?? 'active';
+  const [c] = await tx`
+    insert into confounders (workspace_id, sku_id, kind, starts_at, ends_at, note, source, created_by, status, detail)
+    values (${ctx.workspaceId}, ${input.skuId}, ${input.kind}, coalesce(${input.startsAt ?? null}::timestamptz, now()),
+            case when ${input.endsAt === 'P1D'} then coalesce(${input.startsAt ?? null}::timestamptz, now()) + interval '1 day' else ${input.endsAt === 'P1D' ? null : (input.endsAt ?? null)}::timestamptz end,
+            ${input.note}, 'automatic', ${actorString(ctx)}, ${status}, ${tx.json((input.detail ?? {}) as never)})
+    returning id`;
+  if (status === 'active') await confoundRunning(tx, ctx, input.skuId, input.kind);
+  return c!.id as string;
+}
+
+/** Close the SKU's ongoing automatic confounders of a kind (e.g. back in stock): the window ends now. */
+export async function closeAutomaticConfounders(tx: Tx, skuId: string, kind: string) {
+  const r = await tx`update confounders set ends_at = now() where sku_id = ${skuId} and kind = ${kind} and source = 'automatic' and ends_at is null returning id`;
+  return r.length;
 }

@@ -8,6 +8,7 @@ import { confoundRunning, LIVE_STATES, recordExperimentApproval, setExperimentSt
 import { authorizeFromQuote } from './render-quotes';
 import type { Proposal } from './intel-schemas';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
+import { recordFatigue } from './fatigue';
 import { FRESHNESS_DAYS } from './performance';
 import { approveForProduction } from './production';
 import { planSteps } from './progress';
@@ -192,6 +193,11 @@ interface ObsAgg {
   spend_micros: number;
   purchase_value_micros: number;
   days: number;
+  optimization_event: string;
+  campaign_type: string;
+  /** Distinct native currencies in the sum; money is read in the reporting currency (§47). */
+  currencies: number;
+  unconverted: number;
 }
 
 export interface VariantRow {
@@ -289,10 +295,50 @@ export function describeLearning(input: {
 }
 
 /**
+ * An observation day inside an active confounder window of the SKU (or the whole workspace). Windows are
+ * timestamps; an observation's date is a day in its source's reporting timezone (§47), so the window is converted
+ * into that timezone before the days are compared. Candidates awaiting confirmation and dismissed ones never count.
+ */
+const CONFOUNDED_DAY = (tx: Tx, skuId: unknown) => tx`exists (
+  select 1 from confounders c where c.status = 'active' and (c.sku_id is null or c.sku_id = ${skuId as string})
+    and o.date >= (c.starts_at at time zone coalesce(o.source_timezone, 'UTC'))::date
+    and o.date <= (coalesce(c.ends_at, now()) at time zone coalesce(o.source_timezone, 'UTC'))::date)`;
+
+/** The campaign context a comparison is computed under (§45 "aggregate only under compatible context"). */
+export interface CompatScope {
+  optimizationEvent: string;
+  campaignType: string;
+}
+
+/**
+ * Pick the compatible context for one measurement context × window: variants are compared only on observations
+ * sharing an optimization event and campaign type (a purchase-optimized and a traffic-optimized campaign are
+ * different auctions). The scope covering the most variants wins, then the most impressions; rows outside it are
+ * left out and reported.
+ */
+export function compatibleScope<T extends { variant_id: string; optimization_event: string; campaign_type: string; impressions: number | string }>(rows: T[]): { scope: CompatScope | null; kept: T[]; excluded: T[] } {
+  const by = new Map<string, T[]>();
+  for (const r of rows) {
+    const k = `${r.optimization_event}\u0000${r.campaign_type}`;
+    by.set(k, [...(by.get(k) ?? []), r]);
+  }
+  const ranked = [...by.entries()].sort(([, a], [, b]) => {
+    const va = new Set(a.map((r) => r.variant_id)).size;
+    const vb = new Set(b.map((r) => r.variant_id)).size;
+    if (va !== vb) return vb - va;
+    return b.reduce((n, r) => n + Number(r.impressions), 0) - a.reduce((n, r) => n + Number(r.impressions), 0);
+  });
+  if (!ranked.length) return { scope: null, kept: [], excluded: [] };
+  const [key, kept] = ranked[0]!;
+  const [optimizationEvent, campaignType] = key.split('\u0000') as [string, string];
+  return { scope: { optimizationEvent, campaignType }, kept, excluded: ranked.slice(1).flatMap(([, r]) => r) };
+}
+
+/**
  * Recent SKU and account volume in one measurement context and attribution window (last 60 days, current
  * revisions, outside confounder windows, excluding this experiment's own variants) — the shrinkage baseline (§21).
  */
-async function baselinePools(tx: Tx, skuId: string, variantIds: string[], context: string, window: string): Promise<Record<RateMetric, BaselinePool[]>> {
+async function baselinePools(tx: Tx, skuId: string, variantIds: string[], context: string, window: string, accounts: string[]): Promise<Record<RateMetric, BaselinePool[]>> {
   const [r] = await tx`
     with obs as (
       select o.impressions, o.clicks, o.purchases, coalesce(o.video_starts, 0) as vs, coalesce(o.video_75, 0) as v75,
@@ -303,8 +349,8 @@ async function baselinePools(tx: Tx, skuId: string, variantIds: string[], contex
       where o.measurement_context = ${context} and o.attribution_window = ${window} and o.superseded_at is null
         and o.date > (now() - interval '60 days')::date
         and (o.variant_id is null or not (o.variant_id = any(${variantIds}::uuid[])))
-        and not exists (select 1 from confounders c where (c.sku_id is null or c.sku_id = ${skuId})
-                          and o.date >= c.starts_at::date and o.date <= coalesce(c.ends_at, now())::date))
+        and (${accounts.length === 0} or o.account_id = any(${accounts}::text[]))
+        and not ${CONFOUNDED_DAY(tx, skuId)})
     select coalesce(sum(impressions) filter (where sku), 0)::float8 as s_imp, coalesce(sum(clicks) filter (where sku), 0)::float8 as s_clk,
            coalesce(sum(purchases) filter (where sku), 0)::float8 as s_pur, coalesce(sum(vs) filter (where sku), 0)::float8 as s_vs,
            coalesce(sum(v75) filter (where sku), 0)::float8 as s_v75,
@@ -350,21 +396,54 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   if (!e) throw new DomainError('NOT_FOUND', 'Experiment not found');
   const variants = (await tx`select id, role, label, code, genes from variants where experiment_id = ${experimentId}`) as unknown as VariantRow[];
   const variantIds = variants.map((v) => v.id);
-  const agg = (await tx`
+  const ids = variantIds.concat(['00000000-0000-0000-0000-000000000000']);
+  // Money is summed in the workspace's reporting currency, never raw across currencies (§47); rows without a rate
+  // are counted as unconverted instead of being added in their native currency.
+  const allAgg = (await tx`
     select o.variant_id, o.measurement_context, o.attribution_window,
+      coalesce(o.optimization_event, '') as optimization_event, coalesce(o.campaign_type, '') as campaign_type,
       sum(o.impressions)::bigint as impressions, sum(o.clicks)::bigint as clicks, sum(o.purchases)::bigint as purchases,
       sum(coalesce(o.video_starts,0))::bigint as video_starts, sum(coalesce(o.video_75,0))::bigint as video_75,
-      sum(o.spend_micros)::bigint as spend_micros, sum(o.purchase_value_micros)::bigint as purchase_value_micros,
+      coalesce(sum(o.spend_reporting_micros), 0)::bigint as spend_micros, coalesce(sum(o.value_reporting_micros), 0)::bigint as purchase_value_micros,
+      count(distinct o.currency)::int as currencies, count(*) filter (where o.spend_reporting_micros is null)::int as unconverted,
       count(distinct o.date)::int as days
     from performance_observations o
-    where o.variant_id in ${tx(variantIds.concat(['00000000-0000-0000-0000-000000000000']))}
+    where o.variant_id in ${tx(ids)}
       and o.superseded_at is null
-      and not exists (select 1 from confounders c where (c.sku_id is null or c.sku_id = ${e.sku_id})
-                        and o.date >= c.starts_at::date and o.date <= coalesce(c.ends_at, now())::date)
-    group by 1, 2, 3`) as unknown as ObsAgg[];
+      and not ${CONFOUNDED_DAY(tx, e.sku_id)}
+    group by 1, 2, 3, 4, 5`) as unknown as ObsAgg[];
+  // The experiment's observed span and source accounts (all current rows, confounded days included): confounders
+  // are matched by overlap with this span, and baselines and volume come from these accounts only (§47 "keep
+  // observations scoped to source account").
+  const [span] = await tx`select min(date)::text as first, max(date)::text as last, coalesce(array_agg(distinct account_id), '{}') as accounts,
+                                 mode() within group (order by source_timezone) as tz
+                          from performance_observations where variant_id in ${tx(ids)} and superseded_at is null`;
+  const accounts = ((span?.accounts as string[]) ?? []).filter(Boolean);
   const [vol] = await tx`select coalesce(sum(impressions) / nullif(count(distinct date), 0), 0)::bigint as daily from performance_observations
-                         where date > now() - interval '30 days'`;
+                         where date > now() - interval '30 days' and superseded_at is null and (${accounts.length === 0} or account_id = any(${accounts}::text[]))`;
   const daily = Number(vol!.daily);
+  // Confounder windows overlapping the test's span (§45): from its first observation to its last — or to today while
+  // it can still be running, since an ongoing change affects the days still to come. One that ended before the test's
+  // first observation, or starts after it stopped, does not confound it; one that overlaps does, however long ago
+  // it started.
+  const live = LIVE_STATES.includes(e.state as ExperimentState);
+  const windows = span?.first
+    ? ((await tx`select id, kind, source, note, starts_at, ends_at from confounders
+                 where status = 'active' and (sku_id is null or sku_id = ${e.sku_id})
+                   and (starts_at at time zone ${(span.tz as string) ?? 'UTC'})::date
+                       <= (case when ${live} then greatest(${span.last as string}::date, (now() at time zone ${(span.tz as string) ?? 'UTC'})::date) else ${span.last as string}::date end)
+                   and (coalesce(ends_at, now()) at time zone ${(span.tz as string) ?? 'UTC'})::date >= ${span.first as string}::date
+                 order by starts_at`) as unknown as { id: string; kind: string; source: string; note: string | null; starts_at: Date; ends_at: Date | null }[])
+    : [];
+  const confounderWindows = windows.map((w) => ({ id: w.id, kind: w.kind, source: w.source, note: w.note, startsAt: new Date(w.starts_at).toISOString(), endsAt: w.ends_at ? new Date(w.ends_at).toISOString() : null }));
+  // One compatible campaign context per measurement context × window (§45).
+  const scopes = new Map<string, { scope: CompatScope | null; excluded: number }>();
+  const agg: ObsAgg[] = [];
+  for (const key of new Set(allAgg.map((a) => `${a.measurement_context}|${a.attribution_window}`))) {
+    const pick = compatibleScope(allAgg.filter((a) => `${a.measurement_context}|${a.attribution_window}` === key));
+    scopes.set(key, { scope: pick.scope, excluded: pick.excluded.reduce((n, r) => n + Number(r.impressions), 0) });
+    agg.push(...pick.kept);
+  }
   const expGenes = (e.genes ?? {}) as Record<string, unknown>;
   // One comparison per measurement context × attribution window: a 7-day-click and a 1-day-view reading are
   // different measurements and are never summed together (§30).
@@ -380,11 +459,11 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
     cmp: ComparisonResult;
   }
   const summary: Summary[] = [];
-  const [confounded] = await tx`select count(*)::int as n from confounders where (sku_id is null or sku_id = ${e.sku_id})
-                                and starts_at > now() - interval '30 days'`;
 
   for (const g of groups) {
-    const pools = await baselinePools(tx, e.sku_id as string, variantIds, g.context, g.window);
+    const pools = await baselinePools(tx, e.sku_id as string, variantIds, g.context, g.window, accounts);
+    const sc = scopes.get(`${g.context}|${g.window}`);
+    const scope = { ...(sc?.scope ?? {}), excludedImpressions: sc?.excluded ?? 0 };
     const rows = agg.filter((a) => a.measurement_context === g.context && a.attribution_window === g.window);
     for (const metric of metrics) {
       const ev: VariantEvidence[] = rows.map((r) => ({ variantId: r.variant_id, obs: toRate(metric, r), days: Number(r.days) })).filter((x) => x.obs.trials > 0);
@@ -397,12 +476,14 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
         const row = cmp?.variants.find((x) => x.variantId === r.variantId);
         await tx`
           insert into experiment_results (workspace_id, experiment_id, variant_id, measurement_context, attribution_window, metric, successes, trials, raw_rate,
-            posterior_mean, ci_low, ci_high, prob_best, state)
+            posterior_mean, ci_low, ci_high, prob_best, state, confounder_windows, scope)
           values (${ctx.workspaceId}, ${experimentId}, ${r.variantId}, ${g.context}, ${g.window}, ${metric}, ${r.obs.successes}, ${r.obs.trials}, ${post.raw},
-            ${post.mean}, ${post.ciLow}, ${post.ciHigh}, ${row?.probBest ?? null}, ${cmp?.state ?? 'GATHERING_SIGNAL'})
+            ${post.mean}, ${post.ciLow}, ${post.ciHigh}, ${row?.probBest ?? null}, ${cmp?.state ?? 'GATHERING_SIGNAL'},
+            ${tx.json(confounderWindows as never)}, ${tx.json(scope as never)})
           on conflict (workspace_id, experiment_id, variant_id, measurement_context, attribution_window, metric) do update set
             successes = excluded.successes, trials = excluded.trials, raw_rate = excluded.raw_rate, posterior_mean = excluded.posterior_mean,
-            ci_low = excluded.ci_low, ci_high = excluded.ci_high, prob_best = excluded.prob_best, state = excluded.state, computed_at = now()`;
+            ci_low = excluded.ci_low, ci_high = excluded.ci_high, prob_best = excluded.prob_best, state = excluded.state,
+            confounder_windows = excluded.confounder_windows, scope = excluded.scope, computed_at = now()`;
       }
       if (cmp) summary.push({ context: g.context, window: g.window, metric, state: cmp.state, leader: cmp.leader, explanation: cmp.explanation, cmp });
     }
@@ -412,7 +493,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   const best = primary.find((s) => s.state === 'ACTIONABLE') ?? primary.find((s) => s.state === 'DIRECTIONAL') ?? primary.find((s) => s.state === 'INCONCLUSIVE');
   let resultState: ExperimentState = agg.length ? 'GATHERING_SIGNAL' : (e.state as ExperimentState);
   if (best) resultState = best.state as ExperimentState;
-  resultState = withConfounders(resultState, confounded!.n);
+  resultState = withConfounders(resultState, confounderWindows.length);
   const prev = e.state as ExperimentState;
   // Only a test that can be running moves with its results; a pre-launch, archived or invalidated one keeps its state.
   const running = LIVE_STATES.includes(prev);
@@ -424,7 +505,9 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
       await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'signal_update', window: w.key }, { singletonKey: `signal:${w.key}`, runAfter: w.runAt });
     }
   }
-  const out = { state: (moved ? resultState : prev) as ExperimentState, summary: summary.map(({ cmp: _c, ...s }) => s) };
+  const out = { state: (moved ? resultState : prev) as ExperimentState, summary: summary.map(({ cmp: _c, ...s }) => s), confounderWindows };
+  // Measured decay of the leading variant (§45): a fatigued winner asks for a controlled refresh, the learning stays.
+  await recordFatigue(tx, experimentId, variantIds, best && (best.state === 'ACTIONABLE' || best.state === 'DIRECTIONAL') ? best.leader : null);
   // Learnings come from tests that ran (an archived test's late conversions still revise them), never from a
   // pre-launch or invalidated one.
   if (!running && prev !== 'ARCHIVED') return out;
@@ -591,6 +674,30 @@ export async function markConfounder(
            values (${ctx.workspaceId}, ${input.skuId ?? null}, ${input.kind}, ${input.startsAt}, ${input.endsAt ?? null}, ${input.note ?? null},
                    'merchant', ${actorString(ctx)})`;
   await confoundRunning(tx, ctx, input.skuId ?? null, input.kind);
+}
+
+/**
+ * The merchant's decision on a confounder (§45): confirm an automatic candidate (a detected sales spike) so it
+ * excludes its days and marks running tests, or dismiss one that didn't happen so the SKU's tests are recomputed
+ * without it. The row is kept either way (history).
+ */
+export async function decideConfounder(tx: Tx, ctx: TenantContext, confounderId: string, decision: 'confirm' | 'dismiss') {
+  assertCan(ctx, 'sku.edit');
+  const [c] = await tx`select id, sku_id, kind, status from confounders where id = ${confounderId} for update`;
+  if (!c) throw new DomainError('NOT_FOUND', 'Confounder not found');
+  const to = decision === 'confirm' ? 'active' : 'dismissed';
+  if (c.status === to) return { changed: false };
+  if (decision === 'confirm' && c.status !== 'pending_confirmation') throw new DomainError('CONFLICT', 'This was already decided.');
+  await tx`update confounders set status = ${to}, decided_at = now(), decided_by = ${actorString(ctx)} where id = ${confounderId}`;
+  if (to === 'active') {
+    await confoundRunning(tx, ctx, (c.sku_id as string | null) ?? null, c.kind as string);
+  } else {
+    // Dismissed: the tests it touched are read again without it.
+    const exps = await tx`select id from experiments where (${(c.sku_id as string | null) ?? null}::uuid is null or sku_id = ${(c.sku_id as string | null) ?? null}::uuid)
+                          and state in ${tx(LIVE_STATES as ExperimentState[])}`;
+    for (const x of exps) await enqueue(tx, ctx.workspaceId, Queues.computeResults, { experimentId: x.id, reason: 'confounder' }, { singletonKey: `results:${x.id as string}` });
+  }
+  return { changed: true };
 }
 
 export async function experimentView(tx: Tx, experimentId: string) {
