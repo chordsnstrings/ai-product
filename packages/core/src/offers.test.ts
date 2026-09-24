@@ -8,7 +8,7 @@ import { ctxFor } from './testing';
 /** Offer definitions are reference data (not truncated between tests): every test restores the seed. */
 async function restoreSeed() {
   await ownerPool()`delete from offer_definitions where code not in ('TASTE_19', 'STANDALONE_29')`;
-  await ownerPool()`update offer_definitions set active = true, stripe_price_id = null, next_offer_policy = '{}' where code in ('TASTE_19', 'STANDALONE_29')`;
+  await ownerPool()`update offer_definitions set active = true, stripe_price_id = null, next_offer_policy = '{}', experiment = null, experiment_history = '[]', paused_reason = null, stripe_price_archived_at = null where code in ('TASTE_19', 'STANDALONE_29')`;
 }
 async function define(code: string, type: string, price: number, version: number, extra: { ref?: string; eligibility?: unknown; next?: string; stripe?: string } = {}) {
   await ownerPool()`insert into offer_definitions (code, type, price_micros, reference_code, window_minutes, eligibility, next_offer_policy, stripe_price_id, version)

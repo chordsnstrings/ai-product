@@ -15,6 +15,7 @@ import {
   projectVisitor,
   recordFunnel,
   workspaceVisitor,
+  raiseAlert,
   redeemOffer,
   transition,
   transitionWorkspace,
@@ -315,7 +316,9 @@ class ClaimLost extends Error {}
 
 const INVOICE_EVENTS = ['invoice.created', 'invoice.finalized', 'invoice.updated', 'invoice.paid', 'invoice.payment_failed', 'invoice.voided', 'invoice.marked_uncollectible'];
 const DISPUTE_EVENTS = ['charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed', 'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated'];
-const HANDLED_TYPES = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'charge.refunded', ...INVOICE_EVENTS, ...DISPUTE_EVENTS];
+/** Platform-level events (no customer, no tenant): a Stripe Price was archived, deleted or restored. */
+const PRICE_EVENTS = ['price.updated', 'price.deleted'];
+const HANDLED_TYPES = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'charge.refunded', ...INVOICE_EVENTS, ...DISPUTE_EVENTS, ...PRICE_EVENTS];
 
 export type StripeOutcome = 'processed' | 'unmatched' | 'ignored' | 'retry' | 'in_progress';
 
@@ -347,6 +350,22 @@ export async function processStripeEvent(eventId: string): Promise<StripeOutcome
                           where id = ${eventId} and claim_token = ${claim}`);
   const event = row.payload as Stripe.Event;
   const obj = event.data.object as unknown as Record<string, unknown>;
+  if (PRICE_EVENTS.includes(event.type)) {
+    // Not a tenant's event: applied as the system role, and marked processed in the same transaction.
+    try {
+      return await withSystem(async (tx) => {
+        await onPriceChanged(tx, event.type, obj as { id: string; active?: boolean | null });
+        const [done] = await tx`update stripe_events set status = 'processed', processed_at = now(), error = null, claim_token = null
+                                where id = ${eventId} and status = 'processing' and claim_token = ${claim} returning id`;
+        if (!done) throw new ClaimLost();
+        return 'processed' as const;
+      });
+    } catch (e) {
+      if (e instanceof ClaimLost) return 'in_progress';
+      await release('failed', (e as Error).message.slice(0, 500));
+      throw e;
+    }
+  }
   const customerId = (obj.customer as string) ?? null;
   const meta = (obj.metadata as Record<string, string>) ?? {};
   const paymentIntent = typeof obj.payment_intent === 'string' ? obj.payment_intent : ((obj.payment_intent as { id?: string } | null)?.id ?? null);
@@ -400,7 +419,10 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
       return upsertSubscription(tx, ctx, obj as unknown as Stripe.Subscription);
     case 'customer.subscription.deleted': {
       const sub = obj as unknown as Stripe.Subscription;
-      await tx`update subscriptions set status = 'canceled' where stripe_subscription_id = ${sub.id}`;
+      const [ended] = await tx`update subscriptions set status = 'canceled', next_payment_attempt = null
+                               where stripe_subscription_id = ${sub.id} and workspace_id = ${workspaceId} and status <> 'canceled' returning id, plan_code`;
+      // Churn movement (plan 05 §7 revenue): the plan's MRR leaves when the subscription ends, not when it's scheduled.
+      if (ended) await emit(tx, ctx, 'SUBSCRIPTION_ENDED', { type: 'subscription', id: ended.id as string }, { plan: ended.plan_code as string, stripeSubscriptionId: sub.id, reason: (sub as unknown as { cancellation_details?: { reason?: string | null } }).cancellation_details?.reason ?? null });
       await tx`update workspaces set plan_code = null where id = ${workspaceId}`;
       if (['ACTIVE_PAID', 'PAST_DUE'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'CANCELLED', 'subscription ended');
       await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'cancellation_confirmed', subscriptionId: sub.id }, { singletonKey: `cancelled:${sub.id}` });
@@ -410,7 +432,14 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
       return onInvoicePaid(tx, ctx, obj as unknown as Stripe.Invoice);
     case 'invoice.payment_failed': {
       if (ws!.state === 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'PAST_DUE', 'invoice payment failed');
-      await tx`update subscriptions set status = 'past_due' where stripe_subscription_id = ${subscriptionIdOf(obj as never)}`;
+      // Dunning view (plan 05 §7 "retry schedule"): Stripe's attempt count and next retry (null = no more retries).
+      // A late, older event (lower attempt count) never overwrites a newer schedule.
+      const inv = obj as { attempt_count?: number | null; next_payment_attempt?: number | null };
+      const attempt = Math.max(1, Number(inv.attempt_count ?? 1));
+      await tx`update subscriptions set status = 'past_due',
+                 next_payment_attempt = case when ${attempt} >= payment_attempt_count then ${unix(inv.next_payment_attempt)} else next_payment_attempt end,
+                 payment_attempt_count = greatest(payment_attempt_count, ${attempt})
+               where stripe_subscription_id = ${subscriptionIdOf(obj as never)} and workspace_id = ${workspaceId}`;
       await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'payment_failed' }, { singletonKey: `payfail:${event.id}` });
       return 'processed';
     }
@@ -435,6 +464,42 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
     }
   }
   return 'processed';
+}
+
+/**
+ * Plan 05 §6 edge case: "Stripe Price archived while an offer references it → offer auto-pauses and alerts". Every
+ * offer version charging that Price is paused (and can't be reactivated until the Price is restored or a new
+ * version is created); an archived plan or one-off Price configured in env raises an alert too. Restoring the Price
+ * only lifts the block: reactivating stays a staff decision. System role: offer definitions are platform config.
+ */
+export async function onPriceChanged(tx: Tx, type: string, price: { id: string; active?: boolean | null }) {
+  const archived = type === 'price.deleted' || price.active === false;
+  if (!archived) {
+    await tx`update offer_definitions set stripe_price_archived_at = null, updated_at = now() where stripe_price_id = ${price.id} and stripe_price_archived_at is not null`;
+    return { paused: [] as string[] };
+  }
+  const how = type === 'price.deleted' ? 'deleted' : 'archived';
+  const offers = await tx`select code, active from offer_definitions where stripe_price_id = ${price.id} order by code for update`;
+  const paused: string[] = [];
+  for (const o of offers) {
+    await tx`update offer_definitions set active = false, stripe_price_archived_at = coalesce(stripe_price_archived_at, now()),
+               paused_reason = case when active then ${`Stripe Price ${price.id} ${how}`} else paused_reason end, updated_at = now()
+             where code = ${o.code}`;
+    if (!o.active) continue;
+    paused.push(o.code as string);
+    await raiseAlert(tx, {
+      kind: 'offer.stripe_price_archived',
+      severity: 'risk',
+      subject: { type: 'offer', id: o.code as string },
+      message: `${o.code as string} auto-paused: its Stripe Price ${price.id} was ${how}. Create a new version with a live Price.`,
+      details: { priceId: price.id, event: type },
+    });
+  }
+  const configured = (['TASTE', 'STANDALONE', 'LAUNCH', 'GROWTH', 'SCALE'] as const).find((c) => priceIdFor(c) === price.id);
+  if (configured) {
+    await raiseAlert(tx, { kind: 'stripe.configured_price_archived', severity: 'risk', subject: { type: 'stripe_price', id: price.id }, message: `The Stripe Price configured for ${configured} (${price.id}) was ${how}; checkouts that use it will fail. Update STRIPE_PRICE_${configured}.`, details: { code: configured } });
+  }
+  return { paused };
 }
 
 function subscriptionIdOf(inv: { subscription?: string | { id: string } | null; parent?: { subscription_details?: { subscription?: string } } }) {
@@ -493,16 +558,23 @@ async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Che
 
 async function upsertSubscription(tx: Tx, ctx: TenantContext, sub: Stripe.Subscription): Promise<'processed'> {
   const item = sub.items?.data?.[0];
-  const planFromPrice = (Object.keys(PLANS) as PlanCode[]).find((p) => priceIdFor(p) && priceIdFor(p) === item?.price?.id) ?? ((sub.metadata?.plan as PlanCode) || null);
+  // The Price identifies the plan; checkout metadata is only a fallback (it keeps the plan the customer started on).
+  const pricedPlan = (Object.keys(PLANS) as PlanCode[]).find((p) => priceIdFor(p) && priceIdFor(p) === item?.price?.id) ?? null;
+  const planFromPrice = pricedPlan ?? ((sub.metadata?.plan as PlanCode) || null);
   const periodStart = (item as unknown as { current_period_start?: number })?.current_period_start ?? (sub as unknown as { current_period_start?: number }).current_period_start;
   const periodEnd = (item as unknown as { current_period_end?: number })?.current_period_end ?? (sub as unknown as { current_period_end?: number }).current_period_end;
-  const [existing] = await tx`select id from subscriptions where stripe_subscription_id = ${sub.id}`;
+  const [existing] = await tx`select id, plan_code from subscriptions where stripe_subscription_id = ${sub.id}`;
   if (!existing) return 'processed'; // created via checkout handler (consent linkage); nothing to update yet
   await tx`update subscriptions set status = ${sub.status}, cancel_at_period_end = ${sub.cancel_at_period_end},
              plan_code = coalesce(${planFromPrice}, plan_code),
              current_period_start = coalesce(to_timestamp(${periodStart ?? null}), current_period_start),
              current_period_end = coalesce(to_timestamp(${periodEnd ?? null}), current_period_end)
            where id = ${existing.id}`;
+  if (pricedPlan && pricedPlan !== existing.plan_code) {
+    // A plan change made in Stripe itself (dashboard, portal) is an MRR movement like one made here.
+    await tx`update workspaces set plan_code = ${pricedPlan} where id = ${ctx.workspaceId} and plan_code is distinct from ${pricedPlan}`;
+    await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: existing.id as string }, { from: existing.plan_code as string, to: pricedPlan, effective: 'now', source: 'stripe' });
+  }
   if (sub.status === 'active' && ctx.workspaceState === 'PAST_DUE') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'payment recovered');
   return 'processed';
 }
@@ -523,11 +595,13 @@ async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice): P
     await billingGateway().changeSubscriptionPrice(subId, priceIdFor(plan) ?? `price_${plan}`, false);
     await tx`update subscriptions set plan_code = ${plan}, pending_plan_code = null where id = ${s.id}`;
     await tx`update workspaces set plan_code = ${plan} where id = ${ctx.workspaceId}`;
+    // The scheduled downgrade takes effect now: this is when its MRR contraction happens (plan 05 §7).
+    if (plan !== s.plan_code) await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from: s.plan_code as string, to: plan, effective: 'applied' });
   }
   const periodKey = start.toISOString().slice(0, 10);
   const prev = s.current_period_start ? new Date(s.current_period_start as string).toISOString().slice(0, 10) : null;
   if (prev && prev !== periodKey) await expirePeriod(tx, ctx, prev);
-  await tx`update subscriptions set status = 'active', current_period_start = ${start}, current_period_end = ${end} where id = ${s.id}`;
+  await tx`update subscriptions set status = 'active', current_period_start = ${start}, current_period_end = ${end}, next_payment_attempt = null, payment_attempt_count = 0 where id = ${s.id}`;
   const already = await periodUsage(tx, periodKey);
   if (already.granted === 0) {
     await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: PLANS[plan].creativeTestsPerMonth, periodKey, reference: inv.id, idempotencyKey: `grant:${subId}:${periodKey}` });
@@ -608,6 +682,16 @@ export async function completeMockCheckout(sessionId: string): Promise<string[]>
             evt('invoice.paid', { id: `in_mock_${s.id.slice(-8)}`, customer: s.customerId, subscription: subId, billing_reason: 'subscription_create', amount_paid: s.amountCents ?? 0, payment_intent: `pi_mock_in_${s.id.slice(-8)}`, lines: { data: [{ period: { start: now, end: now + 30 * 86400 } }] } }),
           ];
         })();
+  // What Stripe now holds, for the nightly reconciliation: the charge, and for a plan the subscription.
+  const now = Math.floor(Date.now() / 1000);
+  const first = events[0]!.data.object as Record<string, unknown>;
+  if (s.mode === 'payment') {
+    gw.charges.push({ id: `ch_mock_${s.id.slice(-8)}`, customerId: s.customerId, paymentIntentId: first.payment_intent as string, amountCents: s.amountCents ?? 0, amountRefundedCents: 0, status: 'succeeded', disputed: false, created: now });
+  } else {
+    const inv = events[1]!.data.object as Record<string, unknown>;
+    gw.subscriptions.push({ id: first.subscription as string, customerId: s.customerId, status: 'active', priceId: s.priceId ?? null, cancelAtPeriodEnd: false, currentPeriodEnd: now + 30 * 86400 });
+    gw.charges.push({ id: `ch_mock_in_${s.id.slice(-8)}`, customerId: s.customerId, paymentIntentId: inv.payment_intent as string, amountCents: s.amountCents ?? 0, amountRefundedCents: 0, status: 'succeeded', disputed: false, created: now });
+  }
   for (const e of events) {
     const r = await receiveStripeWebhook(JSON.stringify(e), null);
     await processStripeEvent(r.id);

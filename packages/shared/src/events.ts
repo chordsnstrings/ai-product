@@ -73,6 +73,8 @@ export const EventType = [
   'OFFER_EXPIRED',
   'OFFER_REDEEMED',
   'SUBSCRIPTION_CHANGED',
+  // Platform event: the subscription ended (Stripe deleted it) — the churn movement in MRR (plan 05 §7).
+  'SUBSCRIPTION_ENDED',
   'INTEGRATION_CONNECTED',
   'INTEGRATION_DEGRADED',
   'INTEGRATION_DISCONNECTED',
@@ -269,6 +271,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   OFFER_EXPIRED: 'offer',
   OFFER_REDEEMED: 'offer',
   SUBSCRIPTION_CHANGED: 'subscription',
+  SUBSCRIPTION_ENDED: 'subscription',
   INTEGRATION_CONNECTED: 'integration',
   INTEGRATION_DEGRADED: 'integration',
   INTEGRATION_DISCONNECTED: 'integration',

@@ -278,7 +278,8 @@ export interface AdSpendRow {
 }
 
 /** Split one CSV line, honouring double-quoted fields ("a, b" and "" escapes). */
-function csvLine(line: string): string[] {
+/** One CSV line: quoted fields with "" escapes, trimmed. */
+export function csvLine(line: string): string[] {
   const out: string[] = [];
   let cur = '';
   let quoted = false;
