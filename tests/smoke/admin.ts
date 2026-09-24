@@ -86,10 +86,12 @@ async function main() {
   step('Break-glass gates tenant content');
   const before = await (await A.req(`/tenants/${ws.id}?tab=skus`)).text();
   if (!/Start break-glass/.test(before)) throw new Error('content visible without break-glass');
-  await A.act('tenant.breakglass', { workspaceId: ws.id, reason: 'Smoke test: verifying support access flow', ticket: 'SMOKE-1' });
+  await A.act('tenant.breakglass', { workspaceId: ws.id, reasonKind: 'ticket', reason: 'Smoke test: verifying support access flow', ticket: 'SMOKE-1' });
   const after = await (await A.req(`/tenants/${ws.id}?tab=skus`)).text();
   if (!/Content \(break-glass\)/.test(after) || /Start break-glass/.test(after)) throw new Error('content not shown after break-glass');
   await A.act('tenant.breakglass_end', { workspaceId: ws.id });
+  const [bg] = await withSystem((tx) => tx`select reason_kind, ticket, ended_at from break_glass_sessions where workspace_id = ${ws.id} order by started_at desc limit 1`);
+  if (bg?.reason_kind !== 'ticket' || bg.ticket !== 'SMOKE-1' || !bg.ended_at) throw new Error(`break-glass session not recorded with its reason: ${JSON.stringify(bg)}`);
   console.log('  ✓ (customer access log records it)');
 
   step('Four-eyes: big ledger adjustment waits for FINANCE; 🔐 re-auth enforced');
