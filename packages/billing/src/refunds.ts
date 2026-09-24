@@ -1,5 +1,5 @@
 import { withAdmin, type Tx } from '@arkiv/db';
-import { append, audit, stopForRefund, type Staff, type TenantContext } from '@arkiv/core';
+import { append, audit, lockEntitlement, stopForRefund, type Staff, type TenantContext } from '@arkiv/core';
 import { sendEmail } from '@arkiv/email';
 import { DomainError, env, formatUsd, type RefundReason } from '@arkiv/shared';
 import { billingGateway } from './gateway';
@@ -86,7 +86,13 @@ export async function applySucceededRefund(tx: Tx, ctx: Pick<TenantContext, 'wor
     if (pu) {
       unit = pu.kind as 'taste' | 'standalone';
       projectId = (pu.project_id as string) ?? null;
+      // Plan 02 B9: delivered work stays accessible "unless fraud-flagged".
+      if (row.reason_code === 'fraudulent') await tx`update purchases set fraud_flagged_at = coalesce(fraud_flagged_at, now()) where id = ${pu.id} and workspace_id = ${ws}`;
       if (pu.status === 'refunded') {
+        // The withdrawal below is a check-then-append on the balance: the project (production's own lock) and
+        // then the workspace's entitlement lock serialize it with a reservation for the same credit.
+        if (projectId) await tx`select 1 from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+        await lockEntitlement(tx, ws);
         const [granted] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and type = 'CREDIT_GRANTED' and unit = ${unit} and reference = ${pu.stripe_checkout_session_id as string}`;
         const [used] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and project_id = ${projectId} and type = 'CREDIT_CONSUMED'`;
         const [reserved] = await tx`select 1 from cost_authorizations where workspace_id = ${ws} and project_id = ${projectId} and status = 'active'`;

@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
 import { env, formatUsd, PLANS, PRICES, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import { assetUrl, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
+import { assetUrl, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -75,6 +75,14 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
     case 'cancellation_confirmed': {
       const [s] = await withTenant(ws, (tx) => tx`select plan_code, current_period_end from subscriptions order by created_at desc limit 1`);
       await send('cancellation_confirmed', { planName: PLANS[(s?.plan_code as PlanCode) ?? 'GROWTH'].name, endsOn: s ? new Date(s.current_period_end as string).toDateString() : 'today', exportUrl: `${base}/settings/data` }, await recipients(ws, ['OWNER']));
+      return;
+    }
+    case 'plan_ended_payment_failed': {
+      const [s] = await withTenant(ws, (tx) => tx`select plan_code from subscriptions where stripe_subscription_id = ${(data.subscriptionId as string) ?? null}`);
+      const [st] = await withTenant(ws, (tx) => tx`select cancelled_at from workspaces where id = ${ws}`);
+      const days = await withTenant(ws, (tx) => setting(tx, 'retention.cancelled_archive_days'));
+      const deletesOn = new Date(new Date((st?.cancelled_at as string) ?? Date.now()).getTime() + days * 86400_000).toDateString();
+      await send('plan_ended_payment_failed', { planName: PLANS[(s?.plan_code as PlanCode) ?? 'GROWTH'].name, deletesOn, reactivateUrl: `${app}/app/plan`, exportUrl: `${base}/settings/data` }, await recipients(ws, ['OWNER']));
       return;
     }
     case 'offer_ending': {

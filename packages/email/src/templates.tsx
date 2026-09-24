@@ -79,6 +79,8 @@ export interface TemplateMap {
   claims_guidance: { workspaceName: string; blocked: number; examples: string[]; url: string };
   media_review_result: { productName: string; outcome: 'approved' | 'rejected'; note: string; url: string };
   cancellation_confirmed: { planName: string; endsOn: string; exportUrl: string };
+  // A plan Stripe ended because its payment kept failing (dunning over): not "you cancelled".
+  plan_ended_payment_failed: { planName: string; deletesOn: string; reactivateUrl: string; exportUrl: string };
   subscription_started: { planName: string; tests: number; price: string; renewsOn: string; url: string };
   price_change_notice: { planName: string; oldPrice: string; newPrice: string; effectiveOn: string; url: string };
   payment_failed: { url: string; workspaceName: string };
@@ -312,6 +314,10 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: 
     case 'cancellation_confirmed': {
       const m = d as TemplateMap['cancellation_confirmed'];
       return { subject: 'Your plan is cancelled', stream: 'transactional', element: (<L preview={`Access until ${m.endsOn}.`} label="Billing"><H>Cancelled</H><Meta rows={[['Plan', m.planName], ['Access until', m.endsOn], ['Your archive', 'Kept for 90 days, then deleted']]} /><Cta href={m.exportUrl}>Export your data</Cta></L>) };
+    }
+    case 'plan_ended_payment_failed': {
+      const m = d as TemplateMap['plan_ended_payment_failed'];
+      return { subject: 'Your plan ended: the payment didn’t go through', stream: 'transactional', element: (<L preview={`Your archive is kept until ${m.deletesOn}.`} label="Billing"><H>Your plan has ended</H><P>We couldn’t take the payment for {m.planName} after several tries, so the plan has ended and nothing more will be charged.</P><Meta rows={[['Plan', m.planName], ['Your archive', `Kept until ${m.deletesOn}, then deleted`]]} /><P>Choose a plan again anytime to pick up where you left off, or export everything first.</P><Cta href={m.reactivateUrl}>Reactivate</Cta><P><a href={m.exportUrl}>Export your data</a></P></L>) };
     }
     case 'subscription_started': {
       const m = d as TemplateMap['subscription_started'];

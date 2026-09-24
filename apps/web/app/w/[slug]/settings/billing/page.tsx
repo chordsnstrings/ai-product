@@ -46,7 +46,12 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
             {canManage && d.hasCustomer ? <ActionButton slug={slug} action="portal">Payment method & invoices</ActionButton> : null}
           </div>
           {d.sub.status === 'past_due' ? <Banner tone="risk">Your last payment failed. Update your card to keep producing tests.</Banner> : null}
-          {d.sub.pending_plan_code ? <Banner>Switching to {PLANS[d.sub.pending_plan_code as PlanCode].name} on {fmt(d.sub.current_period_end as string)}.</Banner> : null}
+          {d.sub.pending_plan_code ? (
+            <Banner>
+              Switching to {PLANS[d.sub.pending_plan_code as PlanCode].name} on {fmt(d.sub.current_period_end as string)}.{' '}
+              {canManage ? <ActionButton slug={slug} action="change-plan" body={{ plan: d.sub.plan_code }} variant="text">Keep {plan!.name}</ActionButton> : null}
+            </Banner>
+          ) : null}
           {d.sub.cancel_at_period_end ? (
             <Banner>
               Your plan is cancelled and ends {fmt(d.sub.current_period_end as string)}. You keep access until then.{' '}
@@ -56,7 +61,8 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
         </div>
       )}
 
-      {d.sub && canManage && !d.sub.cancel_at_period_end ? (
+      {/* A past-due plan can't change until the card is fixed (or it is cancelled, which is immediate). */}
+      {d.sub && canManage && !d.sub.cancel_at_period_end && d.sub.status !== 'past_due' ? (
         <section>
           <h2 className="ak-label">Change plan</h2>
           <div className="ak-grid-3">
@@ -64,11 +70,12 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
               const p = PLANS[c];
               const current = c === d.sub!.plan_code;
               const up = p.priceMicros > plan!.priceMicros;
+              const scheduled = c === d.sub!.pending_plan_code;
               return (
                 <div key={c} className={`ak-card${current ? ' ak-card--pick' : ''}`}>
                   <h3 className="ak-label">{p.name}</h3>
                   <p style={{ margin: 0 }}>{formatUsd(p.priceMicros, 0)}/mo · {p.creativeTestsPerMonth} tests</p>
-                  {current ? <span className="ak-small ak-muted">Current plan</span> : (
+                  {current ? <span className="ak-small ak-muted">Current plan</span> : scheduled ? <span className="ak-small ak-muted">Starts at renewal</span> : (
                     <ActionButton slug={slug} action="change-plan" body={{ plan: c }} confirm={up ? `Upgrade to ${p.name} now? You'll be charged the prorated difference today and get extra tests for this period.` : `Downgrade to ${p.name} at the end of this period? Nothing changes until then.`}>
                       {up ? 'Upgrade now' : 'Downgrade at renewal'}
                     </ActionButton>
@@ -93,7 +100,7 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
       {d.sub && canManage && !d.sub.cancel_at_period_end ? (
         <section>
           <h2 className="ak-label">Cancel</h2>
-          <CancelFlow slug={slug} endsOn={d.sub.current_period_end ? fmt(d.sub.current_period_end as string) : 'the end of this period'} planCode={d.sub.plan_code as string} archiveDays={d.archiveDays} />
+          <CancelFlow slug={slug} endsOn={d.sub.current_period_end ? fmt(d.sub.current_period_end as string) : 'the end of this period'} planCode={d.sub.plan_code as string} archiveDays={d.archiveDays} pastDue={d.sub.status === 'past_due'} />
         </section>
       ) : null}
       <p className="ak-small ak-muted">Questions about a charge? <Link href={`mailto:${d.support}`}>{d.support}</Link></p>

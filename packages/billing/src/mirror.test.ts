@@ -93,7 +93,7 @@ describe('staff billing actions (plan 05 §2.2 Billing)', () => {
     expect([sa!.plan_code, sb!.plan_code]).toEqual(['GROWTH', 'LAUNCH']);
     const [c] = await ownerPool()`select kind, text_snapshot, context from consent_records where id = ${r.consentRecordId}`;
     expect(c).toMatchObject({ kind: 'auto_renew', context: { plan: 'GROWTH', from: 'LAUNCH', via: 'staff', reference: 'Ticket #401 (email 12 Sep)' } });
-    expect(c!.text_snapshot).toMatch(/every month/);
+    expect(c!.text_snapshot).toMatch(/^\$99\/month plus applicable sales tax/);
     await expect(withAdmin((tx) => staffChangePlan(tx, ctx, 'GROWTH', { reference: 'Ticket #402', staffId: 'staff-1' }))).rejects.toThrow(/Already on/);
   });
 });

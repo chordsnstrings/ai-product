@@ -67,6 +67,13 @@ export interface BillingGateway {
   createCheckout(p: CheckoutParams): Promise<{ id: string; clientSecret: string | null; url: string | null }>;
   expireCheckout(id: string): Promise<void>;
   setCancelAtPeriodEnd(subscriptionId: string, cancel: boolean): Promise<void>;
+  /**
+   * End a subscription now (plan 03 A9 "cancel during PAST_DUE → immediate"; a workspace being purged): no
+   * proration, no final invoice, and Stripe stops retrying its open invoices.
+   */
+  cancelNow(subscriptionId: string): Promise<void>;
+  /** The customer a charge belongs to (disputes name only the charge), or null for a guest charge. */
+  chargeCustomer(chargeId: string): Promise<string | null>;
   changeSubscriptionPrice(subscriptionId: string, priceId: string, prorate: boolean): Promise<void>;
   /** Apply a Stripe coupon to a subscription (replaces its current discount). */
   applyCoupon(subscriptionId: string, coupon: string): Promise<void>;
@@ -115,6 +122,15 @@ class LiveStripe implements BillingGateway {
   }
   async setCancelAtPeriodEnd(id: string, cancel: boolean) {
     await this.s.subscriptions.update(id, { cancel_at_period_end: cancel });
+  }
+  async cancelNow(id: string) {
+    const sub = await this.s.subscriptions.retrieve(id);
+    if (sub.status === 'canceled') return;
+    await this.s.subscriptions.cancel(id, { prorate: false, invoice_now: false }, { idempotencyKey: `cancel-now:${id}` });
+  }
+  async chargeCustomer(chargeId: string) {
+    const c = await this.s.charges.retrieve(chargeId);
+    return typeof c.customer === 'string' ? c.customer : (c.customer?.id ?? null);
   }
   async changeSubscriptionPrice(id: string, priceId: string, prorate: boolean) {
     const sub = await this.s.subscriptions.retrieve(id);
@@ -186,6 +202,8 @@ export class MockStripe implements BillingGateway {
   readonly live = false;
   sessions = new Map<string, MockSession>();
   cancelFlags = new Map<string, boolean>();
+  /** Subscriptions ended immediately (cancelNow). */
+  canceled: string[] = [];
   priceChanges: { id: string; priceId: string; prorate: boolean }[] = [];
   coupons: { id: string; coupon: string }[] = [];
   refunds: { pi: string; amount?: number; id: string; idempotencyKey?: string }[] = [];
@@ -215,6 +233,14 @@ export class MockStripe implements BillingGateway {
     this.cancelFlags.set(id, cancel);
     const sub = this.subscriptions.find((x) => x.id === id);
     if (sub) sub.cancelAtPeriodEnd = cancel;
+  }
+  async cancelNow(id: string) {
+    if (!this.canceled.includes(id)) this.canceled.push(id);
+    const sub = this.subscriptions.find((x) => x.id === id);
+    if (sub) sub.status = 'canceled';
+  }
+  async chargeCustomer(chargeId: string) {
+    return this.charges.find((c) => c.id === chargeId)?.customerId ?? null;
   }
   async changeSubscriptionPrice(id: string, priceId: string, prorate: boolean) {
     this.priceChanges.push({ id, priceId, prorate });
