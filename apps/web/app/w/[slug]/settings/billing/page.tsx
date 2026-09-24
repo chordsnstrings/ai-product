@@ -7,10 +7,11 @@ import { Banner, LinkButton } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
 import { CancelFlow } from '@/components/cancel-flow';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Billing · Arkiv' };
 
-const fmt = (d: string) => new Date(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+const fmt = (d: string) => formatDate(d);
 
 export default async function Billing({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -92,7 +93,7 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
         {d.purchases.length === 0 ? <p className="ak-small ak-muted">None yet.</p> : d.purchases.map((p, i) => (
           <div key={i} className="ak-index-row">
             <span>{p.kind === 'taste' ? 'Intro ad' : 'Standalone ad'}{p.name ? ` · ${p.name}` : ''}</span>
-            <span className="ak-index">{formatUsd(Number(p.amount_micros), 0)} · {p.status as string} · {new Date((p.paid_at ?? p.created_at) as string).toLocaleDateString()}</span>
+            <span className="ak-index">{formatUsd(Number(p.amount_micros), 0)} · {p.status as string} · {formatDate((p.paid_at ?? p.created_at) as string)}</span>
           </div>
         ))}
       </section>

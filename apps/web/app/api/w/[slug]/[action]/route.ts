@@ -46,7 +46,7 @@ import {
 } from '@arkiv/core';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { CSV_PLATFORMS, DomainError, env, PLANS, type PlanCode } from '@arkiv/shared';
+import { CSV_PLATFORMS, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, json, route } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
@@ -287,7 +287,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       if (w.user) {
         const plan = PLANS[(ctx.planCode as PlanCode) ?? 'LAUNCH'];
         // A past-due plan ends today (immediate cancel); otherwise access runs to the end of the paid period.
-        const endsOn = r.immediate ? 'today' : new Date(r.endsAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+        const endsOn = r.immediate ? 'today' : formatDate(r.endsAt);
         await sendEmail('cancellation_confirmed', w.user.email, { planName: plan?.name ?? 'Your plan', endsOn, exportUrl: `${env().APP_URL}/w/${slug}/settings/data` }, { idempotencyKey: `cancel:${ctx.workspaceId}:${r.immediate ? 'now' : r.endsAt}` });
       }
       return json(r);

@@ -6,6 +6,7 @@ import { Empty, SignalChip } from '@arkiv/ui';
 import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
 import { ConnectAdsCard } from '@/components/connect-ads-card';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Results · Arkiv' };
 
@@ -73,7 +74,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
               <span>
                 {String(c.kind).replace(/_/g, ' ')}{c.name ? ` · ${c.name as string}` : ' · all products'}{c.note ? ` — ${c.note as string}` : ''}
                 <span className="ak-small ak-muted" style={{ display: 'block' }}>
-                  {new Date(c.starts_at as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}{c.ends_at ? ` – ${new Date(c.ends_at as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}` : ' – ongoing'}
+                  {formatDate(c.starts_at as string)}{c.ends_at ? ` – ${formatDate(c.ends_at as string)}` : ' – ongoing'}
                   {' · '}{c.source === 'automatic' ? 'detected automatically' : c.source === 'staff' ? 'marked by Arkiv' : 'marked by your team'}
                   {c.status === 'pending_confirmation' ? ' · waiting for your confirmation' : ''}
                 </span>

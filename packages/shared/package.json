@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./log": "./src/log.ts"
+    "./log": "./src/log.ts",
+    "./format": "./src/format.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

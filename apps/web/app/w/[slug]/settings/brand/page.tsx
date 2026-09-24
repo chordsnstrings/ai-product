@@ -3,6 +3,7 @@ import { withTenant } from '@arkiv/db';
 import { brandBrainHistory, toBrain } from '@arkiv/core';
 import { ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Brand · Arkiv' };
 
@@ -47,7 +48,7 @@ export default async function Brand({ params }: { params: Promise<{ slug: string
                   v{h.version as number} · {Object.keys((h.diff as Record<string, unknown>) ?? {}).map((k) => FIELD[k] ?? k).join(', ') || 'first version'}
                   {h.reason ? ` — ${h.reason as string}` : ''}
                 </span>
-                <span className="ak-index">{new Date(h.created_at as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                <span className="ak-index">{formatDate(h.created_at as string)}</span>
               </div>
             ))}
           </>
