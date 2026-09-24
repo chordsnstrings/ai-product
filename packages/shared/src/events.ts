@@ -76,6 +76,8 @@ export const EventType = [
   'INTEGRATION_CONNECTED',
   'INTEGRATION_DEGRADED',
   'INTEGRATION_DISCONNECTED',
+  // Platform event: staff moved a SKU between workspaces with the owner's consent (plan 05 §2.3); one per side.
+  'SKU_TRANSFERRED',
   // Funnel (plan 04 §1) — server-side source of truth
   'LP_VIEWED',
   'UPLOAD_STARTED',

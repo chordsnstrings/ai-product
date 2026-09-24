@@ -28,4 +28,6 @@ export const QUEUE_CONFIG: Record<string, { concurrency: number; expireInSeconds
   [Queues.purgeWorkspace]: { concurrency: 1, expireInSeconds: 1800, retryLimit: 3 },
   [Queues.extractGenome]: { concurrency: 2, expireInSeconds: 300, retryLimit: 2 },
   [Queues.customerThemes]: { concurrency: 1, expireInSeconds: 600, retryLimit: 2 },
+  // Staff SKU transfer (plan 05 §2.3): one at a time; copies stored objects, so a generous lease.
+  [Queues.transferSku]: { concurrency: 1, expireInSeconds: 900, retryLimit: 2 },
 };

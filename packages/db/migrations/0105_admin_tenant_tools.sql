@@ -61,8 +61,9 @@ revoke all on function find_ownership_transfer, ownership_transfer_decide from p
 grant execute on function find_ownership_transfer, ownership_transfer_decide to app_rw;
 
 -- ───────────── §2.2 / §7 Billing: Stripe invoice and dispute mirror ─────────────
--- Upserted from webhooks (invoice.*, charge.dispute.*), keyed by the Stripe id; last_event_id records which event
--- last wrote the row. Refunds are mirrored in `refunds` (0101); one-time payments in `purchases`.
+-- Upserted from webhooks (invoice.*, charge.dispute.*) in the tenant's context, keyed by the Stripe id; an event
+-- older than the one that last wrote the row never overwrites it (last_event_at). Refunds are mirrored in
+-- `refunds` (0101); one-time payments in `purchases`.
 create table stripe_invoices (
   id text primary key,
   workspace_id uuid not null references workspaces(id) on delete cascade,
@@ -79,10 +80,12 @@ create table stripe_invoices (
   period_end timestamptz,
   stripe_created_at timestamptz,
   last_event_id text,
+  last_event_at timestamptz,
   updated_at timestamptz not null default now()
 );
 create index stripe_invoices_ws on stripe_invoices (workspace_id, stripe_created_at desc);
-select arkiv_tenant_table('stripe_invoices', false); insert into table_registry values ('stripe_invoices','tenant');
+select arkiv_tenant_table('stripe_invoices'); insert into table_registry values ('stripe_invoices','tenant');
+revoke delete on stripe_invoices from app_rw;
 
 create table stripe_disputes (
   id text primary key,
@@ -96,10 +99,12 @@ create table stripe_disputes (
   evidence_due_by timestamptz,
   stripe_created_at timestamptz,
   last_event_id text,
+  last_event_at timestamptz,
   updated_at timestamptz not null default now()
 );
 create index stripe_disputes_ws on stripe_disputes (workspace_id, stripe_created_at desc);
-select arkiv_tenant_table('stripe_disputes', false); insert into table_registry values ('stripe_disputes','tenant');
+select arkiv_tenant_table('stripe_disputes'); insert into table_registry values ('stripe_disputes','tenant');
+revoke delete on stripe_disputes from app_rw;
 
 -- Coupon applied by FINANCE (plan 05 §2.2 "apply coupon"); Stripe holds the discount itself.
 alter table subscriptions add column coupon text;

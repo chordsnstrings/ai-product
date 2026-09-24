@@ -144,17 +144,20 @@ export async function setCancellation(tx: Tx, ctx: TenantContext, cancel: boolea
   return { endsAt: s.current_period_end as string };
 }
 
-/** Upgrade now (prorated) or downgrade at period end (plan 02 B6/B7). */
+/**
+ * Upgrade now (prorated) or downgrade at period end (plan 02 B6/B7). Explicit workspace filters: the staff console
+ * runs it as admin_rw (whose policies see every tenant) for a change the customer consented to.
+ */
 export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   assertCan(ctx, 'billing.manage');
-  const [s] = await tx`select * from subscriptions where status = 'active' order by created_at desc limit 1`;
+  const [s] = await tx`select * from subscriptions where workspace_id = ${ctx.workspaceId} and status = 'active' order by created_at desc limit 1`;
   if (!s) throw new DomainError('NOT_FOUND', 'No active plan.');
   const from = s.plan_code as PlanCode;
   if (from === to) return { effective: 'none' as const };
   const upgrade = PLANS[to].priceMicros > PLANS[from].priceMicros;
   if (upgrade) {
     await billingGateway().changeSubscriptionPrice(s.stripe_subscription_id as string, priceIdFor(to) ?? `price_${to}`, true);
-    await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null where id = ${s.id}`;
+    await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
     await tx`update workspaces set plan_code = ${to} where id = ${ctx.workspaceId}`;
     // Pro-rata extra Creative Tests for the rest of this period (rounded up).
     const start = new Date(s.current_period_start as string).getTime();
@@ -166,9 +169,42 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
     await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from, to, effective: 'now', extraTests: extra });
     return { effective: 'now' as const, extraTests: extra };
   }
-  await tx`update subscriptions set pending_plan_code = ${to} where id = ${s.id}`;
+  await tx`update subscriptions set pending_plan_code = ${to} where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from, to, effective: 'period_end' });
   return { effective: 'period_end' as const, on: s.current_period_end as string };
+}
+
+// ───────────── Staff billing actions (plan 05 §2.2 Billing) ─────────────
+
+/**
+ * "Change plan (customer consent recorded)": a plan change staff make on the customer's instruction. The recurring
+ * charge changes, so an auto-renew consent record is written first with the new price and where the customer
+ * agreed (ticket/email reference); then the same upgrade-now / downgrade-at-period-end rules as the customer's own
+ * change apply.
+ */
+export async function staffChangePlan(tx: Tx, ctx: TenantContext, to: PlanCode, consent: { reference: string; staffId: string }) {
+  if (consent.reference.trim().length < 4) throw new DomainError('INVALID', 'Reference where the customer agreed (ticket or email).');
+  const [s] = await tx`select plan_code from subscriptions where workspace_id = ${ctx.workspaceId} and status = 'active' order by created_at desc limit 1`;
+  if (!s) throw new DomainError('NOT_FOUND', 'No active plan to change.');
+  if (s.plan_code === to) throw new DomainError('CONFLICT', `Already on ${PLANS[to].name}.`);
+  const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context)
+                       values (${ctx.workspaceId}, null, 'auto_renew', ${AUTO_RENEW_TEXT_VERSION}, ${autoRenewText(to)},
+                               ${tx.json({ plan: to, priceMicros: PLANS[to].priceMicros, from: s.plan_code as string, via: 'staff', staffId: consent.staffId, reference: consent.reference.trim() })})
+                       returning id`;
+  const r = await changePlan(tx, ctx, to);
+  return { ...r, consentRecordId: c!.id as string };
+}
+
+/** "Apply coupon": a Stripe coupon on the workspace's active subscription, mirrored on the row and as an event. */
+export async function applySubscriptionCoupon(tx: Tx, ctx: TenantContext, coupon: string) {
+  if (!/^[A-Za-z0-9_-]{2,64}$/.test(coupon)) throw new DomainError('INVALID', 'Coupon ids are letters, digits, - and _.');
+  const [s] = await tx`select id, stripe_subscription_id, coupon from subscriptions where workspace_id = ${ctx.workspaceId} and status in ('active','trialing','past_due')
+                       order by created_at desc limit 1 for update`;
+  if (!s?.stripe_subscription_id) throw new DomainError('NOT_FOUND', 'No active subscription to discount.');
+  await billingGateway().applyCoupon(s.stripe_subscription_id as string, coupon);
+  await tx`update subscriptions set coupon = ${coupon} where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
+  await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { coupon, previousCoupon: (s.coupon as string) ?? null });
+  return { subscriptionId: s.id as string, previous: (s.coupon as string) ?? null };
 }
 
 // ───────────── Webhooks ─────────────
@@ -186,7 +222,7 @@ export async function receiveStripeWebhook(raw: string, signature: string | null
   return { id: event.id, duplicate: !r?.inserted };
 }
 
-async function resolveWorkspace(tx: Tx, customerId: string | null, metaWorkspace: string | null): Promise<string | null> {
+async function resolveWorkspace(tx: Tx, customerId: string | null, metaWorkspace: string | null, paymentIntent: string | null = null): Promise<string | null> {
   if (customerId) {
     const [m] = await tx`select workspace_id from stripe_customers where customer_id = ${customerId}`;
     if (m) {
@@ -194,8 +230,72 @@ async function resolveWorkspace(tx: Tx, customerId: string | null, metaWorkspace
       if (metaWorkspace && metaWorkspace !== m.workspace_id) return null;
       return m.workspace_id as string;
     }
+    return null;
+  }
+  // Disputes carry no customer, only the payment: route them by the payment we recorded (a one-off purchase or
+  // a mirrored invoice). Two workspaces claiming the same payment is never guessed.
+  if (paymentIntent) {
+    const ws = await tx`select workspace_id from purchases where stripe_payment_intent_id = ${paymentIntent}
+                        union select workspace_id from stripe_invoices where payment_intent_id = ${paymentIntent}`;
+    if (ws.length === 1 && (!metaWorkspace || metaWorkspace === ws[0]!.workspace_id)) return ws[0]!.workspace_id as string;
   }
   return null;
+}
+
+type InvoiceLike = {
+  id: string;
+  status?: string | null;
+  billing_reason?: string | null;
+  currency?: string | null;
+  amount_due?: number | null;
+  amount_paid?: number | null;
+  amount_remaining?: number | null;
+  hosted_invoice_url?: string | null;
+  created?: number | null;
+  payment_intent?: string | { id: string } | null;
+  payments?: { data?: { payment?: { payment_intent?: string } }[] };
+  lines?: { data?: { period?: { start: number; end: number } }[] };
+};
+
+/** An invoice event's status when the payload leaves it out (older API versions, test fixtures). */
+const INVOICE_STATUS_FROM_EVENT: Record<string, string> = { 'invoice.paid': 'paid', 'invoice.payment_failed': 'open', 'invoice.voided': 'void', 'invoice.marked_uncollectible': 'uncollectible', 'invoice.finalized': 'open', 'invoice.created': 'draft' };
+const unix = (s: number | null | undefined) => (s ? new Date(s * 1000) : null);
+
+/**
+ * Stripe mirror (plan 05 §2.2 Billing, §7): every invoice event upserts the invoice row. An event older than the one
+ * already applied never overwrites it, so late deliveries can't roll a paid invoice back to open.
+ */
+export async function mirrorInvoice(tx: Tx, workspaceId: string, event: { id: string; type: string; created?: number }, inv: InvoiceLike) {
+  const pi = typeof inv.payment_intent === 'string' ? inv.payment_intent : (inv.payment_intent?.id ?? inv.payments?.data?.[0]?.payment?.payment_intent ?? null);
+  const period = inv.lines?.data?.[0]?.period;
+  const at = unix(event.created) ?? new Date();
+  await tx`
+    insert into stripe_invoices (id, workspace_id, stripe_subscription_id, status, billing_reason, currency, amount_due_cents, amount_paid_cents, amount_remaining_cents,
+                                 payment_intent_id, hosted_invoice_url, period_start, period_end, stripe_created_at, last_event_id, last_event_at)
+    values (${inv.id}, ${workspaceId}, ${subscriptionIdOf(inv as never)}, ${inv.status ?? INVOICE_STATUS_FROM_EVENT[event.type] ?? 'open'}, ${inv.billing_reason ?? null},
+            ${inv.currency ?? 'usd'}, ${inv.amount_due ?? inv.amount_paid ?? 0}, ${inv.amount_paid ?? 0}, ${inv.amount_remaining ?? 0}, ${pi}, ${inv.hosted_invoice_url ?? null},
+            ${unix(period?.start)}, ${unix(period?.end)}, ${unix(inv.created) ?? at}, ${event.id}, ${at})
+    on conflict (id) do update set status = excluded.status, billing_reason = coalesce(excluded.billing_reason, stripe_invoices.billing_reason),
+      amount_due_cents = excluded.amount_due_cents, amount_paid_cents = excluded.amount_paid_cents, amount_remaining_cents = excluded.amount_remaining_cents,
+      payment_intent_id = coalesce(excluded.payment_intent_id, stripe_invoices.payment_intent_id), hosted_invoice_url = coalesce(excluded.hosted_invoice_url, stripe_invoices.hosted_invoice_url),
+      period_start = coalesce(excluded.period_start, stripe_invoices.period_start), period_end = coalesce(excluded.period_end, stripe_invoices.period_end),
+      last_event_id = excluded.last_event_id, last_event_at = excluded.last_event_at, updated_at = now()
+    where stripe_invoices.workspace_id = excluded.workspace_id and (stripe_invoices.last_event_at is null or stripe_invoices.last_event_at <= excluded.last_event_at)`;
+}
+
+type DisputeLike = { id: string; charge?: string | { id: string } | null; payment_intent?: string | { id: string } | null; amount?: number | null; currency?: string | null; reason?: string | null; status?: string | null; created?: number | null; evidence_details?: { due_by?: number | null } | null };
+
+/** Dispute mirror (plan 05 §2.2 Billing, §7 Disputes): the latest state of each dispute. */
+export async function mirrorDispute(tx: Tx, workspaceId: string, event: { id: string; type: string; created?: number }, d: DisputeLike) {
+  const idOf = (x: string | { id: string } | null | undefined) => (typeof x === 'string' ? x : (x?.id ?? null));
+  const at = unix(event.created) ?? new Date();
+  await tx`
+    insert into stripe_disputes (id, workspace_id, charge_id, payment_intent_id, amount_cents, currency, reason, status, evidence_due_by, stripe_created_at, last_event_id, last_event_at)
+    values (${d.id}, ${workspaceId}, ${idOf(d.charge)}, ${idOf(d.payment_intent)}, ${d.amount ?? 0}, ${d.currency ?? 'usd'}, ${d.reason ?? null},
+            ${d.status ?? (event.type === 'charge.dispute.closed' ? 'closed' : 'needs_response')}, ${unix(d.evidence_details?.due_by)}, ${unix(d.created) ?? at}, ${event.id}, ${at})
+    on conflict (id) do update set status = excluded.status, reason = coalesce(excluded.reason, stripe_disputes.reason), amount_cents = excluded.amount_cents,
+      evidence_due_by = coalesce(excluded.evidence_due_by, stripe_disputes.evidence_due_by), last_event_id = excluded.last_event_id, last_event_at = excluded.last_event_at, updated_at = now()
+    where stripe_disputes.workspace_id = excluded.workspace_id and (stripe_disputes.last_event_at is null or stripe_disputes.last_event_at <= excluded.last_event_at)`;
 }
 
 const sysCtx = (workspaceId: string, state = 'ACTIVE_PAID'): TenantContext => ({
@@ -206,6 +306,9 @@ const sysCtx = (workspaceId: string, state = 'ACTIVE_PAID'): TenantContext => ({
   requestId: 'stripe',
 });
 
+const INVOICE_EVENTS = ['invoice.created', 'invoice.finalized', 'invoice.updated', 'invoice.paid', 'invoice.payment_failed', 'invoice.voided', 'invoice.marked_uncollectible'];
+const DISPUTE_EVENTS = ['charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed', 'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated'];
+
 /** Process one stored event (system job). Idempotent: every side effect is keyed on Stripe ids. */
 export async function processStripeEvent(eventId: string): Promise<'processed' | 'unmatched' | 'ignored' | 'retry'> {
   const [row] = await withSystem((tx) => tx`select * from stripe_events where id = ${eventId}`);
@@ -214,8 +317,9 @@ export async function processStripeEvent(eventId: string): Promise<'processed' |
   const obj = event.data.object as unknown as Record<string, unknown>;
   const customerId = (obj.customer as string) ?? null;
   const meta = (obj.metadata as Record<string, string>) ?? {};
-  const workspaceId = await withSystem((tx) => resolveWorkspace(tx, customerId, meta.workspace_id ?? null));
-  const handled = ['checkout.session.completed', 'checkout.session.expired', 'invoice.paid', 'invoice.payment_failed', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'charge.refunded', 'charge.dispute.created', 'charge.dispute.closed'];
+  const paymentIntent = typeof obj.payment_intent === 'string' ? obj.payment_intent : ((obj.payment_intent as { id?: string } | null)?.id ?? null);
+  const workspaceId = await withSystem((tx) => resolveWorkspace(tx, customerId, meta.workspace_id ?? null, paymentIntent));
+  const handled = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'charge.refunded', ...INVOICE_EVENTS, ...DISPUTE_EVENTS];
   if (!handled.includes(event.type)) {
     await withSystem((tx) => tx`update stripe_events set status = 'ignored', processed_at = now() where id = ${eventId}`);
     return 'ignored';
@@ -228,6 +332,9 @@ export async function processStripeEvent(eventId: string): Promise<'processed' |
     const outcome = await withTenant(workspaceId, async (tx) => {
       const [ws] = await tx`select state, name from workspaces where id = ${workspaceId}`;
       const ctx = sysCtx(workspaceId, ws!.state as string);
+      // Mirror first (plan 05 §7): the invoice/dispute row reflects Stripe even when the side effects below no-op.
+      if (INVOICE_EVENTS.includes(event.type)) await mirrorInvoice(tx, workspaceId, event, obj as unknown as InvoiceLike);
+      if (DISPUTE_EVENTS.includes(event.type)) await mirrorDispute(tx, workspaceId, event, obj as unknown as DisputeLike);
       switch (event.type) {
         case 'checkout.session.completed': {
           const cs = obj as unknown as Stripe.Checkout.Session;
@@ -265,7 +372,8 @@ export async function processStripeEvent(eventId: string): Promise<'processed' |
           return 'processed';
         }
         case 'charge.dispute.created':
-          await transitionWorkspace(tx, ctx, 'LOCKED', 'chargeback opened');
+          // Lock a live workspace; one already on hold or being purged keeps that state (and the event still processes).
+          if (['ACTIVE_FREE', 'ACTIVE_PAID', 'PAST_DUE', 'CANCELLED'].includes(ws!.state as string)) await transitionWorkspace(tx, ctx, 'LOCKED', 'chargeback opened');
           return 'processed';
         case 'charge.dispute.closed': {
           const d = obj as unknown as Stripe.Dispute;

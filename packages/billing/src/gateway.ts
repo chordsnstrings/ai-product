@@ -28,6 +28,8 @@ export interface BillingGateway {
   expireCheckout(id: string): Promise<void>;
   setCancelAtPeriodEnd(subscriptionId: string, cancel: boolean): Promise<void>;
   changeSubscriptionPrice(subscriptionId: string, priceId: string, prorate: boolean): Promise<void>;
+  /** Apply a Stripe coupon to a subscription (replaces its current discount). */
+  applyCoupon(subscriptionId: string, coupon: string): Promise<void>;
   portalUrl(customerId: string, returnUrl: string): Promise<string>;
   /** Refund a payment. The idempotency key makes a retried request return the same refund (never a second one). */
   refund(paymentIntentId: string, amountCents?: number, idempotencyKey?: string): Promise<string>;
@@ -75,6 +77,9 @@ class LiveStripe implements BillingGateway {
       proration_behavior: prorate ? 'always_invoice' : 'none',
     });
   }
+  async applyCoupon(id: string, coupon: string) {
+    await this.s.subscriptions.update(id, { discounts: [{ coupon }] }, { idempotencyKey: `coupon:${id}:${coupon}` });
+  }
   async portalUrl(customerId: string, returnUrl: string) {
     return (await this.s.billingPortal.sessions.create({ customer: customerId, return_url: returnUrl })).url;
   }
@@ -97,6 +102,7 @@ export class MockStripe implements BillingGateway {
   sessions = new Map<string, MockSession>();
   cancelFlags = new Map<string, boolean>();
   priceChanges: { id: string; priceId: string; prorate: boolean }[] = [];
+  coupons: { id: string; coupon: string }[] = [];
   refunds: { pi: string; amount?: number; id: string; idempotencyKey?: string }[] = [];
   async createCustomer(_email: string, workspaceId: string) {
     return `cus_mock_${workspaceId.replace(/-/g, '').slice(0, 14)}`;
@@ -117,6 +123,9 @@ export class MockStripe implements BillingGateway {
   }
   async changeSubscriptionPrice(id: string, priceId: string, prorate: boolean) {
     this.priceChanges.push({ id, priceId, prorate });
+  }
+  async applyCoupon(id: string, coupon: string) {
+    this.coupons.push({ id, coupon });
   }
   async portalUrl(_c: string, returnUrl: string) {
     return `${returnUrl}?portal=mock`;

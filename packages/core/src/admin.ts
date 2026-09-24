@@ -44,6 +44,8 @@ const P = {
   'billing.read': ['SUPER_ADMIN', 'FINANCE'],
   'billing.refund': ['SUPER_ADMIN', 'FINANCE'],
   'billing.unmatched': ['SUPER_ADMIN', 'FINANCE'],
+  // Coupons and plan changes on a tenant's subscription (plan 05 §2.2 Billing).
+  'billing.manage': ['SUPER_ADMIN', 'FINANCE'],
   'ledger.read': ['SUPER_ADMIN', 'FINANCE', 'OPS'],
   'ledger.adjust': ['SUPER_ADMIN', 'FINANCE'],
   'rates.propose': ['SUPER_ADMIN', 'FINANCE', 'OPS'],
@@ -540,7 +542,8 @@ export async function startIntervention(s: Staff, workspaceId: string, flagId: s
 /** Production states that have not yet dispatched a billable provider call (§39 cancel semantics). */
 export const CANCELLABLE_BEFORE_DISPATCH: readonly ProjectState[] = ['STORYBOARD_APPROVED', 'RENDER_RESERVED'];
 
-async function staffTenantCtx(tx: Tx, s: Staff, workspaceId: string): Promise<TenantContext> {
+/** A tenant context for a staff action run inside the customer's own domain functions (actor = staff). */
+export async function staffTenantCtx(tx: Tx, s: Staff, workspaceId: string): Promise<TenantContext> {
   const [w] = await tx`select state, plan_code from workspaces where id = ${workspaceId}`;
   if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
   return { workspaceId, workspaceState: w.state as WorkspaceState, role: 'OWNER', actor: { kind: 'staff', id: s.staffId }, requestId: newId(), planCode: (w.plan_code as string) ?? null };

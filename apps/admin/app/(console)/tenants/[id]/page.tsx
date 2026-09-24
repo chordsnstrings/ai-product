@@ -66,7 +66,7 @@ export default async function Tenant({ params, searchParams }: { params: Promise
       {tab === 'skus' ? <Skus id={id} staff={s} bg={bg} canBg={staffCan(s.roles, 'breakglass.read')} canWrite={staffCan(s.roles, 'breakglass.write')} /> : null}
       {tab === 'projects' ? <Projects id={id} canManage={staffCan(s.roles, 'jobs.manage')} focus={focusProject} /> : null}
       {tab === 'ledger' ? <Ledger id={id} canAdjust={staffCan(s.roles, 'ledger.adjust')} /> : null}
-      {tab === 'billing' ? <Billing id={id} canRefund={staffCan(s.roles, 'billing.refund')} pii={pii} /> : null}
+      {tab === 'billing' ? <Billing id={id} canRefund={staffCan(s.roles, 'billing.refund')} canManage={staffCan(s.roles, 'billing.manage')} pii={pii} /> : null}
       {tab === 'integrations' ? <Integrations id={id} canManage={staffCan(s.roles, 'integrations.manage')} /> : null}
       {tab === 'emails' ? <Emails id={id} pii={pii} canUnsuppress={staffCan(s.roles, 'email.manage')} canResend={staffCan(s.roles, 'email.manage')} /> : null}
       {tab === 'risk' ? <Risk id={id} canSuppress={staffCan(s.roles, 'tenant.flags')} /> : null}
@@ -195,6 +195,10 @@ async function Skus({ id, staff, bg, canBg, canWrite }: { id: string; staff: Awa
     where s.workspace_id = ${id} order by b.name nulls last, s.catalogue_no`);
   const brandsWithoutSkus = await withAdmin((tx) => tx`select b.id, b.name from brands b where b.workspace_id = ${id} and not exists (select 1 from skus s where s.workspace_id = b.workspace_id and s.brand_id = b.id) order by b.name`);
   const tree = brandTree(meta, brandsWithoutSkus);
+  // §2.3 transfers in and out of this workspace (metadata only).
+  const transfers = await withAdmin((tx) => tx`select t.*, fw.name as from_name, tw.name as to_name from sku_transfers t
+      join workspaces fw on fw.id = t.from_workspace_id join workspaces tw on tw.id = t.to_workspace_id
+      where t.from_workspace_id = ${id} or t.to_workspace_id = ${id} order by t.created_at desc limit 20`);
   let content: { skus: Record<string, unknown>[]; scenes: Record<string, unknown>[] } | null = null;
   if (bg) {
     content = await withAdmin(async (tx) => {
@@ -244,6 +248,16 @@ async function Skus({ id, staff, bg, canBg, canWrite }: { id: string; staff: Awa
                     { name: 'reason', label: 'Reason', required: true },
                   ]} />
                 )])} empty="No storyboard awaiting approval." />
+                <div className="ak-panel" style={{ maxWidth: 640, marginTop: 12 }}>
+                  <p className="ak-label">🔐 Transfer SKU to workspace (plan 05 §2.3)</p>
+                  <p className="ak-small ak-muted" style={{ marginTop: 0 }}>Needs the owner’s written consent. One job copies the SKU, facts, claims, evidence, fingerprint and files into the target with new ids and archives the original; experiments and results stay here.</p>
+                  <ActForm action="tenant.sku_transfer" extra={{ workspaceId: id }} submit="🔐 Queue transfer" fields={[
+                    { name: 'skuId', label: 'SKU', type: 'select', options: content.skus.map((c) => ({ value: c.id as string, label: `${no(c.catalogue_no)} · ${c.name as string}` })) },
+                    { name: 'toWorkspaceId', label: 'Target workspace id', required: true },
+                    { name: 'consentRef', label: 'Owner’s written consent (ticket / email reference)', required: true },
+                    { name: 'reason', label: 'Reason', required: true },
+                  ]} />
+                </div>
               </>
             ) : null}
           </>
@@ -258,6 +272,17 @@ async function Skus({ id, staff, bg, canBg, canWrite }: { id: string; staff: Awa
             ]} />
           </div>
         ) : <p className="ak-small ak-muted">Your role can’t access tenant content.</p>}
+      </Section>
+      <Section title="SKU transfers">
+        <Table head={['Requested', 'Direction', 'SKU', 'Other workspace', 'Consent', 'Status']} rows={transfers.map((x) => {
+          const out = x.from_workspace_id === id;
+          const other = (out ? x.to_workspace_id : x.from_workspace_id) as string;
+          return [
+            dt(x.created_at), out ? 'out' : 'in', <Mono key="s">{String(out ? x.sku_id : (x.new_sku_id ?? '—')).slice(0, 8)}</Mono>,
+            <Link key="w" href={`/tenants/${other}?tab=skus`}>{(out ? x.to_name : x.from_name) as string}</Link>, <span key="c" className="ak-small">{x.consent_ref as string}</span>,
+            `${x.status as string}${x.error ? ` — ${String(x.error).slice(0, 80)}` : ''}${x.completed_at ? ` ${dt(x.completed_at)}` : ''}`,
+          ];
+        })} empty="No SKU transfers." />
       </Section>
     </>
   );
@@ -390,8 +415,12 @@ async function Ledger({ id, canAdjust }: { id: string; canAdjust: boolean }) {
   );
 }
 
-async function Billing({ id, canRefund, pii }: { id: string; canRefund: boolean; pii: PiiView }) {
+async function Billing({ id, canRefund, canManage, pii }: { id: string; canRefund: boolean; canManage: boolean; pii: PiiView }) {
   const d0 = await withAdmin(async (tx) => ({
+    // Stripe mirror (§2.2 "invoices, payments, refunds, disputes (mirrored)"), written by the webhook processor.
+    mirror: await tx`select id, status, billing_reason, amount_due_cents, amount_paid_cents, amount_remaining_cents, currency, hosted_invoice_url, period_start, period_end, stripe_created_at
+                     from stripe_invoices where workspace_id = ${id} order by stripe_created_at desc nulls last limit 36`,
+    disputes: await tx`select id, status, reason, amount_cents, payment_intent_id, evidence_due_by, stripe_created_at from stripe_disputes where workspace_id = ${id} order by stripe_created_at desc nulls last`,
     cust: (await tx`select customer_id from stripe_customers where workspace_id = ${id}`)[0],
     subs: await tx`select * from subscriptions where workspace_id = ${id} order by created_at desc`,
     purchases: await tx`select * from purchases where workspace_id = ${id} order by created_at desc limit 50`,
@@ -415,7 +444,38 @@ async function Billing({ id, canRefund, pii }: { id: string; canRefund: boolean;
       <p className="ak-small">Stripe customer: <Mono>{(d0.cust?.customer_id as string) ?? '—'}</Mono> {d0.cust ? <ActButton small action="billing.portal" payload={{ workspaceId: id }}>Open in Stripe</ActButton> : null}</p>
       <p className="ak-small ak-muted">Refunds over $200 need a second FINANCE approver. Each refund writes CREDIT_REFUNDED; a full refund of an unused credit withdraws it.</p>
       <Section title="Subscriptions">
-        <Table head={['Plan', 'Status', 'Period', 'Cancel at end', 'Pending', 'Stripe id']} rows={d0.subs.map((s) => [s.plan_code as string, s.status as string, `${d(s.current_period_start)} → ${d(s.current_period_end)}`, s.cancel_at_period_end ? 'yes' : 'no', (s.pending_plan_code as string) ?? '—', <Mono key="i">{s.stripe_subscription_id as string}</Mono>])} />
+        <Table head={['Plan', 'Status', 'Period', 'Cancel at end', 'Pending', 'Coupon', 'Stripe id']} rows={d0.subs.map((s) => [s.plan_code as string, s.status as string, `${d(s.current_period_start)} → ${d(s.current_period_end)}`, s.cancel_at_period_end ? 'yes' : 'no', (s.pending_plan_code as string) ?? '—', (s.coupon as string) ?? '—', <Mono key="i">{s.stripe_subscription_id as string}</Mono>])} />
+        {canManage && d0.subs.some((s) => ['active', 'trialing', 'past_due'].includes(s.status as string)) ? (
+          <div className="ak-grid-2" style={{ alignItems: 'start', marginTop: 12 }}>
+            <div className="ak-panel">
+              <p className="ak-label">Apply coupon</p>
+              <ActForm action="billing.apply_coupon" extra={{ workspaceId: id }} submit="Apply coupon" fields={[
+                { name: 'coupon', label: 'Stripe coupon id', required: true, placeholder: 'e.g. SORRY_20' },
+                { name: 'reason', label: 'Reason (audit)', required: true },
+              ]} />
+            </div>
+            <div className="ak-panel">
+              <p className="ak-label">🔐 Change plan (customer consent recorded)</p>
+              <p className="ak-small ak-muted">Upgrades apply now, prorated; downgrades at renewal. A new auto-renew consent record cites where the customer agreed.</p>
+              <ActForm action="billing.change_plan" extra={{ workspaceId: id }} submit="🔐 Change plan" fields={[
+                { name: 'plan', label: 'New plan', type: 'select', options: (Object.keys(PLANS) as PlanCode[]).map((p) => ({ value: p, label: `${PLANS[p].name} · ${money(PLANS[p].priceMicros, 0)}/mo` })) },
+                { name: 'consentRef', label: 'Customer consent (ticket / email reference)', required: true },
+                { name: 'reason', label: 'Reason (audit)', required: true },
+              ]} />
+            </div>
+          </div>
+        ) : null}
+      </Section>
+      <Section title="Invoices (Stripe mirror)">
+        <Table head={['Created', 'Invoice', 'Reason', 'Status', 'Due', 'Paid', 'Remaining', 'Period', '']} rows={d0.mirror.map((v) => [
+          dt(v.stripe_created_at), <Mono key="i">{v.id as string}</Mono>, (v.billing_reason as string) ?? '—', v.status as string,
+          money(Number(v.amount_due_cents) * 10_000), money(Number(v.amount_paid_cents) * 10_000), money(Number(v.amount_remaining_cents) * 10_000),
+          v.period_start ? `${d(v.period_start)} → ${d(v.period_end)}` : '—',
+          v.hosted_invoice_url ? <a key="u" href={v.hosted_invoice_url as string} target="_blank" rel="noreferrer">view</a> : null,
+        ])} empty="No invoices mirrored yet." />
+      </Section>
+      <Section title="Disputes (Stripe mirror)">
+        <Table head={['Opened', 'Dispute', 'Amount', 'Reason', 'Status', 'Payment', 'Evidence due']} rows={d0.disputes.map((x) => [dt(x.stripe_created_at), <Mono key="i">{x.id as string}</Mono>, money(Number(x.amount_cents) * 10_000), (x.reason as string) ?? '—', x.status as string, <Mono key="p">{(x.payment_intent_id as string) ?? '—'}</Mono>, dt(x.evidence_due_by)])} empty="No disputes." />
       </Section>
       <Section title="Subscription payments">
         <Table head={['Paid', 'Invoice event', 'Amount', 'Refunded', '']} rows={d0.invoices.map((v) => {

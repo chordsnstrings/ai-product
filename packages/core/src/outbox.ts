@@ -29,6 +29,7 @@ export const Queues = {
   purgeWorkspace: 'purge-workspace',
   extractGenome: 'extract-genome',
   customerThemes: 'customer-themes',
+  transferSku: 'transfer-sku',
 } as const;
 export type QueueName = (typeof Queues)[keyof typeof Queues];
 

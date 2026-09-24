@@ -351,3 +351,39 @@ describe('act on behalf (plan 05 §0.3)', () => {
     expect(sa).toMatchObject({ before: { spoken_line: 'Meet your new serum' }, after: { spoken_line: 'Meet your new favourite serum' } });
   });
 });
+
+describe('tenant billing tab actions (plan 05 §2.2 Billing)', () => {
+  it('FINANCE applies a coupon and changes plan with the customer consent reference; both are audited', async () => {
+    const gw = new MockStripe();
+    setBillingGateway(gw);
+    const t = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, current_period_start, current_period_end, consent_record_id)
+                      values (${t.workspaceId}, 'sub_tab', 'GROWTH', 'active', now() - interval '5 days', now() + interval '25 days', gen_random_uuid())`;
+    const fin = await staff(['FINANCE']);
+    expect(() => assertStaff({ roles: ['SUPPORT'] }, ACTIONS['billing.apply_coupon'].perm)).toThrow(/role/);
+    expect(ACTIONS['billing.change_plan'].reauth).toBe(true);
+    await act(fin, 'billing.apply_coupon', { workspaceId: t.workspaceId, coupon: 'SORRY_20', reason: 'Ticket #5: late delivery' });
+    expect(gw.coupons).toEqual([{ id: 'sub_tab', coupon: 'SORRY_20' }]);
+    const r = await act(fin, 'billing.change_plan', { workspaceId: t.workspaceId, plan: 'LAUNCH', consentRef: 'Ticket #6 (customer email)', reason: 'Customer asked to downgrade' });
+    expect(String(r.message)).toMatch(/end of the current period/);
+    const [s] = await ownerPool()`select plan_code, pending_plan_code, coupon from subscriptions where workspace_id = ${t.workspaceId}`;
+    expect(s).toEqual({ plan_code: 'GROWTH', pending_plan_code: 'LAUNCH', coupon: 'SORRY_20' });
+    const audits = await ownerPool()`select action from admin_audit_log where workspace_id = ${t.workspaceId} and action like 'billing.%' order by id`;
+    expect(audits.map((a) => a.action)).toEqual(['billing.apply_coupon', 'billing.change_plan']);
+    const [c] = await ownerPool()`select context->>'reference' as ref from consent_records where workspace_id = ${t.workspaceId}`;
+    expect(c!.ref).toBe('Ticket #6 (customer email)');
+  });
+
+  it('SKU transfer needs break-glass write (🔐) and the owner consent reference', async () => {
+    expect(ACTIONS['tenant.sku_transfer']).toMatchObject({ perm: 'breakglass.write', reauth: true });
+    const from = await makeTenant();
+    const to = await makeTenant();
+    const sku = await makeSku(from.workspaceId);
+    const ops = await staff(['OPS']);
+    await expect(act(ops, 'tenant.sku_transfer', { workspaceId: from.workspaceId, skuId: sku, toWorkspaceId: to.workspaceId, consentRef: 'Ticket #3 owner email', reason: 'consolidating' })).rejects.toThrow(/break-glass/);
+    await startBreakGlass(ops, from.workspaceId, { reasonKind: 'ticket', ticket: '3', reason: 'Owner asked to move a SKU', write: true, writeReason: 'Moving it for them' });
+    const r = await act(ops, 'tenant.sku_transfer', { workspaceId: from.workspaceId, skuId: sku, toWorkspaceId: to.workspaceId, consentRef: 'Ticket #3 owner email', reason: 'consolidating' });
+    expect(r.transferId).toBeTruthy();
+    expect(await ownerPool()`select 1 from outbox where queue = 'transfer-sku' and workspace_id = ${from.workspaceId}`).toHaveLength(1);
+  });
+});

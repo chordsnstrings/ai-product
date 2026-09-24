@@ -24,6 +24,7 @@ import {
   emit,
   enqueue,
   staffCtx,
+  staffTenantCtx,
   evalDatasetFor,
   GOLDEN,
   normalizeAllowKey,
@@ -39,6 +40,7 @@ import {
   setTenantFlags,
   setTenantHold,
   requestOwnershipTransfer,
+  requestSkuTransfer,
   cancelOwnershipTransfer,
   OWNERSHIP_TRANSFER_HOURS,
   rotateInviteToken,
@@ -49,7 +51,7 @@ import {
   type Permission,
   type SettingKey,
 } from '@arkiv/core';
-import { billingGateway, processStripeEvent, refundPayment } from '@arkiv/billing';
+import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan } from '@arkiv/billing';
 import { canResendTemplate, sendEmail, type TemplateName } from '@arkiv/email';
 import { DataRequestKind, DomainError, env, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
@@ -188,6 +190,17 @@ export const ACTIONS = {
         await audit(tx, s, 'tenant.scene_edit', { type: 'scene', id: i.sceneId }, { workspaceId: i.workspaceId, reason: i.reason, before, after: { spoken_line: i.spokenLine ?? before.spoken_line, overlay_text: i.overlayText ?? before.overlay_text } });
         return { message: 'Scene updated on the customer’s behalf (claims-checked like their own edits).' };
       }),
+  }),
+  /* §2.3 "Transfer SKU to workspace": with the owner's written consent, one job copies the SKU's product truth
+     and assets into the target workspace with new ids (break-glass write on the source, audited on both sides). */
+  'tenant.sku_transfer': a({
+    perm: 'breakglass.write',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, skuId: uuid, toWorkspaceId: uuid, consentRef: z.string().trim().min(4, 'Reference the owner’s written consent (ticket or email)').max(200), reason }),
+    run: async (s, i) => {
+      const r = await requestSkuTransfer(s, { fromWorkspaceId: i.workspaceId, skuId: i.skuId, toWorkspaceId: i.toWorkspaceId, consentRef: i.consentRef, reason: i.reason });
+      return { transferId: r.transferId, message: 'Transfer queued. The SKU, its facts, claims, evidence, fingerprint and files are copied with new ids; the original is archived.' };
+    },
   }),
   'tenant.purge_now': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'workspace.purge_now', { workspaceId: i.workspaceId }, i.reason) }),
   'tenant.schedule_purge': a({ perm: 'tenant.purge', reauth: true, schema: z.object({ workspaceId: uuid, reason }), run: (s, i) => scheduleTenantPurge(s, i.workspaceId, i.reason) }),
@@ -343,6 +356,33 @@ export const ACTIONS = {
       .refine((x) => !!x.purchaseId !== !!x.invoiceEventId, 'Choose exactly one payment to refund'),
     // The nonce keys the Stripe refund and its mirror row, so a replay (retried click, re-run approval) never refunds twice.
     run: (s, i) => requestOrExecute(s, 'billing.refund', { workspaceId: i.workspaceId, purchaseId: i.purchaseId ?? null, invoiceEventId: i.invoiceEventId ?? null, amountMicros: Math.round(i.amount * 1e6), reasonCode: i.reasonCode, customerNote: i.customerNote ?? null, nonce: i.requestId ?? newId() }, i.reason),
+  }),
+  /* §2.2 Billing "apply coupon": FINANCE applies a Stripe coupon to the tenant's subscription (a deliberate,
+     reasoned discount — retention playbooks never discount). */
+  'billing.apply_coupon': a({
+    perm: 'billing.manage',
+    schema: z.object({ workspaceId: uuid, coupon: z.string().trim().regex(/^[A-Za-z0-9_-]{2,64}$/, 'Coupon ids are letters, digits, - and _'), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const ctx = await staffTenantCtx(tx, s, i.workspaceId);
+        const r = await applySubscriptionCoupon(tx, ctx, i.coupon);
+        await audit(tx, s, 'billing.apply_coupon', { type: 'subscription', id: r.subscriptionId }, { workspaceId: i.workspaceId, reason: i.reason, before: { coupon: r.previous }, after: { coupon: i.coupon } });
+        return { message: `Coupon ${i.coupon} applied in Stripe; it shows on the next invoice.` };
+      }),
+  }),
+  /* §2.2 Billing "change plan (customer consent recorded)": the customer asked support to change plan; the consent
+     record names where they agreed, and the usual upgrade-now / downgrade-at-renewal rules apply. */
+  'billing.change_plan': a({
+    perm: 'billing.manage',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, plan: z.enum(['LAUNCH', 'GROWTH', 'SCALE']), consentRef: z.string().trim().min(4, 'Where did the customer agree? (ticket or email reference)').max(200), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const ctx = await staffTenantCtx(tx, s, i.workspaceId);
+        const r = await staffChangePlan(tx, ctx, i.plan, { reference: i.consentRef, staffId: s.staffId });
+        await audit(tx, s, 'billing.change_plan', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { plan: i.plan, effective: r.effective, consentRecordId: r.consentRecordId, consentRef: i.consentRef } });
+        return { message: r.effective === 'now' ? `Upgraded to ${i.plan.toLowerCase()} now (prorated${r.extraTests ? `, +${r.extraTests} tests this period` : ''}).` : r.effective === 'period_end' ? `Moves to ${i.plan.toLowerCase()} at the end of the current period.` : 'No change.' };
+      }),
   }),
   'billing.stripe_assign': a({ perm: 'billing.unmatched', reauth: true, schema: z.object({ eventId: z.string(), workspaceId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'stripe.assign', { eventId: i.eventId, workspaceId: i.workspaceId }, i.reason) }),
   'billing.stripe_ignore': a({ perm: 'billing.unmatched', schema: z.object({ eventId: z.string(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`update stripe_events set status = 'ignored', error = ${i.reason}, processed_at = now() where id = ${i.eventId} and status = 'unmatched' returning id`; if (!b) throw new DomainError('CONFLICT', 'Event is not unmatched'); await audit(tx, s, 'stripe.ignored', { type: 'stripe_event', id: i.eventId }, { reason: i.reason, before: { status: 'unmatched' }, after: { status: 'ignored' } }); }) }),
