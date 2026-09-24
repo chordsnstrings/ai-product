@@ -1,59 +1,31 @@
-import { headers } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import { globalTx } from '@arkiv/db';
-import { applyLandingVariant, env, geoFromHeaders, landingBlocksFrom, landingVariantFrom, type LandingBlocks, type LandingVariantContent } from '@arkiv/shared';
-import { assignVariantOrNull, claimsCheckedLast7Days, deviceClass, publicExampleUrls, recordFunnel } from '@arkiv/core';
+import { applyLandingVariant, env, landingBlocksFrom, landingVariantFrom, type LandingBlocks, type LandingVariantContent } from '@arkiv/shared';
+import { assignVariantOrNull, claimsCheckedLast7Days, publicExampleUrls } from '@arkiv/core';
 import { ExampleAsset, Testimonial } from '@arkiv/ui';
 import { StickyCta } from '@arkiv/ui/client';
+import { LandingBeacon } from '@/components/landing-beacon';
 import { MarketingShell } from '@/components/marketing';
 import { UploadModule } from '@/components/upload-module';
+import { FIRST_VIEW_COOKIE } from '@/lib/landing-routing';
+import { recordLandingView } from '@/lib/lp-view';
 import { currentUser, hasVisitorCookie, visitorId } from '@/lib/session';
 
 type StoredVariant = { key: string; weight: number; content: unknown };
+type PageRow = { slug: string; content: unknown; variants: unknown; version: unknown } | undefined;
 
-/**
- * P1 campaign landing page (plan 03 P1). Headline echoes the ad (L1); upload is in the hero (L2); proof is
- * process-level and real (L13); examples are labelled; sticky CTA after the hero scrolls away (L19).
- * Content is the page's structured blocks (plan 05 §5): visitors see the published copy; the console's signed
- * preview shows the draft (optionally one variant) without recording a visit.
- */
-export async function Landing({ slug, searchParams, preview }: { slug: string; searchParams: Record<string, string | string[] | undefined>; preview?: { variant: string | null } | null }) {
-  const utm = Object.fromEntries(Object.entries(searchParams).filter(([k]) => k.startsWith('utm_')).map(([k, v]) => [k, String(v)]));
-  const page = await globalTx(async (tx) => {
-    if (preview) {
-      const [d] = await tx`select slug, content, variants, version from landing_pages where slug = ${slug}`;
-      if (d) return d;
-    }
-    // utm_content routing (plan 05 §5): e.g. utm_content=texture* → the texture page.
-    if (slug === 'default' && utm.utm_content) {
-      const [m] = await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where status = 'live'
-                           and exists (select 1 from unnest(utm_match) u where ${utm.utm_content.toLowerCase()} like u || '%') limit 1`;
-      if (m) return m;
-    }
+const variantsOf = (page: PageRow) => ((page?.variants as StoredVariant[]) ?? []).map((v) => ({ key: v.key, weight: Number(v.weight), content: landingVariantFrom(v.content) }));
+
+/** The live copy of a page (the default page when it isn't live). */
+async function livePage(slug: string): Promise<PageRow> {
+  return globalTx(async (tx) => {
     const [p] = await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = ${slug} and status = 'live'`;
-    return p ?? (await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = 'default'`)[0];
+    return (p ?? (await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = 'default'`)[0]) as PageRow;
   });
-  // A visitor who already carries our first-party cookie has been here before (plan 05 §4 "new vs returning").
-  const returning = await hasVisitorCookie();
-  const vid = await visitorId();
-  const variants = ((page?.variants as StoredVariant[]) ?? []).map((v) => ({ key: v.key, weight: Number(v.weight), content: landingVariantFrom(v.content) }));
-  const variant = preview ? (variants.find((v) => v.key === preview.variant)?.key ?? null) : page ? assignVariantOrNull(`lp:${page.slug}`, vid, variants) : null;
-  const blocks: LandingBlocks = applyLandingVariant(landingBlocksFrom(page?.content), variants.find((v) => v.key === variant)?.content as LandingVariantContent | undefined);
-  const user = await currentUser();
-  const h = await headers();
-  const ua = h.get('user-agent') ?? '';
-  const geo = geoFromHeaders(h);
-  // Slices for plan 05 §4: device class, edge country/region, new vs returning, and the ad (creative) id the
-  // campaign passes (ad_id, or the utm_id macro). A staff preview is not a visit.
-  const adId = String(searchParams.ad_id ?? searchParams.utm_id ?? '').slice(0, 64) || null;
-  if (!preview) {
-    await recordFunnel('LP_VIEWED', {
-      visitorId: vid,
-      page: page?.slug as string,
-      variant,
-      utm,
-      props: { inApp: /Instagram|FBAN|FBAV|TikTok|musical_ly|BytedanceWebview/i.test(ua), device: deviceClass(ua), country: geo?.country ?? null, region: geo?.region ?? null, returning, adId },
-    }).catch(() => {});
-  }
+}
+
+/** What the page shows besides its copy: the platform proof counter, example media, consented testimonials. */
+async function pageExtras(blocks: LandingBlocks) {
   // A platform-wide count and our own demo workspace's examples, through narrow database functions: the customer
   // app never holds a cross-tenant role (plan 02 §3).
   const exampleIds = [...(blocks.hero.visualAssetId ? [blocks.hero.visualAssetId] : []), ...blocks.gallery.items.map((g) => g.assetId)];
@@ -65,12 +37,79 @@ export async function Landing({ slug, searchParams, preview }: { slug: string; s
   const testimonials = testimonialIds.length
     ? await globalTx((tx) => tx`select id, quote, person_name, brand_name from testimonials where id in ${tx(testimonialIds)} and revoked_at is null`)
     : [];
+  return { claimsChecked, examples, testimonials };
+}
+
+/**
+ * The static campaign page (plan 04 L6): rendered once per (page, copy variant), cached and served from the CDN —
+ * the proxy picks the page and the visitor's variant and rewrites here. Nothing per visitor is read while
+ * rendering; the view is recorded by a small beacon once the page shows, and the hero needs no client JS.
+ */
+export async function StaticLanding({ slug, variant }: { slug: string; variant: string | null }) {
+  const page = await livePage(slug);
+  const variants = variantsOf(page);
+  const chosen = variant ? (variants.find((v) => v.key === variant) ?? null) : null;
+  const blocks: LandingBlocks = applyLandingVariant(landingBlocksFrom(page?.content), chosen?.content as LandingVariantContent | undefined);
+  return <LandingBody page={page} blocks={blocks} variant={chosen?.key ?? null} loggedIn={false} extras={await pageExtras(blocks)} beacon />;
+}
+
+/**
+ * P1 campaign landing page rendered per request (plan 03 P1): the console's signed draft preview, and the fallback
+ * when the proxy can't route a visit to the static page. Headline echoes the ad (L1); upload is in the hero (L2);
+ * proof is process-level and real (L13); examples are labelled; sticky CTA after the hero scrolls away (L19).
+ * Content is the page's structured blocks (plan 05 §5): visitors see the published copy; the preview shows the
+ * draft (optionally one variant) without recording a visit.
+ */
+export async function Landing({ slug, searchParams, preview }: { slug: string; searchParams: Record<string, string | string[] | undefined>; preview?: { variant: string | null } | null }) {
+  const utmContent = typeof searchParams.utm_content === 'string' ? searchParams.utm_content : null;
+  const routed = (await globalTx(async (tx) => {
+    if (preview) {
+      const [d] = await tx`select slug, content, variants, version from landing_pages where slug = ${slug}`;
+      if (d) return d;
+    }
+    // utm_content routing (plan 05 §5): e.g. utm_content=texture* → the texture page.
+    if (slug === 'default' && utmContent) {
+      const [m] = await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where status = 'live'
+                           and exists (select 1 from unnest(utm_match) u where ${utmContent.toLowerCase()} like u || '%') limit 1`;
+      if (m) return m;
+    }
+    return null;
+  })) as PageRow | null;
+  const page = routed ?? (await livePage(slug));
+  // A visitor who already carries our first-party cookie has been here before (plan 05 §4 "new vs returning"); the
+  // proxy marks the first view of a visitor whose cookie it has just created.
+  const returning = (await hasVisitorCookie()) && !(await cookies()).get(FIRST_VIEW_COOKIE)?.value;
+  const vid = await visitorId();
+  const variants = variantsOf(page);
+  const variant = preview ? (variants.find((v) => v.key === preview.variant)?.key ?? null) : page ? assignVariantOrNull(`lp:${page.slug}`, vid, variants) : null;
+  const blocks: LandingBlocks = applyLandingVariant(landingBlocksFrom(page?.content), variants.find((v) => v.key === variant)?.content as LandingVariantContent | undefined);
+  const user = await currentUser();
+  // A staff preview is not a visit.
+  if (!preview) {
+    const search = new URLSearchParams();
+    for (const [k, v] of Object.entries(searchParams)) for (const x of Array.isArray(v) ? v : v === undefined ? [] : [v]) search.append(k, x);
+    await recordLandingView({ visitorId: vid, page: (page?.slug as string) ?? null, variant, search, headers: new Headers(await headers()), returning }).catch(() => {});
+  }
+  return <LandingBody page={page} blocks={blocks} variant={variant} loggedIn={!!user} extras={await pageExtras(blocks)} preview={!!preview} />;
+}
+
+function LandingBody({ page, blocks, variant, loggedIn, extras, preview, beacon }: {
+  page: PageRow;
+  blocks: LandingBlocks;
+  variant: string | null;
+  loggedIn: boolean;
+  extras: Awaited<ReturnType<typeof pageExtras>>;
+  preview?: boolean;
+  beacon?: boolean;
+}) {
+  const { claimsChecked, examples, testimonials } = extras;
   const heroVisual = blocks.hero.visualAssetId ? examples.get(blocks.hero.visualAssetId) : undefined;
   const gallery = blocks.gallery.items.map((g) => ({ ...g, media: examples.get(g.assetId) })).filter((g) => g.media);
 
   return (
     <div className="ak-marketing">
-      <MarketingShell loggedIn={!!user}>
+      <MarketingShell loggedIn={loggedIn}>
+        {beacon ? <LandingBeacon page={page?.slug as string} variant={variant} /> : null}
         {preview ? (
           <p className="ak-wrap ak-label" role="status" style={{ padding: '8px 0', color: 'var(--risk)' }}>
             Preview of draft v{String(page?.version ?? '?')}{variant ? ` · variant ${variant}` : ''} — not live, not counted
