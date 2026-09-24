@@ -4,7 +4,7 @@ import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { extractionFacts } from './analysis';
 import type { ExtractedProduct } from './ingest';
 import { mockExtraction } from './mock-intel';
-import { acceptSourceFact, currentFacts, decideFact, parseSizes, recordFacts, sameValue } from './product-truth';
+import { acceptSourceFact, confirmFacts, currentFacts, decideFact, parseSizes, recordFacts, sameValue } from './product-truth';
 import { ctxFor } from './testing';
 
 beforeEach(truncateAll);
@@ -193,5 +193,26 @@ describe('extraction facts are labelled for what they are (§15)', () => {
     await withTenant(t2.workspaceId, (tx) => recordFacts(tx, c2, s2, [{ key: 'size', valueText: '30 ml', sourceType: 'json_ld', state: 'OBSERVED' }]));
     const r2 = await withTenant(t2.workspaceId, (tx) => recordFacts(tx, c2, s2, extractionFacts(mockExtraction({ name: page.name, text: '', sizeText: '1 fl oz' }), page, null, 'job-4')));
     expect(r2.disputes).toEqual([]);
+  });
+});
+
+describe('merchant confirmation (§13, §16 merchant_confirmed)', () => {
+  it('confirms the shown facts of this SKU only, once, and not for a viewer', async () => {
+    const { t, ctx, skuId } = await sku();
+    const other = await makeSku(t.workspaceId, 'Other');
+    await withTenant(t.workspaceId, (tx) => recordFacts(tx, ctx, skuId, [{ key: 'size', valueText: '30 ml', sourceType: 'product_page', state: 'OBSERVED' }, { key: 'texture', valueText: 'gel', sourceType: 'vision', state: 'INFERRED' }]));
+    await withTenant(t.workspaceId, (tx) => recordFacts(tx, ctx, other, [{ key: 'size', valueText: '50 ml', sourceType: 'product_page', state: 'OBSERVED' }]));
+    const ids = (await ownerPool()`select id, sku_id from product_facts where workspace_id = ${t.workspaceId}`).map((r) => ({ id: r.id as string, mine: r.sku_id === skuId }));
+    const viewer = ctxFor(t.workspaceId, t.userId, 'VIEWER');
+    await expect(withTenant(t.workspaceId, (tx) => confirmFacts(tx, viewer, skuId, ids.map((i) => i.id)))).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    const confirmed = await withTenant(t.workspaceId, (tx) => confirmFacts(tx, ctx, skuId, ids.map((i) => i.id)));
+    expect(confirmed.sort()).toEqual(ids.filter((i) => i.mine).map((i) => i.id).sort());
+    expect(await withTenant(t.workspaceId, (tx) => confirmFacts(tx, ctx, skuId, ids.map((i) => i.id)))).toEqual([]); // idempotent
+    const flags = await ownerPool()`select sku_id, merchant_confirmed from product_facts where workspace_id = ${t.workspaceId}`;
+    expect(flags.every((f) => f.merchant_confirmed === (f.sku_id === skuId))).toBe(true);
+    const cur = await withTenant(t.workspaceId, (tx) => currentFacts(tx, skuId));
+    expect(cur.size!.value.merchantConfirmed).toBe(true);
+    expect((await events(skuId, 'PRODUCT_FACT_CHANGED')).filter((e) => (e.payload as { confirmed?: boolean }).confirmed)).toHaveLength(2);
   });
 });

@@ -88,6 +88,9 @@ export async function projectView(workspaceId: string, projectId: string) {
       .filter(([k]) => !['description', 'variants', 'packaging', 'label_text'].includes(k))
       .map(([key, f]) => ({
         key,
+        id: f.value.id,
+        /** The merchant confirmed this value (P4 "Looks right") or decided it themselves. */
+        confirmed: f.value.merchantConfirmed || f.value.state === 'DECIDED',
         value: f.value.valueText ?? (f.value.valueNumber != null ? (key.includes('price') ? `$${f.value.valueNumber.toFixed(2)}` : String(f.value.valueNumber)) : JSON.stringify(f.value.valueJson)),
         state: f.value.state,
         source: f.value.sourceType,

@@ -216,6 +216,13 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
     }
   }
   const disputed = v.facts.filter((f) => f.disputed);
+  // "Looks right" confirms what the merchant was shown (§13, §16 merchant_confirmed), then moves on. A failed
+  // confirmation never blocks the ideas: the facts stay as observed.
+  async function confirmAndGo() {
+    const shown = v!.facts.filter((f) => FACT_LABELS[f.key] && !f.disputed && !f.confirmed).map((f) => f.id);
+    if (shown.length) await api(`/api/projects/${projectId}/confirm`, { factIds: shown }).catch(() => {});
+    window.location.assign(`/concepts/${projectId}`);
+  }
   // Keep the merchant's correction (a fresh decision acknowledges the newer source value) or take the source's.
   async function resolveSource(key: string, keep: { value: string } | { factId: string }) {
     setErr(null);
@@ -277,7 +284,12 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                           ) : null}
                         </span>
                       ),
-                    chip: <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} />,
+                    chip: (
+                      <span className="ak-row" style={{ gap: 6 }}>
+                        <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} />
+                        {f.confirmed && f.state !== 'DECIDED' ? <span className="ak-small ak-muted" title="You confirmed this">✓ confirmed</span> : null}
+                      </span>
+                    ),
                   }))}
               />
               {err ? <p className="ak-error" role="alert">{err}</p> : null}
@@ -337,7 +349,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                 </div>
               ) : null}
               {failed ? null : ready ? (
-                <LinkButton href={`/concepts/${projectId}`} block id="cta">Looks right — show me 3 ad ideas</LinkButton>
+                <LinkButton href={`/concepts/${projectId}`} block id="cta" onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
               ) : v.project.state === 'NEEDS_USER_ACTION' ? (
                 <Banner tone="warn">{v.project.failureReason ?? 'We need a clearer photo of the product. Add one to continue.'}</Banner>
               ) : (

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
 import {
   acceptSourceFact,
+  confirmFacts,
   approveClaim,
   approveExperiment,
   assertCan,
@@ -164,6 +165,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const n = i.key.includes('price') ? Number(i.value.replace(/[^0-9.]/g, '')) : null;
       await t((tx) => decideFact(tx, ctx, i.skuId, i.key, n != null && n > 0 ? { number: n } : { text: i.value }));
       return json({ ok: true });
+    }
+    case 'fact-confirm': {
+      const i = await body(req, z.object({ skuId: uuid, factIds: z.array(uuid).min(1).max(50) }));
+      return json({ ok: true, confirmed: (await t((tx) => confirmFacts(tx, ctx, i.skuId, i.factIds))).length });
     }
     case 'asset-delete': {
       const i = await body(req, z.object({ assetId: uuid }));
