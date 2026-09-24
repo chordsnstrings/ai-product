@@ -128,3 +128,17 @@ describe('a failed analysis never stays "analyzing" (plan 03 P3)', () => {
     expect(await sweeps['sweep-stuck-analysis']!.run()).toBe(0);
   });
 });
+
+describe('growth and finance sweeps (plan 05 §5–§7)', () => {
+  it('are scheduled, run as the system role, and do nothing when there is nothing to do', async () => {
+    expect(sweeps['landing-gallery-rights']!.cron).toBe('12 * * * *');
+    expect(sweeps['offer-guardrails']!.cron).toBe('*/15 * * * *');
+    expect(sweeps['stripe-reconcile']!.cron).toBe('40 3 * * *');
+    expect(await sweeps['landing-gallery-rights']!.run()).toBe(0);
+    expect(await sweeps['offer-guardrails']!.run()).toBe(0);
+    // Without Stripe configured the nightly reconciliation records a skipped run instead of flagging mock data.
+    expect(await sweeps['stripe-reconcile']!.run()).toBe(0);
+    const runs = await ownerPool()`select status, error from stripe_recon_runs`;
+    expect(runs).toEqual([{ status: 'skipped', error: 'Stripe is not configured (mock gateway)' }]);
+  });
+});
