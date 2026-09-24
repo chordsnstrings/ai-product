@@ -33,7 +33,7 @@ async function resendClient() {
  * never stored with the email log, and they can't be resent from the log: the console issues a fresh one instead
  * (resend invite, send login link).
  */
-export const SECRET_LINK_TEMPLATES: ReadonlySet<TemplateName> = new Set(['magic_link', 'invite', 'export_ready', 'ownership_transfer_confirm']);
+export const SECRET_LINK_TEMPLATES: ReadonlySet<TemplateName> = new Set(['magic_link', 'invite', 'export_ready', 'ownership_transfer_confirm', 'staff_invite']);
 export const REDACTED_LINK = '[single-use link — not stored]';
 
 /** The template data kept on email_log (plan 05 §2.2 Emails "Resend, view rendered email"), minus credentials. */
@@ -51,6 +51,7 @@ const TEMPLATE_NAMES: Record<TemplateName, true> = {
   claim_evidence_request: true, sku_out_of_scope: true, claims_guidance: true, media_review_result: true,
   cancellation_confirmed: true, plan_ended_payment_failed: true, subscription_started: true, price_change_notice: true, payment_failed: true, security_alert: true,
   weekly_brief: true, friday_summary: true, signal_update: true, day30_review: true, staff_break_glass: true, ownership_transfer_confirm: true, intervention: true,
+  staff_invite: true, review_text_erased: true,
 };
 export const isTemplateName = (t: string): t is TemplateName => Object.hasOwn(TEMPLATE_NAMES, t);
 

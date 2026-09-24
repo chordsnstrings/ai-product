@@ -33,6 +33,7 @@ import {
   sweepRateLimits,
   sweepSignInRecords,
   sweepHeartbeats,
+  sweepStaffAccessReview,
   sweepExpiringTokens,
   sweepStaleIntegrations,
   sweepRetention,
@@ -82,6 +83,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return n;
     },
   },
+  // Plan 05 §23 quarterly access review: roles not re-confirmed within 14 days of the review falling due are removed
+  // (sessions end; each removal is audited as a system action).
+  'staff-access-review': { cron: '35 6 * * *', run: () => withSystem((tx) => sweepStaffAccessReview(tx)).then((r) => r.length) },
   // Plan 05 §22: service instances not heard from in a day are dropped.
   'sweep-heartbeats': { cron: '5 4 * * *', run: () => withSystem((tx) => sweepHeartbeats(tx)) },
   // Plan 05 §15: free-preview COGS outliers become abuse signals (once a day per workspace).

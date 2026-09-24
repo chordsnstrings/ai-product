@@ -191,4 +191,92 @@ export async function staffLogoutToken(token: string | undefined | null) {
 export async function deprovisionStaff(tx: Tx, staffId: string) {
   await tx`update staff_users set active = false where id = ${staffId}`;
   await tx`update staff_sessions set revoked_at = now() where staff_id = ${staffId} and revoked_at is null`;
+  await tx`update staff_invites set revoked_at = now() where staff_id = ${staffId} and accepted_at is null and revoked_at is null`;
+}
+
+// ── Invites (plan 05 §23 "Invite staff … require passkey") ──
+// The inviter never learns either factor: the invitee opens a single-use link, sets their own password and enrols
+// their authenticator (a passkey can be added after the first sign-in, or required by a SUPER_ADMIN).
+
+export const STAFF_INVITE_HOURS = 48;
+/** Never a valid Argon2 hash: an invited (inactive) staff row can't be signed into before the invite is accepted. */
+const NO_PASSWORD = '!invited';
+
+/**
+ * Invite someone (admin role, inside the caller's transaction). The staff row starts inactive and without roles, so
+ * requested roles can go through four-eyes meanwhile. Re-inviting a deprovisioned member reuses their row with its
+ * roles cleared. Returns the link token (shown once, in the email).
+ */
+export async function inviteStaff(tx: Tx, input: { email: string; name: string; createdBy: string }) {
+  const email = input.email.trim().toLowerCase();
+  const [existing] = await tx`select id, active from staff_users where email = ${email} for update`;
+  if (existing?.active) throw new DomainError('CONFLICT', `${email} already has an active staff account.`);
+  let staffId = existing?.id as string | undefined;
+  if (staffId) {
+    const [open] = await tx`select 1 from staff_invites where staff_id = ${staffId} and accepted_at is null and revoked_at is null and expires_at > now()`;
+    if (open) throw new DomainError('CONFLICT', `${email} already has an open invite. Resend it instead.`);
+    await tx`update staff_users set name = ${input.name}, roles = '{}', password_hash = ${NO_PASSWORD}, totp_secret_enc = null, require_passkey = false where id = ${staffId}`;
+  } else {
+    const [s] = await tx`insert into staff_users (email, name, password_hash, roles, active) values (${email}, ${input.name}, ${NO_PASSWORD}, '{}', false) returning id`;
+    staffId = s!.id as string;
+  }
+  return { staffId, ...(await issueInvite(tx, staffId, email, input.createdBy)) };
+}
+
+/** A fresh single-use link for an invited, not yet active member; earlier links stop working. */
+export async function resendStaffInvite(tx: Tx, staffId: string, createdBy: string) {
+  const [s] = await tx`select email, active from staff_users where id = ${staffId} for update`;
+  if (!s) throw new DomainError('NOT_FOUND', 'Staff member not found');
+  if (s.active) throw new DomainError('CONFLICT', 'This member has already accepted their invite.');
+  const [inv] = await tx`select 1 from staff_invites where staff_id = ${staffId} and accepted_at is null`;
+  if (!inv) throw new DomainError('CONFLICT', 'This member was deprovisioned. Invite them again.');
+  return { email: s.email as string, ...(await issueInvite(tx, staffId, s.email as string, createdBy)) };
+}
+
+async function issueInvite(tx: Tx, staffId: string, email: string, createdBy: string) {
+  await tx`update staff_invites set revoked_at = now() where staff_id = ${staffId} and accepted_at is null and revoked_at is null`;
+  const token = randomBytes(32).toString('base64url');
+  const [i] = await tx`insert into staff_invites (staff_id, email, token_hash, created_by, expires_at)
+                       values (${staffId}, ${email}, ${sha(token)}, ${createdBy}, now() + make_interval(hours => ${STAFF_INVITE_HOURS})) returning id, expires_at`;
+  return { inviteId: i!.id as string, token, expiresAt: new Date(i!.expires_at as string) };
+}
+
+async function openInvite(tx: Tx, token: string, lock = false) {
+  const [i] = await tx`select i.id, i.staff_id, i.email, i.totp_secret, u.name, u.active from staff_invites i join staff_users u on u.id = i.staff_id
+                       where i.token_hash = ${sha(token)} and i.accepted_at is null and i.revoked_at is null and i.expires_at > now()
+                       ${lock ? tx`for update of i` : tx``}`;
+  if (!i || i.active) throw new DomainError('NOT_FOUND', 'This invite link has expired or was already used. Ask a SUPER_ADMIN to resend it.');
+  return i;
+}
+
+/**
+ * The invite page: who it is for, and the authenticator secret to enrol (created on first view and kept on the
+ * invite until accepted, so reloading the page shows the same one).
+ */
+export async function viewStaffInvite(token: string) {
+  return withAdmin(async (tx) => {
+    const i = await openInvite(tx, token, true);
+    let secret = i.totp_secret as string | null;
+    if (!secret) {
+      secret = base32Encode(randomBytes(20));
+      await tx`update staff_invites set totp_secret = ${secret} where id = ${i.id}`;
+    }
+    return { email: i.email as string, name: i.name as string, totpSecret: secret, otpauth: `otpauth://totp/Arkiv%20Admin:${encodeURIComponent(i.email as string)}?secret=${secret}&issuer=Arkiv%20Admin` };
+  });
+}
+
+/** Accept: the invitee's own password and a code proving their authenticator is enrolled. Single use. */
+export async function acceptStaffInvite(token: string, password: string, code: string, meta: RequestMeta = {}) {
+  if (password.length < 14) throw new DomainError('INVALID', 'Staff passwords must be at least 14 characters.');
+  return withAdmin(async (tx) => {
+    const i = await openInvite(tx, token, true);
+    if (!i.totp_secret || !verifyTotp(i.totp_secret as string, code)) throw new DomainError('INVALID', 'That code doesn’t match. Scan the secret again and enter the current code.');
+    await tx`update staff_users set password_hash = ${await argonHash(password)}, totp_secret_enc = ${i.totp_secret as string}, active = true, roles_confirmed_at = now()
+             where id = ${i.staff_id}`;
+    await tx`update staff_invites set accepted_at = now() where id = ${i.id}`;
+    const [u] = await tx`select roles from staff_users where id = ${i.staff_id}`;
+    await tx`insert into admin_audit_log (staff_id, staff_roles, action, target_type, target_id, ip, user_agent)
+             values (${i.staff_id}, ${u!.roles as string[]}, 'staff.invite_accepted', 'staff', ${i.staff_id as string}, ${normalizeIp(meta.ip)}, ${meta.userAgent ?? null})`;
+    return { staffId: i.staff_id as string, email: i.email as string };
+  });
 }

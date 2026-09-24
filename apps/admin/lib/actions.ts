@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
-import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
+import { assertFreshReauth, deprovisionStaff, inviteStaff, resendStaffInvite, STAFF_INVITE_HOURS, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
   deleteUser,
   actOnBehalf,
@@ -162,6 +162,11 @@ async function sendUserLoginLink(s: StaffUser, userId: string, why: string, veri
   await requestMagicLink({ email: u.email as string, purpose: 'login' });
   await withAdmin((tx) => audit(tx, s, verification ? 'user.resend_verification' : 'user.send_login_link', { type: 'user', id: userId }, { reason: why }));
   return { message: verification ? 'Verification link sent; opening it confirms the address.' : 'Sign-in link sent to the user’s inbox (valid 15 minutes).' };
+}
+
+/** The invite email: a single-use link to the console's invite page (never stored in the email log). */
+async function sendStaffInvite(s: StaffUser, email: string, name: string, token: string, inviteId: string) {
+  await sendEmail('staff_invite', email, { name, inviterName: s.name, url: `${env().ADMIN_URL}/invite/${token}`, expiresIn: `${STAFF_INVITE_HOURS} hours` }, { idempotencyKey: `staff-invite:${inviteId}` });
 }
 
 /** Customer-app link inside the workspace (plan 02 M11): email buttons land on the page they name. */
@@ -1277,25 +1282,45 @@ export const ACTIONS = {
   }),
 
   /* ── Staff ── */
-  // Invite staff: the account starts with no roles; the requested roles go through four-eyes like any role
-  // change (plan 05 §0.5, §23), so one SUPER_ADMIN can't mint another privileged account alone.
-  'staff.create': a({
+  // Invite staff (§23): an emailed single-use link; the invitee sets their own password and enrols their
+  // authenticator, so the inviter never holds either factor. The account starts without roles and the requested
+  // roles go through four-eyes like any role change (§0.5), so one SUPER_ADMIN can't mint a privileged account alone.
+  'staff.invite': a({
     perm: 'staff.manage',
     reauth: true,
-    schema: z.object({ email: z.string().email(), name: z.string().min(2), password: z.string().min(14), roles: z.string(), reason }),
+    schema: z.object({ email: z.string().email(), name: z.string().trim().min(2).max(120), roles: z.string(), reason }),
     run: async (s, i) => {
       const roles = parseRoles(i.roles);
       if (!roles.length) throw new DomainError('INVALID', `Pick at least one role (${StaffRole.join(', ')}).`);
-      const r = await createStaff({ email: i.email, name: i.name, password: i.password, roles: [] });
-      await withAdmin((tx) => audit(tx, s, 'staff.create', { type: 'staff', id: r.staffId }, { reason: i.reason, after: { email: i.email, requestedRoles: roles } }));
+      const r = await withAdmin(async (tx) => {
+        const inv = await inviteStaff(tx, { email: i.email, name: i.name, createdBy: s.staffId });
+        await audit(tx, s, 'staff.invite', { type: 'staff', id: inv.staffId }, { reason: i.reason, after: { email: i.email.toLowerCase(), requestedRoles: roles, expiresAt: inv.expiresAt.toISOString() } });
+        return inv;
+      });
+      await sendStaffInvite(s, i.email, i.name, r.token, r.inviteId);
       const grant = await requestOrExecute(s, 'staff.roles', { staffId: r.staffId, roles }, i.reason);
       const pending = grant.status === 'pending' ? ` Roles (${roles.join(', ')}) are pending approval by another SUPER_ADMIN (approval ${grant.approvalId.slice(0, 8)}).` : '';
-      return { status: grant.status, approvalId: grant.status === 'pending' ? grant.approvalId : null, message: `Created without roles.${pending} Give them this authenticator secret once, in person: ${r.totpSecret}` };
+      return { status: grant.status, approvalId: grant.status === 'pending' ? grant.approvalId : null, message: `Invite emailed to ${i.email} (valid ${STAFF_INVITE_HOURS} hours).${pending}` };
+    },
+  }),
+  'staff.invite_resend': a({
+    perm: 'staff.manage',
+    reauth: true,
+    schema: z.object({ staffId: uuid, reason: z.string().trim().max(500).optional() }),
+    run: async (s, i) => {
+      const r = await withAdmin(async (tx) => {
+        const inv = await resendStaffInvite(tx, i.staffId, s.staffId);
+        const [u] = await tx`select name from staff_users where id = ${i.staffId}`;
+        await audit(tx, s, 'staff.invite_resend', { type: 'staff', id: i.staffId }, { reason: i.reason ?? null, after: { expiresAt: inv.expiresAt.toISOString() } });
+        return { ...inv, name: u!.name as string };
+      });
+      await sendStaffInvite(s, r.email, r.name, r.token, r.inviteId);
+      return { message: `New invite link emailed to ${r.email}; earlier links no longer work.` };
     },
   }),
   'staff.roles': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, roles: z.string(), reason }), run: (s, i) => requestOrExecute(s, 'staff.roles', { staffId: i.staffId, roles: parseRoles(i.roles) }, i.reason) }),
   'staff.deprovision': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'You can’t deprovision yourself.'); const [b] = await tx`select email, roles, active from staff_users where id = ${i.staffId}`; if (!b) throw new DomainError('NOT_FOUND', 'Staff member not found'); await deprovisionStaff(tx, i.staffId); await audit(tx, s, 'staff.deprovision', { type: 'staff', id: i.staffId }, { reason: i.reason, before: b, after: { active: false } }); }) }),
-  'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select roles, roles_confirmed_at from staff_users where id = ${i.staffId}`; await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }, { before: b ?? null, after: { roles_confirmed_at: 'now' } }); }) }),
+  'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'Another SUPER_ADMIN confirms your roles (quarterly access review).'); const [b] = await tx`select roles, roles_confirmed_at from staff_users where id = ${i.staffId}`; await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }, { before: b ?? null, after: { roles_confirmed_at: 'now' } }); }) }),
   // §23 "require passkey": the staff member must already have one, or they'd be locked out.
   'staff.require_passkey': a({
     perm: 'staff.manage',

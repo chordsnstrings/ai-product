@@ -3,6 +3,7 @@ import { closeAll, ownerPool } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { assertStaff, decideApproval, decideOwnershipTransfer, lookupInvite, startBreakGlass } from '@arkiv/core';
 import { MockStripe, setBillingGateway } from '@arkiv/billing';
+import { acceptStaffInvite, staffLogin, totp, viewStaffInvite } from '@arkiv/auth';
 import { devOutbox, REDACTED_LINK, sendEmail } from '@arkiv/email';
 import { DataRequestKind, newId, type StaffRole } from '@arkiv/shared';
 import { ACTIONS, type ActionName } from './actions';
@@ -25,22 +26,44 @@ async function act(s: StaffUser, action: ActionName, input: Record<string, unkno
 beforeEach(truncateAll);
 afterAll(closeAll);
 
-describe('staff.create (plan 05 §0.5, §23)', () => {
-  it('creates the account without roles and routes the requested roles through four-eyes', async () => {
+describe('staff.invite (plan 05 §0.5, §23)', () => {
+  it('emails a single-use link, routes the requested roles through four-eyes, and the invitee sets both factors', async () => {
     const sa = await staff(['SUPER_ADMIN'], 'Founder A');
     const sa2 = await staff(['SUPER_ADMIN'], 'Founder B');
-    await expect(act(sa, 'staff.create', { email: 'new@arkiv.test', name: 'New Person', password: 'correct horse battery staple', roles: 'SUPER_ADMIN,FINANCE' })).rejects.toThrow();
-    await expect(act(sa, 'staff.create', { email: 'new@arkiv.test', name: 'New Person', password: 'correct horse battery staple', roles: 'WIZARD', reason: 'hiring' })).rejects.toThrow(/Unknown role/);
-    const r = await act(sa, 'staff.create', { email: 'new@arkiv.test', name: 'New Person', password: 'correct horse battery staple', roles: 'super_admin, finance', reason: 'second founder joining' });
+    await expect(act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'SUPER_ADMIN,FINANCE' })).rejects.toThrow();
+    await expect(act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'WIZARD', reason: 'hiring' })).rejects.toThrow(/Unknown role/);
+    devOutbox.length = 0;
+    const r = await act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'super_admin, finance', reason: 'second founder joining' });
     expect(r.status).toBe('pending');
-    expect(String(r.message)).toMatch(/pending approval/);
-    const [u] = await ownerPool()`select id, roles from staff_users where email = 'new@arkiv.test'`;
-    expect(u!.roles).toEqual([]);
+    expect(String(r.message)).toMatch(/Invite emailed.*pending approval/);
+    expect(String(r.message)).not.toMatch(/secret/i); // the inviter never sees a factor
+    const [u] = await ownerPool()`select id, roles, active from staff_users where email = 'new@arkiv.test'`;
+    expect(u).toMatchObject({ roles: [], active: false });
+    const mail = devOutbox.find((m) => m.template === 'staff_invite' && m.to === 'new@arkiv.test');
+    const token = /\/invite\/([A-Za-z0-9_-]+)/.exec(mail!.html)![1]!;
+    const [log] = await ownerPool()`select data from email_log where template = 'staff_invite'`;
+    expect((log!.data as { url: string }).url).toBe(REDACTED_LINK);
+    // A second invite for the same person is refused; a resend replaces the link.
+    await expect(act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'SUPPORT', reason: 'again' })).rejects.toThrow(/open invite/);
+    await act(sa, 'staff.invite_resend', { staffId: u!.id });
+    const mail2 = devOutbox.filter((m) => m.template === 'staff_invite').at(-1)!;
+    const token2 = /\/invite\/([A-Za-z0-9_-]+)/.exec(mail2.html)![1]!;
+    expect(token2).not.toBe(token);
+    await expect(viewStaffInvite(token)).rejects.toThrow(/expired or was already used/);
+    // The invitee enrols their own authenticator and password.
+    const v = await viewStaffInvite(token2);
+    expect(v.email).toBe('new@arkiv.test');
+    await expect(acceptStaffInvite(token2, 'correct horse battery staple', '000000')).rejects.toThrow(/code doesn’t match/);
+    await acceptStaffInvite(token2, 'correct horse battery staple', totp(v.totpSecret));
+    await expect(acceptStaffInvite(token2, 'correct horse battery staple', totp(v.totpSecret))).rejects.toThrow(/already used/);
+    expect(await staffLogin('new@arkiv.test', 'correct horse battery staple', totp(v.totpSecret), {})).toBeTruthy();
     // The creator can't approve their own request; another SUPER_ADMIN can.
     await expect(decideApproval(sa, r.approvalId as string, true)).rejects.toThrow(/own request/);
     await decideApproval(sa2, r.approvalId as string, true);
-    const [after] = await ownerPool()`select roles from staff_users where id = ${u!.id}`;
-    expect(after!.roles).toEqual(['SUPER_ADMIN', 'FINANCE']);
+    const [after] = await ownerPool()`select roles, active from staff_users where id = ${u!.id}`;
+    expect(after).toMatchObject({ roles: ['SUPER_ADMIN', 'FINANCE'], active: true });
+    // Staff don't confirm their own roles in the access review.
+    await expect(act(sa, 'staff.confirm_roles', { staffId: sa.staffId })).rejects.toThrow(/Another SUPER_ADMIN/);
   });
 });
 
