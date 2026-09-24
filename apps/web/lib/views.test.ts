@@ -1,9 +1,33 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
-import { ingestBytes, startPreview, step } from '@arkiv/core';
+import { analyzeProduct, append, generateStoryboard, ingestBytes, selectConcept, startPreview, step } from '@arkiv/core';
+import { ownerPool } from '@arkiv/db';
 import { ctxFor, productPhoto } from '../../../packages/core/src/testing';
-import { projectVersion } from './views';
+import { projectVersion, projectView } from './views';
+
+describe('storyboard view: plan and free picture changes (standard §5, §13; plan 03 P7)', () => {
+  it('shows the Creative Tests left for a subscriber and how many free picture changes remain', async () => {
+    const t = await makeTenant({ plan: 'GROWTH', state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, current_period_start, current_period_end, consent_record_id)
+                      values (${t.workspaceId}, ${'sub_' + t.workspaceId.slice(-8)}, 'GROWTH', 'active', now(), now() + interval '30 days', gen_random_uuid())`;
+    await withTenant(t.workspaceId, (tx) => append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 2, periodKey: '2026-09-01', idempotencyKey: 'grant:view' }));
+    const asset = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctx, await productPhoto(), 'product_photo', null));
+    const { skuId, projectId } = await withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [asset.id] }));
+    await analyzeProduct(ctx, skuId, projectId);
+    const [c] = await ownerPool()`select id from concepts where project_id = ${projectId} order by idx limit 1`;
+    const { storyboardId } = await withTenant(t.workspaceId, (tx) => selectConcept(tx, ctx, projectId, c!.id as string));
+    await generateStoryboard(ctx, projectId, storyboardId, c!.id as string);
+    const v = (await projectView(t.workspaceId, projectId))!;
+    expect(v.plan).toMatchObject({ subscribed: true, planCode: 'GROWTH', creativeTestsLeft: 2 });
+    expect(v.storyboard).toMatchObject({ freeRegenerationsLeft: 3, freeRegenerationsTotal: 3 });
+    await ownerPool()`update scenes set free_regenerations_used = 1 where storyboard_id = ${storyboardId} and position in (0, 1)`;
+    expect((await projectView(t.workspaceId, projectId))!.storyboard!.freeRegenerationsLeft).toBe(1);
+    await ownerPool()`update scenes set free_regenerations_used = 2 where storyboard_id = ${storyboardId} and position in (0, 1)`;
+    expect((await projectView(t.workspaceId, projectId))!.storyboard!.freeRegenerationsLeft).toBe(0);
+  }, 120_000);
+});
 
 beforeEach(truncateAll);
 afterAll(closeAll);

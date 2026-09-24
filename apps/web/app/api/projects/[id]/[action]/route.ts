@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, produceWithCreativeTest, retryAnalysis, retryProduction, retryStoryboard, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -11,11 +11,13 @@ import { projectAccess } from '@/lib/tenant';
  *   concepts  – "Try 3 more" (limited for provisional workspaces). Queued: 202 + the batch to poll for
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
+ *   produce-with-test – a subscriber makes this storyboard with one of their plan's Creative Tests (§5), no checkout
  *   retry     – retry a failed production (entitlement was returned on failure)
  *   reopen    – back to the storyboard to fix a line the claims check blocked (purchase kept)
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   recompose – "Update my ad" after the product's price or size changed: new on-screen text, same footage (§42)
+ *   storyboard-retry – draw the chosen idea's storyboard again after we failed to (P7 edge, §14)
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   photos    – add photos to this product (multipart `photos`): resumes an analysis waiting for them (the URL
  *               failed, §13), or adds side/back reference views to an analysed one (P4)
@@ -55,6 +57,16 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       if (!a.user || a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
       const r = await withTenant(a.ctx.workspaceId, (tx) => startProductionCheckout(tx, a.ctx, id, { id: a.user!.id, email: a.user!.email }));
       return json(r);
+    }
+    case 'produce-with-test': {
+      if (!a.user || a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const r = await withTenant(a.ctx.workspaceId, async (tx) => {
+        const out = await produceWithCreativeTest(tx, a.ctx, id);
+        // A one-off checkout still open for this storyboard is closed: it is being made with a test instead.
+        if (!out.replayed) await closeOpenCheckouts(tx, a.ctx, id);
+        return out;
+      });
+      return json({ ok: true, ...r, next: `/produce/${id}` });
     }
     case 'fact': {
       // Confirmation screen (P4): the merchant's correction becomes a DECIDED fact and wins over page/photo values.
@@ -118,6 +130,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const photos = await Promise.all(files.map(async (f) => ({ bytes: Buffer.from(await f.arrayBuffer()), filename: f.name })));
       const r = await withTenant(a.ctx.workspaceId, (tx) => addProductPhotos(tx, a.ctx, id, photos));
       return json({ ok: true, ...r }, r.mode === 'resumed' ? 202 : 200);
+    }
+    case 'storyboard-retry': {
+      const r = await withTenant(a.ctx.workspaceId, (tx) => retryStoryboard(tx, a.ctx, id));
+      return json({ ok: true, queued: true, ...r }, 202);
     }
     case 'retry-analysis': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));

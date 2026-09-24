@@ -2,6 +2,7 @@ import { withTenant, type Tx } from '@arkiv/db';
 import {
   ANALYSIS_KEY_FACTS,
   assetUrl,
+  available,
   blockedLines,
   bonusHookDue,
   bonusHooks,
@@ -11,6 +12,7 @@ import {
   currentQuote,
   customerQaSummary,
   DELIVERY_HOLD_STATES,
+  FREE_FRAME_REGENERATIONS,
   IN_PRODUCTION,
   listClaims,
   listSteps,
@@ -53,6 +55,10 @@ export async function projectView(workspaceId: string, projectId: string) {
       .filter((s) => String(s.step_key).startsWith('concepts.batch.'))
       .sort((a, b) => Number(String(b.step_key).split('.').pop()) - Number(String(a.step_key).split('.').pop()))[0];
     const quote = await currentQuote(tx);
+    // A subscriber's storyboard is made with one of their plan's Creative Tests; the one-off price applies only
+    // when none are left ("outside your plan", §5).
+    const [sub] = await tx`select plan_code from subscriptions where workspace_id = ${workspaceId} and status in ('active','trialing','past_due') order by created_at desc limit 1`;
+    const creativeTestsLeft = Math.max(0, await available(tx, 'creative_test', workspaceId));
     const [purchase] = await tx`select status, kind, amount_micros from purchases where project_id = ${projectId} order by created_at desc limit 1`;
     let exports: { aspect: string; assetId: string; url: string; download: string }[] = [];
     // What in the delivered ad is AI-generated (standard §40), for the platform disclosure steps on delivery.
@@ -196,6 +202,8 @@ export async function projectView(workspaceId: string, projectId: string) {
       storyboard,
       productionSteps: productionSteps.map(stepJson),
       quote,
+      /** The workspace's plan, for "Produce with 1 of N Creative Tests" instead of the one-off checkout. */
+      plan: { subscribed: !!sub, planCode: (sub?.plan_code as string | undefined) ?? null, creativeTestsLeft },
       purchase: purchase ? { status: purchase.status as string, kind: purchase.kind as string, amountMicros: Number(purchase.amount_micros) } : null,
       exports,
       // An offer bonus is shown only when the offer carries it (what is shown is what is delivered, §8).
@@ -233,9 +241,15 @@ async function storyboardBlock(tx: Tx, storyboardId: string) {
                          join scenes s on s.id = ps.subject_id where s.storyboard_id = ${storyboardId} and ps.step_key like 'frame.v%'
                          order by ps.subject_id, ps.started_at desc nulls last`;
   const regenByScene = new Map(regen.map((r) => [r.subject_id as string, { status: r.status as string, detail: (r.detail as string) ?? null }]));
+  // "Free · N of 3 left" (plan 03 P7, standard §13 "shows billable implications before render"): changes made plus
+  // changes still being drawn, the same count the server enforces.
+  const inflight = [...regenByScene.values()].filter((r) => r.status === 'pending' || r.status === 'active').length;
+  const used = v.scenes.reduce((n, s) => n + Number(s.free_regenerations_used), 0) + inflight;
   return {
     id: storyboardId,
     status: v.storyboard.status as string,
+    freeRegenerationsLeft: Math.max(0, FREE_FRAME_REGENERATIONS - used),
+    freeRegenerationsTotal: FREE_FRAME_REGENERATIONS,
     hook: (v.storyboard.hook_text as string) ?? null,
     cta: (v.storyboard.cta_text as string) ?? null,
     steps: steps.map(stepJson),
