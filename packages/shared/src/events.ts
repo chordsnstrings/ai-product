@@ -34,6 +34,8 @@ export const EventType = [
   // Platform event: a hook variant was not shipped (claims, integrity or fit) — never shipped confounded.
   'VARIANT_SKIPPED',
   'VARIANT_EXPORTED',
+  // Standard §26 / §49 usage: a Creator Pack (a structured brief for a human creator) was made for an experiment.
+  'CREATOR_PACK_CREATED',
   'EXPERIMENT_CONFOUNDED',
   // Performance
   'PERFORMANCE_INGESTED',
@@ -285,6 +287,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   QA_FAILED: 'scene',
   QA_PASSED: 'scene',
   COMPOSITION_COMPLETED: 'project',
+  CREATOR_PACK_CREATED: 'experiment',
   CREATIVE_REGENERATION_REQUESTED: 'project',
   CREDIT_RESERVED: 'project',
   CREDIT_CONSUMED: 'project',
@@ -346,6 +349,7 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   VARIANT_GENERATED: ['variantId', 'experimentId', 'creativeId', 'skuId'],
   VARIANT_SKIPPED: ['variantId', 'experimentId', 'skuId'],
   COMPOSITION_COMPLETED: ['projectId', 'skuId', 'creativeId'],
+  CREATOR_PACK_CREATED: ['experimentId', 'skuId'],
   CREATIVE_REGENERATION_REQUESTED: ['projectId', 'skuId'],
   CREDIT_RESERVED: ['ledgerEntryId', 'authorizationId'],
   CREDIT_CONSUMED: ['ledgerEntryId', 'authorizationId'],

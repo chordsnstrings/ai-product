@@ -12,6 +12,7 @@ import {
   cancelDeletion,
   changeRole,
   connectSelectedAccounts,
+  createCreatorPack,
   createExperiment,
   decideConfounder,
   decideFact,
@@ -34,6 +35,7 @@ import {
   proposeClaim,
   Queues,
   removeMember,
+  revokeCreatorPack,
   requestExport,
   saveIntegration,
   scheduleDeletion,
@@ -150,6 +152,18 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       assertCan(ctx, 'spend.creative_test');
       const r = await t((tx) => idempotent(tx, ctx.workspaceId, 'experiment-approve', key, { experimentId: i.experimentId, quoteId: i.quoteId }, () => approveExperiment(tx, ctx, i.experimentId, { quoteId: i.quoteId })));
       return json({ ok: true, replayed: r.replayed, ...r.result });
+    }
+    /* ── Creator Packs (§26) ── */
+    case 'creator-pack': {
+      const { experimentId } = await body(req, z.object({ experimentId: uuid }));
+      const r = await t((tx) => createCreatorPack(tx, ctx, experimentId));
+      // The link is shown once: only its hash is stored.
+      return json({ ok: true, id: r.id, url: new URL(`/pack/${r.token}`, env().APP_URL).toString(), expiresAt: r.expiresAt });
+    }
+    case 'creator-pack-revoke': {
+      const { id } = await body(req, z.object({ id: uuid }));
+      await t((tx) => revokeCreatorPack(tx, ctx, id));
+      return json({ ok: true });
     }
     case 'experiment-archive': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
