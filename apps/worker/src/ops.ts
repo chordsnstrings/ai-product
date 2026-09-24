@@ -1,6 +1,6 @@
 import type { PgBoss } from 'pg-boss';
 import { ownerPool, withSystem, withTenant } from '@arkiv/db';
-import { cancelProduction, DATASETS, JOB_HOLD_STATES, loadCases, Queues, runDeterministicEval, runModelEval, verifyShopifyWebhooks, type TenantContext } from '@arkiv/core';
+import { cancelProduction, DATASETS, JOB_HOLD_STATES, loadCases, Queues, runDeterministicEval, runModelEval, applyTaxonomyRemap, verifyShopifyWebhooks, type TenantContext } from '@arkiv/core';
 import { reconcileStripe } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 
@@ -82,6 +82,10 @@ export async function processOpsCommands(boss: PgBoss): Promise<number> {
         }
         case 'stripe.reconcile':
           result = await reconcileStripe();
+          break;
+        case 'taxonomy.remap':
+          // An approved taxonomy change's migration plan, applied to existing genomes (plan 05 §19).
+          result = await applyTaxonomyRemap(p.proposalId!);
           break;
         case 'integration.verify_webhooks': {
           // Each shop's registrations are listed with its own token and missing topics re-registered (plan 05 §16).

@@ -16,6 +16,7 @@ export * from './integrations-health';
 export * from './retention';
 export * from './status-banner';
 export * from './system-health';
+export * from './taxonomy';
 export * from './ledger';
 export * from './rates';
 export * from './cost-governor';

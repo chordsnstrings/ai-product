@@ -51,6 +51,9 @@ import {
   setOfferExperiment,
   normalizeAllowKey,
   normalizeCidr,
+  proposeTaxonomyChange,
+  reviewTaxonomyProposal,
+  TAXONOMY_FAMILIES,
   parseBannerAudience,
   describeAudience,
   QA_VERDICT_KEY,
@@ -1240,7 +1243,23 @@ export const ACTIONS = {
   }),
 
   /* ── Taxonomy ── */
-  'taxonomy.version': a({ perm: 'taxonomy.manage', reauth: true, schema: z.object({ spec: z.record(z.string(), z.unknown()), reason }), run: (s, i) => withAdmin(async (tx) => { const [v] = await tx`select coalesce(max(version), 0) + 1 as v from taxonomy_versions`; await tx`insert into taxonomy_versions (version, spec) values (${v!.v}, ${tx.json({ ...i.spec, changeReason: i.reason, by: s.email } as never)})`; await audit(tx, s, 'taxonomy.version', { type: 'taxonomy', id: String(v!.v) }, { reason: i.reason, after: i.spec }); return { message: `Taxonomy v${v!.v} recorded. Existing genomes keep their version until remapped.` }; }) }),
+  /* §19 taxonomy: a proposal (add / rename / deprecate one value) → review by a second staff member → new version
+     and, when genomes must move, a remap the worker applies. Nothing becomes canonical without review. */
+  'taxonomy.propose': a({
+    perm: 'taxonomy.manage',
+    schema: z.object({ family: z.enum(TAXONOMY_FAMILIES), op: z.enum(['add', 'rename', 'deprecate']), value: z.string().trim().toUpperCase(), to: z.string().trim().toUpperCase().optional(), reason }),
+    run: (s, i) => withAdmin(async (tx) => ({ id: await proposeTaxonomyChange(tx, s, { family: i.family, op: i.op, value: i.value, to: i.to || null, reason: i.reason }), message: 'Proposed. Another staff member reviews it before it becomes canonical.' })),
+  }),
+  'taxonomy.review': a({
+    perm: 'taxonomy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, approve: z.boolean(), note: z.string().trim().min(4, 'A review note is required') }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const r = await reviewTaxonomyProposal(tx, s, i.id, i.approve, i.note);
+        return { message: r.version ? `Taxonomy v${r.version} recorded.${r.remap ? ' Existing genomes are being remapped.' : ''}` : 'Proposal rejected.' };
+      }),
+  }),
 
   /* ── Staff ── */
   // Invite staff: the account starts with no roles; the requested roles go through four-eyes like any role
