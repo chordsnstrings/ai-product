@@ -386,10 +386,27 @@ export function usePoll<T>(url: string, intervalMs: number, active: boolean): { 
   return { data, error, refresh };
 }
 
-export async function api<T = unknown>(url: string, body?: unknown, method = 'POST'): Promise<T> {
+/**
+ * An idempotency key for one submission of a create form (standard §39): the same key while the submission is
+ * being retried or clicked twice, a new one once it succeeded (`next()`).
+ */
+export function useSubmissionKey(): { key: () => string; next: () => void } {
+  const ref = useRef<string | null>(null);
+  const key = useCallback(() => (ref.current ??= newKey()), []);
+  const next = useCallback(() => {
+    ref.current = null;
+  }, []);
+  return { key, next };
+}
+const newKey = () => (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `k-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`);
+
+export async function api<T = unknown>(url: string, body?: unknown, method = 'POST', opts: { idempotencyKey?: string } = {}): Promise<T> {
+  const headers: Record<string, string> = body instanceof FormData ? {} : { 'Content-Type': 'application/json' };
+  // One key per submission (standard §39): a retried or doubled submit of the same create returns the first answer.
+  if (opts.idempotencyKey) headers['Idempotency-Key'] = opts.idempotencyKey;
   const r = await fetch(url, {
     method,
-    headers: body instanceof FormData ? undefined : { 'Content-Type': 'application/json' },
+    headers,
     body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body),
   });
   const j = await r.json().catch(() => ({}));

@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '@arkiv/ui/client';
+import { api, useSubmissionKey } from '@arkiv/ui/client';
 import { loadTurnstile } from './turnstile';
 import { usePhotoUploads } from './photo-uploads';
 
@@ -111,6 +111,7 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
     uploads.add(imgs);
   };
 
+  const submission = useSubmissionKey();
   async function submit(e?: React.FormEvent) {
     e?.preventDefault();
     if (!validUrl && !uploads.items.some((i) => i.status !== 'failed')) return setError('Paste your product link or add a photo.');
@@ -129,7 +130,10 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
       if (variant) fd.set('variant', variant);
       const challenge = await turnstile.token();
       if (challenge) fd.set('cf-turnstile-response', challenge);
-      const r = await api<{ projectId: string }>('/api/preview', fd);
+      // One key per submission: a double submit (or a retry after a dropped response) opens the same preview
+      // instead of creating a second product (§39, §35).
+      const r = await api<{ projectId: string }>('/api/preview', fd, 'POST', { idempotencyKey: submission.key() });
+      submission.next();
       uploads.clear();
       window.location.assign(`/start/${r.projectId}`);
     } catch (err) {
