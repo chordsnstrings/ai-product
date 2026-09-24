@@ -1223,12 +1223,17 @@ export async function cancelProduction(tx: Tx, ctx: TenantContext, projectId: st
 /**
  * A refund of the order's payment (Stripe dashboard, console, dispute) while its ad isn't delivered stops the
  * production and ends the project REFUNDED: the money went back, so the credit it bought is withdrawn too. A
- * delivered ad stays delivered (plan 02 B9). Runs in the refund's transaction (tenant or staff role; every query is
+ * delivered ad stays delivered (plan 02 B9), and a refunded duplicate payment leaves a still-paid order alone. Runs in the refund's transaction (tenant or staff role; every query is
  * scoped to the workspace).
  */
 export async function stopForRefund(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, projectId: string, purchaseId: string): Promise<'none' | 'requested' | 'refunded'> {
   const [p] = await tx`select state from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!p || p.state === 'COMPLETE' || isTerminal(p.state as ProjectState)) return 'none';
+  // A duplicate payment refunded while the order's own payment stands (a second tab, a double charge) changes
+  // nothing: the production is still paid for.
+  const [paid] = await tx`select 1 from purchases where workspace_id = ${ctx.workspaceId} and project_id = ${projectId} and id <> ${purchaseId}
+                          and status = 'paid' and kind in ('taste', 'standalone') limit 1`;
+  if (paid) return 'none';
   const request = { by: 'refund', purchaseId, at: new Date().toISOString() };
   await tx`update projects set cancel_requested_at = coalesce(cancel_requested_at, now()), cancel_request = ${tx.json(request as never)}
            where id = ${projectId} and workspace_id = ${ctx.workspaceId}`;
