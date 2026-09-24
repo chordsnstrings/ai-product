@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { assertCan } from '@arkiv/core';
-import { metaAuthUrl, shopifyInstallUrl, signState, tiktokAuthUrl } from '@arkiv/integrations';
+import { META_SCOPES, metaAuthUrl, shopifyInstallUrl, signState, tiktokAuthUrl } from '@arkiv/integrations';
 import { errorResponse } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
@@ -15,7 +15,11 @@ export async function GET(req: Request, { params }: { params: Promise<{ slug: st
       const shop = (new URL(req.url).searchParams.get('shop') ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
       return NextResponse.redirect(shopifyInstallUrl(shop.includes('.') ? shop : `${shop}.myshopify.com`, state));
     }
-    if (provider === 'meta') return NextResponse.redirect(metaAuthUrl(state));
+    if (provider === 'meta') {
+      // A partial-scope connection re-asks only for the permissions it is missing (§47), never unrelated ones.
+      const only = (new URL(req.url).searchParams.get('scopes') ?? '').split(',').filter((s) => META_SCOPES.includes(s));
+      return NextResponse.redirect(only.length ? metaAuthUrl(state, only) : metaAuthUrl(state));
+    }
     if (provider === 'tiktok') return NextResponse.redirect(tiktokAuthUrl(state));
     return new NextResponse('Not found', { status: 404 });
   } catch (e) {

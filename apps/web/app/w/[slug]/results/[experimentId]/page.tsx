@@ -24,13 +24,16 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     const conf = await tx`select id, kind, source, status, starts_at, ends_at, note from confounders where (sku_id is null or sku_id = ${v.experiment.sku_id})
                           and status <> 'dismissed' and coalesce(ends_at, now()) > now() - interval '120 days' order by starts_at desc`;
     const revised = await tx`select max(superseded_at) as at from performance_observations where variant_id in ${tx(v.variants.length ? v.variants.map((x) => x.id as string) : ['00000000-0000-0000-0000-000000000000'])}`;
-    return { ...v, conf, revisedAt: revised[0]?.at as string | null };
+    // Ads deleted on the platform (§48): their history stays; the variant is labelled, never back-filled.
+    const deleted = await tx`select v.id from variants v join creatives c on c.id = v.creative_id and c.workspace_id = v.workspace_id
+                             where v.experiment_id = ${experimentId} and c.source_deleted_at is not null`;
+    return { ...v, conf, revisedAt: revised[0]?.at as string | null, deletedVariants: new Set(deleted.map((x) => x.id as string)) };
   });
   if (!d) notFound();
   // One table per measurement context and attribution window: different windows are different measurements (§30).
   const groups = [...new Map(d.results.map((r) => [`${r.measurement_context}|${r.attribution_window}`, { ctx: r.measurement_context as string, window: String(r.attribution_window ?? 'default') }])).values()];
   const windowLabel = (w: string) => (w === 'default' ? null : w.replace(/_/g, ' ').replace(/(\d+)d/g, '$1-day'));
-  const label = new Map(d.variants.map((v) => [v.id as string, `${v.code} · ${v.label}`]));
+  const label = new Map(d.variants.map((v) => [v.id as string, `${v.code} · ${v.label}${d.deletedVariants.has(v.id as string) ? ' · deleted on platform' : ''}`]));
   // Confounder windows that overlapped this test's observed dates (§45), as of the last computation.
   const overlapping = new Set(d.results.flatMap((r) => ((r.confounder_windows as { id: string }[] | null) ?? []).map((c) => c.id)));
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);

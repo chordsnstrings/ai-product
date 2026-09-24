@@ -65,6 +65,7 @@ import {
   scheduleTenantPurge,
   SETTING_DEFAULTS,
   setTenantFlags,
+  staffApproveShopTransfer,
   setTenantHold,
   requestOwnershipTransfer,
   requestSkuTransfer,
@@ -732,6 +733,18 @@ export const ACTIONS = {
         await tx`insert into platform_settings (key, value, updated_by) values ('integrations.app_status', ${tx.json(after as never)}, ${s.staffId})
                  on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
         await audit(tx, s, 'integration.app_status', { type: 'setting', id: 'integrations.app_status' }, { before: before[i.provider] ?? null, after: after[i.provider] });
+      }),
+  }),
+  /* Plan 02 §3 layer 8: a store transfer the current owner hasn't answered in 14 days, with the requester's Shopify OAuth as proof. */
+  'integration.shop_transfer_approve': a({
+    perm: 'integrations.manage',
+    reauth: true,
+    schema: z.object({ requestId: uuid, reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const r = await staffApproveShopTransfer(tx, s, i.requestId, i.reason);
+        await audit(tx, s, 'integration.shop_transfer_approve', { type: 'shop_transfer', id: i.requestId }, { workspaceId: r.fromWorkspaceId, reason: i.reason, before: { status: 'pending', workspaceId: r.fromWorkspaceId }, after: { status: 'approved', shop: r.shop, toWorkspaceId: r.toWorkspaceId } });
+        return { message: `${r.shop} released. The requesting workspace can connect it now.` };
       }),
   }),
   'integration.verify': a({ perm: 'integrations.manage', schema: z.object({}), run: (s) => requestOpsCommand(s, 'integration.verify_webhooks', {}, 'nightly check run manually').then(() => ({ message: 'Verification queued' })) }),

@@ -12,6 +12,8 @@ import {
   cancelDeletion,
   changeRole,
   connectSelectedAccounts,
+  decideShopTransfer,
+  requestShopTransfer,
   createCreatorPack,
   createExperiment,
   decideConfounder,
@@ -322,6 +324,18 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const i = await body(req, z.object({ pendingId: uuid, accountIds: z.array(z.string().min(1).max(64)).min(1).max(200), mode: z.enum(['add', 'replace']).default('add') }));
       const r = await t((tx) => connectSelectedAccounts(tx, ctx, i.pendingId, i.accountIds, { replace: i.mode === 'replace' }));
       return json({ ok: true, ...r, next: `/w/${slug}/settings/integrations?${new URLSearchParams({ result: `Connected ${r.connected} account${r.connected === 1 ? '' : 's'}${r.disconnected ? `, disconnected ${r.disconnected}` : ''}. First sync running.` })}` });
+    }
+    case 'shop-transfer-request': {
+      // Plan 02 §3 layer 8: the store is routed to another workspace; the signed proof comes from this user's OAuth.
+      const { proof } = await body(req, z.object({ proof: z.string().min(10).max(2000) }));
+      if (!w.user) throw new DomainError('UNAUTHENTICATED', 'Please log in.');
+      await t((tx) => requestShopTransfer(tx, ctx, proof, w.user!.email));
+      return json({ ok: true, next: `/w/${slug}/settings/integrations?${new URLSearchParams({ result: 'Transfer requested. The store’s current workspace owner has been asked to approve it.' })}` });
+    }
+    case 'shop-transfer-decide': {
+      const i = await body(req, z.object({ id: uuid, decision: z.enum(['approve', 'reject']) }));
+      await t((tx) => decideShopTransfer(tx, ctx, i.id, i.decision));
+      return json({ ok: true });
     }
     case 'integration-demo': {
       // Dev/test only: a demo ad account so the loop can be exercised without platform credentials.

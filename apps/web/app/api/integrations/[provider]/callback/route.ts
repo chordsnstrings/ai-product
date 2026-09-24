@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server';
 import { withTenant, globalTx } from '@arkiv/db';
-import { saveIntegration, stashPendingConnection } from '@arkiv/core';
+import { registerShopifyWebhooks, saveIntegration, shopTransferProof, stashPendingConnection } from '@arkiv/core';
 import { metaExchangeCode, shopifyExchangeCode, tiktokExchangeCode, verifyShopifyQuery, verifyState } from '@arkiv/integrations';
-import { env, type Role, type WorkspaceState } from '@arkiv/shared';
+import { DomainError, env, type Role, type WorkspaceState } from '@arkiv/shared';
+import { logger } from '@arkiv/shared/log';
+
+const log = logger('oauth-callback');
 import { currentUser } from '@/lib/session';
 
 /**
@@ -26,7 +29,19 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
       if (!verifyShopifyQuery(q)) return back(st.slug!, 'Shopify signature check failed. Try again.');
       const shop = q.shop!;
       const tok = await shopifyExchangeCode(shop, q.code!);
-      await withTenant(ctx.workspaceId, (tx) => saveIntegration(tx, ctx, { provider: 'shopify', externalAccountId: shop, displayName: shop, token: tok.accessToken, scopes: tok.scopes }));
+      try {
+        await withTenant(ctx.workspaceId, (tx) => saveIntegration(tx, ctx, { provider: 'shopify', externalAccountId: shop, displayName: shop, token: tok.accessToken, scopes: tok.scopes }));
+      } catch (e) {
+        // The store is routed to another workspace (plan 02 §3 layer 8): this OAuth is the requester's proof of
+        // control, carried (signed, short-lived, without the token) to the "Request transfer" prompt.
+        if (e instanceof DomainError && e.code === 'CONFLICT' && e.details?.transfer) {
+          const proof = shopTransferProof({ shop, workspaceId: ctx.workspaceId, userId: user.userId, scopes: tok.scopes });
+          return NextResponse.redirect(`${env().APP_URL}/w/${st.slug}/settings/integrations?${new URLSearchParams({ result: e.message, transfer: proof })}`, 303);
+        }
+        throw e;
+      }
+      // Product webhooks now (§28 "re-sync on webhook"); the nightly check repairs a registration that fails here.
+      await registerShopifyWebhooks(shop, tok.accessToken).catch((err: unknown) => log.warn('webhook registration failed', { shop, err }));
       return back(st.slug!, 'Shopify connected. Importing products…');
     }
     if (!q.code && !q.auth_code) return back(st.slug!, q.error_description ?? 'Connection cancelled.');
@@ -36,13 +51,24 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
     if (r.accounts.length === 1) {
       const a = r.accounts[0]!;
       await withTenant(ctx.workspaceId, (tx) =>
-        saveIntegration(tx, ctx, { provider: provider as 'meta' | 'tiktok', externalAccountId: a.id, displayName: a.name, token: r.accessToken, scopes: ['ads_read'], currency: a.currency, timezone: a.timezone, platformUserId: r.platformUserId }),
+        saveIntegration(tx, ctx, {
+          provider: provider as 'meta' | 'tiktok',
+          externalAccountId: a.id,
+          displayName: a.name,
+          token: r.accessToken,
+          // The permissions actually granted (§27), so a declined one shows as unavailable features.
+          scopes: r.scopes,
+          currency: a.currency,
+          timezone: a.timezone,
+          platformUserId: r.platformUserId,
+          tokenExpiresAt: r.expiresAt,
+        }),
       );
       return back(st.slug!, `${label} connected (${a.name}). First sync running.`);
     }
     // Several readable accounts (an agency login can read other brands'): nothing is connected until the merchant
     // picks which belong to this workspace (§47 "Wrong ad account selected").
-    const pendingId = await withTenant(ctx.workspaceId, (tx) => stashPendingConnection(tx, ctx, provider as 'meta' | 'tiktok', r.accessToken, r.accounts, r.platformUserId));
+    const pendingId = await withTenant(ctx.workspaceId, (tx) => stashPendingConnection(tx, ctx, provider as 'meta' | 'tiktok', r.accessToken, r.accounts, r.platformUserId, { scopes: r.scopes, expiresAt: r.expiresAt }));
     return NextResponse.redirect(`${env().APP_URL}/w/${st.slug}/settings/integrations?${new URLSearchParams({ pick: pendingId })}`, 303);
   } catch (e) {
     return back(st.slug!, e instanceof Error ? e.message : 'Connection failed.');
