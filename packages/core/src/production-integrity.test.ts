@@ -13,7 +13,9 @@ import { generateVideo } from './model-gateway';
 import { approveForProduction, blockedLines, cancelProduction, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
 import { clearSettingsCache } from './settings';
 import { customerReason } from './projects';
-import { repeatedFidelityFailures } from './qa-metrics';
+import { firstRenderAcceptance, repeatedFidelityFailures } from './qa-metrics';
+import { recordAssetExport } from './exports';
+import { emit } from './events';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
@@ -428,4 +430,35 @@ describe('repeated product-fidelity failure KPI (standard §10: biz-21)', () => 
     await ownerPool()`update workspaces set is_test = true where id = ${r.t.workspaceId}`;
     expect((await withAdmin((tx) => repeatedFidelityFailures(tx, 7))).paid).toBe(0);
   }, 240_000);
+});
+
+describe('first-render acceptance (Appendix C; exp-38)', () => {
+  it('counts paid ads exported without a customer-requested regeneration', async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    // Delivered, not exported yet: not accepted.
+    expect(await withAdmin((tx) => firstRenderAcceptance(tx, 7))).toEqual({ delivered: 1, accepted: 0, rate: 0 });
+    const [a] = await ownerPool()`select id from assets where workspace_id = ${r.t.workspaceId} and kind = 'final_export' and lineage->>'projectId' = ${r.projectId} limit 1`;
+    await withTenant(r.t.workspaceId, (tx) => recordAssetExport(tx, r.ctx, a!.id as string, r.projectId));
+    expect(await withAdmin((tx) => firstRenderAcceptance(tx, 7))).toEqual({ delivered: 1, accepted: 1, rate: 1 });
+    const regen = (by: 'user' | 'staff') =>
+      withTenant(r.t.workspaceId, (tx) => emit(tx, r.ctx, 'CREATIVE_REGENERATION_REQUESTED', { type: 'project', id: r.projectId }, { by, from: 'PROVIDER_FAILED', reason: null }, { projectId: r.projectId, skuId: r.skuId }));
+    // A staff (or system) retry is not the customer's: still accepted first time.
+    await regen('staff');
+    expect((await withAdmin((tx) => firstRenderAcceptance(tx, 7))).accepted).toBe(1);
+    await regen('user');
+    expect(await withAdmin((tx) => firstRenderAcceptance(tx, 7))).toEqual({ delivered: 1, accepted: 0, rate: 0 });
+    await ownerPool()`update workspaces set is_test = true where id = ${r.t.workspaceId}`;
+    expect((await withAdmin((tx) => firstRenderAcceptance(tx, 7))).delivered).toBe(0);
+  }, 240_000);
+
+  it("a customer's retry of a failed paid production is recorded as their regeneration request", async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    await withTenant(r.t.workspaceId, (tx) => failProduction(tx, r.ctx, r.projectId, 'test: render failed QA'));
+    await withTenant(r.t.workspaceId, (tx) => retryProduction(tx, r.ctx, r.projectId));
+    const events = await ownerPool()`select payload, refs from events where workspace_id = ${r.t.workspaceId} and type = 'CREATIVE_REGENERATION_REQUESTED'`;
+    expect(events).toEqual([expect.objectContaining({ payload: { by: 'user', from: 'PROVIDER_FAILED', reason: 'quality_failed' }, refs: expect.objectContaining({ projectId: r.projectId, skuId: r.skuId }) })]);
+  }, 120_000);
 });

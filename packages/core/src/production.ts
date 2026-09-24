@@ -1363,6 +1363,11 @@ export async function retryProduction(tx: Tx, ctx: TenantContext, projectId: str
            where workspace_id = ${ctx.workspaceId} and project_id = ${projectId} and idempotency_key = ${'produce:' + projectId} and status <> 'active'`;
   await transition(tx, ctx, projectId, 'STORYBOARD_APPROVED');
   await tx`update projects set outage = null where id = ${projectId}`;
+  // A failed paid production generated again (Appendix C first-render acceptance): whose request it was.
+  if (p.state === 'PROVIDER_FAILED' && ['taste', 'standalone', 'creative_test'].includes(p.kind as string)) {
+    const by = ctx.actor.kind === 'staff' ? 'staff' : ctx.actor.kind === 'system' ? 'system' : 'user';
+    await emit(tx, ctx, 'CREATIVE_REGENERATION_REQUESTED', { type: 'project', id: projectId }, { by, from: p.state as string, reason: (p.failure_code as string | null) ?? null }, { projectId, skuId: p.sku_id as string });
+  }
   await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor, retry: true }, { singletonKey: `produce:${projectId}:${Date.now()}`, priority: priorityFor(ctx, 'production') });
   return { resumed: false };
 }
