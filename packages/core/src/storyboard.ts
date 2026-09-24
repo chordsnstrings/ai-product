@@ -1,20 +1,24 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
-import { compositeProduct, placeholderFrame } from '@arkiv/media';
+import { compositeProduct, productionBackdrop } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
-import { classifyClaim, scanCreativeText } from './compliance';
+import { brandBrainFor } from './brand';
+import { classifyClaim, scanCreativeText, type LineMapping } from './compliance';
+import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
 import type { TenantContext } from './context';
 import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
 import { allowedClaimTexts, planStoryboard } from './creative-director';
 import { emit } from './events';
 import { recordFunnel } from './funnel';
 import type { StoryboardPlan } from './intel-schemas';
-import { generateImage, route } from './model-gateway';
+import { generateImage, routedLines } from './model-gateway';
 import { issueTasteOffer } from './offers';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
+import { sceneClaimIds } from './production';
 import { transition } from './projects';
+import { qaClaims } from './qa';
 import { toDataUrl } from './vision';
 
 const FRAME = { width: 1080, height: 1920 };
@@ -47,12 +51,6 @@ export async function selectConcept(tx: Tx, ctx: TenantContext, projectId: strin
   return { storyboardId: sb!.id as string, replayed: false };
 }
 
-async function productCutout(tx: Tx, skuId: string): Promise<Buffer | null> {
-  const [fp] = await tx`select cutout_asset_id from visual_fingerprints where sku_id = ${skuId} and active`;
-  if (!fp?.cutout_asset_id) return null;
-  return assetBytes(tx, fp.cutout_asset_id as string);
-}
-
 async function referenceDataUrls(tx: Tx, skuId: string): Promise<string[]> {
   const [fp] = await tx`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and active`;
   const ids = ((fp?.reference_asset_ids as string[]) ?? []).slice(0, 2);
@@ -79,14 +77,14 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
   });
   if (status !== 'generating') return; // superseded or already done
 
-  const auth = await withTenant(ws, (tx) =>
+  const auth = await withTenant(ws, async (tx) =>
     authorize(tx, ctx, {
       purpose: 'storyboard',
       projectId,
-      lines: [
-        { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 5_000, outputTokens: 2_500 },
-        { kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: MAX_GENERATED_FRAMES },
-      ],
+      lines: await routedLines(tx, ws, [
+        { task: 'creative_director.storyboard', kind: 'llm', inputTokens: 5_000, outputTokens: 2_500 },
+        { task: 'image.storyboard_frame', kind: 'image', images: MAX_GENERATED_FRAMES },
+      ]),
       idempotencyKey: `storyboard:${storyboardId}`,
     }),
   );
@@ -110,15 +108,28 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
       void model;
     });
 
+    // Each scene records the Claim IDs its lines use (§24), mapped against the Claims Vault.
+    await withTenant(ws, async (tx) => {
+      const rows = await tx`select id, spoken_line, overlay_text from scenes where storyboard_id = ${storyboardId}`;
+      const names = [productName, (await brandBrainFor(tx, skuId))?.name ?? null];
+      const lines = rows.flatMap((r) => [r.spoken_line, r.overlay_text]).filter(Boolean) as string[];
+      const mapping = (qaClaims(lines, await allowedClaimTexts(tx, skuId), { names }).data as { mapping: LineMapping[] }).mapping;
+      for (const r of rows) await tx`update scenes set claim_ids = ${sceneClaimIds([r.spoken_line as string | null, r.overlay_text as string | null], mapping)}::uuid[] where id = ${r.id}`;
+    });
+
     // Frames: exact product composites where possible; at most 2 generated frames (COGS, §6).
     const scenes = await withTenant(ws, (tx) => tx`select * from scenes where storyboard_id = ${storyboardId} order by position`);
-    const { cut, refs } = await withTenant(ws, async (tx) => ({ cut: await productCutout(tx, skuId), refs: await referenceDataUrls(tx, skuId) }));
+    const { imagery, refs } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId), refs: await referenceDataUrls(tx, skuId) }));
+    const cut = imagery.cutout?.keyed ? imagery.cutout : null;
     let generated = 0;
     for (const s of scenes) {
       let bytes: Buffer;
       let technique: string;
+      let lineage: Record<string, unknown> = {};
       let jobModel: string | null = null;
-      const wantsGen = (s.production_mode === 'GENERATIVE_INTERACTION' || s.production_mode === 'HYBRID') && generated < MAX_GENERATED_FRAMES;
+      // A hybrid is a generated setting *plus the exact product*: without a clean cut-out it would show only the
+      // generated (unchecked) product, so it falls back to the exact-product frame instead.
+      const wantsGen = (s.production_mode === 'GENERATIVE_INTERACTION' || (s.production_mode === 'HYBRID' && !!cut)) && generated < MAX_GENERATED_FRAMES;
       if (wantsGen) {
         const img = await generateImage({
           ctx,
@@ -131,25 +142,30 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
           mockLabel: `${s.purpose} · ${s.visual_plan}`.slice(0, 90),
         });
         generated++;
-        bytes = s.production_mode === 'HYBRID' && cut ? await compositeProduct(img.bytes, cut, '9x16', { scale: 0.38, anchor: 'lower' }) : img.bytes;
-        technique = s.production_mode === 'HYBRID' ? 'generated_bg+exact_product' : 'generated';
+        // A hybrid places the exact product from the clean cut-out onto the generated setting.
+        bytes = s.production_mode === 'HYBRID' && cut ? await compositeProduct(img.bytes, cut.bytes, '9x16', { scale: 0.38, anchor: 'lower', shadow: true }) : img.bytes;
+        technique = s.production_mode === 'HYBRID' && cut ? 'generated_bg+exact_product' : 'generated';
+        lineage = { providerJobId: img.jobId, ...(cut && technique === 'generated_bg+exact_product' ? { cutoutAssetId: cut.assetId } : {}) };
         jobModel = img.modelVersion;
       } else {
-        const bg = await placeholderFrame('', '9x16', s.position as number);
-        bytes = cut ? await compositeProduct(bg, cut, '9x16', { scale: s.purpose === 'cta' ? 0.3 : 0.5 }) : bg;
-        technique = 'exact_product_composite';
+        // Strict product composite (§23): the exact product on a clean production backdrop — or, when the photo
+        // couldn't be cut out, the photo itself. Never a debug placeholder.
+        const fb = await exactProductFrame(imagery, { purpose: s.purpose as string });
+        bytes = fb?.bytes ?? (await productionBackdrop('9x16', imagery.palette));
+        technique = fb?.technique ?? 'backdrop';
+        lineage = fb?.lineage ?? {};
       }
       await withTenant(ws, async (tx) => {
-        const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId, source: 'generated', lineage: { sceneId: s.id, technique } });
-        const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status)
-                             values (${ws}, ${s.id}, 1, 'frame', ${a.id}, ${technique}, ${jobModel}, 'succeeded')
-                             on conflict (workspace_id, scene_id, kind, version) do update set asset_id = excluded.asset_id
+        const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId, source: 'generated', lineage: { sceneId: s.id, technique, ...lineage } });
+        const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage)
+                             values (${ws}, ${s.id}, 1, 'frame', ${a.id}, ${technique}, ${jobModel}, 'succeeded', ${tx.json(lineage as never)})
+                             on conflict (workspace_id, scene_id, kind, version) do update set asset_id = excluded.asset_id, technique = excluded.technique, lineage = excluded.lineage
                              returning id`;
         await tx`update scenes set current_version_id = ${v!.id} where id = ${s.id}`;
       });
     }
     await withTenant(ws, async (tx) => {
-      await step(tx, ws, storyboardId, 'frames', 'done', `${scenes.length} frames`);
+      await step(tx, ws, storyboardId, 'frames', 'done', imagery.cutout && !imagery.cutout.keyed ? `${scenes.length} frames. ${CLEAN_PHOTO_TIP}` : `${scenes.length} frames`);
       await tx`update storyboards set status = 'ready' where id = ${storyboardId}`;
       await transition(tx, ctx, projectId, 'STORYBOARD_READY');
       await settle(tx, ctx, auth.authorizationId, 'consumed');
@@ -186,10 +202,15 @@ export async function editScene(
   if (s.sb_status === 'approved') throw new DomainError('CONFLICT', 'This storyboard is approved for production.');
   const lines = [patch.spokenLine, patch.overlayText].filter((l): l is string => !!l && !!l.trim());
   if (lines.length) {
-    const scan = scanCreativeText(lines, await allowedClaimTexts(tx, s.sku_id as string));
+    const [sku] = await tx`select name from skus where id = ${s.sku_id}`;
+    const scan = scanCreativeText(lines, await allowedClaimTexts(tx, s.sku_id as string), { names: [sku?.name as string | undefined, (await brandBrainFor(tx, s.sku_id as string))?.name] });
     if (!scan.ok) {
       const v = scan.violations[0]!;
       throw new DomainError('GATE_BLOCKED', `“${v.text}” can’t be used: ${v.reason}`, { alternative: v.alternative ?? classifyClaim(v.text).matched[0]?.alternative });
+    }
+    // Every product-effect statement needs an approved claim (§25 check 3) — or production would stop on it later.
+    if (scan.unmapped.length) {
+      throw new DomainError('GATE_BLOCKED', `“${scan.unmapped[0]}” makes a product claim that isn’t approved yet. Add it to your Claims Vault with evidence, or describe the look or feel instead.`, { unmapped: scan.unmapped });
     }
   }
   await tx`update scenes set
@@ -256,7 +277,8 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
                          join projects p on p.id = sb.project_id join skus sk on sk.id = p.sku_id where s.id = ${sceneId}`;
     if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
     const [done] = await tx`select 1 from scene_versions where scene_id = ${sceneId} and kind = 'frame' and version = ${version}`;
-    return { s, done: !!done, cut: done ? null : await productCutout(tx, s.sku_id as string), refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string) };
+    const imagery = done ? null : await productImagery(tx, s.sku_id as string);
+    return { s, done: !!done, cut: imagery?.cutout?.keyed ? imagery.cutout : null, refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string) };
   });
   if (info.done) {
     await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'done'));
@@ -270,11 +292,10 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
   let auth: Awaited<ReturnType<typeof authorize>>;
   try {
     auth = await withTenant(ws, async (tx) => {
-      const r = await route(tx, 'image.storyboard_frame');
       const a = await authorizeOrTakeOver(
         tx,
         ctx,
-        { purpose: 'storyboard', projectId: info.s.project_id as string, lines: [{ kind: 'image', provider: r.provider, model: r.model, images: 1 }], idempotencyKey: `frame:${sceneId}:${version}` },
+        { purpose: 'storyboard', projectId: info.s.project_id as string, lines: await routedLines(tx, ws, [{ task: 'image.storyboard_frame', kind: 'image', images: 1 }]), idempotencyKey: `frame:${sceneId}:${version}` },
         FRAME_REQUEST_STALE_MINUTES,
       );
       await step(tx, ws, sceneId, key, 'active');
@@ -296,11 +317,13 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
       ...FRAME,
       mockLabel: `${info.s.purpose} · ${instruction}`.slice(0, 90),
     });
-    const bytes = info.cut && info.s.production_mode !== 'GENERATIVE_INTERACTION' ? await compositeProduct(img.bytes, info.cut, '9x16', { scale: 0.4, anchor: 'lower' }) : img.bytes;
+    const composite = !!info.cut && info.s.production_mode !== 'GENERATIVE_INTERACTION';
+    const bytes = composite ? await compositeProduct(img.bytes, info.cut!.bytes, '9x16', { scale: 0.4, anchor: 'lower', shadow: true }) : img.bytes;
+    const lineage = { providerJobId: img.jobId, instruction, ...(composite ? { cutoutAssetId: info.cut!.assetId } : {}) };
     await withTenant(ws, async (tx) => {
-      const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: info.s.sku_id as string, source: 'generated', lineage: { sceneId, instruction } });
-      const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status)
-                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, 'generated', ${img.modelVersion}, 'succeeded') returning id`;
+      const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: info.s.sku_id as string, source: 'generated', lineage: { sceneId, ...lineage } });
+      const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage)
+                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, ${composite ? 'generated_bg+exact_product' : 'generated'}, ${img.modelVersion}, 'succeeded', ${tx.json(lineage as never)}) returning id`;
       await tx`update scenes set current_version_id = ${v!.id}, free_regenerations_used = free_regenerations_used + 1,
                  visual_plan = ${`${info.s.visual_plan}. ${instruction}`.slice(0, 300)} where id = ${sceneId}`;
       await settle(tx, ctx, auth.authorizationId, 'consumed');

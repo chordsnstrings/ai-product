@@ -26,6 +26,8 @@ export const EventType = [
   'EXPERIMENT_APPROVED',
   'EXPERIMENT_STATE_CHANGED',
   'VARIANT_GENERATED',
+  // Platform event: a hook variant was not shipped (claims, integrity or fit) — never shipped confounded.
+  'VARIANT_SKIPPED',
   'VARIANT_EXPORTED',
   'EXPERIMENT_CONFOUNDED',
   // Performance

@@ -1,33 +1,30 @@
 import { withAdmin } from '@arkiv/db';
-import { estimate, loadRates, planProduction, type RateTable } from '@arkiv/core';
+import { COST_LIMITS } from '@arkiv/shared';
+import { estimate, loadRates, planProduction, productionEstimate, productionRoutes, type RateTable } from '@arkiv/core';
 
 /** A representative standard 15s test: 2 generative scenes of 4s, ~300 chars of voiceover (plan 05 §9 impact preview). */
 const STANDARD_SCENES = [
   { id: 'a', production_mode: 'GENERATIVE_INTERACTION', duration_ms: 4000, purpose: 'hook' },
-  { id: 'b', production_mode: 'COMPOSITED_PRODUCT', duration_ms: 3000, purpose: 'product_reveal' },
+  { id: 'b', production_mode: 'STRICT_COMPOSITE', duration_ms: 3000, purpose: 'product_reveal' },
   { id: 'c', production_mode: 'GENERATIVE_INTERACTION', duration_ms: 4000, purpose: 'demonstration' },
-  { id: 'd', production_mode: 'MOTION_GRAPHIC', duration_ms: 4000, purpose: 'cta' },
+  { id: 'd', production_mode: 'STRICT_COMPOSITE', duration_ms: 4000, purpose: 'cta' },
 ];
 
 /**
- * What a production retry would authorise at today's rates (plan 05 §12: a retry that can spend shows the
- * fresh Cost Governor estimate to the operator). Null when the plan can't be priced.
+ * What a production retry would authorise at today's rates and routes (plan 05 §12: a retry that can spend shows
+ * the fresh Cost Governor estimate to the operator), reusing accepted renders. Null when the plan can't be priced.
  */
 export async function estimateProjectRetry(workspaceId: string, projectId: string): Promise<number | null> {
   return withAdmin(async (tx) => {
-    const [p] = await tx`select storyboard_id from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
-    if (!p?.storyboard_id) return null;
-    const scenes = await tx`select id, production_mode, duration_ms, purpose, locked, spoken_line from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${workspaceId} order by position`;
-    const voChars = scenes.map((s) => (s.spoken_line as string | null) ?? '').filter(Boolean).join(' ').length;
     try {
-      return estimate(await loadRates(tx), planProduction(scenes as never, voChars).lines).totalMicros;
+      return await productionEstimate(tx, workspaceId, projectId);
     } catch {
       return null;
     }
   });
 }
 
-/** Estimate at the published rates, or with one draft rate table swapped in. */
+/** Estimate on the stable routes at the published rates, or with one draft rate table swapped in. */
 export async function estimateStandardTest(draftId: string | 'published'): Promise<number> {
   return withAdmin(async (tx) => {
     const rates = await loadRates(tx);
@@ -36,7 +33,8 @@ export async function estimateStandardTest(draftId: string | 'published'): Promi
       if (d) rates.set(`${d.provider}/${d.model}`, d as unknown as RateTable);
     }
     try {
-      return estimate(rates, planProduction(STANDARD_SCENES as never, 300).lines).totalMicros;
+      const routes = await productionRoutes(tx, null);
+      return estimate(rates, planProduction(STANDARD_SCENES as never, 300, routes, rates, { plates: 1, ceilingMicros: COST_LIMITS.CREATIVE_TEST_CEILING }).lines).totalMicros;
     } catch {
       return NaN;
     }
