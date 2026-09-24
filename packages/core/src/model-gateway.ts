@@ -93,6 +93,19 @@ export async function routedLines(tx: Tx, workspaceId: string | null, items: ({ 
   return out;
 }
 
+/**
+ * How customer copy names the service behind a task (standard §8: no provider names, job IDs or token counts
+ * in the interface): "our video partner", "our voice partner"…
+ */
+export function partnerFor(task: string): string {
+  const family = task.split('.')[0];
+  if (family === 'video') return 'our video partner';
+  if (family === 'image') return 'our image partner';
+  if (family === 'tts') return 'our voice partner';
+  if (['creative_director', 'qa', 'extract', 'genome', 'customer_language', 'vision'].includes(family ?? '')) return 'our AI partner';
+  return 'a production partner';
+}
+
 /** Tasks that dispatch a render; `kill.renders` stops them at the gateway as well as at authorization. */
 const isRenderTask = (task: string) => task.startsWith('video.');
 
@@ -112,9 +125,11 @@ interface CallMeta {
 async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFingerprint: unknown) {
   return withTenant(meta.ctx.workspaceId, async (tx) => {
     const r = await route(tx, meta.task, meta.ctx.workspaceId);
-    if (r.circuitOpen) throw new DomainError('UNAVAILABLE', `Provider circuit open for ${meta.task}`, { circuitOpen: meta.task });
+    // Customer-safe messages: the route and provider travel in `details` (and the job log), never in the text.
+    const partner = partnerFor(meta.task).replace(/^./, (c) => c.toUpperCase());
+    if (r.circuitOpen) throw new DomainError('UNAVAILABLE', `${partner} is busy right now. Your work is saved.`, { circuitOpen: meta.task });
     if (await isFlagOn(tx, `kill.provider.${r.provider}`, meta.ctx.workspaceId)) {
-      throw new DomainError('UNAVAILABLE', `${r.provider} is switched off for maintenance. Your work is saved.`, { killSwitch: r.provider });
+      throw new DomainError('UNAVAILABLE', `${partner} is paused for maintenance. Your work is saved.`, { killSwitch: r.provider, task: meta.task });
     }
     if (isRenderTask(meta.task) && (await isFlagOn(tx, 'kill.renders', meta.ctx.workspaceId))) {
       throw new DomainError('UNAVAILABLE', 'Production is paused for maintenance. Your place is held.', { killSwitch: 'renders' });

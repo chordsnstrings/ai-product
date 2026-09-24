@@ -39,12 +39,24 @@ export default async function Providers() {
         <Table head={['Task', 'Provider', 'Model', 'Prompt', 'Rollout', 'Canary', 'Approved fallback', 'Circuit', '']} rows={d0.routes.map((r) => [
           <Mono key="t">{r.task as string}</Mono>, r.provider as string, <Mono key="m">{r.model as string}</Mono>, <Mono key="p">{r.prompt_version as string}</Mono>, `${r.rollout_pct}%`, r.canary ? <Mono key="c">{JSON.stringify(r.canary)}</Mono> : '—',
           r.fallback_task ? <Mono key="f">{r.fallback_task as string}</Mono> : 'queue on outage',
-          r.circuit_open ? <span key="o" className="ak-chip ak-chip--risk">open</span> : 'closed',
+          r.circuit_open ? <span key="o" className="ak-chip ak-chip--risk">open{r.circuit_until ? ` · back ~${dt(r.circuit_until)}` : ''}</span> : 'closed',
           <span key="a" className="ak-row">
             {staffCan(s.roles, 'providers.circuit') ? <ActButton small action="route.circuit" payload={{ task: r.task, open: !r.circuit_open }} reason danger={!r.circuit_open}>{r.circuit_open ? 'Close circuit' : 'Open circuit'}</ActButton> : null}
           </span>,
         ])} />
       </Section>
+      {staffCan(s.roles, 'providers.circuit') && d0.routes.some((r) => r.circuit_open) ? (
+        <Section title="Queue ETA for an open circuit">
+          <div className="ak-panel" style={{ maxWidth: 560 }}>
+            <p className="ak-small ak-muted">Customers whose ads wait behind an open circuit see “Queued: our … partner is busy. Your place is held.” Add when you expect it back and they see that too.</p>
+            <ActForm action="route.circuit" extra={{ open: true }} submit="Set ETA" fields={[
+              { name: 'task', label: 'Route', type: 'select', options: d0.routes.filter((r) => r.circuit_open).map((r) => r.task as string) },
+              { name: 'reopenMinutes', label: 'Expected back in (minutes)', type: 'number', required: true },
+              { name: 'reason', label: 'Reason', required: true },
+            ]} />
+          </div>
+        </Section>
+      ) : null}
       {staffCan(s.roles, 'routes.manage') ? (
         <Section title="Change a route (needs a passing eval for this template × model; 100% also needs a second approver)">
           <div className="ak-panel" style={{ maxWidth: 560 }}>

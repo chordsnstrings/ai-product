@@ -11,7 +11,7 @@ import {
   heartbeat,
   ingestBytes,
   liveness,
-  OUTAGE_MESSAGE,
+  outageStatus,
   produceProject,
   selectConcept,
   startPreview,
@@ -53,10 +53,17 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
     const { t, ctx, projectId, storyboardId } = await readyForProduction('[[fail:render]]');
     expect(await produceProject(ctx, projectId)).toBe('paused');
     await withTenant(t.workspaceId, async (tx) => {
-      const [p] = await tx`select state, outage, failure_reason, qa_report from projects where id = ${projectId}`;
+      const [p] = await tx`select state, outage, failure_reason, failure_code, qa_report from projects where id = ${projectId}`;
       expect(p!.state).toBe('NEEDS_USER_ACTION');
       expect((p!.outage as { task: string }).task).toBe('video.scene');
-      expect(p!.failure_reason).toBe(OUTAGE_MESSAGE);
+      // Plan 03 P9: the customer sees a queued status naming the partner, never the provider's error.
+      expect(p!.failure_reason).toBe('Queued: our video partner is busy. Your place is held.');
+      expect(p!.failure_code).toBe('provider_outage');
+      const q = await outageStatus(tx, t.workspaceId, projectId);
+      expect(q).toMatchObject({ message: 'Queued: our video partner is busy. Your place is held.', etaKind: 'retry' });
+      expect(new Date(q!.etaAt!).getTime()).toBeGreaterThan(Date.now());
+      const steps = await tx`select detail from progress_steps where subject_id = ${projectId} and status = 'active'`;
+      expect(steps.map((x) => x.detail)).toEqual(['Queued: our video partner is busy. Your place is held.']);
       expect(JSON.stringify(p!.qa_report)).not.toMatch(/switched to exact product composite/); // no degraded output
       expect(await available(tx, 'taste')).toBe(0); // reservation held, not released
       const [a] = await tx`select status, expires_at > now() + interval '5 hours' as held from cost_authorizations where project_id = ${projectId} and idempotency_key like 'produce:%'`;

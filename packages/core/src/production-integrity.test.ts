@@ -9,7 +9,8 @@ import type { CompositionManifest } from './composition';
 import { authorize } from './cost-governor';
 import { available, append } from './ledger';
 import { generateVideo } from './model-gateway';
-import { approveForProduction, failProduction, produceProject, retryProduction } from './production';
+import { approveForProduction, blockedLines, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
+import { customerReason } from './projects';
 import { repeatedFidelityFailures } from './qa-metrics';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
@@ -269,12 +270,52 @@ describe('strict product composites (§23: prod-02) and Claim IDs per scene (§2
     await expect(withTenant(r.t.workspaceId, (tx) => editScene(tx, r.ctx, s!.id as string, { spokenLine: 'It hydrates all day.' }))).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
     await ownerPool()`update scenes set spoken_line = 'It hydrates all day.' where id = ${s!.id}`; // bypassing the editor
     await approve(r);
+    await ownerPool()`insert into purchases (workspace_id, kind, project_id, amount_micros, stripe_checkout_session_id, status, created_by, paid_at)
+                      values (${r.t.workspaceId}, 'taste', ${r.projectId}, 19000000, ${'cs_' + r.projectId}, 'paid', 'test', now())`;
     await produceProject(r.ctx, r.projectId);
-    const [p] = await ownerPool()`select state, failure_reason from projects where id = ${r.projectId}`;
+    const [p] = await ownerPool()`select state, failure_reason, failure_code, qa_report from projects where id = ${r.projectId}`;
     expect(p!.state).toBe('BLOCKED_COMPLIANCE');
-    expect(p!.failure_reason).toMatch(/It hydrates all day/);
+    // The customer sees mapped copy and the line itself (with why), never the raw check detail (surf-33).
+    expect(p!.failure_code).toBe('claims_blocked');
+    expect(customerReason(p!)).toBe('A line needs changing before we can finish your ad.');
+    const blocked = blockedLines(p!.qa_report);
+    expect(blocked.map((b) => b.line)).toEqual(['It hydrates all day.']);
+    expect(blocked[0]!.reason).toMatch(/Claims Vault/);
+    expect(blocked[0]!.platforms.length).toBeGreaterThan(0);
     expect(await withTenant(r.t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
+    const renders = async () => (await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`)[0]!.n as number;
+    const rendered = await renders();
+
+    // A way forward (surf-35): back to the storyboard, fix the line, finish — no new checkout, same credit.
+    await expect(withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'CONFLICT' });
+    const reopened = await withTenant(r.t.workspaceId, (tx) => reopenForEdit(tx, r.ctx, r.projectId));
+    expect(reopened).toMatchObject({ storyboardId: r.storyboardId, replayed: false });
+    expect(reopened.lines.map((l) => l.line)).toEqual(['It hydrates all day.']);
+    expect(await withTenant(r.t.workspaceId, (tx) => reopenForEdit(tx, r.ctx, r.projectId))).toMatchObject({ replayed: true });
+    const [again] = await ownerPool()`select p.state, sb.status, sb.approved_at from projects p join storyboards sb on sb.id = p.storyboard_id where p.id = ${r.projectId}`;
+    expect(again).toMatchObject({ state: 'STORYBOARD_READY', status: 'ready' });
+    expect(again!.approved_at).toBeTruthy();
+    expect(await withTenant(r.t.workspaceId, (tx) => resumableAfterEdit(tx, r.t.workspaceId, r.projectId))).toBe(true);
+    // Finishing without fixing the line is refused before any spend.
+    await expect(withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'GATE_BLOCKED', message: expect.stringMatching(/It hydrates all day/) });
+    await withTenant(r.t.workspaceId, (tx) => editScene(tx, r.ctx, s!.id as string, { spokenLine: 'Morning and night, after cleansing.' }));
+    expect(await withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).toMatchObject({ replayed: false });
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    await withTenant(r.t.workspaceId, async (tx) => {
+      expect(await available(tx, 'taste')).toBe(0);
+      const [n] = await tx`select count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed, count(*) filter (where type = 'CREDIT_RELEASED')::int as released from ledger_entries`;
+      expect(n).toMatchObject({ consumed: 1, released: 1 });
+      const [pu] = await tx`select count(*)::int as n from purchases where project_id = ${r.projectId}`;
+      expect(pu!.n).toBe(1); // no second checkout
+    });
+    expect(await renders()).toBe(rendered); // accepted renders were reused: fixing words costs no new footage
   }, 240_000);
+
+  it('a claims block before any storyboard approval has nothing to reopen', async () => {
+    const r = await storyboardReady();
+    await ownerPool()`update projects set state = 'BLOCKED_COMPLIANCE' where id = ${r.projectId}`;
+    await expect(withTenant(r.t.workspaceId, (tx) => reopenForEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'CONFLICT' });
+  }, 120_000);
 });
 
 describe('retry reuses accepted renders (§35: prod-08)', () => {

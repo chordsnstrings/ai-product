@@ -6,7 +6,7 @@ import { Banner, Button, Ledger } from '@arkiv/ui';
 import { api, Sheet, usePoll } from '@arkiv/ui/client';
 import type { ProjectView } from '@/lib/views';
 import { ActionButton, ActionForm, SheetButton } from './actions';
-import { Liveness } from './flow';
+import { Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
 
 type V = { id: string; code: string; label: string; role: string; projectId: string | null; projectState: string | null; files: { aspect: string; url: string }[] };
 
@@ -79,8 +79,17 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
       {producing ? (
         <>
           <h2 className="ak-label">Producing</h2>
-          <Ledger steps={v?.productionSteps ?? []} />
-          {v ? <Liveness live={v.project.liveness} /> : null}
+          {v?.project.paused ? <QueuedBanner v={v} /> : null}
+          {v && masterProjectId && productionStopped(v) ? (
+            <ProductionIssue projectId={masterProjectId} v={v} onChange={done} />
+          ) : v?.project.resumable && masterProjectId ? (
+            <p>The storyboard is open for your change. <a href={`/storyboard/${masterProjectId}`}>Change the line and finish</a> — no extra Creative Test.</p>
+          ) : (
+            <>
+              <Ledger steps={v?.productionSteps ?? []} />
+              {v ? <Liveness live={v.project.liveness} /> : null}
+            </>
+          )}
         </>
       ) : null}
 

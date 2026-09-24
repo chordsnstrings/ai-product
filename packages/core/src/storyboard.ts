@@ -207,7 +207,7 @@ export async function editScene(
   patch: { spokenLine?: string | null; overlayText?: string | null; durationMs?: number },
 ) {
   assertCan(ctx, 'sku.edit');
-  const [s] = await tx`select s.*, sb.project_id, sb.status as sb_status, p.sku_id from scenes s join storyboards sb on sb.id = s.storyboard_id
+  const [s] = await tx`select s.*, sb.project_id, sb.status as sb_status, sb.hook_text, p.sku_id from scenes s join storyboards sb on sb.id = s.storyboard_id
                        join projects p on p.id = sb.project_id where s.id = ${sceneId} for update of s`;
   if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
   if (s.locked) throw new DomainError('CONFLICT', 'Unlock this scene to edit it.');
@@ -230,6 +230,12 @@ export async function editScene(
              overlay_text = ${patch.overlayText === undefined ? s.overlay_text : patch.overlayText},
              duration_ms = ${patch.durationMs ?? s.duration_ms}
            where id = ${sceneId}`;
+  // The storyboard's hook is the opening scene's line: editing that line edits the hook too, so a blocked hook can
+  // be fixed from its scene and hook variants keep recognising a spoken hook.
+  if (Number(s.position) === 0 && s.hook_text) {
+    const hook = patch.spokenLine !== undefined && s.spoken_line === s.hook_text ? patch.spokenLine : patch.overlayText !== undefined && s.overlay_text === s.hook_text ? patch.overlayText : undefined;
+    if (hook && hook.trim()) await tx`update storyboards set hook_text = ${hook.trim().slice(0, 90)} where id = ${s.storyboard_id}`;
+  }
   return { billable: false };
 }
 

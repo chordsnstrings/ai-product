@@ -8,7 +8,7 @@ import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
-import type { LineMapping } from './compliance';
+import { classifyClaim, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
 import { diffCompositions, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
@@ -17,11 +17,11 @@ import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, type LedgerUnit } from './ledger';
-import { generateImage, generateVideo, lineFor, route, synthesizeVoice, type Route } from './model-gateway';
+import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
-import { getProject, IN_PRODUCTION, isTerminal, PATH, transition } from './projects';
+import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 
@@ -238,9 +238,14 @@ export const OUTAGE_MAX_HOURS = 6;
 const AUTH_TTL_MINUTES = 180;
 const leaseResource = (projectId: string) => `produce:${projectId}`;
 
-/** Customer-facing copy (failure_reason is shown in the funnel); internal causes go on the event only. */
-export const OUTAGE_MESSAGE = 'A production service we use is temporarily unavailable. Your ad is paused and will resume automatically — your credit is held and you won’t be charged twice.';
-const FAILED_MESSAGE = 'We couldn’t produce this ad to our quality standard. You haven’t been charged for it.';
+/**
+ * Customer-facing queue copy for a paused production (plan 03 P9 "Queued: our video partner is busy. Your place
+ * is held."). Internal causes (provider, error) go on the event and the outage record only.
+ */
+export function queuedCopy(task: string): string {
+  if (task === 'renders') return FAILURE_COPY.renders_paused;
+  return `Queued: ${partnerFor(task)} is busy. Your place is held.`;
+}
 
 export type ProduceOutcome = 'complete' | 'failed' | 'skipped' | 'paused';
 
@@ -452,7 +457,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   } catch (e) {
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     if (e instanceof DomainError && (e.code === 'PAYMENT_REQUIRED' || e.code === 'GATE_BLOCKED')) {
-      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: e.message }));
+      // A Cost Governor refusal is written for the customer (what to do next); the code says which kind it is.
+      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: e.message, code: e.code === 'PAYMENT_REQUIRED' ? 'entitlement' : 'gate_blocked' }));
       return 'failed';
     }
     // Anomaly hold / open circuit / unpriceable route before anything was reserved: pause and try again later.
@@ -703,7 +709,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       if (!claimCheck.pass) {
         await withTenant(ws, async (tx) => {
           await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
-          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: claimCheck.detail });
+          // The lines and why are in the QA report (shown with a compliant alternative); the reason is customer copy.
+          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: claimCheck.detail, code: 'claims_blocked' });
           await tx`update projects set qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
           await settle(tx, ctx, auth.authorizationId, 'released');
         });
@@ -871,26 +878,66 @@ async function masterIntegrity(tx: Tx, variant: Record<string, unknown> | null, 
  * pause, and resumption by the resume sweep once the provider (or its circuit) recovers. An outage longer than
  * OUTAGE_MAX_HOURS ends the attempt: entitlement returned, paid one-off orders refunded.
  */
-async function pauseForOutage(ctx: TenantContext, projectId: string, task: string, e: unknown, checks: CheckResult[]): Promise<ProduceOutcome> {
+async function pauseForOutage(ctx: TenantContext, projectId: string, stage: string, e: unknown, checks: CheckResult[]): Promise<ProduceOutcome> {
   const detail = ((e as Error)?.message ?? String(e)).slice(0, 300);
+  // The route that is actually down (an open circuit names its task), so the resume sweep watches that circuit and
+  // the customer copy names the right partner.
+  const cause = e instanceof ProviderOutage ? e.underlying : e;
+  const details = cause instanceof DomainError ? (cause.details as { circuitOpen?: string; killSwitch?: string } | undefined) : undefined;
+  const task = stage === 'renders' || details?.killSwitch === 'renders' ? 'renders' : (details?.circuitOpen ?? stage);
+  const code: FailureCode = task === 'renders' ? 'renders_paused' : 'provider_outage';
   return withTenant(ctx.workspaceId, async (tx) => {
     const [p] = await tx`select state, outage, authorization_id from projects where id = ${projectId} for update`;
     if (!p || isTerminal(p.state as ProjectState) || p.state === 'PROVIDER_FAILED') return 'skipped';
     const prev = (p.outage ?? null) as { since?: string; attempts?: number } | null;
     const since = prev?.since ? new Date(prev.since) : new Date();
     if (Date.now() - since.getTime() > OUTAGE_MAX_HOURS * 3600_000) {
-      await failProduction(tx, ctx, projectId, `provider outage over ${OUTAGE_MAX_HOURS}h (${task}): ${detail}`, { checks });
+      await failProduction(tx, ctx, projectId, `provider outage over ${OUTAGE_MAX_HOURS}h (${task}): ${detail}`, { checks, code: 'outage_expired' });
       return 'failed';
     }
-    if (p.state !== 'NEEDS_USER_ACTION') await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: OUTAGE_MESSAGE, detail: `provider outage (${task}): ${detail}` });
+    const copy = queuedCopy(task);
+    if (p.state !== 'NEEDS_USER_ACTION') await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: copy, code, detail: `provider outage (${task}): ${detail}` });
     const outage = { task, since: since.toISOString(), attempts: (prev?.attempts ?? 0) + 1, lastAt: new Date().toISOString(), lastError: detail };
-    await tx`update projects set outage = ${tx.json(outage as never)}, failure_reason = ${OUTAGE_MESSAGE},
+    await tx`update projects set outage = ${tx.json(outage as never)}, failure_reason = ${copy}, failure_code = ${code},
                qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
     if (p.authorization_id) await holdAuthorization(tx, p.authorization_id as string, new Date(since.getTime() + (OUTAGE_MAX_HOURS + 1) * 3600_000));
-    await tx`update progress_steps set detail = 'Paused while a provider recovers — we’ll continue automatically.'
+    await tx`update progress_steps set detail = ${copy}
              where workspace_id = ${ctx.workspaceId} and subject_id = ${projectId} and status = 'active'`;
     return 'paused';
   });
+}
+
+/** Minutes the resume sweep waits after a paused production's last attempt (exponential, capped at 30). */
+export const outageBackoffMinutes = (attempts: number) => Math.min(30, 2 ** Math.max(0, attempts - 1));
+
+export interface QueueStatus {
+  /** Customer copy: "Queued: our video partner is busy. Your place is held." */
+  message: string;
+  /** When we expect to continue, if known: the circuit's announced reopening, or the next automatic attempt. */
+  etaAt: string | null;
+  etaKind: 'reopen' | 'retry' | null;
+}
+
+/**
+ * Truthful queue state of a production paused by an outage (plan 03 P9 "plus an ETA if known", §48 "expose
+ * truthful queued state/ETA where available"): the partner that is busy and, when known, when we expect to go
+ * on. An open circuit with no announced reopening has no ETA; kill-switched renders never do.
+ */
+export async function outageStatus(tx: Tx, workspaceId: string, projectId: string, now = new Date()): Promise<QueueStatus | null> {
+  const [p] = await tx`select state, outage from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
+  if (!p || p.state !== 'NEEDS_USER_ACTION' || !p.outage) return null;
+  const o = p.outage as { task?: string; lastAt?: string; attempts?: number };
+  const task = o.task ?? 'production';
+  if (task === 'renders' || (await isFlagOn(tx, 'kill.renders', workspaceId))) return { message: queuedCopy('renders'), etaAt: null, etaKind: null };
+  const message = queuedCopy(task);
+  const [r] = await tx`select circuit_open, circuit_until from model_routes where task = ${task}`;
+  if (r?.circuit_open) {
+    const until = r.circuit_until ? new Date(r.circuit_until as string) : null;
+    return until && until > now ? { message, etaAt: until.toISOString(), etaKind: 'reopen' } : { message, etaAt: null, etaKind: null };
+  }
+  const last = o.lastAt ? new Date(o.lastAt) : now;
+  const next = new Date(Math.max(now.getTime(), last.getTime() + outageBackoffMinutes(o.attempts ?? 1) * 60_000));
+  return { message, etaAt: next.toISOString(), etaKind: 'retry' };
 }
 
 /**
@@ -898,11 +945,12 @@ async function pauseForOutage(ctx: TenantContext, projectId: string, task: strin
  * settled as refunded (entitlement returned), and — for paid one-off orders — the automatic refund queued
  * (the L12 guarantee: you don't pay for an ad we couldn't deliver to our quality standard). Idempotent.
  */
-export async function failProduction(tx: Tx, ctx: TenantContext, projectId: string, detail: string, opts: { checks?: CheckResult[] } = {}): Promise<boolean> {
+export async function failProduction(tx: Tx, ctx: TenantContext, projectId: string, detail: string, opts: { checks?: CheckResult[]; code?: FailureCode } = {}): Promise<boolean> {
   const [p] = await tx`select state, authorization_id from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!p || isTerminal(p.state as ProjectState) || p.state === 'PROVIDER_FAILED') return false;
   if (opts.checks) await tx`update projects set qa_report = ${tx.json({ ...summarize(opts.checks), error: detail.slice(0, 300) } as never)} where id = ${projectId}`;
-  await transition(tx, ctx, projectId, 'PROVIDER_FAILED', { reason: FAILED_MESSAGE, detail: detail.slice(0, 500) });
+  const code = opts.code ?? 'quality_failed';
+  await transition(tx, ctx, projectId, 'PROVIDER_FAILED', { reason: FAILURE_COPY[code], code, detail: detail.slice(0, 500) });
   await tx`update projects set outage = null where id = ${projectId}`;
   if (p.authorization_id) await settle(tx, ctx, p.authorization_id as string, 'refunded');
   await tx`update progress_steps set status = 'failed', detail = 'We hit a problem on our side. You have not been charged for this attempt.', completed_at = now()
@@ -911,6 +959,98 @@ export async function failProduction(tx: Tx, ctx: TenantContext, projectId: stri
                         and status = 'paid' and kind in ('taste','standalone') order by created_at desc limit 1`;
   if (pu) await enqueue(tx, ctx.workspaceId, Queues.refundPurchase, { projectId, purchaseId: pu.id, reason: 'guarantee' }, { singletonKey: `refund:${pu.id}`, priority: 20 });
   return true;
+}
+
+/** A line that stopped production at the claims check, with why and a compliant alternative when one is known. */
+export interface BlockedLine {
+  line: string;
+  reason: string;
+  alternative: string | null;
+  /** Platforms (customer labels) on which the line is not allowed. */
+  platforms: string[];
+}
+
+type ScanGroup = { platform?: Platform | null; violations?: { text: string; reason: string; alternative?: string }[]; unmapped?: string[] };
+
+/** The blocked lines recorded in a project's QA report (the claims check of its last production run). */
+export function blockedLines(report: unknown): BlockedLine[] {
+  const checks = ((report as { checks?: CheckResult[] } | null)?.checks ?? []).filter((c) => c.check === 'claims' && !c.pass);
+  const out = new Map<string, BlockedLine>();
+  const add = (line: string, reason: string, alternative: string | null | undefined, platform: Platform | null | undefined) => {
+    const cur = out.get(line) ?? { line, reason, alternative: alternative ?? classifyClaim(line).matched.find((m) => m.alternative)?.alternative ?? null, platforms: [] };
+    if (platform && !cur.platforms.includes(PLATFORM_LABEL[platform])) cur.platforms.push(PLATFORM_LABEL[platform]);
+    out.set(line, cur);
+  };
+  for (const c of checks) {
+    const d = (c.data ?? {}) as ScanGroup & { platforms?: ScanGroup[] };
+    for (const g of d.platforms ?? [d]) {
+      for (const v of g.violations ?? []) add(v.text, v.reason, v.alternative, g.platform);
+      for (const u of g.unmapped ?? []) add(u, 'It makes a product claim that isn’t approved in your Claims Vault.', null, g.platform);
+    }
+  }
+  return [...out.values()];
+}
+
+/** Every line an ad says or shows, as production checks them (scenes, hook, CTA). */
+async function adLines(tx: Tx, storyboardId: string): Promise<string[]> {
+  const scenes = await tx`select spoken_line, overlay_text from scenes where storyboard_id = ${storyboardId} order by position`;
+  const [sb] = await tx`select hook_text, cta_text from storyboards where id = ${storyboardId}`;
+  return [...scenes.flatMap((x) => [x.spoken_line, x.overlay_text]), sb?.hook_text, sb?.cta_text].filter(Boolean) as string[];
+}
+
+/**
+ * A production stopped at the claims check (BLOCKED_COMPLIANCE) goes back to its storyboard so the merchant can
+ * fix the line (plan 03 P9 "reassure and build anticipation"; standard §14). The purchase stays paid and the
+ * approval is remembered (storyboards.approved_at): finishAfterEdit resumes with the same entitlement, without a
+ * new checkout. Accepted renders are reused when production resumes (their inputs don't include the words).
+ */
+export async function reopenForEdit(tx: Tx, ctx: TenantContext, projectId: string) {
+  assertCan(ctx, 'sku.edit');
+  const [p] = await tx`select state, storyboard_id, qa_report from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  const lines = blockedLines(p.qa_report);
+  if (p.state === 'STORYBOARD_READY' && p.storyboard_id) return { storyboardId: p.storyboard_id as string, lines, replayed: true };
+  if (p.state !== 'BLOCKED_COMPLIANCE' || !p.storyboard_id) throw new DomainError('CONFLICT', 'There’s nothing to change on this ad right now.');
+  const [sb] = await tx`select status from storyboards where id = ${p.storyboard_id} for update`;
+  // A product blocked before any storyboard was approved (e.g. not skincare) has no line to fix.
+  if (sb?.status !== 'approved') throw new DomainError('CONFLICT', 'There’s nothing to change on this ad right now.');
+  await tx`update storyboards set status = 'ready' where id = ${p.storyboard_id}`;
+  await transition(tx, ctx, projectId, 'STORYBOARD_READY', { from: 'BLOCKED_COMPLIANCE', detail: 'reopened to fix a blocked line' });
+  // The next run starts its progress afresh.
+  await tx`update progress_steps set status = 'pending', detail = null, started_at = null, completed_at = null, expected_ms = null
+           where workspace_id = ${ctx.workspaceId} and subject_id = ${projectId} and step_key = any(${PRODUCTION_STEPS.map((x) => x.key)})`;
+  return { storyboardId: p.storyboard_id as string, lines, replayed: false };
+}
+
+/** Can this storyboard go back into production without a new checkout (it was approved, and paid for)? */
+export async function resumableAfterEdit(tx: Tx, workspaceId: string, projectId: string): Promise<boolean> {
+  const [r] = await tx`select p.state, p.entitlement_unit, sb.approved_at,
+                              exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.project_id = p.id and pu.status = 'paid') as paid
+                       from projects p left join storyboards sb on sb.id = p.storyboard_id and sb.workspace_id = p.workspace_id
+                       where p.id = ${projectId} and p.workspace_id = ${workspaceId}`;
+  if (!r || r.state !== 'STORYBOARD_READY' || !r.entitlement_unit || !r.approved_at) return false;
+  return r.entitlement_unit === 'creative_test' || !!r.paid;
+}
+
+/**
+ * Finish an ad after the merchant fixed its blocked line: the edited lines are checked first (no spend on a line
+ * that would be blocked again), then production is approved again with the entitlement unit it was bought with.
+ */
+export async function finishAfterEdit(tx: Tx, ctx: TenantContext, projectId: string) {
+  const [p] = await tx`select state, entitlement_unit, storyboard_id, sku_id from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  const unit = p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'> | null;
+  if (ctx.actor.kind === 'user') assertCan(ctx, unit === 'creative_test' ? 'spend.creative_test' : 'storyboard.approve');
+  if (p.state === 'STORYBOARD_APPROVED' || p.state === 'COMPLETE' || IN_PRODUCTION.includes(p.state as ProjectState)) return { replayed: true, lines: [] as BlockedLine[] };
+  if (!unit || !(await resumableAfterEdit(tx, ctx.workspaceId, projectId))) throw new DomainError('CONFLICT', 'This storyboard hasn’t been paid for yet.');
+  const [sku] = await tx`select name from skus where id = ${p.sku_id}`;
+  const check = await claimsQaForExports(tx, p.sku_id as string, await adLines(tx, p.storyboard_id as string), ASPECTS, { names: [sku?.name as string, (await brandBrainFor(tx, p.sku_id as string))?.name ?? null] });
+  if (!check.pass) {
+    const lines = blockedLines({ checks: [check] });
+    throw new DomainError('GATE_BLOCKED', `“${lines[0]?.line ?? 'A line'}” still can’t be used: ${lines[0]?.reason ?? check.detail}`, { lines });
+  }
+  await approveForProduction(tx, ctx, projectId, unit);
+  return { replayed: false, lines: [] as BlockedLine[] };
 }
 
 /**

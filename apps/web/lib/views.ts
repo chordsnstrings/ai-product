@@ -2,7 +2,9 @@ import { withTenant, type Tx } from '@arkiv/db';
 import {
   ANALYSIS_KEY_FACTS,
   assetUrl,
+  blockedLines,
   currentFacts,
+  customerReason,
   currentQuote,
   customerQaSummary,
   DELIVERY_HOLD_STATES,
@@ -11,6 +13,8 @@ import {
   listSteps,
   listVariants,
   liveness,
+  outageStatus,
+  resumableAfterEdit,
   SLOW_STEP_MS,
   stepEta,
   storyboardView,
@@ -60,6 +64,18 @@ export async function projectView(workspaceId: string, projectId: string) {
       );
       exports.sort((a, b) => ['9x16', '4x5', '1x1'].indexOf(a.aspect) - ['9x16', '4x5', '1x1'].indexOf(b.aspect));
     }
+    // Why production stopped, in customer words (plan 03 P9, standard §8): a paused production's queue status
+    // (partner + ETA), otherwise the copy mapped from the stored reason code — never an internal error.
+    const queue = p.outage ? await outageStatus(tx, workspaceId, projectId) : null;
+    const resumable = p.state === 'STORYBOARD_READY' && (await resumableAfterEdit(tx, workspaceId, projectId));
+    // Lines that stopped production at the claims check, tied to the scene that says or shows them.
+    const blocked =
+      p.state === 'BLOCKED_COMPLIANCE' || resumable
+        ? blockedLines(p.qa_report).map((b) => {
+            const sc = storyboard?.scenes.find((x) => x.spokenLine?.trim() === b.line || x.overlayText?.trim() === b.line);
+            return { ...b, sceneId: sc?.id ?? null, scene: sc ? sc.position + 1 : null };
+          })
+        : [];
     const factRows = Object.entries(facts)
       .filter(([k]) => !['description', 'variants', 'packaging', 'label_text'].includes(k))
       .map(([key, f]) => ({
@@ -76,9 +92,15 @@ export async function projectView(workspaceId: string, projectId: string) {
         id: p.id as string,
         state: p.state as string,
         kind: p.kind as string,
-        failureReason: (p.failure_reason as string) ?? null,
+        failureReason: queue?.message ?? customerReason(p as { failure_code?: string | null; failure_reason?: string | null }),
         /** Paused by a provider outage: resumes automatically with the reservation held (§44). */
         paused: p.state === 'NEEDS_USER_ACTION' && !!p.outage,
+        /** Truthful queue ETA while paused, when known (plan 03 P9, standard §48). */
+        queue: queue ? { etaAt: queue.etaAt, etaKind: queue.etaKind } : null,
+        /** Lines to change before production can finish (BLOCKED_COMPLIANCE), with why and an alternative. */
+        blockedLines: blocked,
+        /** Paid for and reopened to fix a line: finishing needs no new checkout. */
+        resumable,
         /** Is the production run alive? From its heartbeat, never from elapsed time alone (§39). */
         liveness: liveness(IN_PRODUCTION.includes(p.state as ProjectState), (p.heartbeat_at as string | null) ?? null),
         /** What we checked, in customer words (plan 03 P10), derived from the stored QA report. */

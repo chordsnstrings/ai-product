@@ -431,7 +431,21 @@ export const ACTIONS = {
   'rates.publish': a({ perm: 'rates.propose', reauth: true, schema: z.object({ rateTableId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'rates.publish', { rateTableId: i.rateTableId }, i.reason) }),
 
   /* ── Providers & routes ── */
-  'route.circuit': a({ perm: 'providers.circuit', schema: z.object({ task: z.string(), open: z.boolean(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select circuit_open from model_routes where task = ${i.task}`; await tx`update model_routes set circuit_open = ${i.open}, updated_at = now() where task = ${i.task}`; await audit(tx, s, i.open ? 'route.circuit_open' : 'route.circuit_close', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: { circuit_open: i.open } }); }) }),
+  // Opening a circuit may carry staff's estimate of when it closes: customers whose ads are queued behind it see
+  // it as the ETA (plan 03 P9 "plus an ETA if known"). Closing clears it.
+  'route.circuit': a({
+    perm: 'providers.circuit',
+    schema: z.object({ task: z.string(), open: z.boolean(), reopenMinutes: z.coerce.number().int().min(1).max(7 * 24 * 60).optional(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select circuit_open, circuit_until from model_routes where task = ${i.task}`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Unknown route');
+        const [a0] = await tx`update model_routes set circuit_open = ${i.open},
+                                circuit_until = ${i.open && i.reopenMinutes ? tx`now() + make_interval(mins => ${i.reopenMinutes})` : i.open ? tx`circuit_until` : null},
+                                updated_at = now() where task = ${i.task} returning circuit_open, circuit_until`;
+        await audit(tx, s, i.open ? 'route.circuit_open' : 'route.circuit_close', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: a0 });
+      }),
+  }),
   'route.update': a({
     perm: 'routes.manage',
     reauth: true,

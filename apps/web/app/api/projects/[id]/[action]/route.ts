@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { decideFact, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { decideFact, finishAfterEdit, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -12,6 +12,8 @@ import { projectAccess } from '@/lib/tenant';
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
  *   retry     – retry a failed production (entitlement was returned on failure)
+ *   reopen    – back to the storyboard to fix a line the claims check blocked (purchase kept)
+ *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
  */
@@ -47,6 +49,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     case 'retry':
       await withTenant(a.ctx.workspaceId, (tx) => retryProduction(tx, a.ctx, id));
       return json({ ok: true });
+    case 'reopen': {
+      const r = await withTenant(a.ctx.workspaceId, (tx) => reopenForEdit(tx, a.ctx, id));
+      return json({ ok: true, next: `/storyboard/${id}`, lines: r.lines });
+    }
+    case 'finish': {
+      await withTenant(a.ctx.workspaceId, (tx) => finishAfterEdit(tx, a.ctx, id));
+      return json({ ok: true, next: `/produce/${id}` });
+    }
     case 'variant': {
       const { variantId } = await body(req, z.object({ variantId: z.string().uuid().nullable() }));
       const v = await withTenant(a.ctx.workspaceId, (tx) => selectVariant(tx, a.ctx, id, variantId));

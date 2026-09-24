@@ -4,6 +4,43 @@ import type { TenantContext } from './context';
 import { emit } from './events';
 
 /**
+ * Why a project stopped, as a code (plan 03 P9, standard §8). The customer sees copy mapped from the code
+ * (customerReason), never an internal error message; the internal cause stays on the state-change event.
+ */
+export type FailureCode =
+  | 'provider_outage'
+  | 'renders_paused'
+  | 'claims_blocked'
+  | 'quality_failed'
+  | 'outage_expired'
+  | 'stalled'
+  | 'entitlement'
+  | 'gate_blocked';
+
+/** Customer copy per code. `provider_outage` is refined per partner and ETA by outageStatus(). */
+export const FAILURE_COPY: Readonly<Record<FailureCode, string>> = {
+  provider_outage: 'Queued: a production partner is busy. Your place is held.',
+  renders_paused: 'Queued: production is paused for maintenance. Your place is held.',
+  claims_blocked: 'A line needs changing before we can finish your ad.',
+  quality_failed: 'We couldn’t produce this ad to our quality standard. You haven’t been charged for it.',
+  outage_expired: 'A production partner was unavailable for too long, so we stopped this attempt. You haven’t been charged for it.',
+  stalled: 'This production stopped on our side, so we ended the attempt. You haven’t been charged for it.',
+  entitlement: 'This ad needs a Creative Test or payment before we can produce it.',
+  gate_blocked: 'We can’t produce this ad as it stands.',
+};
+
+/**
+ * The reason a customer is shown: the mapped copy for a code; for codes whose own message is customer copy by
+ * contract (a Cost Governor refusal the customer can act on), that message; otherwise the stored text.
+ */
+export function customerReason(p: { failure_code?: string | null; failure_reason?: string | null }): string | null {
+  const code = p.failure_code as FailureCode | null | undefined;
+  if (code && (code === 'entitlement' || code === 'gate_blocked')) return p.failure_reason ?? FAILURE_COPY[code];
+  if (code && code in FAILURE_COPY) return FAILURE_COPY[code];
+  return p.failure_reason ?? null;
+}
+
+/**
  * Creative project state machine (§35). Every transition is guarded, evented and idempotent: a late or
  * duplicate event can never move a terminal project backwards (§48 out-of-order callbacks).
  *
@@ -84,7 +121,7 @@ export async function transition(
   ctx: Pick<TenantContext, 'workspaceId' | 'actor'>,
   projectId: string,
   to: ProjectState,
-  opts: { from?: ProjectState | ProjectState[]; reason?: string; detail?: string; patch?: Record<string, unknown> } = {},
+  opts: { from?: ProjectState | ProjectState[]; reason?: string; detail?: string; code?: FailureCode; patch?: Record<string, unknown> } = {},
 ): Promise<{ changed: boolean; from: ProjectState }> {
   const [p] = await tx`select state from projects where id = ${projectId} for update`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
@@ -94,8 +131,10 @@ export async function transition(
   if (expected && !expected.includes(from)) return { changed: false, from }; // stale/duplicate event: ignore safely
   if (!canTransition(from, to)) throw new DomainError('CONFLICT', `Project cannot move from ${from} to ${to}`);
   const patch = opts.patch ?? {};
+  const failing = to === 'PROVIDER_FAILED' || to === 'BLOCKED_COMPLIANCE' || to === 'NEEDS_USER_ACTION';
   await tx`update projects set state = ${to}, state_version = state_version + 1,
-             failure_reason = ${to === 'PROVIDER_FAILED' || to === 'BLOCKED_COMPLIANCE' || to === 'NEEDS_USER_ACTION' ? (opts.reason ?? null) : null}
+             failure_reason = ${failing ? (opts.reason ?? null) : null},
+             failure_code = ${failing ? (opts.code ?? null) : null}
            where id = ${projectId}`;
   for (const [k, v] of Object.entries(patch)) {
     await tx`update projects set ${tx({ [k]: v } as never)} where id = ${projectId}`;

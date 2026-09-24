@@ -99,7 +99,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       let n = 0;
       for (const r of rows) {
         if (r.exhausted) {
-          await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'outage-sweep'), r.id as string, 'provider outage did not recover in time'));
+          await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'outage-sweep'), r.id as string, 'provider outage did not recover in time', { code: 'outage_expired' }));
           n++;
         } else if (!r.blocked && r.due) {
           const attempts = Number((r.outage as { attempts?: number }).attempts ?? 1);
@@ -127,7 +127,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
           and ${notHeld(tx)}
         limit 200`);
       for (const r of rows) {
-        if (r.overdue) await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'stuck-sweep'), r.id as string, 'production stalled (no live worker) past the deadline'));
+        if (r.overdue) await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'stuck-sweep'), r.id as string, 'production stalled (no live worker) past the deadline', { code: 'stalled' }));
         else await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:stuck:${Math.floor(Date.now() / 300_000)}`, 20));
       }
       return rows.length;

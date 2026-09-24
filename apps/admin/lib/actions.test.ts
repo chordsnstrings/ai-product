@@ -119,6 +119,27 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
       await ownerPool()`update model_routes set canary = null`;
     }
   });
+
+  it('route.circuit can announce when an open circuit is expected back; closing clears it (plan 03 P9 ETA)', async () => {
+    const ops = await staff(['OPS']);
+    try {
+      await act(ops, 'route.circuit', { task: 'video.scene', open: true, reopenMinutes: '30', reason: 'provider incident' });
+      const [r] = await ownerPool()`select circuit_open, extract(epoch from circuit_until - now())::int as secs from model_routes where task = 'video.scene'`;
+      expect(r!.circuit_open).toBe(true);
+      expect(Number(r!.secs)).toBeGreaterThan(29 * 60);
+      expect(Number(r!.secs)).toBeLessThanOrEqual(30 * 60);
+      // Re-opening without an estimate keeps the announced one.
+      await act(ops, 'route.circuit', { task: 'video.scene', open: true, reason: 'still down' });
+      expect((await ownerPool()`select circuit_until is not null as eta from model_routes where task = 'video.scene'`)[0]!.eta).toBe(true);
+      await act(ops, 'route.circuit', { task: 'video.scene', open: false, reason: 'recovered' });
+      expect((await ownerPool()`select circuit_open, circuit_until from model_routes where task = 'video.scene'`)[0]).toMatchObject({ circuit_open: false, circuit_until: null });
+      const audits = await ownerPool()`select action from admin_audit_log where target_id = 'video.scene' order by at`;
+      expect(audits.map((a) => a.action)).toEqual(['route.circuit_open', 'route.circuit_open', 'route.circuit_close']);
+      await expect(act(ops, 'route.circuit', { task: 'no.such_route', open: true, reason: 'typo' })).rejects.toThrow(/Unknown route/);
+    } finally {
+      await ownerPool()`update model_routes set circuit_open = false, circuit_until = null`;
+    }
+  });
 });
 
 describe('billing.refund (plan 05 §7)', () => {
