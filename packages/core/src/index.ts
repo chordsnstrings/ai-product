@@ -14,6 +14,8 @@ export * from './abuse';
 export * from './rights';
 export * from './integrations-health';
 export * from './retention';
+export * from './status-banner';
+export * from './system-health';
 export * from './ledger';
 export * from './rates';
 export * from './cost-governor';

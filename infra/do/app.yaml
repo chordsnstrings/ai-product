@@ -110,6 +110,8 @@ services:
     instance_size_slug: apps-s-1vcpu-1gb
     instance_count: 1
     routes: [{ path: /, preserve_path_prefix: true }]
+    # Also records the console instance's heartbeat for System health (plan 05 §22).
+    health_check: { http_path: /api/health, initial_delay_seconds: 10, period_seconds: 30 }
     # Served on admin.arkiv.app via a DO ingress rule on the Host header (configured in the console);
     # additionally lock down with DO App Platform's IP allowlist / Cloudflare Access in front.
     # Staff console: app_rw (global tables), admin_rw (explicit staff policies) and system_rw for the platform-wide
@@ -120,6 +122,9 @@ services:
       - { key: APP_DATABASE_URL, value: CHANGE_ME_app_pool_url, scope: RUN_TIME, type: SECRET }
       - { key: ADMIN_DATABASE_URL, value: CHANGE_ME_admin_pool_url, scope: RUN_TIME, type: SECRET }
       - { key: SYSTEM_DATABASE_URL, value: CHANGE_ME_direct_system_rw_url, scope: RUN_TIME, type: SECRET }
+      # Optional: a read-only DigitalOcean token and the database cluster id show the latest backup on System health.
+      # - { key: DO_API_TOKEN, value: CHANGE_ME_read_only_token, scope: RUN_TIME, type: SECRET }
+      # - { key: DO_DATABASE_CLUSTER_ID, value: CHANGE_ME_cluster_id, scope: RUN_TIME }
 
 workers:
   - name: worker

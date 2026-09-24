@@ -710,6 +710,30 @@ describe('email & lifecycle actions (plan 05 §18)', () => {
   });
 });
 
+describe('system health actions (plan 05 §22)', () => {
+  it('publishes a banner to a subset of tenants, validates the audience, and records backup checks', async () => {
+    const ops = await staff(['OPS']);
+    try {
+      await expect(act(ops, 'banner.set', { text: 'TikTok sync delayed', tone: 'warn', audience: 'integration', provider: 'pinterest' })).rejects.toThrow(/shopify, meta or tiktok/);
+      const r = await act(ops, 'banner.set', { text: 'TikTok sync delayed', tone: 'warn', audience: 'integration', provider: 'tiktok' });
+      expect(r.message).toBe('Published to workspaces with tiktok connected.');
+      const [b] = await ownerPool()`select value from platform_settings where key = 'status.banner'`;
+      expect(b!.value).toMatchObject({ text: 'TikTok sync delayed', tone: 'warn', audience: { kind: 'integration', provider: 'tiktok' } });
+      expect((await act(ops, 'banner.set', { text: '' })).message).toBe('Banner cleared.');
+      const audits = await ownerPool()`select after from admin_audit_log where action = 'banner.set' order by id`;
+      expect(audits.map((a) => a.after === null ? null : (a.after as { audience: { kind: string } }).audience.kind)).toEqual(['integration', null]);
+
+      await expect(act(ops, 'ops.backup_check', { lastBackupAt: '2999-01-01T00:00', result: 'ok' })).rejects.toThrow(/future/);
+      await act(ops, 'ops.backup_check', { lastBackupAt: '2026-09-24T03:00', result: 'ok', notes: 'daily snapshot present' });
+      const [bk] = await ownerPool()`select value from platform_settings where key = 'ops.backup_check'`;
+      expect(bk!.value).toMatchObject({ result: 'ok', notes: 'daily snapshot present', by: ops.email });
+    } finally {
+      await ownerPool()`delete from platform_settings where key in ('ops.backup_check')`;
+      await ownerPool()`update platform_settings set value = 'null'::jsonb where key = 'status.banner'`;
+    }
+  });
+});
+
 describe('integrations health actions (plan 05 §16)', () => {
   it('an API-version switch flag needs a passing contract run; app status is recorded and audited', async () => {
     const eng = await staff(['ENGINEERING']);

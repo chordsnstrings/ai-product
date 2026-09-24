@@ -15,7 +15,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
   const user = await requireUser(`/w/${slug}/this-week`);
   const w = await workspacePage(slug);
   const all = await userWorkspaces(user.userId);
-  const { meter, fresh, ws, notices } = await withTenant(w.ctx.workspaceId, async (tx) => {
+  const { meter, fresh, ws, notices, providers } = await withTenant(w.ctx.workspaceId, async (tx) => {
     const [sub] = await tx`select current_period_start, current_period_end from subscriptions where status in ('active','trialing','past_due') order by created_at desc limit 1`;
     let meter: string | null = null;
     if (sub) {
@@ -26,7 +26,9 @@ export default async function WorkspaceLayout({ children, params }: { children: 
     // In-app notices from Arkiv (retention playbooks, plan 05 §17), until dismissed or expired.
     const notices = await tx`select id, title, body, link_path, link_label from workspace_notices
                              where workspace_id = ${w.ctx.workspaceId} and dismissed_at is null and expires_at > now() order by created_at desc limit 2`;
-    return { meter, fresh: await freshness(tx), ws, notices };
+    // Connected platforms, for incident banners aimed at one connector (plan 05 §22).
+    const providers = (await tx`select distinct provider from integrations where status <> 'disconnected'`).map((r) => r.provider as string);
+    return { meter, fresh: await freshness(tx), ws, notices, providers };
   });
   const stale = fresh.filter((f) => f.stale);
   return (
@@ -37,7 +39,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
         <span className="ak-small ak-muted">{meter ?? w.name}</span>
       </header>
       <main className="ak-main">
-        <StatusBanner />
+        <StatusBanner viewer={{ workspaceId: w.ctx.workspaceId, planCode: (ws?.plan_code as string | null) ?? null, providers }} />
         {ws?.state === 'PURGE_SCHEDULED' ? (
           <Banner tone="risk">This workspace is scheduled for deletion on {new Date(ws.purge_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}. <Link href={`/w/${slug}/settings/data`}>Cancel deletion</Link></Banner>
         ) : null}

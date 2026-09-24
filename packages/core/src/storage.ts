@@ -162,14 +162,57 @@ class S3Storage implements Storage {
   }
 }
 
+/**
+ * Storage errors in this process (plan 05 §22 "Spaces errors"): every failed put/get/delete/sign, reported with
+ * the service heartbeat. `exists` answering false is not an error.
+ */
+const storageErrors = { count: 0, last: null as string | null, lastAt: null as string | null };
+export const storageErrorStats = () => ({ ...storageErrors });
+
+class CountingStorage implements Storage {
+  constructor(private readonly inner: Storage) {}
+  private async track<T>(op: string, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (e) {
+      storageErrors.count++;
+      storageErrors.last = `${op}: ${(e as Error).message}`.slice(0, 200);
+      storageErrors.lastAt = new Date().toISOString();
+      throw e;
+    }
+  }
+  put(key: string, bytes: Buffer, contentType: string) {
+    return this.track('put', () => this.inner.put(key, bytes, contentType));
+  }
+  get(key: string) {
+    return this.track('get', () => this.inner.get(key));
+  }
+  exists(key: string) {
+    return this.track('exists', () => this.inner.exists(key));
+  }
+  delete(key: string) {
+    return this.track('delete', () => this.inner.delete(key));
+  }
+  deletePrefix(prefix: string) {
+    return this.track('deletePrefix', () => this.inner.deletePrefix(prefix));
+  }
+  signedGetUrl(key: string, ttlSeconds?: number, downloadName?: string) {
+    return this.track('signedGetUrl', () => this.inner.signedGetUrl(key, ttlSeconds, downloadName));
+  }
+  signedPutUrl(key: string, contentType: string, ttlSeconds?: number) {
+    return this.track('signedPutUrl', () => this.inner.signedPutUrl(key, contentType, ttlSeconds));
+  }
+}
+
 let instance: Storage | undefined;
 export function storage(): Storage {
   if (!instance) {
     const e = env();
-    instance =
+    instance = new CountingStorage(
       e.STORAGE_DRIVER === 's3'
         ? new S3Storage(e.SPACES_BUCKET ?? (() => { throw new Error('SPACES_BUCKET required'); })())
-        : new LocalStorage(path.resolve(process.cwd().replace(/\/(apps|packages)\/[^/]+$/, ''), e.STORAGE_LOCAL_DIR));
+        : new LocalStorage(path.resolve(process.cwd().replace(/\/(apps|packages)\/[^/]+$/, ''), e.STORAGE_LOCAL_DIR)),
+    );
   }
   return instance;
 }

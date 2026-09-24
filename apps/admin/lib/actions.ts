@@ -51,6 +51,8 @@ import {
   setOfferExperiment,
   normalizeAllowKey,
   normalizeCidr,
+  parseBannerAudience,
+  describeAudience,
   QA_VERDICT_KEY,
   Queues,
   registerExecutor,
@@ -1166,8 +1168,40 @@ export const ACTIONS = {
         return { message: 'Saved. Other processes pick it up within 30 seconds.' };
       }),
   }),
-  'banner.set': a({ perm: 'system.banner', schema: z.object({ text: z.string().max(200).default(''), tone: z.enum(['info', 'warn', 'risk']).default('warn') }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into platform_settings (key, value, updated_by) values ('status.banner', ${tx.json(i.text ? { text: i.text, tone: i.tone, at: new Date().toISOString() } : null)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`; await audit(tx, s, 'banner.set', { type: 'setting', id: 'status.banner' }, { after: i }); }) }),
+  /* §22 status banner: to every tenant, or a subset (plans, workspaces with a connector, listed workspaces). */
+  'banner.set': a({
+    perm: 'system.banner',
+    schema: z.object({
+      text: z.string().max(200).default(''),
+      tone: z.enum(['info', 'warn', 'risk']).default('warn'),
+      audience: z.enum(['all', 'plans', 'integration', 'workspaces']).default('all'),
+      plans: z.string().max(200).optional(),
+      provider: z.string().max(20).optional(),
+      workspaceIds: z.string().max(20_000).optional(),
+    }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const value = i.text ? { text: i.text, tone: i.tone, at: new Date().toISOString(), audience: parseBannerAudience(i) } : null;
+        const [b] = await tx`select value from platform_settings where key = 'status.banner'`;
+        // Clearing stores JSON null (the column is not null; tx.json(null) would be SQL NULL).
+        await tx`insert into platform_settings (key, value, updated_by) values ('status.banner', ${value ? tx.json(value as never) : tx`'null'::jsonb`}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'banner.set', { type: 'setting', id: 'status.banner' }, { before: b?.value ?? null, after: value });
+        return { message: value ? `Published to ${describeAudience(value.audience)}.` : 'Banner cleared.' };
+      }),
+  }),
   'ops.restore_drill': a({ perm: 'system.read', schema: z.object({ result: z.enum(['passed', 'failed']), notes: z.string().max(500).optional() }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into platform_settings (key, value, updated_by) values ('ops.restore_drill', ${tx.json({ at: new Date().toISOString(), result: i.result, notes: i.notes ?? null, by: s.email })}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_at = now()`; await audit(tx, s, 'ops.restore_drill', { type: 'setting', id: 'ops.restore_drill' }, { after: i }); }) }),
+  /* §22 backups: the last successful backup as checked by staff (when the DigitalOcean API isn't configured). */
+  'ops.backup_check': a({
+    perm: 'system.read',
+    schema: z.object({ lastBackupAt: z.string().refine((v) => !Number.isNaN(Date.parse(v)), 'Enter the backup time'), result: z.enum(['ok', 'missing', 'failed']), notes: z.string().max(500).optional() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        if (Date.parse(i.lastBackupAt) > Date.now() + 5 * 60_000) throw new DomainError('INVALID', 'The backup time is in the future.');
+        const value = { at: new Date().toISOString(), lastBackupAt: new Date(i.lastBackupAt).toISOString(), result: i.result, notes: i.notes ?? null, by: s.email };
+        await tx`insert into platform_settings (key, value, updated_by) values ('ops.backup_check', ${tx.json(value)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'ops.backup_check', { type: 'setting', id: 'ops.backup_check' }, { after: value });
+      }),
+  }),
 
   /* ── Privacy ── */
   'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(DataRequestKind), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),

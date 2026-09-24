@@ -31,6 +31,7 @@ import {
   sweepPreviewCogsOutliers,
   verifyShopifyWebhooks,
   sweepRateLimits,
+  sweepHeartbeats,
   sweepRetention,
   weekOf,
 } from '@arkiv/core';
@@ -79,6 +80,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
     },
   },
   // Plan 05 §15: free-preview COGS outliers become abuse signals (once a day per workspace).
+  'sweep-heartbeats': { cron: '5 4 * * *', run: () => withSystem((tx) => sweepHeartbeats(tx)) },
   'abuse-cogs-outliers': { cron: '20 * * * *', run: () => withSystem((tx) => sweepPreviewCogsOutliers(tx)) },
   // Plan 05 §16: Shopify webhook registrations verified (and missing topics re-registered) nightly.
   'verify-shopify-webhooks': { cron: '40 3 * * *', run: () => verifyShopifyWebhooks() },

@@ -2,7 +2,7 @@ import { PgBoss } from 'pg-boss';
 import { closeAll, systemPool, withSystem } from '@arkiv/db';
 import { env } from '@arkiv/shared';
 import { processStripeEvent } from '@arkiv/billing';
-import { processPendingWebhooks } from '@arkiv/core';
+import { processPendingWebhooks, recordHeartbeat } from '@arkiv/core';
 import { handleResendEvent } from '@arkiv/email';
 import { onFinalFailure, processPendingStripeEvents, runJob } from './handlers';
 import { sweepQueue, sweeps } from './sweeps';
@@ -102,12 +102,17 @@ async function main() {
   };
   await systemPool().listen('outbox', () => void tick()).catch(() => log.warn('LISTEN unavailable; polling only'));
   const timer = setInterval(tick, 1000);
+  // Service status (plan 05 §22): this worker instance reports in every minute.
+  const beat = () => recordHeartbeat('worker', { queues: Object.keys(QUEUE_CONFIG).length }).catch((e) => log.warn('heartbeat failed', { err: e }));
+  await beat();
+  const heartbeat = setInterval(beat, 60_000);
   await tick();
   log.info('ready', { queues: Object.keys(QUEUE_CONFIG).length, schedules: Object.keys(sweeps).length });
 
   const shutdown = async () => {
     log.info('shutting down');
     clearInterval(timer);
+    clearInterval(heartbeat);
     await boss.stop({ graceful: true, timeout: 30_000 });
     await closeAll();
     process.exit(0);
