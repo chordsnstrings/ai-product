@@ -13,6 +13,11 @@ describe('house date/time format (design §6)', () => {
     expect(formatDate('2026-09-24T02:00:00Z', { timeZone: 'UTC' })).toBe('24 Sep 2026');
   });
 
+  it('keeps a calendar date on its day in every zone', () => {
+    expect(formatDate('2026-09-23')).toBe('23 Sep 2026');
+    expect(formatDate('2026-09-23', { timeZone: 'America/Los_Angeles' })).toBe('23 Sep 2026');
+  });
+
   it('uses "Sep", never the en-GB "Sept"', () => {
     expect(formatDate('2026-09-05T12:00:00Z')).toBe('5 Sep 2026');
   });

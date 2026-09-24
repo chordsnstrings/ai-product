@@ -48,7 +48,7 @@ export default async function Review({ params, searchParams }: { params: Promise
       ) : (
         <div className="ak-stack" style={{ ['--stack' as string]: '32px', maxWidth: 880 }}>
           <p className="ak-small ak-muted">
-            {r.kind === 'day30' ? 'Day 30' : 'Month end'} · {formatDate(b.period.start)} – {formatDate(b.period.end)} · version {r.version as number}
+            {r.kind === 'day30' ? 'Day 30' : 'Month end'} · {formatDate(b.period.start, { timeZone: 'UTC' })} – {formatDate(b.period.end, { timeZone: 'UTC' })} · version {r.version as number}
             {d.all.length > 1 ? <> · earlier: {d.all.filter((x) => x.id !== r.id).map((x) => <Link key={x.id as string} href={`?v=${x.version}`} style={{ marginLeft: 6 }}>v{x.version as number}</Link>)}</> : null}
           </p>
           <MetadataTable rows={[

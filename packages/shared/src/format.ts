@@ -43,7 +43,9 @@ export function tzLabel(timeZone: string = DEFAULT_TZ, at: Date = new Date()): s
 export function formatDate(v: DateInput | null | undefined, opts: { timeZone?: string; year?: boolean } = {}): string {
   const d = v == null ? null : toDate(v);
   if (!d) return '';
-  const p = parts(d, opts.timeZone ?? DEFAULT_TZ, { day: 'numeric', month: 'numeric', year: 'numeric' });
+  // A calendar date ("2026-09-23") has no time or zone: it is that day everywhere, not UTC midnight.
+  const calendar = typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const p = parts(d, calendar ? 'UTC' : (opts.timeZone ?? DEFAULT_TZ), { day: 'numeric', month: 'numeric', year: 'numeric' });
   const day = `${Number(p.day)} ${MONTHS[Number(p.month) - 1]}`;
   return opts.year === false ? day : `${day} ${p.year}`;
 }
