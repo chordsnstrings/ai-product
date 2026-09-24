@@ -36,6 +36,7 @@
     "@arkiv/core": "workspace:*",
     "@arkiv/db": "workspace:*",
     "@arkiv/auth": "workspace:*",
-    "@arkiv/billing": "workspace:*"
+    "@arkiv/billing": "workspace:*",
+    "@arkiv/shared": "workspace:*"
   }
 }
