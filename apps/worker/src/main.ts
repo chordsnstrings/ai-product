@@ -21,11 +21,12 @@ const log = (...a: unknown[]) => console.log(new Date().toISOString(), '[worker]
 
 async function dispatchOnce(boss: PgBoss): Promise<number> {
   return withSystem(async (tx) => {
-    const rows = await tx`select id, queue, payload, priority, run_after from outbox
+    const rows = await tx`select id, queue, payload, priority, run_after, singleton_key from outbox
                           where dispatched_at is null and run_after <= now() + interval '1 second'
                           order by priority desc, created_at limit 100 for update skip locked`;
     for (const r of rows) {
-      await boss.send(r.queue as string, r.payload as object, { id: r.id as string, priority: Number(r.priority), startAfter: new Date(r.run_after as string) });
+      // The key travels with the job (visible in pg-boss); overlap is prevented by the handlers' leases.
+      await boss.send(r.queue as string, r.payload as object, { id: r.id as string, priority: Number(r.priority), startAfter: new Date(r.run_after as string), ...(r.singleton_key ? { singletonKey: r.singleton_key as string } : {}) });
       await tx`update outbox set dispatched_at = now() where id = ${r.id}`;
     }
     // Delayed jobs (run_after in the future) are picked up once due.

@@ -65,6 +65,9 @@ export interface EnqueueOptions {
 /**
  * Transactional enqueue: the job exists iff the surrounding transaction commits. The dispatcher moves rows
  * into pg-boss. Payloads always carry the workspaceId so workers re-enter the tenant context.
+ * A singleton key allows one undispatched job per (queue, key); the unique index `outbox_singleton_pending`
+ * makes that atomic, so concurrent requests (a double click, two tabs) cannot both enqueue. Returns whether a
+ * job was added. Jobs that must not overlap once running also hold a lease in their handler (leases.ts).
  */
 export async function enqueue(
   tx: Tx,
@@ -72,14 +75,12 @@ export async function enqueue(
   queue: QueueName,
   payload: Record<string, unknown>,
   opts: EnqueueOptions = {},
-): Promise<void> {
-  if (opts.singletonKey) {
-    const existing = await tx`select 1 from outbox where queue = ${queue} and singleton_key = ${opts.singletonKey}
-                              and dispatched_at is null limit 1`;
-    if (existing.length) return;
-  }
-  await tx`
+): Promise<boolean> {
+  const r = await tx`
     insert into outbox (workspace_id, queue, payload, singleton_key, run_after, priority)
     values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId } as never)}, ${opts.singletonKey ?? null},
-            ${opts.runAfter ?? new Date()}, ${opts.priority ?? 0})`;
+            ${opts.runAfter ?? new Date()}, ${opts.priority ?? 0})
+    on conflict (queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing
+    returning id`;
+  return r.length > 0;
 }

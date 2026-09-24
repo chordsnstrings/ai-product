@@ -23,14 +23,19 @@ import {
   weekOf,
 } from '@arkiv/core';
 
+// Scheduled maintenance (§39: reservations must never be stranded; plan 02 lifecycle; plan 04 L20 recovery).
+// Each sweep runs as the system role and fans out tenant work through the outbox.
+
 /**
- * Scheduled maintenance (§39: reservations must never be stranded; plan 02 lifecycle; plan 04 L20 recovery).
- * Each sweep runs as the system role and fans out tenant work through the outbox.
+ * Fan-out enqueue, once per singleton key ever (a reminder is never sent twice, even after its job ran). Atomic:
+ * a concurrent run's pending row wins through the `outbox_singleton_pending` index; this workspace's own rows
+ * are checked explicitly (system_rw sees every tenant).
  */
 async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], workspaceId: string, queue: string, payload: Record<string, unknown>, singletonKey: string, priority = 0) {
-  const [dup] = await tx`select 1 from outbox where queue = ${queue} and singleton_key = ${singletonKey} limit 1`;
-  if (dup) return;
-  await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority) values (${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority})`;
+  await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority)
+           select ${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority}
+           where not exists (select 1 from outbox where workspace_id = ${workspaceId} and queue = ${queue} and singleton_key = ${singletonKey})
+           on conflict (queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing`;
 }
 
 const sysCtx = (workspaceId: string, id: string): TenantContext => ({ ...systemContext(workspaceId, id), actor: { kind: 'system', id } });

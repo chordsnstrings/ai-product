@@ -10,7 +10,7 @@ import { idempotent } from './idempotency';
 import { append, available, balances, expirePeriod, periodUsage } from './ledger';
 import { llmJson } from './model-gateway';
 import { checkoutSessionExpiry, currentQuote, issueTasteOffer } from './offers';
-import { acceptInvite, changeRole, claimProvisional, createProvisionalWorkspace, inviteMember, removeMember, resolveProvisional } from './workspaces';
+import { acceptInvite, changeRole, claimProvisional, createProvisionalWorkspace, inviteMember, removeMember, resolveProvisional, transferOwnership } from './workspaces';
 
 beforeEach(truncateAll);
 afterAll(closeAll);
@@ -270,5 +270,77 @@ describe('workspaces & members (plan 02 §2.1, §5)', () => {
     const owner = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
     await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'a@x.com', 'MEMBER'));
     await expect(withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'b@x.com', 'MEMBER'))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    // Re-inviting the same address replaces its invite instead of counting twice.
+    await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'a@x.com', 'ADMIN'));
+    const [n] = await ownerPool()`select count(*)::int as n from invites where workspace_id = ${t.workspaceId} and accepted_at is null and revoked_at is null`;
+    expect(n!.n).toBe(1);
+  });
+
+  it('concurrent invites at limit − 1 admit exactly one, and two invites to one address leave one live (x-races-09)', async () => {
+    const t = await makeTenant(); // free: 2 members, the owner is one
+    const owner = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_FREE');
+    const results = await Promise.allSettled(['c1@x.com', 'c2@x.com', 'c3@x.com'].map((e) => withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, e, 'MEMBER'))));
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected').map((r) => (r as PromiseRejectedResult).reason.code)).toEqual(['PAYMENT_REQUIRED', 'PAYMENT_REQUIRED']);
+
+    const g = await makeTenant({ plan: 'GROWTH' });
+    const gOwner = ctxFor(g.workspaceId, g.userId);
+    await Promise.allSettled(Array.from({ length: 4 }, () => withTenant(g.workspaceId, (tx) => inviteMember(tx, gOwner, 'same@x.com', 'MEMBER'))));
+    const [live] = await ownerPool()`select count(*)::int as n from invites where workspace_id = ${g.workspaceId} and email = 'same@x.com' and accepted_at is null and revoked_at is null`;
+    expect(live!.n).toBe(1);
+  });
+
+  it('accepting an invite re-checks the member limit (e.g. after a downgrade) and leaves the invite open', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const owner = ctxFor(t.workspaceId, t.userId);
+    const { token } = await withTenant(t.workspaceId, (tx) => inviteMember(tx, owner, 'late@x.com', 'MEMBER'));
+    // Downgrade to free (2 members) and fill the second seat.
+    const [other] = await ownerPool()`insert into users (email) values ('other@x.com') returning id`;
+    await ownerPool()`update workspaces set plan_code = null where id = ${t.workspaceId}`;
+    await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${other!.id}, 'MEMBER')`;
+    const [late] = await ownerPool()`insert into users (email) values ('late@x.com') returning id`;
+    await expect(acceptInvite(token, { id: late!.id as string, email: 'late@x.com' })).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    const [inv] = await ownerPool()`select accepted_at from invites where email = 'late@x.com'`;
+    expect(inv!.accepted_at).toBeNull();
+    // After an upgrade the same invite works.
+    await ownerPool()`update workspaces set plan_code = 'GROWTH' where id = ${t.workspaceId}`;
+    expect(await acceptInvite(token, { id: late!.id as string, email: 'late@x.com' })).toBe(t.workspaceId);
+  });
+
+  it('two Owners demoting or removing each other concurrently never leave the workspace without an Owner (x-races-10)', async () => {
+    for (const op of ['demote', 'remove'] as const) {
+      const t = await makeTenant({ plan: 'GROWTH' });
+      const [b] = await ownerPool()`insert into users (email) values (${`b-${op}@x.com`}) returning id`;
+      await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${b!.id}, 'OWNER')`;
+      const a = ctxFor(t.workspaceId, t.userId);
+      const bc = ctxFor(t.workspaceId, b!.id as string);
+      const run = (actor: TenantContext, target: string) =>
+        withTenant(t.workspaceId, (tx) => (op === 'demote' ? changeRole(tx, actor, target, 'ADMIN') : removeMember(tx, actor, target)));
+      const results = await Promise.allSettled([run(a, b!.id as string), run(bc, t.userId)]);
+      expect(results.filter((r) => r.status === 'rejected').map((r) => (r as PromiseRejectedResult).reason.code)).toEqual(['CONFLICT']);
+      const [o] = await ownerPool()`select count(*)::int as n from memberships where workspace_id = ${t.workspaceId} and role = 'OWNER'`;
+      expect(o!.n).toBe(1);
+    }
+  });
+
+  it('a transfer to a member removed at the same moment fails without demoting the Owner (x-races-10)', async () => {
+    const t = await makeTenant({ plan: 'GROWTH' });
+    const [adm] = await ownerPool()`insert into users (email) values ('admin@x.com') returning id`;
+    const [m] = await ownerPool()`insert into users (email) values ('member@x.com') returning id`;
+    await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${adm!.id}, 'ADMIN'), (${t.workspaceId}, ${m!.id}, 'MEMBER')`;
+    const owner = ctxFor(t.workspaceId, t.userId);
+    const admin = ctxFor(t.workspaceId, adm!.id as string, 'ADMIN');
+    await Promise.allSettled([
+      withTenant(t.workspaceId, (tx) => removeMember(tx, admin, m!.id as string)),
+      withTenant(t.workspaceId, (tx) => transferOwnership(tx, owner, m!.id as string)),
+    ]);
+    const owners = await ownerPool()`select user_id from memberships where workspace_id = ${t.workspaceId} and role = 'OWNER'`;
+    expect(owners.length).toBeGreaterThanOrEqual(1);
+    const [me] = await ownerPool()`select role from memberships where workspace_id = ${t.workspaceId} and user_id = ${t.userId}`;
+    const [still] = await ownerPool()`select role from memberships where workspace_id = ${t.workspaceId} and user_id = ${m!.id}`;
+    // Either the transfer won (member became Owner, then was an Owner the Admin may not remove) or the removal won
+    // (the transfer found no member and the original Owner kept the role).
+    if (still) expect([still.role, me!.role]).toEqual(['OWNER', 'ADMIN']);
+    else expect(me!.role).toBe('OWNER');
   });
 });

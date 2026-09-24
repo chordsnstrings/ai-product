@@ -1,6 +1,6 @@
 import { withSystem, withTenant } from '@arkiv/db';
 import { DomainError, type PlanCode } from '@arkiv/shared';
-import { refundProjectPurchase } from '@arkiv/billing';
+import { STRIPE_CLAIM_STALE_MINUTES, refundProjectPurchase } from '@arkiv/billing';
 import {
   analyzeProduct,
   buildExport,
@@ -23,12 +23,18 @@ import {
   enqueue,
   holdDecision,
   holdJob,
+  exportSatisfied,
+  LEASE_BUSY,
+  releaseJobLease,
+  tryJobLease,
+  withJobLease,
   planQuota,
   priorityFor,
   type TenantContext,
 } from '@arkiv/core';
 import { jobContext } from './context';
 import { sendQueuedEmail } from './emails';
+import { QUEUE_CONFIG } from './queues';
 
 export type Handler = (ctx: TenantContext, data: Record<string, unknown>, jobId: string) => Promise<unknown>;
 
@@ -75,9 +81,15 @@ export const handlers: Record<string, Handler> = {
   [Queues.refundPurchase]: (ctx, d) => refundProjectPurchase(ctx, d.purchaseId as string, String(d.reason ?? 'guarantee')),
   [Queues.processUpload]: (ctx, d) => withTenant(ctx.workspaceId, (tx) => processUpload(tx, ctx, d.uploadId as string, (d.skuId as string) ?? null)),
   [Queues.sendEmail]: (ctx, d, jobId) => sendQueuedEmail(ctx, d, jobId),
-  [Queues.syncIntegration]: (ctx, d) => syncIntegration(ctx, d.integrationId as string, { full: !!d.full }),
+  // One sync per integration at a time: a request arriving mid-run waits for it (one queued follow-up).
+  [Queues.syncIntegration]: (ctx, d, jobId) =>
+    exclusive(ctx, Queues.syncIntegration, `sync:${d.integrationId as string}`, jobId, d, () => syncIntegration(ctx, d.integrationId as string, { full: !!d.full })),
   [Queues.computeResults]: async (ctx, d) => {
-    const r = await withTenant(ctx.workspaceId, (tx) => computeResults(tx, ctx, d.experimentId as string));
+    // Serialized per experiment: a second run waits for the first to commit, then recomputes on fresh data.
+    const r = await withTenant(ctx.workspaceId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtext(${'results:' + (d.experimentId as string)}))`;
+      return computeResults(tx, ctx, d.experimentId as string);
+    });
     const [e] = await withTenant(ctx.workspaceId, (tx) => tx`select sku_id from experiments where id = ${d.experimentId as string}`);
     if (e) await withTenant(ctx.workspaceId, (tx) => refreshMaturity(tx, e.sku_id as string));
     return r;
@@ -90,22 +102,46 @@ export const handlers: Record<string, Handler> = {
     if (n) await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week }, { singletonKey: `brief:${week}` }));
     return n;
   },
-  [Queues.exportWorkspace]: async (ctx, _d, jobId) => {
+  [Queues.exportWorkspace]: async (ctx, d, jobId) => {
     // Runs even while the workspace is held (staff export on legal request), but a suspended tenant's link is
     // parked with the other deliveries; a fresh signed URL is minted from the asset when it is released.
-    const r = await buildExport(ctx);
-    const email = { template: 'export_ready', assetId: r.assetId, actor: ctx.actor };
-    if (holdDecision(ctx.workspaceState, Queues.sendEmail, email) === 'hold') {
-      await withTenant(ctx.workspaceId, (tx) => holdJob(tx, ctx.workspaceId, Queues.sendEmail, email, `export-email:${jobId}`, `workspace ${ctx.workspaceState}`));
-      return { assetId: r.assetId, delivery: 'held' };
+    // One export per workspace at a time; a request an export has already answered stands down.
+    const lease = await tryJobLease(ctx.workspaceId, 'export', jobId, QUEUE_CONFIG[Queues.exportWorkspace]!.expireInSeconds);
+    if (!lease) return { skipped: 'an export is already running' };
+    try {
+      if (await withTenant(ctx.workspaceId, (tx) => exportSatisfied(tx, ctx.workspaceId, d.requestedAt as string | undefined))) return { skipped: 'already exported since this request' };
+      return await deliverExport(ctx, jobId);
+    } finally {
+      await releaseJobLease(ctx.workspaceId, 'export', jobId);
     }
-    await sendQueuedEmail(ctx, { template: 'export_ready', url: r.url }, `export:${r.assetId}`);
-    return r.assetId;
   },
   [Queues.purgeWorkspace]: (_ctx, d) => purgeWorkspace(d.workspaceId as string),
   [Queues.extractGenome]: (ctx, d) => extractGenome(ctx, d.creativeId as string),
-  [Queues.customerThemes]: (ctx, d) => clusterThemes(ctx, d.skuId as string),
+  [Queues.customerThemes]: (ctx, d, jobId) => exclusive(ctx, Queues.customerThemes, `themes:${d.skuId as string}`, jobId, d, () => clusterThemes(ctx, d.skuId as string)),
 };
+
+async function deliverExport(ctx: TenantContext, jobId: string) {
+  const r = await buildExport(ctx);
+  const email = { template: 'export_ready', assetId: r.assetId, actor: ctx.actor };
+  if (holdDecision(ctx.workspaceState, Queues.sendEmail, email) === 'hold') {
+    await withTenant(ctx.workspaceId, (tx) => holdJob(tx, ctx.workspaceId, Queues.sendEmail, email, `export-email:${jobId}`, `workspace ${ctx.workspaceState}`));
+    return { assetId: r.assetId, delivery: 'held' };
+  }
+  await sendQueuedEmail(ctx, { template: 'export_ready', url: r.url }, `export:${r.assetId}`);
+  return r.assetId;
+}
+
+/**
+ * Run a job that must not overlap with another run for the same subject (x-races-14). When a live run holds
+ * the lease, the job is re-queued once behind it (a pending follow-up per subject), so the request is honoured
+ * with fresh data instead of racing the running one.
+ */
+async function exclusive(ctx: TenantContext, queue: typeof Queues.syncIntegration | typeof Queues.customerThemes, resource: string, jobId: string, data: Record<string, unknown>, fn: () => Promise<unknown>) {
+  const r = await withJobLease(ctx.workspaceId, resource, jobId, QUEUE_CONFIG[queue]!.expireInSeconds, fn);
+  if (r !== LEASE_BUSY) return r;
+  await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, queue, data, { runAfter: new Date(Date.now() + 60_000), singletonKey: `${resource}:after-running` }));
+  return { requeued: `${resource} is already running` };
+}
 
 /** Run one job with tenant context. Domain errors are final (no retry); others bubble up for pg-boss retry. */
 export async function runJob(queue: string, data: Record<string, unknown>, jobId: string): Promise<unknown> {
@@ -137,9 +173,19 @@ export async function runJob(queue: string, data: Record<string, unknown>, jobId
   }
 }
 
-/** System jobs (not tenant-scoped). */
+/**
+ * System jobs (not tenant-scoped). Drains stored Stripe events: new ones, a retry (webhook before our row
+ * committed) at most every 10 seconds, briefly the unmatched ones, and claims abandoned by a crashed process.
+ * processStripeEvent claims each row atomically, so running this next to the webhook route and admin replay
+ * never applies an event twice.
+ */
 export async function processPendingStripeEvents(process: (id: string) => Promise<unknown>) {
-  const rows = await withSystem((tx) => tx`select id from stripe_events where status in ('received') or (status = 'unmatched' and attempts < 3 and received_at > now() - interval '10 minutes') order by received_at limit 50`);
+  const rows = await withSystem((tx) => tx`
+    select id from stripe_events
+    where (status = 'received' and (claimed_at is null or claimed_at < now() - interval '10 seconds'))
+       or (status = 'unmatched' and attempts < 3 and received_at > now() - interval '10 minutes')
+       or (status = 'processing' and claimed_at < now() - make_interval(mins => ${STRIPE_CLAIM_STALE_MINUTES}))
+    order by received_at limit 50`);
   for (const r of rows) await process(r.id as string).catch((e) => console.error('[stripe]', r.id, e));
   return rows.length;
 }

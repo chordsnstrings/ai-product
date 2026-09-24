@@ -8,6 +8,7 @@ export * from './funnel';
 export * from './flags';
 export * from './settings';
 export * from './holds';
+export * from './leases';
 export * from './allowlist';
 export * from './ledger';
 export * from './rates';
