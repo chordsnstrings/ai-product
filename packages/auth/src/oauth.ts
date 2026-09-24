@@ -3,7 +3,7 @@ import { SignJWT, createRemoteJWKSet, importPKCS8, jwtVerify, type JWTPayload } 
 import { globalTx } from '@arkiv/db';
 import { DomainError, env } from '@arkiv/shared';
 import { recordLoginFailure, type LoginMeta } from './login-attempts';
-import { MOCK_IDP_ISSUER, mockClientId, mockExchange, verifyMockIdToken, type OAuthProvider } from './mock-idp';
+import { MOCK_IDP_ISSUER, mockClientId, mockExchange, mockIdpEnabled, verifyMockIdToken, type OAuthProvider } from './mock-idp';
 import { flagDisposableSignup, notifyIfNewDevice, securityNotice } from './signals';
 import { createSession, findOrCreateUser } from './sessions';
 import { safeRedirect } from './redirect';
@@ -35,10 +35,10 @@ function liveConfigured(p: Provider) {
   return p === 'google' ? !!(e.GOOGLE_CLIENT_ID && e.GOOGLE_CLIENT_SECRET) : !!(e.APPLE_CLIENT_ID && e.APPLE_TEAM_ID && e.APPLE_KEY_ID && e.APPLE_PRIVATE_KEY);
 }
 
-/** Real credentials win; without them, mock mode signs in through the built-in mock identity provider. */
+/** Real credentials win; without them, mock mode (outside production) signs in through the mock identity provider. */
 export function oauthMode(p: Provider): 'live' | 'mock' | null {
   if (liveConfigured(p)) return 'live';
-  return env().PROVIDERS_MODE === 'mock' ? 'mock' : null;
+  return mockIdpEnabled() ? 'mock' : null;
 }
 
 export function providerEnabled(p: Provider) {

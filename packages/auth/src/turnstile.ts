@@ -30,20 +30,21 @@ export async function verifyTurnstile(
 }
 
 /**
- * The site key the sign-in challenge renders: the configured one, or (mock mode without keys, i.e. local and e2e)
- * Cloudflare's always-pass test key, whose dummy token is then accepted. Null when no challenge can be shown.
+ * The site key the sign-in challenge renders: the configured one, or — in mock mode without keys, outside
+ * production (local and e2e) — Cloudflare's always-pass test key, whose dummy token is then accepted. Null when no
+ * challenge can be shown.
  */
 export function loginChallengeSiteKey(): string | null {
   const e = env();
   if (e.TURNSTILE_SITE_KEY) return e.TURNSTILE_SITE_KEY;
-  return e.PROVIDERS_MODE === 'mock' ? TURNSTILE_TEST_SITE_KEY : null;
+  return e.PROVIDERS_MODE === 'mock' && e.NODE_ENV !== 'production' ? TURNSTILE_TEST_SITE_KEY : null;
 }
 
 export async function verifyLoginChallenge(token: string | null | undefined, ip: string | null, fetchImpl: typeof fetch = fetch): Promise<boolean> {
   if (!token) return false;
   const e = env();
   if (e.TURNSTILE_SECRET) return verifyTurnstile(token, e.TURNSTILE_SECRET, ip, fetchImpl);
-  return e.PROVIDERS_MODE === 'mock' && token === TURNSTILE_DUMMY_TOKEN;
+  return e.PROVIDERS_MODE === 'mock' && e.NODE_ENV !== 'production' && token === TURNSTILE_DUMMY_TOKEN;
 }
 
 /** Sign-in attempts allowed per IP per window before the human check (plan 03 Part C: "10 … per 15 min, then Turnstile"). */

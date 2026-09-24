@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { MOCK_IDENTITIES, mockAuthorize, type MockIdentity } from '@arkiv/auth';
+import { MOCK_IDENTITIES, mockAuthorize, mockIdpEnabled, type MockIdentity } from '@arkiv/auth';
 import { env } from '@arkiv/shared';
 
 /**
@@ -10,7 +10,7 @@ import { env } from '@arkiv/shared';
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 export async function POST(req: Request) {
-  if (env().PROVIDERS_MODE !== 'mock') return new NextResponse('Not found', { status: 404 });
+  if (!mockIdpEnabled()) return new NextResponse('Not found', { status: 404 });
   const f = await req.formData();
   const get = (k: string) => (typeof f.get(k) === 'string' ? (f.get(k) as string) : '');
   const provider = get('provider') === 'apple' ? 'apple' : 'google';

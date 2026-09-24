@@ -3,17 +3,17 @@ import { closeAll, globalTx, ownerPool, withSystem } from '@arkiv/db';
 import { truncateAll } from '@arkiv/db/testing';
 import { devOutbox } from '@arkiv/email';
 import { sweepSignInRecords } from '@arkiv/core';
-import { MAGIC_LINK_TTL_MIN, PRIVACY_VERSION, TERMS_VERSION, disposableEmailDomain, emailSuggestion } from '@arkiv/shared';
+import { MAGIC_LINK_TTL_MIN, PRIVACY_VERSION, TERMS_VERSION, disposableEmailDomain, emailSuggestion, resetEnvCache } from '@arkiv/shared';
 import { claimToken, readClaimToken } from './claim';
 import { consumeMagicLink, magicLinkStatus, previewMagicLink, requestMagicLink } from './magic-link';
-import { MOCK_IDENTITIES, mockAuthorize, mockClientId, mockExchange, type MockIdentity, type OAuthProvider } from './mock-idp';
+import { MOCK_IDENTITIES, mockAuthorize, mockClientId, mockExchange, mockIdpEnabled, type MockIdentity, type OAuthProvider } from './mock-idp';
 import { finishOAuth, providerEnabled, startOAuth } from './oauth';
 import { passkeyLoginOptions, passkeyPromptEligible, passkeyRegistrationOptions, verifyPasskeyLogin, verifyPasskeyRegistration } from './passkeys';
 import { passwordLogin, removePassword, setPassword } from './password';
 import { safeRedirect } from './redirect';
 import { createSession, getSession, rotateSession } from './sessions';
 import { notifyIfNewDevice } from './signals';
-import { assertLoginBudget, LOGIN_ATTEMPTS_PER_IP, TURNSTILE_DUMMY_TOKEN } from './turnstile';
+import { assertLoginBudget, loginChallengeSiteKey, LOGIN_ATTEMPTS_PER_IP, TURNSTILE_DUMMY_TOKEN, verifyLoginChallenge } from './turnstile';
 import { SoftAuthenticator } from './webauthn-testing';
 
 beforeEach(async () => {
@@ -76,6 +76,28 @@ describe('Google / Apple through the mock identity provider (auth-16, auth-02, a
     const relay = await oauth('apple', appleRelay);
     expect(relay.userId).not.toBe(g.userId);
     expect(relay.email).toBe('k7x2q9@privaterelay.appleid.com');
+  });
+
+  it('never exists in production, even when production runs mock providers for a demo', async () => {
+    const prod = { NODE_ENV: 'production', ALLOW_MOCK_PROVIDERS: '1', STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_WEBHOOK_SECRET: 'whsec_x', RESEND_API_KEY: 're_x', TOKEN_ENCRYPTION_KEY: 'k'.repeat(64), STORAGE_DRIVER: 's3' };
+    const saved = Object.fromEntries(Object.keys(prod).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, prod);
+    resetEnvCache();
+    try {
+      expect(mockIdpEnabled()).toBe(false);
+      expect(providerEnabled('google')).toBe(false);
+      await expect(startOAuth('google', {})).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+      await expect(mockAuthorize({ provider: 'google', clientId: mockClientId('google'), redirectUri: `${APP}/api/auth/google/callback`, nonce: 'n', identity: google })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      expect(loginChallengeSiteKey()).toBeNull();
+      expect(await verifyLoginChallenge(TURNSTILE_DUMMY_TOKEN, null)).toBe(false);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      resetEnvCache();
+    }
+    expect(mockIdpEnabled()).toBe(true);
   });
 
   it('refuses a callback without the starting browser’s binding cookie, or with another one (login CSRF)', async () => {

@@ -1,7 +1,6 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
-import { MOCK_IDENTITIES } from '@arkiv/auth';
-import { env } from '@arkiv/shared';
+import { MOCK_IDENTITIES, mockIdpEnabled } from '@arkiv/auth';
 
 export const metadata: Metadata = { title: 'Mock sign-in · Arkiv', robots: { index: false } };
 
@@ -10,7 +9,7 @@ export const metadata: Metadata = { title: 'Mock sign-in · Arkiv', robots: { in
  * "Hide my email" relay and a Google account with the same email — type any address, or cancel.
  */
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | undefined>> }) {
-  if (env().PROVIDERS_MODE !== 'mock') notFound();
+  if (!mockIdpEnabled()) notFound();
   const sp = await searchParams;
   const provider = sp.provider === 'apple' ? 'apple' : 'google';
   const hidden = (['provider', 'client_id', 'redirect_uri', 'state', 'nonce', 'code_challenge'] as const).map((k) => <input key={k} type="hidden" name={k} value={k === 'provider' ? provider : (sp[k] ?? '')} />);

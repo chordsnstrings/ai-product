@@ -37,8 +37,17 @@ export const MOCK_IDENTITIES: Record<OAuthProvider, { label: string; identity: M
 const key = () => createHash('sha256').update(`arkiv-mock-idp:${env().APP_SECRET}`).digest();
 const b64url = (b: Buffer) => b.toString('base64url');
 
+/**
+ * The mock provider signs anyone in as any address, so it exists only in mock mode and never in production, even
+ * where production runs mock providers (ALLOW_MOCK_PROVIDERS for a demo).
+ */
+export function mockIdpEnabled(): boolean {
+  const e = env();
+  return e.PROVIDERS_MODE === 'mock' && e.NODE_ENV !== 'production';
+}
+
 function assertMock() {
-  if (env().PROVIDERS_MODE !== 'mock') throw new DomainError('NOT_FOUND', 'Not found');
+  if (!mockIdpEnabled()) throw new DomainError('NOT_FOUND', 'Not found');
 }
 
 /** The authorize step: the chosen identity becomes a one-use code bound to the request's client, redirect and PKCE. */
