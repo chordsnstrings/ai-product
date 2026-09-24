@@ -15,6 +15,8 @@ import { clearSettingsCache } from './settings';
 import { customerReason } from './projects';
 import { firstRenderAcceptance, repeatedFidelityFailures } from './qa-metrics';
 import { recordAssetExport } from './exports';
+import { decideFact } from './product-truth';
+import { priceUpdate, recomposeProject } from './recompose';
 import { emit } from './events';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
@@ -511,4 +513,44 @@ describe('first-render acceptance (Appendix C; exp-38)', () => {
     const events = await ownerPool()`select payload, refs from events where workspace_id = ${r.t.workspaceId} and type = 'CREATIVE_REGENERATION_REQUESTED'`;
     expect(events).toEqual([expect.objectContaining({ payload: { by: 'user', from: 'PROVIDER_FAILED', reason: 'quality_failed' }, refs: expect.objectContaining({ projectId: r.projectId, skuId: r.skuId }) })]);
   }, 120_000);
+});
+
+describe('price changes after production (standard §42; edge-42-08)', () => {
+  it('shows the current price through tokens, and recomposes a delivered ad on a price change with no new footage', async () => {
+    const r = await storyboardReady();
+    await withTenant(r.t.workspaceId, (tx) => decideFact(tx, r.ctx, r.skuId, 'price', { number: 24, json: { currency: 'USD' } }));
+    await ownerPool()`update scenes set overlay_text = 'Only {price}' where storyboard_id = ${r.storyboardId} and purpose = 'routine'`;
+    await ownerPool()`update storyboards set cta_text = 'Shop now {price}' where id = ${r.storyboardId}`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const first = await manifestOf(r.projectId);
+    expect(first.tokens?.price).toMatchObject({ text: '$24' });
+    const routine = first.scenes.find((s) => s.overlayTemplate === 'Only {price}');
+    expect(routine).toMatchObject({ overlayText: 'Only $24' });
+    expect(first.endCard).toMatchObject({ cta: 'Shop now', price: '$24', ctaTemplate: 'Shop now {price}' });
+    // The price is a traced fact (Launch Gate 2).
+    const [rep1] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect((rep1!.qa_report as { statementMap: { text: string; status: string }[] }).statementMap.find((m) => m.text === 'Only $24')).toMatchObject({ status: 'sourced' });
+
+    const jobsBefore = (await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId}`)[0]!.n;
+    const [before] = await ownerPool()`select final_creative_id from projects where id = ${r.projectId}`;
+    // The price changes: the delivered ad is queued for recomposition and shows as stale until then.
+    await withTenant(r.t.workspaceId, (tx) => decideFact(tx, r.ctx, r.skuId, 'price', { number: 19, json: { currency: 'USD' } }));
+    expect(await ownerPool()`select payload->>'projectId' as project from outbox where queue = 'recompose-project'`).toEqual([{ project: r.projectId }]);
+    expect(await withTenant(r.t.workspaceId, (tx) => priceUpdate(tx, r.t.workspaceId, r.projectId))).toEqual({ stale: true, shown: '$24', current: '$19' });
+
+    expect(await recomposeProject(r.ctx, r.projectId)).toBe('recomposed');
+    const next = await manifestOf(r.projectId);
+    expect(next.scenes.find((s) => s.sceneId === routine!.sceneId)).toMatchObject({ overlayText: 'Only $19', assetId: routine!.assetId });
+    expect(next.endCard).toMatchObject({ price: '$19', cta: 'Shop now' });
+    // Same footage and voice, no provider call, a new version of the creative.
+    expect(next.scenes.map((s) => s.assetId)).toEqual(first.scenes.map((s) => s.assetId));
+    expect(next.voiceover?.segments.map((s) => s.clipAssetId)).toEqual(first.voiceover?.segments.map((s) => s.clipAssetId));
+    expect((await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId}`)[0]!.n).toBe(jobsBefore);
+    const [after] = await ownerPool()`select p.final_creative_id, c.parent_creative_id, cardinality(c.final_asset_ids) as n from projects p join creatives c on c.id = p.final_creative_id where p.id = ${r.projectId}`;
+    expect(after).toMatchObject({ parent_creative_id: before!.final_creative_id, n: 3 });
+    expect(await withTenant(r.t.workspaceId, (tx) => priceUpdate(tx, r.t.workspaceId, r.projectId))).toMatchObject({ stale: false });
+    // Idempotent: nothing more to do.
+    expect(await recomposeProject(r.ctx, r.projectId)).toBe('unchanged');
+  }, 240_000);
 });

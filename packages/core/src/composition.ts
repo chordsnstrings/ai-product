@@ -18,6 +18,8 @@ export interface ManifestScene {
   versionId: string | null;
   technique: string;
   overlayText: string | null;
+  /** The overlay as written, when it uses fact tokens ({price}, {size}): recomposed when those facts change (§42). */
+  overlayTemplate?: string | null;
   spokenText: string | null;
   durationMs: number;
   claimIds: string[];
@@ -40,12 +42,45 @@ export interface CompositionManifest {
   scenes: ManifestScene[];
   voiceover: { voice: string; segments: VoiceSegment[] } | null;
   captions: Cue[];
-  endCard: { productName: string; cta: string; index: string; durationMs: number; sceneId: string | null; spokenText: string | null; accent?: string | null; note?: string | null };
+  endCard: { productName: string; cta: string; index: string; durationMs: number; sceneId: string | null; spokenText: string | null; accent?: string | null; note?: string | null; price?: string | null; ctaTemplate?: string | null };
+  /** The product facts on screen through tokens, as used (price, size): what a later change recomposes against. */
+  tokens?: FactTokens | null;
+  /** A spoken line said a token's value: a change then needs a new voice line, not only a recomposition. */
+  tokensSpoken?: boolean;
   durationMs: number;
   aspects: Aspect[];
   genes: Record<string, unknown>;
   /** What in this ad is AI-generated (standard §40): drives platform disclosure guidance and export metadata. */
   disclosure?: AiDisclosure;
+}
+
+/** Facts an ad shows through {price} / {size} tokens: the value shown and the fact it came from. */
+export interface FactTokens {
+  price: { factId: string; text: string } | null;
+  size: { factId: string; text: string } | null;
+}
+
+const TOKEN_RE = /\{(price|size)\}/g;
+
+/** Whether a text uses fact tokens. */
+export const hasFactTokens = (text: string | null | undefined) => !!text && /\{(price|size)\}/.test(text);
+
+/** Replace {price} / {size} with the current facts (a token with no fact is dropped, never invented, §42). */
+export function resolveFactTokens(text: string, tokens: FactTokens): string {
+  return text
+    .replace(TOKEN_RE, (_, k: 'price' | 'size') => tokens[k]?.text ?? '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([,.!?])/g, '$1')
+    .trim()
+    .replace(/^[·—-]\s*|\s*[·—-]$/g, '')
+    .trim();
+}
+
+/** The price as shown on an ad: currency symbol for the common currencies, two decimals unless whole. */
+export function formatPrice(amount: number, currency = 'USD'): string {
+  const sym: Record<string, string> = { USD: '$', EUR: '€', GBP: '£', AUD: 'A$', CAD: 'C$' };
+  const n = Number.isInteger(amount) ? String(amount) : amount.toFixed(2);
+  return sym[currency.toUpperCase()] ? `${sym[currency.toUpperCase()]}${n}` : `${n} ${currency.toUpperCase()}`;
 }
 
 /** AI-generated media in an ad (standard §40 "AI-generated talent and synthetic media must follow platform disclosure"). */

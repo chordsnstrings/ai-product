@@ -18,6 +18,7 @@ import {
   refreshMaturity,
   regenerateFrame,
   Queues,
+  recomposeProject,
   syncIntegration,
   transferSku,
   weekOf,
@@ -97,6 +98,7 @@ export const handlers: Record<string, Handler> = {
     return r;
   },
   [Queues.hookVariants]: (ctx, d) => produceHookVariants(ctx, d.projectId as string),
+  [Queues.recomposeProject]: (ctx, d) => recomposeProject(ctx, d.projectId as string),
   [Queues.recoveryConcept]: (ctx, d) => draftRecoveryConcept(ctx, d.projectId as string),
   // Core can't import billing, so the guarantee refund (queued by failProduction) runs here.
   [Queues.refundPurchase]: (ctx, d) => refundProjectPurchase(ctx, d.purchaseId as string, String(d.reason ?? 'guarantee')),

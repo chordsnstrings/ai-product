@@ -10,7 +10,7 @@ import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
 import { classifyClaim, showsSyntheticPeople, syntheticTestimonials, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
-import { diffCompositions, disclosureMetadata, type AiDisclosure, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
+import { diffCompositions, disclosureMetadata, hasFactTokens, resolveFactTokens, type AiDisclosure, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
 import { authorize, holdAuthorization, reissueToken, settle, type Purpose } from './cost-governor';
 import { allowedClaimTexts } from './creative-director';
@@ -30,6 +30,7 @@ import { estimate, loadRates, priceLine, type CostLine, type RateTable } from '.
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
 import { factsForStatements, mapStatements, statementCheck } from './statements';
+import { factTokens } from './recompose';
 
 export const PRODUCTION_STEPS = [
   { key: 'prepare', label: 'Preparing your product' },
@@ -526,6 +527,28 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
   });
   const { p, scenes, sb, sku, fp, variant, versions, brand, imagery } = load;
+  // {price} / {size} in on-screen text and the CTA show the product's current facts (§42): resolved now, and kept
+  // as templates in the manifest so a later change recomposes the ad without new footage.
+  const tokens = await withTenant(ws, (tx) => factTokens(tx, p.sku_id as string));
+  const usedTokens = { price: false, size: false };
+  let tokensSpoken = false;
+  const resolve = (text: string) => {
+    if (/\{price\}/.test(text)) usedTokens.price = true;
+    if (/\{size\}/.test(text)) usedTokens.size = true;
+    return resolveFactTokens(text, tokens);
+  };
+  for (const s of scenes) {
+    if (hasFactTokens(s.overlay_text as string | null)) {
+      s.overlay_template = s.overlay_text;
+      s.overlay_text = resolve(s.overlay_text as string) || null;
+    }
+    if (hasFactTokens(s.spoken_line as string | null)) {
+      tokensSpoken = true;
+      s.spoken_line = resolve(s.spoken_line as string) || null;
+    }
+  }
+  const ctaTemplate = hasFactTokens(sb?.cta_text as string | null) ? (sb!.cta_text as string) : null;
+  if (ctaTemplate) sb!.cta_text = resolve(ctaTemplate);
   // Cancelled while queued or while a previous run was stopping: this run holds the lease, so it settles the cancel.
   if (p.cancel_requested_at && RUNNABLE.includes(p.state as ProjectState)) return withTenant(ws, async (tx) => ((await finalizeCancel(tx, ctx, projectId)) ? 'cancelled' : 'skipped'));
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
@@ -692,6 +715,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         versionId,
         technique,
         overlayText: (s.overlay_text as string | null) ?? null,
+        ...(s.overlay_template ? { overlayTemplate: s.overlay_template as string } : {}),
         spokenText: ((s.spoken_line as string | null) ?? '').trim() || null,
         durationMs: s.duration_ms,
         claimIds: [],
@@ -1008,7 +1032,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // disclosure on the end card of every export.
       const endCard = {
         productName: sku.name as string,
-        cta: ((sb.cta_text as string | null) ?? '').trim() || brand?.brain.cta?.trim() || 'Shop now',
+        // A CTA template with {price} shows the price on its own line above the CTA bar.
+        cta: ctaTemplate && /\{price\}/.test(ctaTemplate) ? resolveFactTokens(ctaTemplate.replace(/\{price\}/g, ''), tokens) || 'Shop now' : ((sb.cta_text as string | null) ?? '').trim() || brand?.brain.cta?.trim() || 'Shop now',
+        price: ctaTemplate && /\{price\}/.test(ctaTemplate) ? (tokens.price?.text ?? null) : null,
         index: `NO. ${String(sku.catalogue_no).padStart(3, '0')}`,
         durationMs: endCardMs,
         accent: brandAccent(brand?.brain.colors),
@@ -1064,7 +1090,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         scenes: slots.map((s) => s.entry),
         voiceover: segments.length ? { voice, segments } : null,
         captions,
-        endCard: { ...endCard, sceneId: ctaScene?.id ?? null, spokenText: ((ctaScene?.spoken_line as string | null) ?? '').trim() || null },
+        endCard: { ...endCard, sceneId: ctaScene?.id ?? null, spokenText: ((ctaScene?.spoken_line as string | null) ?? '').trim() || null, ctaTemplate },
+        tokens: usedTokens.price || usedTokens.size ? { price: usedTokens.price ? tokens.price : null, size: usedTokens.size ? tokens.size : null } : null,
+        ...(tokensSpoken ? { tokensSpoken } : {}),
         durationMs: totalMs,
         aspects: ASPECTS,
         genes: { angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment },

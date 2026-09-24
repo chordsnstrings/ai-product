@@ -15,6 +15,8 @@ export const QUEUE_CONFIG: Record<string, { concurrency: number; expireInSeconds
   [Queues.regenerateFrameFree]: { concurrency: 1, expireInSeconds: 180, retryLimit: 2 },
   [Queues.produceProject]: { concurrency: 6, expireInSeconds: 3600, retryLimit: 1 },
   [Queues.hookVariants]: { concurrency: 2, expireInSeconds: 900, retryLimit: 2 },
+  // A price/size change recomposes delivered ads (media only, §42).
+  [Queues.recomposeProject]: { concurrency: 2, expireInSeconds: 600, retryLimit: 2 },
   // Marketing recovery (plan 04 L20): lowest urgency, one at a time.
   [Queues.recoveryConcept]: { concurrency: 1, expireInSeconds: 300, retryLimit: 1 },
   // Money back for undeliverable paid orders: retried generously (every step is idempotent).
