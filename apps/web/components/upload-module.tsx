@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@arkiv/ui/client';
 import { TURNSTILE_SCRIPT } from '@/lib/turnstile';
+import { usePhotoUploads } from './photo-uploads';
 
 interface TurnstileApi {
   render(el: HTMLElement, opts: Record<string, unknown>): string;
@@ -102,7 +103,7 @@ const hostOf = (u: string) => {
 export function UploadModule({ page, variant, compact, turnstileSiteKey, assurance }: { page: string; variant?: string | null; compact?: boolean; turnstileSiteKey?: string | null; assurance?: string }) {
   const turnstile = useTurnstile(turnstileSiteKey);
   const [url, setUrl] = useState('');
-  const [files, setFiles] = useState<File[]>([]);
+  const uploads = usePhotoUploads(downscale);
   const [state, setState] = useState<'idle' | 'drag' | 'busy'>('idle');
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -130,25 +131,29 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
     if (!imgs.length) return setError('Choose a photo (JPG or PNG).');
     markStarted('photos');
     setError(null);
-    setFiles((prev) => [...prev, ...imgs].slice(0, 6));
+    uploads.add(imgs);
   };
 
   async function submit(e?: React.FormEvent) {
     e?.preventDefault();
-    if (!validUrl && !files.length) return setError('Paste your product link or add a photo.');
+    if (!validUrl && !uploads.items.some((i) => i.status !== 'failed')) return setError('Paste your product link or add a photo.');
     // Mirrors isMarketplaceUrl in @arkiv/core (the server checks again).
-    if (validUrl && !files.length && MARKETPLACE_RE.test(hostOf(url.trim()))) return setError('Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.');
+    if (validUrl && !uploads.items.length && MARKETPLACE_RE.test(hostOf(url.trim()))) return setError('Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.');
     setState('busy');
     setError(null);
     try {
+      // Photos started uploading when they were chosen; wait for any still on their way.
+      const photos = await uploads.settled();
+      if (!validUrl && !photos.length) throw new Error('Add a photo we can use, or paste your product link.');
       const fd = new FormData();
       if (validUrl) fd.set('url', url.trim());
-      for (const f of files) fd.append('photos', await downscale(f));
+      for (const id of photos) fd.append('assetIds', id);
       fd.set('page', page);
       if (variant) fd.set('variant', variant);
       const challenge = await turnstile.token();
       if (challenge) fd.set('cf-turnstile-response', challenge);
       const r = await api<{ projectId: string }>('/api/preview', fd);
+      uploads.clear();
       window.location.assign(`/start/${r.projectId}`);
     } catch (err) {
       setState('idle');
@@ -208,17 +213,22 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
         <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={(e) => addFiles(e.target.files)} />
         <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden onChange={(e) => addFiles(e.target.files)} />
       </div>
-      {files.length > 0 && (
-        <div className="ak-row" style={{ flexWrap: 'wrap' }}>
-          {files.map((f, i) => (
-            <span key={i} className="ak-chip">{f.name.slice(0, 18)} <button type="button" className="ak-textbtn" aria-label={`Remove ${f.name}`} onClick={() => setFiles(files.filter((_, j) => j !== i))}>×</button></span>
+      {uploads.items.length > 0 && (
+        <div className="ak-row" style={{ flexWrap: 'wrap' }} aria-live="polite">
+          {uploads.items.map((f) => (
+            <span key={f.key} className="ak-chip" title={f.error}>
+              {f.name.slice(0, 18)}
+              {f.status === 'uploading' ? ` · ${Math.round(f.progress * 100)}%` : f.status === 'waiting' ? ' · waiting for connection' : f.status === 'failed' ? ' · can’t use this file' : ' · ✓'}
+              {' '}<button type="button" className="ak-textbtn" aria-label={`Remove ${f.name}`} onClick={() => uploads.remove(f.key)}>×</button>
+            </span>
           ))}
         </div>
       )}
+      {uploads.items.filter((f) => f.status === 'failed').map((f) => <p key={f.key} className="ak-error ak-small" role="alert" style={{ margin: 0 }}>{f.name}: {f.error}</p>)}
       {error && <p className="ak-error" role="alert" style={{ margin: 0 }}>{error}</p>}
       {turnstileSiteKey ? <div ref={turnstile.box} className="ak-turnstile" /> : null}
       <button type="submit" className="ak-btn ak-btn--accent ak-btn--block" disabled={state === 'busy'}>
-        {state === 'busy' ? 'Starting…' : 'Analyze my product — free'}
+        {state === 'busy' ? 'Starting…' : uploads.pending ? 'Uploading photos…' : 'Analyze my product — free'}
       </button>
       <p id="upload-help" className="ak-small ak-muted" style={{ margin: 0 }}>{assurance || 'Free analysis · no card · about 40 seconds'}</p>
     </form>

@@ -140,7 +140,7 @@ export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
 }
 
 /** Worker step: move a quarantined upload into the tenant prefix as an asset. */
-export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string, skuId: string | null) {
+export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string, skuId: string | null, origin: Record<string, unknown> = {}) {
   const [u] = await tx`select * from uploads where id = ${uploadId} for update`;
   if (!u) throw new DomainError('NOT_FOUND', 'Upload not found');
   if (u.status === 'accepted') return { assetId: u.asset_id as string, replayed: true };
@@ -153,7 +153,9 @@ export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string
   }
   try {
     const v = await validateMedia(raw);
-    const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind: u.kind as AssetKind, skuId, source: 'upload', origin: { uploadId, declaredMime: u.declared_mime } });
+    const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind: u.kind as AssetKind, skuId, source: 'upload', origin: { ...origin, uploadId, declaredMime: u.declared_mime } });
+    // Same review as a direct upload: media named as a before/after or showing children waits for compliance.
+    if (REVIEWABLE_KINDS.has(u.kind as AssetKind)) await holdForReview(tx, [{ assetId: asset.id, flags: { ...nameReviewFlags(JSON.stringify(origin)), sources: ['name'] } }]);
     await tx`update uploads set status = 'accepted', asset_id = ${asset.id} where id = ${uploadId}`;
     await storage().delete(u.quarantine_key as string);
     return { assetId: asset.id, replayed: false };
@@ -185,3 +187,41 @@ export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind:
 
 /** Merchant-supplied media that can end up in an ad (and so in the before/after and minors review). */
 const REVIEWABLE_KINDS: ReadonlySet<AssetKind> = new Set<AssetKind>(['product_photo', 'reference_view', 'creator_footage', 'historical_creative']);
+
+/** Photos a visitor can add to one preview (the upload module's own limit). */
+export const MAX_PREVIEW_PHOTOS = 6;
+const PHOTO_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'image/avif']);
+
+/**
+ * Plan 03 P2 "starts uploading the moment a file is chosen (presigned PUT to quarantine)": one quarantined upload
+ * per chosen product photo, each with its own short-lived PUT URL. Browsers that report HEIC with no type send
+ * image/heic; the bytes are checked on completion regardless of what is declared.
+ */
+export async function startPhotoUploads(tx: Tx, ctx: TenantContext, files: { mime: string; bytes: number }[]) {
+  if (!files.length || files.length > MAX_PREVIEW_PHOTOS) throw new DomainError('INVALID', `Add 1 to ${MAX_PREVIEW_PHOTOS} photos.`);
+  const out: { uploadId: string; putUrl: string }[] = [];
+  for (const f of files) {
+    const mime = f.mime || 'image/heic';
+    if (!PHOTO_MIMES.has(mime)) throw new DomainError('INVALID', 'Choose a photo (JPG, PNG, WebP or HEIC).');
+    const u = await createUpload(tx, ctx, 'product_photo', mime, f.bytes);
+    out.push({ uploadId: u.uploadId, putUrl: u.putUrl });
+  }
+  return out;
+}
+
+/**
+ * The browser finished its PUT: validate the quarantined bytes and turn them into an (unattached) product photo.
+ * A rejected file is recorded as rejected and reported back — the transaction still commits, so the reason and the
+ * quarantine clean-up stick. Completing twice returns the same asset.
+ */
+export async function completePhotoUpload(tx: Tx, ctx: TenantContext, uploadId: string, filename?: string | null): Promise<{ assetId: string } | { error: string }> {
+  assertCan(ctx, 'sku.edit');
+  const [u] = await tx`select kind, status from uploads where id = ${uploadId}`;
+  if (!u || u.kind !== 'product_photo') throw new DomainError('NOT_FOUND', 'Upload not found. Please add the photo again.');
+  try {
+    return { assetId: (await processUpload(tx, ctx, uploadId, null, filename ? { filename: filename.slice(0, 200) } : {})).assetId };
+  } catch (e) {
+    if (e instanceof DomainError && e.code === 'INVALID') return { error: e.message };
+    throw e;
+  }
+}
