@@ -568,6 +568,8 @@ export function SaveGate({ open, onOpenChange, next, productName }: { open: bool
 /* ───────────── P7 · Storyboard + offer ───────────── */
 
 const PURPOSE: Record<string, string> = { hook: 'Hook', problem: 'Problem', product_reveal: 'Reveal', demonstration: 'Demo', proof: 'Proof', benefit: 'Benefit', routine: 'Routine', cta: 'Call to action' };
+/** The Production Planner's medium, in customer words (§23). */
+const MODE_LABEL: Record<string, string> = { STRICT_COMPOSITE: 'Exact product', GENERATIVE_INTERACTION: 'Generated motion', HYBRID: 'Generated setting + exact product', REAL_ASSET_REMIX: 'Your footage', CREATOR_PACK: 'Creator shot' };
 
 export function StoryboardFlow({ projectId }: { projectId: string }) {
   const active = useCallback(
@@ -627,6 +629,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
                 <div className="ak-between"><span className="ak-index">{String(s.position + 1).padStart(2, '0')} · {PURPOSE[s.purpose] ?? s.purpose}</span><span className="ak-index">{(s.durationMs / 1000).toFixed(1)}s</span></div>
                 {s.overlayText ? <p style={{ fontWeight: 600 }}>{s.overlayText}</p> : null}
                 {s.spokenLine ? <p className="ak-muted">“{s.spokenLine}”</p> : null}
+                {s.plannerReason ? <p className="ak-small ak-muted">{MODE_LABEL[s.productionMode] ?? 'Scene'} · {s.plannerReason}</p> : null}
                 {s.regeneration?.status === 'pending' || s.regeneration?.status === 'active' ? <p className="ak-small ak-muted" role="status">Redrawing this frame…</p> : null}
                 {s.regeneration?.status === 'failed' ? <p className="ak-small ak-error" role="status">{s.regeneration.detail ?? 'We couldn’t redraw this frame.'}</p> : null}
                 <div className="ak-row">

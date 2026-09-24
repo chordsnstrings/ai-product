@@ -222,6 +222,8 @@ async function storyboardBlock(tx: Tx, storyboardId: string) {
         spokenLine: (s.spoken_line as string) ?? null,
         overlayText: (s.overlay_text as string) ?? null,
         productionMode: s.production_mode as string,
+        /** Why the Production Planner chose this scene's medium (§23), shown before approval. */
+        plannerReason: (s.planner_reason as string | null) ?? null,
         locked: s.locked as boolean,
         frameUrl: s.frame_asset_id ? await assetUrl(tx, s.frame_asset_id as string) : null,
         freeRegenerationsUsed: Number(s.free_regenerations_used),

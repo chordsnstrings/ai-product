@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProjectState } from '@arkiv/shared';
+import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProductionMode, type ProjectState } from '@arkiv/shared';
 import { brandAccent, captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
@@ -28,6 +28,7 @@ import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, 
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
+import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
 
 export const PRODUCTION_STEPS = [
   { key: 'prepare', label: 'Preparing your product' },
@@ -197,6 +198,46 @@ export function planProduction(
 }
 
 const CEILING_PURPOSES: readonly Purpose[] = ['taste', 'standalone', 'creative_test'];
+
+export interface PlannedStoryboardScene {
+  mode: ProductionMode;
+  reason: string;
+  /** Planned provider cost of producing the scene (a generated render with its repair reserve; 0 for stills). */
+  estimateMicros: number;
+}
+
+/**
+ * Run the Production Planner (production-planner.ts) over a planned storyboard: the facts it decides on are read
+ * here — the Visual Fingerprint's transparency and reference views, whether the cut-out keyed (or will be tried),
+ * the video route's availability, rights-cleared footage — and the plan is priced on today's routes and rates
+ * against the paid-ad ceiling, so the modes the merchant approves are the ones production makes. Explicitly scoped
+ * by workspace.
+ */
+export async function planStoryboardScenes(tx: Tx, workspaceId: string, skuId: string, scenes: readonly PlannerScene[], opts: { cutoutWillBeTried?: boolean } = {}): Promise<PlannedStoryboardScene[]> {
+  const [fp] = await tx`select f.transparency, coalesce(array_length(f.reference_asset_ids, 1), 0)::int as views, a.lineage->>'keyed' as keyed
+                        from visual_fingerprints f left join assets a on a.id = f.cutout_asset_id and a.workspace_id = f.workspace_id
+                        where f.workspace_id = ${workspaceId} and f.sku_id = ${skuId} and f.active`;
+  const [footage] = await tx`select count(*)::int as n from assets where workspace_id = ${workspaceId} and sku_id = ${skuId} and kind = 'creator_footage'
+                             and deleted_at is null and coalesce(review_status, 'approved') = 'approved'`;
+  const video = await route(tx, 'video.scene', workspaceId);
+  const videoAvailable = !video.circuitOpen || (!!video.fallbackTask && !(await route(tx, video.fallbackTask, workspaceId)).circuitOpen);
+  const facts: PlannerFacts = {
+    transparency: (fp?.transparency as string | null) ?? null,
+    referenceViews: Number(fp?.views ?? 0),
+    keyedCutout: (!!fp && fp.keyed !== 'false') || !!opts.cutoutWillBeTried,
+    videoAvailable,
+    remixFootage: Number(footage?.n ?? 0) > 0,
+  };
+  const routes = await productionRoutes(tx, workspaceId);
+  const rates = await loadRates(tx);
+  const rows = (modes: readonly ProductionMode[]) => scenes.map((s, i) => ({ id: `planned-${i}`, purpose: s.purpose, duration_ms: s.durationMs, production_mode: modes[i]! })) as SceneRow[];
+  const cost = (modes: readonly ProductionMode[]) => estimate(rates, planProduction(rows(modes), 0, routes, rates).lines).totalMicros;
+  const planned = fitCeiling(scenes, planSceneModes(scenes, facts), cost, COST_LIMITS.CREATIVE_TEST_CEILING, facts);
+  return planned.map((p, i) => ({
+    ...p,
+    estimateMicros: p.mode === 'GENERATIVE_INTERACTION' ? priceLine(rates, dearerLine(routes.video, rates, { kind: 'video', seconds: genSeconds(scenes[i]!.durationMs), resolution: '720p' })).micros : 0,
+  }));
+}
 
 /**
  * Hash of what a scene's render depends on (§24, §35): the frame it is generated from, the visual plan, the

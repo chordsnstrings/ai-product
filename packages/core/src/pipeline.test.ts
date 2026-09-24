@@ -68,6 +68,13 @@ describe('free preview → storyboard (Launch Gate 1, first half)', () => {
       expect(v.storyboard.status).toBe('ready');
       expect(v.scenes.reduce((s, x) => s + Number(x.duration_ms), 0)).toBe(15000);
       expect(v.scenes.every((s) => s.frame_asset_id)).toBe(true);
+      // The Production Planner decided every scene's medium and recorded why and what it is planned to cost (§23).
+      expect(v.scenes.every((s) => typeof s.planner_reason === 'string' && (s.planner_reason as string).length > 10)).toBe(true);
+      expect(v.scenes.find((s) => s.purpose === 'cta')).toMatchObject({ production_mode: 'STRICT_COMPOSITE' });
+      const gen = v.scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION');
+      expect(gen.length).toBeGreaterThan(0);
+      expect(gen.every((s) => Number(s.estimate_micros) > 0)).toBe(true);
+      expect(v.scenes.filter((s) => s.production_mode !== 'GENERATIVE_INTERACTION').every((s) => Number(s.estimate_micros) === 0)).toBe(true);
       const [p] = await tx`select state from projects where id = ${projectId}`;
       expect(p!.state).toBe('STORYBOARD_READY');
       const q = await currentQuote(tx);

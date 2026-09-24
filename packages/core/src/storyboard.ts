@@ -17,7 +17,7 @@ import { CUTOUT_TASK, generateImage, routedLines } from './model-gateway';
 import { issueTasteOffer } from './offers';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
-import { sceneClaimIds } from './production';
+import { planStoryboardScenes, sceneClaimIds } from './production';
 import { transition } from './projects';
 import { qaClaims } from './qa';
 import { ensureVariantImage, referenceAssetIds } from './sku-variants';
@@ -106,15 +106,18 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     await withTenant(ws, (tx) => step(tx, ws, storyboardId, 'plan', 'active'));
     const { plan, promptVersion, model, brandBrainVersionId } = await planStoryboard({ ctx, token: auth.token, skuId, projectId, conceptId });
     await withTenant(ws, async (tx) => {
+      // The Production Planner decides each scene's medium (and records why) before any frame is drawn (§23).
+      const planned = await planStoryboardScenes(tx, ws, skuId, plan.scenes, { cutoutWillBeTried: segment });
       await step(tx, ws, storyboardId, 'plan', 'done', `${plan.scenes.length} scenes · 15 seconds`);
       await step(tx, ws, storyboardId, 'claims', 'done', 'Every line uses approved or neutral wording');
       await tx`update storyboards set hook_text = ${plan.hook}, cta_text = ${plan.cta}, total_ms = 15000, brand_brain_version_id = ${brandBrainVersionId} where id = ${storyboardId}`;
       await tx`delete from scenes where storyboard_id = ${storyboardId}`;
       for (const [i, s] of plan.scenes.entries()) {
+        const p = planned[i]!;
         await tx`insert into scenes (workspace_id, storyboard_id, position, purpose, duration_ms, visual_plan, product_behavior,
-                   spoken_line, overlay_text, production_mode, shows_human_skin)
+                   spoken_line, overlay_text, production_mode, shows_human_skin, planner_reason, estimate_micros)
                  values (${ws}, ${storyboardId}, ${i}, ${s.purpose}, ${s.durationMs}, ${s.visualPlan}, ${s.productBehavior},
-                   ${s.spokenLine}, ${s.overlayText}, ${s.productionMode}, ${s.showsHumanSkin})`;
+                   ${s.spokenLine}, ${s.overlayText}, ${p.mode}, ${s.showsHumanSkin}, ${p.reason}, ${p.estimateMicros})`;
       }
       await tx`update storyboards set status = 'generating' where id = ${storyboardId}`;
       await step(tx, ws, storyboardId, 'frames', 'active');
