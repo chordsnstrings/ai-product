@@ -296,8 +296,11 @@ export async function computeRisk(tx: Tx, workspaceId: string): Promise<RiskSign
   if (act?.last && Date.now() - new Date(act.last as string).getTime() > 7 * DAY) out.push({ indicator: 'idle_7d', evidence: { lastActivity: act.last } });
 
   const [pne] = await tx`select count(*)::int as n, min(p.updated_at) as since from projects p
-                         where p.workspace_id = ${ws} and p.state = 'COMPLETE' and p.kind in ('taste','standalone')
-                           and not exists (select 1 from events e where e.workspace_id = ${ws} and e.type = 'ASSET_EXPORTED' and e.subject_id = p.id)`;
+                         where p.workspace_id = ${ws} and p.state = 'COMPLETE' and p.kind in ('taste','standalone','creative_test')
+                           and not exists (select 1 from events e left join assets a on a.workspace_id = e.workspace_id and a.id = e.subject_id
+                                           where e.workspace_id = ${ws} and e.type = 'ASSET_EXPORTED'
+                                             -- The export event names its project; events from before it did resolve through the asset.
+                                             and coalesce(e.payload->>'projectId', a.lineage->>'projectId') = p.id::text)`;
   if (pne!.n > 0) out.push({ indicator: 'paid_no_export', evidence: { projects: pne!.n, since: pne!.since } });
 
   const [qa] = await tx`select count(*)::int as n, max(at) as last from events where workspace_id = ${ws} and type = 'QA_FAILED' and at > now() - interval '30 days'`;

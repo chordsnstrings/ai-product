@@ -19,6 +19,7 @@ export * from './canary';
 export * from './circuits';
 export * from './storage';
 export * from './assets';
+export * from './exports';
 export * from './uploads';
 export * from './workspaces';
 export * from './offers';
