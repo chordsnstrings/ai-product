@@ -31,3 +31,35 @@ export async function listSteps(tx: Tx, subjectId: string) {
   return tx`select step_key, label, status, detail, started_at, completed_at from progress_steps
             where subject_id = ${subjectId} order by position, started_at nulls last`;
 }
+
+// ───────────── Heartbeats (standard §39 "long-running jobs expose heartbeat/progress state") ─────────────
+
+/** A running production writes a heartbeat at least this often (stage boundaries, and every minute while polling). */
+export const HEARTBEAT_INTERVAL_MS = 60_000;
+/** No heartbeat for this long means the run is no longer alive (its lease has lapsed too). */
+export const HEARTBEAT_STALE_MS = 5 * 60_000;
+/** Each heartbeat keeps the run's reservation alive for at least this much longer. */
+export const HEARTBEAT_AUTH_EXTENSION_MINUTES = 30;
+
+/**
+ * Record that a job working on a project is alive, and keep its cost authorization from expiring under it: a
+ * production that legitimately runs past its reservation TTL (slow provider queues, repairs) must not have the
+ * sweeper release its reservation mid-run. Explicitly scoped by workspace (callable under any role).
+ */
+export async function heartbeat(tx: Tx, workspaceId: string, projectId: string, authorizationId: string | null = null): Promise<void> {
+  await tx`update projects set heartbeat_at = now() where id = ${projectId} and workspace_id = ${workspaceId}`;
+  if (authorizationId) {
+    await tx`update cost_authorizations set expires_at = greatest(expires_at, now() + make_interval(mins => ${HEARTBEAT_AUTH_EXTENSION_MINUTES}))
+             where id = ${authorizationId} and workspace_id = ${workspaceId} and status = 'active'`;
+  }
+}
+
+export type Liveness = { heartbeatAt: string | null; heartbeatAgeMs: number | null; state: 'working' | 'stalled' | 'idle' };
+
+/** "Still working" vs "stalled" for a job that should be running (the UI never guesses from elapsed time alone). */
+export function liveness(running: boolean, heartbeatAt: Date | string | null, now = Date.now()): Liveness {
+  const at = heartbeatAt ? new Date(heartbeatAt) : null;
+  const age = at ? Math.max(0, now - at.getTime()) : null;
+  if (!running) return { heartbeatAt: at?.toISOString() ?? null, heartbeatAgeMs: age, state: 'idle' };
+  return { heartbeatAt: at?.toISOString() ?? null, heartbeatAgeMs: age, state: age != null && age <= HEARTBEAT_STALE_MS ? 'working' : 'stalled' };
+}

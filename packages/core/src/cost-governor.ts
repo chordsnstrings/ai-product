@@ -5,6 +5,7 @@ import type { TenantContext } from './context';
 import { append, available, providerSpendSince, type LedgerUnit } from './ledger';
 import { estimate as priceEstimate, loadRates, type CostLine, type Estimate } from './rates';
 import { isFlagOn } from './flags';
+import { HEARTBEAT_STALE_MS } from './progress';
 import { setting } from './settings';
 
 /**
@@ -353,9 +354,12 @@ export async function recordProviderCost(
  * (plan 05 §2.3).
  */
 export async function sweepExpiredAuthorizations(tx: Tx): Promise<number> {
+  // A reservation whose job still sends heartbeats is in use (§39): never released under a running production.
   const rows = await tx`select a.id, a.workspace_id from cost_authorizations a
                         where a.status = 'active' and a.expires_at < now()
                           and not exists (select 1 from workspaces w where w.id = a.workspace_id and w.state = 'SUSPENDED')
+                          and not exists (select 1 from projects p where p.workspace_id = a.workspace_id and p.id = a.project_id
+                                          and p.heartbeat_at > now() - make_interval(secs => ${HEARTBEAT_STALE_MS / 1000}))
                         limit 500`;
   let n = 0;
   for (const r of rows) {

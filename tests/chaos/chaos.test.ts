@@ -8,7 +8,9 @@ import {
   authorize,
   available,
   generateStoryboard,
+  heartbeat,
   ingestBytes,
+  liveness,
   OUTAGE_MESSAGE,
   produceProject,
   selectConcept,
@@ -176,6 +178,66 @@ describe('crashed worker', () => {
       expect(await available(tx, 'taste')).toBe(0);
     });
   }, 240_000);
+});
+
+describe('long-running production (§39 heartbeat)', () => {
+  it('a run that outlives its reservation TTL keeps the reservation: the sweeper sees the heartbeat, the customer is charged once', async () => {
+    const { t, ctx, projectId } = await readyForProduction();
+    const mock = new MockVideo();
+    let swept: number | null = null;
+    // While the first render is in the provider queue, the reservation "expires" and the sweeper runs.
+    const slow: VideoProvider = {
+      name: 'byteplus',
+      submit: (req) => mock.submit(req),
+      poll: async (id) => {
+        if (swept === null) {
+          await ownerPool()`update cost_authorizations set expires_at = now() - interval '1 minute' where project_id = ${projectId}`;
+          swept = await withSystem((tx) => sweepExpiredAuthorizations(tx));
+          // The run's next heartbeat (every minute while polling) extends the reservation it still holds.
+          const [a] = await ownerPool()`select id from cost_authorizations where project_id = ${projectId} and status = 'active'`;
+          await withTenant(t.workspaceId, (tx) => heartbeat(tx, t.workspaceId, projectId, a!.id as string));
+        }
+        return mock.poll(id);
+      },
+      cancel: (id) => mock.cancel(id),
+    };
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: slow, tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    try {
+      expect(await produceProject(ctx, projectId)).toBe('complete');
+    } finally {
+      setProviders(undefined);
+    }
+    expect(swept).toBe(0); // the live run's reservation was not released under it
+    await withTenant(t.workspaceId, async (tx) => {
+      const [p] = await tx`select state, heartbeat_at > now() - interval '1 minute' as fresh from projects where id = ${projectId}`;
+      expect(p).toMatchObject({ state: 'COMPLETE', fresh: true });
+      const [a] = await tx`select status from cost_authorizations where project_id = ${projectId} and idempotency_key like 'produce:%'`;
+      expect(a!.status).toBe('settled');
+      const [n] = await tx`select count(*) filter (where type = 'CREDIT_RELEASED')::int as released, count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed from ledger_entries`;
+      expect(n).toMatchObject({ released: 0, consumed: 1 });
+    });
+  }, 240_000);
+
+  it('a heartbeat extends the reservation; without one a stale reservation is released', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const skuId = await makeSku(t.workspaceId);
+    const [p] = await ownerPool()`insert into projects (workspace_id, sku_id, kind, state, created_by) values (${t.workspaceId}, ${skuId}, 'creative_test', 'RENDERING', 'x') returning id`;
+    const auth = await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 1, idempotencyKey: 'hb-grant' });
+      return authorize(tx, ctx, { purpose: 'creative_test', projectId: p!.id as string, lines: [{ kind: 'media', outputs: 1 }], idempotencyKey: 'hb-1', entitlement: { unit: 'creative_test', amount: 1 }, ttlMinutes: 0 });
+    });
+    await withTenant(t.workspaceId, (tx) => heartbeat(tx, t.workspaceId, p!.id as string, auth.authorizationId));
+    const [a] = await ownerPool()`select expires_at > now() + interval '29 minutes' as extended from cost_authorizations where id = ${auth.authorizationId}`;
+    expect(a!.extended).toBe(true);
+    // The run dies: no heartbeat for longer than the stale window, and the reservation's TTL passes.
+    await ownerPool()`update projects set heartbeat_at = now() - interval '6 minutes' where id = ${p!.id}`;
+    await ownerPool()`update cost_authorizations set expires_at = now() - interval '1 minute' where id = ${auth.authorizationId}`;
+    expect(await withSystem((tx) => sweepExpiredAuthorizations(tx))).toBe(1);
+    expect(liveness(true, new Date(Date.now() - 6 * 60_000)).state).toBe('stalled');
+    expect(liveness(true, new Date(Date.now() - 20_000)).state).toBe('working');
+    expect(liveness(false, null).state).toBe('idle');
+  });
 });
 
 describe('webhook storm', () => {

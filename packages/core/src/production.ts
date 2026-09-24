@@ -19,7 +19,7 @@ import { isFlagOn } from './flags';
 import { append, type LedgerUnit } from './ledger';
 import { generateImage, generateVideo, lineFor, route, synthesizeVoice, type Route } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
-import { planSteps, step } from './progress';
+import { heartbeat as beat, planSteps, step } from './progress';
 import { getProject, IN_PRODUCTION, isTerminal, PATH, transition } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
@@ -379,7 +379,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
   const unit = (p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'>) ?? 'taste';
   const purpose: Purpose = unit === 'creative_test' ? 'creative_test' : unit;
-  const heartbeat = () => renewLease(ctx, projectId, runId);
+  // The run's liveness: renews its lease (or stops, LeaseLost), records projects.heartbeat_at for the progress
+  // view and keeps its reservation from expiring under it (§39).
+  let authorizationId: string | null = (p.authorization_id as string | null) ?? null;
+  const heartbeat = async () => {
+    await renewLease(ctx, projectId, runId);
+    await withTenant(ws, (tx) => beat(tx, ws, projectId, authorizationId));
+  };
   const voice: LogicalVoice = brand?.brain.voice ?? DEFAULT_VOICE;
   const names = [sku.name as string, brand?.name ?? null];
   const reusable = reusableRenders(scenes, versions);
@@ -438,8 +444,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await tx`update projects set authorization_id = ${a.authorizationId} where id = ${projectId}`;
       }
       await step(tx, ws, projectId, 'prepare', 'done', `${scenes.length} scenes planned`);
+      await beat(tx, ws, projectId, a.authorizationId);
       return { auth: a, routes, plan };
     }));
+    authorizationId = auth.authorizationId;
   } catch (e) {
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     if (e instanceof DomainError && (e.code === 'PAYMENT_REQUIRED' || e.code === 'GATE_BLOCKED')) {

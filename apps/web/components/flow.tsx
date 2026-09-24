@@ -468,10 +468,25 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
           {err ? <p className="ak-error">{err}</p> : null}
         </div>
       ) : (
-        <Ledger steps={v.productionSteps} />
+        <>
+          <Ledger steps={v.productionSteps} />
+          <Liveness live={v.project.liveness} />
+        </>
       )}
     </Shell>
   );
+}
+
+/** "Still working" vs "stalled", from the production run's heartbeat (standard §39). */
+export function Liveness({ live }: { live: View['project']['liveness'] }) {
+  if (live.state === 'stalled') {
+    return <Banner tone="warn">This is taking longer than it should. We’re checking on it — nothing is lost, and you won’t be charged twice.</Banner>;
+  }
+  if (live.state === 'working' && live.heartbeatAgeMs != null) {
+    const s = Math.round(live.heartbeatAgeMs / 1000);
+    return <p className="ak-small ak-muted" aria-live="off">Still working · last update {s < 5 ? 'just now' : `${s}s ago`}</p>;
+  }
+  return null;
 }
 
 /* ───────────── P10 · Delivery ───────────── */

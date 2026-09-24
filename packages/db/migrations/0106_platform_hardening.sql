@@ -53,3 +53,8 @@ alter table events add column refs jsonb not null default '{}';
 create index events_refs on events using gin (refs jsonb_path_ops);
 -- Commit order within a transaction: events of one transaction share `at` (now()), so replay orders by seq.
 alter table events add column seq bigint generated always as identity;
+
+-- ───────────── Job heartbeats (standard §39) ─────────────
+-- A running production records its liveness; each heartbeat also extends its reservation, and the sweeper never
+-- releases a reservation whose project heartbeat is recent.
+alter table projects add column heartbeat_at timestamptz;
