@@ -12,13 +12,48 @@ const usd = (micros: number) => `$${(micros / 1_000_000).toFixed(micros % 1_000_
 const LOW_FIDELITY = 0.6;
 const PRODUCING = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA'];
 
+/**
+ * The project view, live while `active` says so: server-sent events from /api/projects/:id/stream (plan 06 Phase 1
+ * #9), falling back to polling GET /api/projects/:id when the stream can't be used (no EventSource, a proxy that
+ * buffers, repeated failures). `refresh` re-reads at once (after the merchant changes something).
+ */
 function useProject(id: string, active: (v: View | null) => boolean) {
   const [live, setLive] = useState(true);
-  const poll = usePoll<View>(`/api/projects/${id}`, 1500, live);
+  const [streaming, setStreaming] = useState(true);
+  const [data, setData] = useState<View | null>(null);
+  // One read on mount and on refresh(); polls on its own only while the stream is off.
+  const poll = usePoll<View>(`/api/projects/${id}`, 1500, live && !streaming);
   useEffect(() => {
-    if (poll.data) setLive(active(poll.data));
-  }, [poll.data, active]);
-  return { ...poll, resume: () => setLive(true) };
+    if (poll.data) setData(poll.data);
+  }, [poll.data]);
+  useEffect(() => {
+    if (!live || !streaming) return;
+    if (typeof EventSource === 'undefined') {
+      setStreaming(false);
+      return;
+    }
+    let failures = 0;
+    const es = new EventSource(`/api/projects/${id}/stream`);
+    es.addEventListener('project', (e) => {
+      failures = 0;
+      setData(JSON.parse((e as MessageEvent<string>).data) as View);
+    });
+    const fallBack = () => {
+      es.close();
+      setStreaming(false);
+    };
+    es.addEventListener('failure', fallBack);
+    es.addEventListener('gone', fallBack);
+    es.onerror = () => {
+      // The browser retries on its own; three failures in a row (or a closed stream) and we poll instead.
+      if (++failures >= 3 || es.readyState === EventSource.CLOSED) fallBack();
+    };
+    return () => es.close();
+  }, [id, live, streaming]);
+  useEffect(() => {
+    if (data) setLive(active(data));
+  }, [data, active]);
+  return { data, error: data ? null : poll.error, refresh: poll.refresh, resume: () => setLive(true) };
 }
 
 function Shell({ step, children, title, sub }: { step: 1 | 2 | 3 | 4; children: React.ReactNode; title: string; sub?: React.ReactNode }) {

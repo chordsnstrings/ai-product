@@ -16,6 +16,24 @@ test('anonymous visitor to delivered ad', async ({ page }) => {
   await page.waitForURL(/\/start\/[0-9a-f-]{36}/);
   const projectId = page.url().split('/').pop()!;
 
+  // P3 cataloguing stream (plan 06 Phase 1 #9): server-sent events carrying the live project view.
+  const streamed = await page.evaluate(
+    (id) =>
+      new Promise<{ id: string; steps: number }>((resolve, reject) => {
+        const es = new EventSource(`/api/projects/${id}/stream`);
+        const t = setTimeout(() => (es.close(), reject(new Error('no stream event'))), 20_000);
+        es.addEventListener('project', (e) => {
+          clearTimeout(t);
+          es.close();
+          const v = JSON.parse((e as MessageEvent<string>).data) as { project: { id: string }; steps: unknown[] };
+          resolve({ id: v.project.id, steps: v.steps.length });
+        });
+      }),
+    projectId,
+  );
+  expect(streamed.id).toBe(projectId);
+  expect(streamed.steps).toBeGreaterThan(0);
+
   // P3/P4: real progress, then confirmation.
   await expect(page.getByText('Cataloguing your product').or(page.getByRole('link', { name: /show me 3 ad ideas/ }))).toBeVisible();
   const toConcepts = page.getByRole('link', { name: /show me 3 ad ideas/ });

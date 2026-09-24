@@ -232,3 +232,24 @@ async function storyboardBlock(tx: Tx, storyboardId: string) {
 }
 
 export type ProjectView = NonNullable<Awaited<ReturnType<typeof projectView>>>;
+
+/**
+ * A cheap fingerprint of everything the funnel view shows (plan 06 Phase 1 #9: the P3 stream follows real events):
+ * the project and SKU rows, every progress step of the SKU, project, storyboard and its scenes, the concepts, and the
+ * workspace's latest event. The stream rebuilds and sends the view only when it changes.
+ */
+export async function projectVersion(workspaceId: string, projectId: string): Promise<string | null> {
+  return withTenant(workspaceId, async (tx) => {
+    const [v] = await tx`
+      select p.state, p.state_version, p.updated_at, s.status as sku_status, s.updated_at as sku_updated,
+             (select coalesce(string_agg(ps.subject_id::text || ps.step_key || ':' || ps.status || ':' || coalesce(ps.detail, ''), '|' order by ps.subject_id, ps.step_key), '')
+                from progress_steps ps where ps.subject_id = any(array[p.sku_id, p.id, p.storyboard_id]::uuid[])
+                   or ps.subject_id in (select sc.id from scenes sc where sc.storyboard_id = p.storyboard_id)) as steps,
+             (select count(*)::int from concepts c where c.project_id = p.id) as concepts,
+             (select max(at) from events e where e.workspace_id = p.workspace_id) as last_event
+      from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
+    if (!v) return null;
+    const { createHash } = await import('node:crypto');
+    return createHash('sha1').update(JSON.stringify(v)).digest('hex').slice(0, 16);
+  });
+}
