@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { Tx } from '@arkiv/db';
 import { COST_LIMITS, DomainError, PLANS, type Micros, type PlanCode } from '@arkiv/shared';
 
@@ -24,6 +25,51 @@ export interface Estimate {
   lines: { line: CostLine; micros: Micros; rateVersion: string }[];
   totalMicros: Micros;
   rateVersions: Record<string, number>;
+}
+
+// ───────────── Rate table contract (plan 05 §9; what priceLine reads) ─────────────
+
+/** Canonical units, one per cost family; the seeds and the console editor use exactly these. */
+export const RATE_UNITS = ['per_million_tokens', 'per_image', 'per_second', 'per_million_chars', 'per_output'] as const;
+export type RateUnit = (typeof RATE_UNITS)[number];
+/** Providers a rate table can be for ('internal' is our own media pipeline). */
+export const RATE_PROVIDERS = ['anthropic', 'byteplus', 'minimax', 'internal'] as const;
+
+const micros = z.number().int('Rates are whole micros (1 USD = 1,000,000)').nonnegative().finite();
+/**
+ * The keys priceLine reads per family, in micros: LLM per million tokens, image per image, video per second by
+ * resolution, TTS per million characters, media per output. Extra numeric keys (reference prices) are kept.
+ */
+export const RATE_SCHEMAS: Record<RateUnit, z.ZodType<Record<string, number>>> = {
+  per_million_tokens: z.object({ input: micros, output: micros, cache_read: micros.optional() }).catchall(micros),
+  per_image: z.object({ image: micros }).catchall(micros),
+  per_second: z.object({ per_second_720p: micros, per_second_1080p: micros }).catchall(micros),
+  per_million_chars: z.object({ char_million: micros }).catchall(micros),
+  per_output: z.object({ transcode_storage_delivery: micros, buffer: micros }).catchall(micros),
+};
+
+/** A template draft for a unit, for the editor to prefill when there is no version to start from. */
+export const RATE_TEMPLATES: Record<RateUnit, Record<string, number>> = {
+  per_million_tokens: { input: 0, output: 0, cache_read: 0 },
+  per_image: { image: 0 },
+  per_second: { per_second_720p: 0, per_second_1080p: 0 },
+  per_million_chars: { char_million: 0 },
+  per_output: { transcode_storage_delivery: 0, buffer: 0 },
+};
+
+/**
+ * Check a proposed rate table against what the Cost Governor will read (plan 05 §9): a canonical unit, the keys
+ * for its family, whole non-negative micros, and 'internal' only for the media pipeline. Throws INVALID with what
+ * to fix; returns the rates as they will be stored.
+ */
+export function validateRateTable(t: { provider: string; model: string; unit: string; rates: unknown }): Record<string, number> {
+  if (!(RATE_PROVIDERS as readonly string[]).includes(t.provider)) throw new DomainError('INVALID', `Unknown provider ${t.provider}.`);
+  if (!(RATE_UNITS as readonly string[]).includes(t.unit)) throw new DomainError('INVALID', `Unit must be one of ${RATE_UNITS.join(', ')}.`);
+  if ((t.provider === 'internal') !== (t.unit === 'per_output')) throw new DomainError('INVALID', 'The internal media pipeline is priced per output, and only it is.');
+  if (t.provider === 'internal' && t.model !== 'media-pipeline') throw new DomainError('INVALID', 'The internal provider has one model: media-pipeline.');
+  const r = RATE_SCHEMAS[t.unit as RateUnit].safeParse(t.rates);
+  if (!r.success) throw new DomainError('INVALID', `Rates for ${t.unit}: ${r.error.issues.map((i) => `${i.path.join('.') || 'rates'} ${i.message}`).join('; ')}.`);
+  return r.data;
 }
 
 export async function loadRates(tx: Tx): Promise<Map<string, RateTable>> {
@@ -81,6 +127,8 @@ export function estimate(rates: Map<string, RateTable>, lines: CostLine[]): Esti
   const out: Estimate = { lines: [], totalMicros: 0, rateVersions: {} };
   for (const line of lines) {
     const p = priceLine(rates, line);
+    // A table missing a key its family needs would price at NaN: refuse rather than authorise an unknown amount.
+    if (!Number.isFinite(p.micros)) throw new DomainError('UNAVAILABLE', `Rate table ${p.key}@${p.version} can’t price a ${line.kind} line (missing or invalid rate).`);
     out.lines.push({ line, micros: p.micros, rateVersion: `${p.key}@${p.version}` });
     out.totalMicros += p.micros;
     out.rateVersions[p.key] = p.version;

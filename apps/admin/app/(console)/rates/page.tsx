@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { diffRates, loadRates, planMarginImpact, rateViability, type RateTable } from '@arkiv/core';
+import { diffRates, loadRates, planMarginImpact, RATE_PROVIDERS, RATE_TEMPLATES, RATE_UNITS, rateViability, type RateTable } from '@arkiv/core';
 import { estimateStandardTest } from '@/lib/estimates';
 import { ActButton, ActForm } from '@/components/act';
 import { dt, money, Mono, Page, pct, Section, Table } from '@/components/ui';
@@ -47,7 +47,11 @@ export default async function Rates() {
             <div key={r.id as string} className="ak-panel" style={{ marginBottom: 12 }}>
               <div className="ak-between" style={{ flexWrap: 'wrap', gap: 8 }}>
                 <p style={{ margin: 0 }}><strong>{r.provider as string}/{r.model as string} v{r.version as number}</strong> · effective {dt(r.effective_from)} {live ? <>· replaces v{live.version}</> : <>· new model</>}</p>
-                <ActButton small action="rates.publish" payload={{ rateTableId: r.id }} reason="Why (link to provider notice)">🔐 Publish (four-eyes)</ActButton>
+                {Number.isFinite(after) ? (
+                  <ActButton small action="rates.publish" payload={{ rateTableId: r.id }} reason="Why (link to provider notice)">🔐 Publish (four-eyes)</ActButton>
+                ) : (
+                  <span className="ak-small" style={{ color: 'var(--risk)' }}>Can’t publish: the standard test can’t be priced with this draft</span>
+                )}
               </div>
               <Table head={['Rate', 'In effect', 'Draft', 'Change']} rows={diff.map((x) => [<Mono key="k">{x.key}</Mono>, x.before ?? '—', x.after ?? 'removed', x.change === null ? (x.before === null ? 'new' : 'removed') : `${x.change > 0 ? '+' : ''}${pct(x.change)}`])} empty="No rate changes against the version in effect." />
               <p className="ak-small" style={{ marginTop: 8 }}>
@@ -59,13 +63,28 @@ export default async function Rates() {
           ))}
         </Section>
       ) : null}
-      <Section title="Propose a new version">
+      <Section title="New version of a model in effect">
+        <p className="ak-small ak-muted">Starts from the rates in effect, in micros (1 USD = 1,000,000). The keys are the ones the Cost Governor reads for the unit.</p>
+        {[...inEffect.values()].map((t) => (
+          <details key={`${t.provider}/${t.model}`} className="ak-panel" style={{ maxWidth: 560, marginBottom: 8 }}>
+            <summary><Mono>{t.provider}/{t.model}</Mono> · v{t.version} · {t.unit}</summary>
+            <ActForm action="rates.propose" submit="Create draft" extra={{ provider: t.provider, model: t.model, unit: t.unit }} fields={[
+              { name: 'rates', label: 'Rates (JSON, micros)', type: 'json', required: true, defaultValue: JSON.stringify(t.rates) },
+              { name: 'effectiveFrom', label: 'Effective from (your local time; empty = on approval)', type: 'datetime-local' },
+              { name: 'sourceUrl', label: 'Source URL' },
+              { name: 'notes', label: 'Notes', type: 'textarea' },
+            ]} />
+          </details>
+        ))}
+      </Section>
+      <Section title="Propose a new model">
+        <p className="ak-small ak-muted">Rate keys per unit: {RATE_UNITS.map((u) => `${u} → ${JSON.stringify(RATE_TEMPLATES[u])}`).join(' · ')}</p>
         <div className="ak-panel" style={{ maxWidth: 560 }}>
           <ActForm action="rates.propose" submit="Create draft" fields={[
-            { name: 'provider', label: 'Provider', type: 'select', options: ['anthropic', 'byteplus', 'minimax', 'internal'] },
+            { name: 'provider', label: 'Provider', type: 'select', options: [...RATE_PROVIDERS] },
             { name: 'model', label: 'Model (logical name)', required: true, placeholder: 'dreamina-seedance-2-5' },
-            { name: 'unit', label: 'Unit', type: 'select', options: ['per_million_tokens', 'per_image', 'per_second', 'per_million_chars', 'per_output'] },
-            { name: 'rates', label: 'Rates (JSON, micros)', type: 'json', required: true, defaultValue: '{"input": 0, "output": 0}' },
+            { name: 'unit', label: 'Unit', type: 'select', options: [...RATE_UNITS] },
+            { name: 'rates', label: 'Rates (JSON, micros)', type: 'json', required: true, defaultValue: JSON.stringify(RATE_TEMPLATES.per_million_tokens) },
             { name: 'effectiveFrom', label: 'Effective from (your local time; empty = on approval)', type: 'datetime-local' },
             { name: 'sourceUrl', label: 'Source URL' },
             { name: 'notes', label: 'Notes', type: 'textarea' },

@@ -10,7 +10,7 @@ import { restoreFromScheduledPurge, RISK_PLAYBOOKS } from './lifecycle';
 import { enqueue, queuePolicy, Queues } from './outbox';
 import { retryProduction } from './production';
 import { transition } from './projects';
-import { estimate as priceEstimate, loadRates, retireSupersededRates, type CostLine, type Estimate } from './rates';
+import { estimate as priceEstimate, loadRates, retireSupersededRates, validateRateTable, type CostLine, type Estimate } from './rates';
 import { planQuota, setting } from './settings';
 import { randomToken, sha256, transitionWorkspace } from './workspaces';
 
@@ -318,6 +318,8 @@ registerExecutor('rates.publish', async (p, { approver }) =>
   withAdmin(async (tx) => {
     const [r] = await tx`select * from provider_rate_tables where id = ${p.rateTableId as string} for update`;
     if (!r || r.status !== 'draft') throw new DomainError('CONFLICT', 'Only drafts can be published');
+    // Checked again at publish: a draft stored before validation existed, or edited in the database, can't go live.
+    validateRateTable({ provider: r.provider as string, model: r.model as string, unit: r.unit as string, rates: r.rates });
     // The current version stays published until the new one takes effect (plan 05 §9 "effective at a time"):
     // the Cost Governor always prices with the latest published version in effect, and superseded versions are
     // retired once their successor is live (here for immediate publishes, and by the hourly sweep).

@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withSystem } from '@arkiv/db';
 import { truncateAll } from '@arkiv/db/testing';
 import { COST_LIMITS, newId, type StaffRole } from '@arkiv/shared';
 import { decideApproval, requestOrExecute, type Staff } from './admin';
-import { diffRates, loadRates, planMarginImpact, priceLine, rateViability, retireSupersededRates } from './rates';
+import { diffRates, estimate, loadRates, planMarginImpact, priceLine, RATE_TEMPLATES, RATE_UNITS, rateViability, retireSupersededRates, validateRateTable, type CostLine } from './rates';
 
 async function staff(roles: StaffRole[], name: string): Promise<Staff> {
   const id = newId();
@@ -69,5 +69,42 @@ describe('rate table publish (plan 05 §9)', () => {
     expect(rateViability(COST_LIMITS.CREATIVE_TEST_CEILING).ok).toBe(true);
     expect(rateViability(COST_LIMITS.CREATIVE_TEST_CEILING + 1).alert).toMatch(/pausing generative scenes/);
     expect(rateViability(Number.NaN).ok).toBe(false);
+  });
+
+  it('only accepts tables the Cost Governor can read, and every published seed passes', async () => {
+    for (const t of await ownerPool()`select provider, model, unit, rates from provider_rate_tables where status = 'published'`) {
+      expect(() => validateRateTable(t as never), `${t.provider}/${t.model}`).not.toThrow();
+    }
+    for (const u of RATE_UNITS) expect(() => validateRateTable({ provider: u === 'per_output' ? 'internal' : 'byteplus', model: u === 'per_output' ? 'media-pipeline' : 'm', unit: u, rates: RATE_TEMPLATES[u] })).not.toThrow();
+    // USD instead of micros, the old editor's default keys for a video model, a made-up unit, a missing internal rate.
+    expect(() => validateRateTable({ provider: 'anthropic', model: 'x', unit: 'per_million_tokens', rates: { input: 4.0, output: 20.5 } })).toThrow(/whole micros/);
+    expect(() => validateRateTable({ provider: 'byteplus', model: 'dreamina-seedance-2-5', unit: 'per_second', rates: { input: 0, output: 0 } })).toThrow(/per_second_720p/);
+    expect(() => validateRateTable({ provider: 'minimax', model: 'x', unit: 'per_kchar', rates: { char_million: 1 } })).toThrow(/Unit must be/);
+    expect(() => validateRateTable({ provider: 'internal', model: 'media-pipeline', unit: 'per_output', rates: { buffer: 1 } })).toThrow(/transcode_storage_delivery/);
+    expect(() => validateRateTable({ provider: 'anthropic', model: 'x', unit: 'per_output', rates: RATE_TEMPLATES.per_output })).toThrow(/internal media pipeline/);
+    expect(() => validateRateTable({ provider: 'byteplus', model: 'x', unit: 'per_image', rates: { image: -1 } })).toThrow(/INVALID|image/);
+  });
+
+  it('publishing re-validates, and a table that can’t price a line is refused rather than priced at NaN', async () => {
+    const [bad] = await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                                    values ('byteplus', 'dreamina-seedance-2-5', 2, 'per_second', '{"input": 0, "output": 0}', now(), 'draft') returning id`;
+    await expect(publish(bad!.id as string)).rejects.toMatchObject({ code: 'INVALID' });
+    expect((await ownerPool()`select status from provider_rate_tables where id = ${bad!.id}`)[0]!.status).toBe('draft');
+
+    // A valid draft, published through four-eyes, prices every kind of cost line.
+    await publish(await draft(new Date(Date.now() - 60_000)));
+    const rates = await withSystem((tx) => loadRates(tx));
+    const lines: CostLine[] = [
+      { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 10_000, outputTokens: 2_000 },
+      { kind: 'image', provider: 'byteplus', model: 'seedream-5-0-pro', images: 2 },
+      { kind: 'video', provider: 'byteplus', model: 'dreamina-seedance-2-5', seconds: 4, resolution: '720p' },
+      tts,
+      { kind: 'media', outputs: 3 },
+    ];
+    const e = estimate(rates, lines);
+    expect(e.lines.every((l) => Number.isFinite(l.micros) && l.micros > 0)).toBe(true);
+    expect(e.rateVersions['minimax/speech-2.8-hd']).toBe(2);
+    rates.set('byteplus/seedream-5-0-pro', { provider: 'byteplus', model: 'seedream-5-0-pro', version: 9, unit: 'per_image', rates: { input: 1 } });
+    expect(() => estimate(rates, [lines[1]!])).toThrow(/can’t price a image line/);
   });
 });
