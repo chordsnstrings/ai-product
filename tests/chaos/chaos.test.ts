@@ -112,6 +112,42 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
   }, 240_000);
 });
 
+describe('open circuit (§44 "optional approved fallback provider"; plan 05 §10)', () => {
+  const restoreRoutes = () =>
+    ownerPool()`update model_routes set circuit_open = false, circuit_until = null, fallback_task = case when task = 'tts.voiceover' then fallback_task else null end`.then(() =>
+      ownerPool()`delete from model_routes where task = 'video.scene_fallback'`,
+    );
+
+  it('fails renders over to the approved route; with none, the order queues with the announced ETA', async () => {
+    try {
+      await ownerPool()`insert into model_routes (task, provider, model, prompt_version)
+                        select 'video.scene_fallback', provider, model, prompt_version from model_routes where task = 'video.scene'`;
+      await ownerPool()`update model_routes set fallback_task = 'video.scene_fallback' where task = 'video.scene'`;
+      await ownerPool()`update model_routes set circuit_open = true, circuit_until = now() + interval '40 minutes' where task = 'video.scene'`;
+      const a = await readyForProduction();
+      expect(await produceProject(a.ctx, a.projectId)).toBe('complete');
+      const jobs = await ownerPool()`select distinct task from provider_jobs where workspace_id = ${a.t.workspaceId} and task like 'video.%'`;
+      expect(jobs.map((j) => j.task)).toEqual(['video.scene_fallback']);
+
+      // Without an approved fallback the order waits, its credit held, telling the customer when it's expected back.
+      await ownerPool()`update model_routes set fallback_task = null where task = 'video.scene'`;
+      const b = await readyForProduction();
+      expect(await produceProject(b.ctx, b.projectId)).toBe('paused');
+      await withTenant(b.t.workspaceId, async (tx) => {
+        const q = await outageStatus(tx, b.t.workspaceId, b.projectId);
+        expect(q).toMatchObject({ message: 'Queued: our video partner is busy. Your place is held.', etaKind: 'reopen' });
+        const [r] = await tx`select circuit_until from model_routes where task = 'video.scene'`;
+        expect(q!.etaAt).toBe(new Date(r!.circuit_until as string).toISOString());
+        expect(await available(tx, 'taste')).toBe(0); // held, not released
+      });
+      // Nothing was dispatched on the open route.
+      expect((await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${b.t.workspaceId} and task like 'video.%'`)[0]!.n).toBe(0);
+    } finally {
+      await restoreRoutes();
+    }
+  }, 240_000);
+});
+
 describe('duplicate job delivery', () => {
   it('two workers picking up the same production job produce and charge once', async () => {
     const { t, ctx, projectId } = await readyForProduction();

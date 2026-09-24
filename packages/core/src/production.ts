@@ -17,7 +17,7 @@ import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, type LedgerUnit } from './ledger';
-import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route } from './model-gateway';
+import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
@@ -75,24 +75,31 @@ export const genSeconds = (durationMs: number) => Math.max(MIN_GEN_SECONDS, Math
 
 type RouteModel = Pick<Route, 'provider' | 'model'>;
 
-/** The routes a production is priced on — the same routes (canary arm included) the gateway dispatches on. */
+/**
+ * The routes a production is priced on — the same routes (canary arm included) the gateway dispatches on. Each is
+ * the task's route followed by its approved fallback route, if any: either may serve the call (§44), so a
+ * planned call is priced at the dearer of the two.
+ */
 export interface ProductionRoutes {
-  video: RouteModel;
-  /** The voice-over route and its approved fallback: the voice line covers whichever is dearer. */
+  video: RouteModel[];
   tts: RouteModel[];
-  qa: RouteModel;
-  plate: RouteModel | null;
+  qa: RouteModel[];
+  plate: RouteModel[] | null;
+}
+
+/** A task's route and its approved fallback route (when one is set). */
+async function withFallbackRoute(tx: Tx, task: string, workspaceId: string | null): Promise<RouteModel[]> {
+  const r = await route(tx, task, workspaceId);
+  return r.fallbackTask ? [r, await route(tx, r.fallbackTask, workspaceId)] : [r];
 }
 
 export async function productionRoutes(tx: Tx, workspaceId: string | null): Promise<ProductionRoutes> {
-  const tts = await route(tx, 'tts.voiceover', workspaceId);
-  const fallback = tts.fallbackTask ? await route(tx, tts.fallbackTask, workspaceId) : null;
   const [plate] = await tx`select 1 from model_routes where task = ${PLATE_TASK}`;
   return {
-    video: await route(tx, 'video.scene', workspaceId),
-    tts: fallback ? [tts, fallback] : [tts],
-    qa: await route(tx, 'qa.fidelity', workspaceId),
-    plate: plate ? await route(tx, PLATE_TASK, workspaceId) : null,
+    video: await withFallbackRoute(tx, 'video.scene', workspaceId),
+    tts: await withFallbackRoute(tx, 'tts.voiceover', workspaceId),
+    qa: await withFallbackRoute(tx, 'qa.fidelity', workspaceId),
+    plate: plate ? await withFallbackRoute(tx, PLATE_TASK, workspaceId) : null,
   };
 }
 
@@ -111,19 +118,24 @@ export interface ProductionPlan {
 }
 
 /**
- * A voice line priced at the dearer of the voice route and its approved fallback, since either may serve the
- * call (§34 Voice). A route without a published rate can't be used, so it doesn't shape the line.
+ * A line priced at the dearer of a route and its approved fallback, since either may serve the call (§34 Voice,
+ * §44 provider outage). A route without a published rate can't be used, so it doesn't shape the line.
  */
-export function voiceLine(routes: Pick<ProductionRoutes, 'tts'>, rates: Map<string, RateTable>, chars: number): CostLine {
-  const priced = routes.tts.flatMap((r) => {
-    const line = lineFor(r, { kind: 'tts', chars });
+export function dearerLine(routes: readonly RouteModel[], rates: Map<string, RateTable>, units: TaskUnits): CostLine {
+  const priced = routes.flatMap((r) => {
+    const line = lineFor(r, units);
     try {
       return [{ line, micros: priceLine(rates, line).micros }];
     } catch {
       return [];
     }
   });
-  return priced.sort((a, b) => b.micros - a.micros)[0]?.line ?? lineFor(routes.tts[0]!, { kind: 'tts', chars });
+  return priced.sort((a, b) => b.micros - a.micros)[0]?.line ?? lineFor(routes[0]!, units);
+}
+
+/** A voice line at the dearer of the voice route and its approved fallback (§34 Voice). */
+export function voiceLine(routes: Pick<ProductionRoutes, 'tts'>, rates: Map<string, RateTable>, chars: number): CostLine {
+  return dearerLine(routes.tts, rates, { kind: 'tts', chars });
 }
 
 /**
@@ -146,7 +158,7 @@ export function planProduction(
   const generative = scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION' && !opts.reuse?.has(s.id)).map((s) => s.id);
   const seconds = Object.fromEntries(generative.map((id) => [id, genSeconds(scenes.find((x) => x.id === id)!.duration_ms)])) as Record<string, number>;
   const secs = Object.values(seconds);
-  const renders: CostLine[] = generative.map((id) => lineFor(routes.video, { kind: 'video', seconds: seconds[id]!, resolution: '720p' }));
+  const renders: CostLine[] = generative.map((id) => dearerLine(routes.video, rates, { kind: 'video', seconds: seconds[id]!, resolution: '720p' }));
   const pooled = secs.reduce((a, b) => a + b, 0) * COST_LIMITS.RETRY_RESERVE_FRACTION;
   const longest = secs.length ? Math.max(...secs) : 0;
   const shortest = secs.length ? Math.min(...secs) : 0;
@@ -157,13 +169,13 @@ export function planProduction(
     const inspections = 2 * generative.length + repairs + plates + 1;
     return [
       ...voice(),
-      lineFor(routes.qa, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
-      ...(plates && routes.plate ? [lineFor(routes.plate, { kind: 'image', images: plates })] : []),
+      dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
+      ...(plates && routes.plate ? [dearerLine(routes.plate, rates, { kind: 'image', images: plates })] : []),
       { kind: 'media', outputs: 1 },
     ];
   };
   if (longest > pooled + 1e-6) {
-    const topUp = lineFor(routes.video, { kind: 'video', seconds: longest - pooled, resolution: '720p', retryReserve: false });
+    const topUp = dearerLine(routes.video, rates, { kind: 'video', seconds: longest - pooled, resolution: '720p', retryReserve: false });
     const lines = [...renders, topUp, ...tail(longest)];
     if (opts.ceilingMicros == null || estimate(rates, lines).totalMicros <= opts.ceilingMicros) return { lines, generative, seconds, reserveSeconds: longest };
   }
@@ -573,11 +585,22 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const seconds = genSeconds(s.duration_ms);
         // Attempts already spent on these inputs by an interrupted run count: a resume never grants an extra repair.
         let attempt = versions.filter((v) => v.scene_id === s.id && v.kind === 'render' && v.status === 'qa_failed' && sameInputs(v, s)).length;
+        // A render already paid for with these inputs but never judged — the run crashed between the render and its
+        // QA, or the reconciler collected it from the provider — is judged instead of paying for another (§35, §39).
+        let pending = await withTenant(ws, async (tx) => {
+          const [a] = await tx`select a.id, a.lineage, j.id as job_id, j.prompt_version, j.model_version_returned
+                               from assets a left join provider_jobs j on j.workspace_id = a.workspace_id and j.id::text = a.lineage->>'providerJobId'
+                               where a.workspace_id = ${ws} and a.kind = 'scene_render' and a.lineage->>'sceneId' = ${s.id} and a.lineage->>'inputHash' = ${hashes.get(s.id)!}
+                                 and not exists (select 1 from scene_versions v where v.workspace_id = a.workspace_id and v.scene_id = ${s.id} and v.asset_id = a.id)
+                               order by a.created_at desc limit 1`;
+          return a?.job_id ? { assetId: a.id as string, jobId: a.job_id as string, promptVersion: a.prompt_version as string, modelVersion: (a.model_version_returned as string | null) ?? undefined, bytes: await assetBytes(tx, a.id as string) } : null;
+        });
         let why = 'repeated QA failure';
         let lastFailure = 'QA';
         while (attempt < 2) {
           attempt++;
-          if (attempt === 2) {
+          // A pending render was paid for already (its repair, if it is one, drew on the reserve then).
+          if (attempt === 2 && !pending) {
             if (!reserve.take(seconds)) {
               why = 'repair reserve used';
               break;
@@ -588,23 +611,39 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             });
           }
           try {
-            const vid = await generateVideo({
-              ctx,
-              token: auth.token,
-              task: 'video.scene',
-              subject: { type: 'scene', id: s.id },
-              prompt: `${s.visual_plan as string}. ${s.product_behavior ?? ''} Keep the product identical to the reference image. Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`,
-              references: [`data:image/png;base64,${frame.bytes.toString('base64')}`],
-              seconds,
-              resolution: '720p',
-              ratio: '9:16',
-              mockLabel: `${s.purpose} · ${(s.visual_plan as string).slice(0, 60)}`,
-              heartbeat,
-            });
+            let vid: { bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string };
+            let assetId: string;
+            if (pending) {
+              ({ assetId, ...vid } = pending);
+              pending = null;
+            } else {
+              vid = await generateVideo({
+                ctx,
+                token: auth.token,
+                task: 'video.scene',
+                subject: { type: 'scene', id: s.id },
+                inputRefs: { skuId: sku.id, sceneId: s.id, inputHash: hashes.get(s.id), frameVersionId: s.current_version_id ?? null, attempt },
+                prompt: `${s.visual_plan as string}. ${s.product_behavior ?? ''} Keep the product identical to the reference image. Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`,
+                references: [`data:image/png;base64,${frame.bytes.toString('base64')}`],
+                seconds,
+                resolution: '720p',
+                ratio: '9:16',
+                mockLabel: `${s.purpose} · ${(s.visual_plan as string).slice(0, 60)}`,
+                heartbeat,
+              });
+              // Paid output goes to our own storage before anything else can fail (§39 "every output is copied to
+              // owned object storage immediately"): a crash or a QA error never loses a render we paid for.
+              const v0 = vid;
+              assetId = await withTenant(ws, async (tx) => {
+                const a = await saveAsset(tx, ws, { bytes: v0.bytes, mime: 'video/mp4', kind: 'scene_render', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, attempt, providerJobId: v0.jobId, model: v0.modelVersion, promptVersion: v0.promptVersion, inputHash: hashes.get(s.id) } });
+                await tx`update provider_jobs set output_asset_id = ${a.id} where id = ${v0.jobId} and workspace_id = ${ws}`;
+                return a.id;
+              });
+            }
             const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, videoBytes: vid.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt });
             const ok = res.every((c) => c.pass);
             const saved = await withTenant(ws, async (tx) => {
-              const a = await saveAsset(tx, ws, { bytes: vid.bytes, mime: 'video/mp4', kind: 'scene_render', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, attempt, providerJobId: vid.jobId, model: vid.modelVersion, promptVersion: vid.promptVersion, inputHash: hashes.get(s.id) } });
+              const a = { id: assetId };
               const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
               const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage)
                                      values (${ws}, ${s.id}, ${v!.v}, 'render', ${a.id}, 'generative', ${vid.modelVersion ?? null}, ${vid.promptVersion},

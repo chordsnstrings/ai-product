@@ -15,6 +15,7 @@ import {
   evaluateCanaries,
   expiredFlagAlerts,
   expireOffers,
+  reconcileProviderJobs,
   refreshRiskFlags,
   retireSupersededRates,
   sweepExpiredAuthorizations,
@@ -188,6 +189,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return sent;
     },
   },
+  // §39: provider jobs a crashed worker left dispatched are reconciled by provider request id — finished renders
+  // are copied into our storage and booked at their real cost; abandoned calls are closed (never under-counted).
+  'reconcile-provider-jobs': { cron: '*/5 * * * *', run: async () => { const r = await reconcileProviderJobs(); return r.succeeded + r.failed ? r : 0; } },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
   'sync-integrations': {

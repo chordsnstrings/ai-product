@@ -46,6 +46,8 @@ export class MockLlm implements LlmProvider {
       },
       model: req.model,
       modelVersion: `${req.model}-mock`,
+      providerRequestId: `mock-msg-${randomUUID()}`,
+      rawMeta: { mock: true, stopReason: 'end_turn' },
     };
   }
 }
@@ -59,7 +61,7 @@ export class MockImage implements ImageProvider {
     if (fail) throw new ProviderError(this.name, `injected ${fail}`, fail !== 'invalid', fail as never);
     const seed = parseInt(createHash('sha1').update(req.prompt).digest('hex').slice(0, 4), 16);
     const bytes = await placeholderFrame(req.mockLabel ?? req.prompt.slice(0, 80), aspectFor(req.width, req.height), seed);
-    return { bytes, mime: 'image/png', model: req.model, modelVersion: `${req.model}-mock`, providerRequestId: `mock-img-${randomUUID()}` };
+    return { bytes, mime: 'image/png', model: req.model, modelVersion: `${req.model}-mock`, providerRequestId: `mock-img-${randomUUID()}`, rawMeta: { mock: true } };
   }
 }
 
@@ -108,7 +110,7 @@ export class MockVideo implements VideoProvider {
       return readFile(out);
     });
     t.status = 'succeeded';
-    return { status: 'succeeded', bytes: t.bytes, modelVersion: `${t.req.model}-mock`, outputSeconds: t.req.seconds };
+    return { status: 'succeeded', bytes: t.bytes, modelVersion: `${t.req.model}-mock`, outputSeconds: t.req.seconds, rawMeta: { mock: true, status: 'succeeded', seconds: t.req.seconds } };
   }
 
   async cancel(id: string): Promise<void> {

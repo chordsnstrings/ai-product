@@ -120,6 +120,35 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
     }
   });
 
+  it('route.fallback approves only a priced route of the same kind, never itself or a loop; route.pin is audited', async () => {
+    const eng = await staff(['ENGINEERING']);
+    const support = await staff(['SUPPORT']);
+    try {
+      await ownerPool()`insert into model_routes (task, provider, model, prompt_version) select 'video.scene_backup', provider, model, prompt_version from model_routes where task = 'video.scene'`;
+      await ownerPool()`insert into model_routes (task, provider, model, prompt_version) values ('video.scene_unpriced', 'byteplus', 'no-rate-model', 'scene@1.0.0')`;
+      expect(() => assertStaff(support, ACTIONS['route.fallback'].perm)).toThrow();
+      await expect(act(eng, 'route.fallback', { task: 'video.scene', fallbackTask: 'video.scene', reason: 'self fallback' })).rejects.toThrow(/own fallback/);
+      await expect(act(eng, 'route.fallback', { task: 'video.scene', fallbackTask: 'qa.fidelity', reason: 'wrong kind' })).rejects.toThrow(/different kind/);
+      await expect(act(eng, 'route.fallback', { task: 'video.scene', fallbackTask: 'video.scene_unpriced', reason: 'no rate yet' })).rejects.toThrow(/No published rate/);
+      const r = await act(eng, 'route.fallback', { task: 'video.scene', fallbackTask: 'video.scene_backup', reason: 'second region' });
+      expect(r.message).toMatch(/fails over to video\.scene_backup/);
+      expect((await ownerPool()`select fallback_task from model_routes where task = 'video.scene'`)[0]!.fallback_task).toBe('video.scene_backup');
+      await expect(act(eng, 'route.fallback', { task: 'video.scene_backup', fallbackTask: 'video.scene', reason: 'loop back' })).rejects.toThrow(/already falls back/);
+      await act(eng, 'route.fallback', { task: 'video.scene', fallbackTask: '', reason: 'remove' });
+      expect((await ownerPool()`select fallback_task from model_routes where task = 'video.scene'`)[0]!.fallback_task).toBeNull();
+
+      await act(eng, 'route.pin', { task: 'video.scene', version: 'seed-2026-09-01', reason: 'freeze output' });
+      expect((await ownerPool()`select pinned_model_version from model_routes where task = 'video.scene'`)[0]!.pinned_model_version).toBe('seed-2026-09-01');
+      await act(eng, 'route.pin', { task: 'video.scene', version: '', reason: 'unpin' });
+      expect((await ownerPool()`select pinned_model_version from model_routes where task = 'video.scene'`)[0]!.pinned_model_version).toBeNull();
+      const audits = await ownerPool()`select action from admin_audit_log where target_id = 'video.scene' order by at, id`;
+      expect(audits.map((a) => a.action)).toEqual(['route.fallback', 'route.fallback', 'route.pin', 'route.pin']);
+    } finally {
+      await ownerPool()`update model_routes set fallback_task = null, pinned_model_version = null where task in ('video.scene', 'video.scene_backup')`;
+      await ownerPool()`delete from model_routes where task in ('video.scene_backup', 'video.scene_unpriced')`;
+    }
+  });
+
   it('route.circuit can announce when an open circuit is expected back; closing clears it (plan 03 P9 ETA)', async () => {
     const ops = await staff(['OPS']);
     try {

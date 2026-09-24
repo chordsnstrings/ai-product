@@ -90,3 +90,56 @@ export async function evaluateCanaries(tx: Tx): Promise<{ task: string; why: str
   }
   return rolled;
 }
+
+/** One rollout arm of one route over a window: what the console compares canary against stable on (plan 05 §11). */
+export interface ArmRow {
+  task: string;
+  arm: 'stable' | 'canary';
+  calls: number;
+  failed: number;
+  errorRate: number;
+  p50LatencyMs: number | null;
+  /** Mean actual cost of a successful call on this arm. */
+  avgCostMicros: number | null;
+  /** First-attempt scene QA and claim blocks on the projects the arm touched (null when not measured). */
+  qaFirst: number | null;
+  qaFirstPassed: number | null;
+  projects: number | null;
+  blocked: number | null;
+}
+
+/**
+ * Canary vs stable per route (standard §41 "roll them out gradually"; plan 05 §11): calls, error rate, latency and
+ * cost per arm, plus live QA first-pass and claim-block rates for routes with a canary — the numbers the automatic
+ * rollback judges on. Platform aggregates only (system/admin role); no tenant content is read.
+ */
+export async function armComparison(tx: Tx, days = 7): Promise<ArmRow[]> {
+  const since = new Date(Date.now() - days * 86400_000);
+  const rows = await tx`
+    select task, arm, count(*)::int as calls, count(*) filter (where status = 'failed')::int as failed,
+           percentile_cont(0.5) within group (order by latency_ms) as p50,
+           avg(actual_micros) filter (where status = 'succeeded') as avg_cost
+    from provider_jobs where arm is not null and created_at >= ${since}
+    group by task, arm order by task, arm`;
+  const out: ArmRow[] = rows.map((r) => ({
+    task: r.task as string,
+    arm: r.arm as 'stable' | 'canary',
+    calls: Number(r.calls),
+    failed: Number(r.failed),
+    errorRate: Number(r.calls) ? Number(r.failed) / Number(r.calls) : 0,
+    p50LatencyMs: r.p50 == null ? null : Math.round(Number(r.p50)),
+    avgCostMicros: r.avg_cost == null ? null : Math.round(Number(r.avg_cost)),
+    qaFirst: null,
+    qaFirstPassed: null,
+    projects: null,
+    blocked: null,
+  }));
+  for (const task of new Set(out.filter((r) => r.arm === 'canary').map((r) => r.task))) {
+    const stats = await armStats(tx, task, since);
+    for (const r of out.filter((x) => x.task === task)) {
+      const s = stats[r.arm];
+      Object.assign(r, { qaFirst: s.qaFirst, qaFirstPassed: s.qaFirstPassed, projects: s.projects, blocked: s.blocked });
+    }
+  }
+  return out;
+}

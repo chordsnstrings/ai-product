@@ -1,20 +1,24 @@
 import { createHash } from 'node:crypto';
-import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, providerVoiceId, sleep, type LogicalVoice, type Micros } from '@arkiv/shared';
+import { withSystem, withTenant, type Tx } from '@arkiv/db';
+import { DomainError, providerVoiceId, sleep, SUBJECT_REF, type EventRefs, type EventSubjectType, type LogicalVoice, type Micros } from '@arkiv/shared';
 import {
   providers,
   ProviderError,
   type ContentPart,
   type ImageResult,
   type LlmJsonResult,
+  type ProviderSet,
+  type RawMeta,
   type TtsProvider,
   type TtsResult,
   type VideoPoll,
 } from '@arkiv/providers';
 import { logger } from '@arkiv/shared/log';
 import type { z } from 'zod';
+import { saveAsset } from './assets';
 import type { TenantContext } from './context';
 import { consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
+import { emit } from './events';
 import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
 import { actualCost, loadRates, priceLine, type CostLine } from './rates';
@@ -35,6 +39,12 @@ export interface Route {
   arm: 'stable' | 'canary';
   /** Staff-approved fallback route used when this one fails or its circuit is open (§44, plan 05 §10). */
   fallbackTask: string | null;
+  /**
+   * The exact provider model version staff pinned for this route (§48 "pin where possible"): sent on the wire
+   * instead of the configured id, so a silent provider upgrade can't change output. Applies to the stable arm and
+   * to a canary that keeps the stable model; a canary on another model is never pinned to this one's version.
+   */
+  pinnedVersion: string | null;
 }
 
 /** A route's canary arm, written by the console's route.update (plan 05 §11: 5% → 25% → 100%). */
@@ -51,7 +61,7 @@ export function canaryBucket(task: string, workspaceId: string): number {
 }
 
 export async function route(tx: Tx, task: string, workspaceId?: string | null): Promise<Route> {
-  const [r] = await tx`select task, provider, model, prompt_version, circuit_open, canary, fallback_task from model_routes where task = ${task}`;
+  const [r] = await tx`select task, provider, model, prompt_version, circuit_open, canary, fallback_task, pinned_model_version from model_routes where task = ${task}`;
   if (!r) throw new DomainError('UNAVAILABLE', `No model route for ${task}`);
   const canary = r.canary as Canary | null;
   const inCanary = !!canary && !!workspaceId && Number(canary.pct) > 0 && canaryBucket(task, workspaceId) < Number(canary.pct);
@@ -63,6 +73,7 @@ export async function route(tx: Tx, task: string, workspaceId?: string | null): 
     circuitOpen: r.circuit_open,
     arm: inCanary ? 'canary' : 'stable',
     fallbackTask: (r.fallback_task as string | null) ?? null,
+    pinnedVersion: !inCanary || !canary!.model || canary!.model === r.model ? ((r.pinned_model_version as string | null) || null) : null,
   };
 }
 
@@ -117,12 +128,30 @@ interface CallMeta {
   inputRefs?: Record<string, unknown>;
 }
 
+/** The wire model a route is called with: its pinned provider version when staff pinned one, else the configured id. */
+const wireModelFor = (r: Route, p: ProviderSet) => r.pinnedVersion ?? p.wireModel(r.model);
+
+/** Refs to a provider job's subject (scene, SKU, variant…), so its events join the object they worked on (§36). */
+function subjectRefs(subject: CallMeta['subject']): EventRefs {
+  const key = subject ? SUBJECT_REF[subject.type as EventSubjectType] : undefined;
+  return key && subject ? { [key]: subject.id } : {};
+}
+
+interface Started {
+  route: Route;
+  line: CostLine;
+  jobId: string;
+  authorizationId: string;
+  projectId: string | null;
+  expected: Micros;
+}
+
 /**
  * Open a provider call: resolve the route (and its canary arm), refuse open circuits and killed providers
- * (plan 05 §20 kill.provider.*, and kill.renders for renders), price the call with the routed model and debit the
- * authorization.
+ * (plan 05 §20 kill.provider.*, and kill.renders for renders), price the call with the routed model, debit the
+ * authorization and record the job (PROVIDER_JOB_CREATED, standard §37).
  */
-async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFingerprint: unknown) {
+async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFingerprint: unknown): Promise<Started> {
   return withTenant(meta.ctx.workspaceId, async (tx) => {
     const r = await route(tx, meta.task, meta.ctx.workspaceId);
     // Customer-safe messages: the route and provider travel in `details` (and the job log), never in the text.
@@ -140,37 +169,71 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
     const auth = await consumeAuthorization(tx, meta.token, expected);
     const [job] = await tx`
       insert into provider_jobs (workspace_id, project_id, subject_type, subject_id, provider, task, model, prompt_version,
-        request_hash, input_refs, status, authorization_id, estimate_micros, arm)
+        request_hash, input_refs, status, authorization_id, estimate_micros, arm, raw_meta)
       values (${meta.ctx.workspaceId}, ${auth.projectId}, ${meta.subject?.type ?? null}, ${meta.subject?.id ?? null},
         ${r.provider}, ${meta.task}, ${r.model}, ${r.promptVersion}, ${hashRequest(requestFingerprint)},
-        ${tx.json((meta.inputRefs ?? {}) as never)}, 'dispatched', ${auth.authorizationId}, ${expected}, ${r.arm})
+        ${tx.json((meta.inputRefs ?? {}) as never)}, 'dispatched', ${auth.authorizationId}, ${expected}, ${r.arm},
+        ${tx.json({ planned: costLine } as never)})
       returning id`;
-    return { route: r, line: costLine, jobId: job!.id as string, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
+    const jobId = job!.id as string;
+    await emit(
+      tx,
+      meta.ctx,
+      'PROVIDER_JOB_CREATED',
+      { type: 'provider_job', id: jobId },
+      { task: meta.task, provider: r.provider, model: r.model, promptVersion: r.promptVersion, arm: r.arm, estimateMicros: expected },
+      { authorizationId: auth.authorizationId, projectId: auth.projectId, ...subjectRefs(meta.subject) },
+    );
+    return { route: r, line: costLine, jobId, authorizationId: auth.authorizationId, projectId: auth.projectId, expected };
   });
 }
 
 const gatewayLog = logger('gateway');
 
-async function finish(
-  meta: CallMeta,
-  started: { jobId: string; authorizationId: string; projectId: string | null; expected: Micros },
-  outcome: { ok: true; actualLine: CostLine; modelVersion?: string; providerRequestId?: string; output?: unknown; latencyMs: number; outputAssetId?: string } | { ok: false; error: string; latencyMs: number; billedLine?: CostLine },
-) {
-  await withTenant(meta.ctx.workspaceId, async (tx) => {
+/** What kind of failure closed a job (ProviderError kind, DomainError code), for events and reconciliation. */
+export function errorKind(e: unknown): string {
+  if (e instanceof ProviderError) return e.kind;
+  if (e instanceof DomainError) return e.code.toLowerCase();
+  return 'error';
+}
+
+type Outcome =
+  | { ok: true; actualLine?: CostLine; actualMicros?: Micros; modelVersion?: string; providerRequestId?: string | null; output?: unknown; latencyMs: number | null; outputAssetId?: string; rawMeta?: RawMeta; wireModel?: string }
+  | { ok: false; error: string; errorKind: string; latencyMs: number | null; billedLine?: CostLine; actualMicros?: Micros; providerRequestId?: string | null; rawMeta?: RawMeta; wireModel?: string };
+
+/**
+ * Close a provider job exactly once (standard §39: duplicate callbacks and late finishes are expected): the job
+ * moves from `dispatched` to succeeded/failed, the unused estimate goes back to the authorization, the actual
+ * cost is booked, raw response metadata is kept, and PROVIDER_JOB_SUCCEEDED / PROVIDER_JOB_FAILED is emitted.
+ * A second close of the same job (the reconciler got there first, or the other way round) changes nothing.
+ */
+async function finish(meta: Pick<CallMeta, 'ctx' | 'task' | 'subject'>, started: Pick<Started, 'jobId' | 'authorizationId' | 'projectId' | 'expected'>, outcome: Outcome): Promise<boolean> {
+  return withTenant(meta.ctx.workspaceId, async (tx) => {
     const rates = await loadRates(tx);
     const line = outcome.ok ? outcome.actualLine : outcome.billedLine;
-    const actual = line ? actualCost(rates, line) : 0;
-    await creditBack(tx, started.authorizationId, started.expected - actual);
-    await tx`
+    const actual = outcome.actualMicros ?? (line ? actualCost(rates, line) : 0);
+    const raw = outcome.rawMeta || outcome.wireModel ? { ...(outcome.rawMeta ?? {}), ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}) } : null;
+    const [closed] = await tx`
       update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual},
         latency_ms = ${outcome.latencyMs}, completed_at = now(),
         model_version_returned = ${outcome.ok ? (outcome.modelVersion ?? null) : null},
-        provider_request_id = coalesce(provider_request_id, ${outcome.ok ? (outcome.providerRequestId ?? null) : null}),
+        provider_request_id = coalesce(provider_request_id, ${outcome.providerRequestId ?? null}),
         error = ${outcome.ok ? null : outcome.error},
         output = ${outcome.ok && outcome.output !== undefined ? tx.json(outcome.output as never) : null},
-        output_asset_id = ${outcome.ok ? (outcome.outputAssetId ?? null) : null}
-      where id = ${started.jobId}`;
+        output_asset_id = ${outcome.ok ? (outcome.outputAssetId ?? null) : null},
+        raw_meta = coalesce(raw_meta, '{}'::jsonb) || coalesce(${raw ? tx.json(raw as never) : null}::jsonb, '{}'::jsonb)
+      where id = ${started.jobId} and workspace_id = ${meta.ctx.workspaceId} and status = 'dispatched'
+      returning provider_request_id`;
+    if (!closed) return false;
+    await creditBack(tx, started.authorizationId, started.expected - actual);
     if (actual > 0) await recordProviderCost(tx, meta.ctx, started.jobId, actual, started.projectId, started.authorizationId);
+    const refs = { authorizationId: started.authorizationId, projectId: started.projectId, ...subjectRefs(meta.subject) };
+    const requestId = (closed.provider_request_id as string | null) ?? null;
+    if (outcome.ok) {
+      await emit(tx, meta.ctx, 'PROVIDER_JOB_SUCCEEDED', { type: 'provider_job', id: started.jobId }, { task: meta.task, latencyMs: outcome.latencyMs, actualMicros: actual, providerRequestId: requestId, modelVersion: outcome.modelVersion ?? null }, refs);
+    } else {
+      await emit(tx, meta.ctx, 'PROVIDER_JOB_FAILED', { type: 'provider_job', id: started.jobId }, { task: meta.task, latencyMs: outcome.latencyMs, actualMicros: actual, providerRequestId: requestId, errorKind: outcome.errorKind }, refs);
+    }
     // One line per provider call, joined to its workspace, project, subject and request (§34, §41).
     const entry = {
       workspaceId: meta.ctx.workspaceId,
@@ -183,7 +246,8 @@ async function finish(
       actualMicros: actual,
     };
     if (outcome.ok) gatewayLog.info('provider call succeeded', entry);
-    else gatewayLog.warn('provider call failed', { ...entry, error: outcome.error.slice(0, 300) });
+    else gatewayLog.warn('provider call failed', { ...entry, errorKind: outcome.errorKind, error: outcome.error.slice(0, 300) });
+    return true;
   });
 }
 
@@ -202,6 +266,47 @@ async function withTransientRetry<T>(fn: () => Promise<T>, attempts = 3): Promis
   throw last;
 }
 
+/**
+ * Outage-class failures an approved fallback route may answer (§44 "optional approved fallback provider"; plan
+ * 05 §10 "when open, the Production Planner uses the approved fallback or queues"): an open circuit, a provider
+ * switched off, or a provider error that isn't about the content (after the gateway's own transient retries).
+ * Content problems (moderation, refusal, invalid input) and the global renders switch never fail over.
+ */
+export function fallbackEligible(e: unknown): boolean {
+  if (e instanceof ProviderError) return e.kind === 'server' || e.kind === 'timeout' || e.kind === 'rate_limit' || e.kind === 'auth';
+  if (e instanceof DomainError && e.code === 'UNAVAILABLE') {
+    const d = e.details as { circuitOpen?: string; killSwitch?: string } | undefined;
+    return !!d?.circuitOpen || (!!d?.killSwitch && d.killSwitch !== 'renders');
+  }
+  return false;
+}
+
+/**
+ * Run a call on its route, and — when the route fails outage-class and staff approved a fallback route that the
+ * same adapter can serve — once more on the fallback route: its own provider job, rate line, wire model and
+ * prompt version (§41). A fallback that can't take the call (its own circuit is open, or the authorization can't
+ * fund its price) leaves the primary's failure as the answer, so the caller pauses/queues as before.
+ */
+async function withRouteFallback<T>(meta: CallMeta, adapter: { name: string }, call: (m: CallMeta) => Promise<T>): Promise<T> {
+  try {
+    return await call(meta);
+  } catch (primaryErr) {
+    if (!fallbackEligible(primaryErr)) throw primaryErr;
+    const fb = await withTenant(meta.ctx.workspaceId, async (tx) => {
+      const r = await route(tx, meta.task, meta.ctx.workspaceId);
+      return r.fallbackTask ? route(tx, r.fallbackTask, meta.ctx.workspaceId) : null;
+    });
+    if (!fb || fb.provider !== adapter.name) throw primaryErr;
+    gatewayLog.warn('provider call failing over', { workspaceId: meta.ctx.workspaceId, task: meta.task, fallbackTask: fb.task, errorKind: errorKind(primaryErr) });
+    try {
+      return await call({ ...meta, task: fb.task });
+    } catch (fallbackErr) {
+      if (fallbackErr instanceof DomainError && (fallbackErr.code === 'UNAVAILABLE' || fallbackErr.code === 'FORBIDDEN')) throw primaryErr;
+      throw fallbackErr;
+    }
+  }
+}
+
 export interface LlmCall<T> extends CallMeta {
   system: string;
   content: ContentPart[];
@@ -211,20 +316,25 @@ export interface LlmCall<T> extends CallMeta {
   maxTokens?: number;
 }
 
-export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string }> {
+export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string; task: string }> {
+  const p = await providers();
+  return withRouteFallback(call, p.llm, (m) => llmOnce({ ...call, task: m.task }, p));
+}
+
+async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string; task: string }> {
   const approxIn = Math.ceil((call.system.length + call.content.reduce((n, c) => n + (c.type === 'image' ? 6000 : c.text.length), 0)) / 4);
   const maxTokens = call.maxTokens ?? 8000;
-  const p = await providers();
   const started = await begin(call, (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn, outputTokens: maxTokens }), {
     task: call.task,
     content: call.content.map((c) => (c.type === 'image' ? { type: 'image', len: c.base64.length } : c)),
   });
+  const wire = wireModelFor(started.route, p);
   const t0 = Date.now();
   try {
     const res = await withTransientRetry(() =>
       p.llm.json({
         task: call.task,
-        model: p.wireModel(started.route.model),
+        model: wire,
         system: call.system,
         content: call.content,
         schema: call.schema,
@@ -237,12 +347,15 @@ export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & {
       ok: true,
       actualLine: lineFor(started.route, { kind: 'llm', inputTokens: res.usage.inputTokens, outputTokens: res.usage.outputTokens, cachedTokens: res.usage.cachedTokens }),
       modelVersion: res.modelVersion,
+      providerRequestId: res.providerRequestId ?? null,
+      rawMeta: res.rawMeta,
+      wireModel: wire,
       output: res.data,
       latencyMs: Date.now() - t0,
     });
-    return { ...res, jobId: started.jobId, promptVersion: started.route.promptVersion };
+    return { ...res, jobId: started.jobId, promptVersion: started.route.promptVersion, task: call.task };
   } catch (e) {
-    await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
+    await finish(call, started, { ok: false, error: (e as Error).message, errorKind: errorKind(e), latencyMs: Date.now() - t0, wireModel: wire });
     throw e;
   }
 }
@@ -255,18 +368,21 @@ export interface ImageCall extends CallMeta {
   mockLabel?: string;
 }
 
-export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string }> {
+export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
   const p = await providers();
+  return withRouteFallback(call, p.image, (m) => imageOnce({ ...call, task: m.task }, p));
+}
+
+async function imageOnce(call: ImageCall, p: ProviderSet): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
   const started = await begin(call, (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: call.references.length });
+  const wire = wireModelFor(started.route, p);
   const t0 = Date.now();
   try {
-    const r = await withTransientRetry(() =>
-      p.image.generate({ model: p.wireModel(started.route.model), prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }),
-    );
-    await finish(call, started, { ok: true, actualLine: started.line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
-    return { ...r, jobId: started.jobId, promptVersion: started.route.promptVersion };
+    const r = await withTransientRetry(() => p.image.generate({ model: wire, prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }));
+    await finish(call, started, { ok: true, actualLine: started.line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, rawMeta: r.rawMeta, wireModel: wire, latencyMs: Date.now() - t0 });
+    return { ...r, jobId: started.jobId, promptVersion: started.route.promptVersion, task: call.task };
   } catch (e) {
-    await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
+    await finish(call, started, { ok: false, error: (e as Error).message, errorKind: errorKind(e), latencyMs: Date.now() - t0, wireModel: wire });
     throw e;
   }
 }
@@ -286,17 +402,25 @@ export interface VideoCall extends CallMeta {
 
 /**
  * Submit + poll to completion. Duplicate submissions are prevented by the caller's scene-version idempotency;
- * slow queues are waited on truthfully rather than resubmitted (§48 "very long provider queue").
+ * slow queues are waited on truthfully rather than resubmitted (§48 "very long provider queue"). A job whose
+ * worker dies while waiting stays `dispatched` with its provider request id, and the reconciler collects it.
+ * A heartbeat that throws (the run lost its lease, or the production was cancelled) cancels the provider task.
  */
-export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string }> {
+export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
   const p = await providers();
+  return withRouteFallback(call, p.video, (m) => videoOnce({ ...call, task: m.task }, p));
+}
+
+async function videoOnce(call: VideoCall, p: ProviderSet): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
   const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
   const line = started.line;
+  const wire = wireModelFor(started.route, p);
   const t0 = Date.now();
   let requestId: string | null = null;
+  let lastMeta: RawMeta | undefined;
   try {
     ({ providerRequestId: requestId } = await withTransientRetry(() =>
-      p.video.submit({ model: p.wireModel(started.route.model), prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel }),
+      p.video.submit({ model: wire, prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel }),
     ));
     await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId} where id = ${started.jobId}`);
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
@@ -305,9 +429,16 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
     for (;;) {
       if (call.heartbeat && Date.now() - beat > 60_000) {
         beat = Date.now();
-        await call.heartbeat();
+        try {
+          await call.heartbeat();
+        } catch (e) {
+          // The run stopped (lease lost or production cancelled): don't leave the provider rendering for nobody.
+          await p.video.cancel(requestId).catch(() => {});
+          throw e;
+        }
       }
       res = await withTransientRetry(() => p.video.poll(requestId!));
+      lastMeta = res.rawMeta ?? lastMeta;
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
       if (Date.now() > deadline) {
         await p.video.cancel(requestId).catch(() => {});
@@ -324,11 +455,13 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
       actualLine: { ...line, seconds: res.outputSeconds ?? call.seconds } as CostLine,
       modelVersion: res.modelVersion,
       providerRequestId: requestId,
+      rawMeta: res.rawMeta,
+      wireModel: wire,
       latencyMs: Date.now() - t0,
     });
-    return { bytes: res.bytes, jobId: started.jobId, modelVersion: res.modelVersion, promptVersion: started.route.promptVersion };
+    return { bytes: res.bytes, jobId: started.jobId, modelVersion: res.modelVersion, promptVersion: started.route.promptVersion, task: call.task };
   } catch (e) {
-    await finish(call, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
+    await finish(call, started, { ok: false, error: (e as Error).message, errorKind: errorKind(e), latencyMs: Date.now() - t0, providerRequestId: requestId, rawMeta: lastMeta, wireModel: wire });
     throw e;
   }
 }
@@ -350,21 +483,22 @@ async function ttsCall(call: TtsCall, task: string, adapter: TtsProvider | null)
   const p = await providers();
   const meta: CallMeta = { ...call, task };
   const started = await begin(meta, (rt) => lineFor(rt, { kind: 'tts', chars: call.text.length }), { text: call.text, voice: call.voice, speed: call.speed ?? 1 });
+  const wire = wireModelFor(started.route, p);
   const t0 = Date.now();
   try {
-    const r = await withTransientRetry(() => adapter.synthesize({ model: p.wireModel(started.route.model), text: call.text, voice, speed: call.speed }));
-    await finish(meta, started, { ok: true, actualLine: lineFor(started.route, { kind: 'tts', chars: r.chars }), modelVersion: r.model, providerRequestId: r.providerRequestId, latencyMs: Date.now() - t0 });
+    const r = await withTransientRetry(() => adapter.synthesize({ model: wire, text: call.text, voice, speed: call.speed }));
+    await finish(meta, started, { ok: true, actualLine: lineFor(started.route, { kind: 'tts', chars: r.chars }), modelVersion: r.model, providerRequestId: r.providerRequestId, rawMeta: r.rawMeta, wireModel: wire, latencyMs: Date.now() - t0 });
     return { ...r, jobId: started.jobId, task, provider: started.route.provider };
   } catch (e) {
-    await finish(meta, started, { ok: false, error: (e as Error).message, latencyMs: Date.now() - t0 });
+    await finish(meta, started, { ok: false, error: (e as Error).message, errorKind: errorKind(e), latencyMs: Date.now() - t0, wireModel: wire });
     throw e;
   }
 }
 
 const noVoice = (e: unknown) => e instanceof DomainError && !!(e.details as { noVoice?: string } | undefined)?.noVoice;
 
-/** Failures the approved fallback may answer: the primary provider erred, is switched off, circuit-broken or voiceless. */
-const fallbackEligible = (e: unknown) => e instanceof ProviderError || (e instanceof DomainError && e.code === 'UNAVAILABLE');
+/** Failures the approved voice fallback may answer: the primary provider erred, is switched off, circuit-broken or voiceless. */
+const voiceFallbackEligible = (e: unknown) => e instanceof ProviderError || (e instanceof DomainError && e.code === 'UNAVAILABLE');
 
 /**
  * Voice-over with the route's approved fallback (MiniMax primary → BytePlus Seed Speech, §34 Voice). Each route is
@@ -379,7 +513,7 @@ export async function synthesizeVoice(call: TtsCall): Promise<VoiceResult> {
   try {
     return await ttsCall(call, call.task, p.tts);
   } catch (primaryErr) {
-    if (!primary.fallbackTask || !fallbackEligible(primaryErr)) throw primaryErr;
+    if (!primary.fallbackTask || !voiceFallbackEligible(primaryErr)) throw primaryErr;
     try {
       return await ttsCall(call, primary.fallbackTask, p.ttsFallback);
     } catch (fallbackErr) {
@@ -389,4 +523,96 @@ export async function synthesizeVoice(call: TtsCall): Promise<VoiceResult> {
       throw primaryErr;
     }
   }
+}
+
+// ───────────── Reconciliation of provider jobs left open (standard §39) ─────────────
+
+/** A render still dispatched after this long has lost its worker; the reconciler polls the provider for it. */
+export const RECONCILE_RENDER_AFTER_MINUTES = 20;
+/** A synchronous call (LLM, image, voice) still dispatched after this long was abandoned mid-call. */
+export const RECONCILE_CALL_AFTER_MINUTES = 30;
+/** A render the provider still hasn't finished after this long is cancelled and closed. */
+export const RECONCILE_RENDER_GIVE_UP_HOURS = 6;
+
+export interface ReconcileResult {
+  succeeded: number;
+  failed: number;
+  pending: number;
+}
+
+/**
+ * Close provider jobs a crashed worker left `dispatched` (standard §39 "Provider request IDs, callbacks and raw
+ * provider response metadata are persisted"; "every output is copied to owned object storage immediately"):
+ *  - a render with a provider request id is polled; a finished one is copied into our storage (assets, linked
+ *    by output_asset_id and tagged with its scene and input hash so a resumed production can use it), booked
+ *    at its actual cost and closed; a failed one is closed unbilled; one still running is left, unless it has run
+ *    past RECONCILE_RENDER_GIVE_UP_HOURS, when it is cancelled;
+ *  - a render that never got a request id was never acknowledged: closed unbilled;
+ *  - an abandoned synchronous call can't be polled: it is closed as failed and booked at its estimate, because
+ *    the provider may well have billed it (COGS is never under-counted).
+ * Runs as the system role across tenants; every write is scoped to the job's own workspace.
+ */
+export async function reconcileProviderJobs(opts: { limit?: number } = {}): Promise<ReconcileResult> {
+  const out: ReconcileResult = { succeeded: 0, failed: 0, pending: 0 };
+  const rows = await withSystem((tx) => tx`
+    select id, workspace_id, task, provider, subject_type, subject_id, project_id, authorization_id, estimate_micros,
+           provider_request_id, input_refs, raw_meta, created_at, created_at < now() - make_interval(hours => ${RECONCILE_RENDER_GIVE_UP_HOURS}) as expired
+    from provider_jobs
+    where status = 'dispatched'
+      and ((task like 'video.%' and created_at < now() - make_interval(mins => ${RECONCILE_RENDER_AFTER_MINUTES}))
+        or (task not like 'video.%' and created_at < now() - make_interval(mins => ${RECONCILE_CALL_AFTER_MINUTES})))
+    order by created_at limit ${opts.limit ?? 100}`);
+  if (!rows.length) return out;
+  const p = await providers();
+  for (const j of rows) {
+    const ctx: TenantContext = { workspaceId: j.workspace_id as string, workspaceState: 'ACTIVE_PAID', role: 'OWNER', actor: { kind: 'system', id: 'provider-reconcile' }, requestId: 'provider-reconcile' };
+    const meta = { ctx, task: j.task as string, subject: j.subject_type ? { type: j.subject_type as string, id: j.subject_id as string } : null };
+    const started = { jobId: j.id as string, authorizationId: j.authorization_id as string, projectId: (j.project_id as string | null) ?? null, expected: Number(j.estimate_micros) };
+    const refs = (j.input_refs ?? {}) as { skuId?: string; inputHash?: string };
+    const planned = ((j.raw_meta ?? {}) as { planned?: CostLine }).planned;
+    const latencyMs = null;
+    if (!isRenderTask(j.task as string)) {
+      if (await finish(meta, started, { ok: false, error: 'abandoned: the worker was lost during the call', errorKind: 'abandoned', latencyMs, actualMicros: started.expected })) out.failed++;
+      continue;
+    }
+    if (!j.provider_request_id) {
+      if (await finish(meta, started, { ok: false, error: 'never acknowledged by the provider (worker lost before submit returned)', errorKind: 'abandoned', latencyMs })) out.failed++;
+      continue;
+    }
+    let res: VideoPoll | null = null;
+    try {
+      res = await p.video.poll(j.provider_request_id as string);
+    } catch {
+      out.pending++; // provider unreachable right now: try again next sweep
+      continue;
+    }
+    if (res.status === 'succeeded' && res.bytes) {
+      const bytes = res.bytes;
+      const asset = await withTenant(ctx.workspaceId, (tx) =>
+        saveAsset(tx, ctx.workspaceId, {
+          bytes,
+          mime: 'video/mp4',
+          kind: 'scene_render',
+          skuId: refs.skuId ?? null,
+          source: 'generated',
+          lineage: { sceneId: j.subject_type === 'scene' ? j.subject_id : null, providerJobId: j.id, inputHash: refs.inputHash ?? null, reconciled: true, model: res!.modelVersion ?? null },
+        }),
+      );
+      const line = planned && planned.kind === 'video' ? ({ ...planned, seconds: res.outputSeconds ?? planned.seconds } as CostLine) : undefined;
+      const ok = await finish(meta, started, { ok: true, actualLine: line, actualMicros: line ? undefined : started.expected, modelVersion: res.modelVersion, rawMeta: res.rawMeta, outputAssetId: asset.id, latencyMs });
+      if (ok) out.succeeded++;
+      continue;
+    }
+    if (res.status === 'failed' || res.status === 'cancelled') {
+      if (await finish(meta, started, { ok: false, error: res.error ?? `video ${res.status}`, errorKind: /moderation/i.test(res.error ?? '') ? 'moderation' : 'server', latencyMs, rawMeta: res.rawMeta })) out.failed++;
+      continue;
+    }
+    if (j.expired) {
+      await p.video.cancel(j.provider_request_id as string).catch(() => {});
+      if (await finish(meta, started, { ok: false, error: `still ${res.status} after ${RECONCILE_RENDER_GIVE_UP_HOURS}h; cancelled`, errorKind: 'timeout', latencyMs, rawMeta: res.rawMeta })) out.failed++;
+      continue;
+    }
+    out.pending++;
+  }
+  return out;
 }

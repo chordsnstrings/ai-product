@@ -65,7 +65,7 @@ export class SeedreamImage implements ImageProvider {
     this.ark = new ArkClient(apiKey, baseUrl);
   }
   async generate(req: ImageRequest): Promise<ImageResult> {
-    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string }>('images/generations', 'POST', {
+    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string; usage?: unknown; created?: number }>('images/generations', 'POST', {
       model: req.model,
       prompt: req.prompt,
       size: `${req.width}x${req.height}`,
@@ -82,6 +82,8 @@ export class SeedreamImage implements ImageProvider {
       model: req.model,
       modelVersion: r.model ?? req.model,
       providerRequestId: r.id ?? url.split('?')[0]!.split('/').pop()!,
+      // The signed download URL is not kept (it grants access); the output is already in our storage.
+      rawMeta: { id: r.id ?? null, model: r.model ?? null, created: r.created ?? null, usage: r.usage ?? null, images: r.data.length },
     };
   }
 }
@@ -106,13 +108,17 @@ export class SeedanceVideo implements VideoProvider {
       model?: string;
       content?: { video_url?: string };
       error?: { message?: string };
+      [k: string]: unknown;
     }>(`contents/generations/tasks/${encodeURIComponent(id)}`, 'GET');
+    // Everything the provider says about the task except the signed output URL (usage, seed, duration, timings).
+    const { content: _content, ...rawMeta } = r;
+    void _content;
     if (r.status === 'succeeded') {
       const url = r.content?.video_url;
-      if (!url) return { status: 'failed', error: 'succeeded without video_url' };
-      return { status: 'succeeded', bytes: await download(url), modelVersion: r.model };
+      if (!url) return { status: 'failed', error: 'succeeded without video_url', rawMeta };
+      return { status: 'succeeded', bytes: await download(url), modelVersion: r.model, rawMeta };
     }
-    return { status: r.status, error: r.error?.message };
+    return { status: r.status, error: r.error?.message, rawMeta };
   }
   async cancel(id: string): Promise<void> {
     await this.ark.call(`contents/generations/tasks/${encodeURIComponent(id)}`, 'DELETE');
@@ -156,6 +162,7 @@ export class MiniMaxTts implements TtsProvider {
       durationMs: j.extra_info?.audio_length ?? 0,
       model: req.model,
       providerRequestId: j.trace_id ?? `minimax-${Date.now()}`,
+      rawMeta: { traceId: j.trace_id ?? null, extraInfo: j.extra_info ?? null, baseResp: j.base_resp ?? null },
     };
   }
 }

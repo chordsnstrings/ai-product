@@ -14,3 +14,11 @@ alter table model_routes add column circuit_until timestamptz;
 -- toggles silently do nothing. A test keeps gateway tasks and routes 1:1.
 delete from model_routes where task in ('extract.claims', 'vision.fingerprint', 'qa.implied_claims')
   and not exists (select 1 from model_routes f where f.fallback_task = model_routes.task);
+
+-- ───────────── Provider jobs: raw response metadata and reconciliation (standard §39) ─────────────
+-- "Provider request IDs, callbacks and raw provider response metadata are persisted": the provider's own
+-- response envelope (request id, usage breakdown, status payload) without media bytes or signed URLs, plus the
+-- planned cost line the call was priced with, so a job a crashed worker left open can be closed at its real cost.
+alter table provider_jobs add column raw_meta jsonb;
+-- Jobs left `dispatched` by a crashed worker are found and reconciled by provider request id.
+create index provider_jobs_dispatched on provider_jobs (created_at) where status = 'dispatched';

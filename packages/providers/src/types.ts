@@ -25,11 +25,20 @@ export interface LlmJsonRequest<T> {
   mock: () => T;
 }
 
+/**
+ * The provider's own response envelope without the payload (standard §39 "raw provider response metadata is
+ * persisted"): request id, usage breakdown, stop reason, status. Never media bytes, signed URLs or tenant text.
+ */
+export type RawMeta = Record<string, unknown>;
+
 export interface LlmJsonResult<T> {
   data: T;
   usage: LlmUsage;
   model: string;
   modelVersion: string;
+  /** The provider's id for this request (e.g. the message id), for reconciliation and support. */
+  providerRequestId?: string;
+  rawMeta?: RawMeta;
 }
 
 export interface LlmProvider {
@@ -53,6 +62,7 @@ export interface ImageResult {
   model: string;
   modelVersion: string;
   providerRequestId: string;
+  rawMeta?: RawMeta;
 }
 export interface ImageProvider {
   readonly name: string;
@@ -76,6 +86,7 @@ export interface VideoPoll {
   error?: string;
   modelVersion?: string;
   outputSeconds?: number;
+  rawMeta?: RawMeta;
 }
 export interface VideoProvider {
   readonly name: string;
@@ -97,6 +108,7 @@ export interface TtsResult {
   durationMs: number;
   model: string;
   providerRequestId: string;
+  rawMeta?: RawMeta;
 }
 export interface TtsProvider {
   readonly name: string;

@@ -1,7 +1,8 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
+import { MockImage, MockLlm, MockTts, MockVideo, ProviderError, setProviders, type LlmJsonRequest, type LlmJsonResult } from '@arkiv/providers';
 import { COST_LIMITS } from '@arkiv/shared';
 import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, proposeClaim } from './claims';
@@ -335,6 +336,42 @@ describe('retry reuses accepted renders (§35: prod-08)', () => {
     const auths = await produceAuth(r.projectId);
     expect(auths).toHaveLength(2);
     expect(auths[1]!.estimate.lines.filter((l) => l.line.kind === 'video')).toHaveLength(0);
+  }, 240_000);
+});
+
+describe('paid output is kept before QA (standard §39: arch-17)', () => {
+  /** A QA inspector that errors (not an outage) the first time it judges the demonstration render. */
+  class QaErrorsOnce extends MockLlm {
+    thrown = false;
+    override async json<T>(req: LlmJsonRequest<T>): Promise<LlmJsonResult<T>> {
+      const text = req.content.map((c) => (c.type === 'image' ? '' : c.text)).join(' ');
+      if (req.task === 'qa.fidelity' && /hand releases/i.test(text) && !this.thrown) {
+        this.thrown = true;
+        throw new ProviderError('anthropic', 'malformed inspection', false, 'invalid');
+      }
+      return super.json(req);
+    }
+  }
+  afterEach(() => setProviders(undefined));
+
+  it('a render whose QA errored is stored, and a retry judges it instead of paying for another', async () => {
+    setProviders({ llm: new QaErrorsOnce(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const r = await storyboardReady();
+    await approve(r);
+    await expect(produceProject(r.ctx, r.projectId)).rejects.toThrow(/malformed inspection/);
+    expect((await ownerPool()`select state from projects where id = ${r.projectId}`)[0]!.state).toBe('PROVIDER_FAILED');
+    const renders = async () => ownerPool()`select id, output_asset_id from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene' order by created_at`;
+    const before = await renders();
+    expect(before).toHaveLength(1);
+    // The render was copied into our storage the moment it came back, before the inspection failed.
+    expect(before[0]!.output_asset_id).toBeTruthy();
+    const [kept] = await ownerPool()`select kind, lineage from assets where id = ${before[0]!.output_asset_id}`;
+    expect(kept).toMatchObject({ kind: 'scene_render', lineage: { providerJobId: before[0]!.id } });
+    await withTenant(r.t.workspaceId, (tx) => retryProduction(tx, r.ctx, r.projectId));
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    expect(await renders()).toHaveLength(1); // judged, not rendered again
+    const [v] = await ownerPool()`select status from scene_versions where workspace_id = ${r.t.workspaceId} and kind = 'render' and asset_id = ${before[0]!.output_asset_id}`;
+    expect(v!.status).toBe('accepted');
   }, 240_000);
 });
 
