@@ -22,10 +22,12 @@ import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoi
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
+import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
+import { fidelityThresholds } from './fidelity';
 
 export const PRODUCTION_STEPS = [
   { key: 'prepare', label: 'Preparing your product' },
@@ -423,6 +425,20 @@ export async function produceProject(ctx: TenantContext, projectId: string, opts
   }
 }
 
+/** Product reference photos sent with each render (the cut-out follows them). */
+const VIDEO_PRODUCT_VIEWS = 3;
+
+/**
+ * The render prompt: the scene, then how to use the references — the first image is the scene's storyboard frame,
+ * the others are the exact product, which must not change (label text, shape, closure, colours).
+ */
+export function videoPrompt(s: Record<string, unknown>, attempt: number, productRefs: number): string {
+  const product = productRefs
+    ? `The first reference image is the scene's storyboard frame; the other ${productRefs} reference images show the exact product. Keep the product identical to those product images: the same label text, shape, closure and colours.`
+    : 'Keep the product identical to the reference image.';
+  return `${s.visual_plan as string}. ${(s.product_behavior as string | null) ?? ''} ${product} Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`;
+}
+
 function platePrompt(s: SceneRow): string {
   return [
     `Empty product-photography set for a vertical 9:16 skincare ad. Setting: ${s.visual_plan as string}.`,
@@ -562,7 +578,18 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     });
     // Fidelity QA compares against the advertised variant's own image first (§42), then the fingerprint's photos.
     const refs = await withTenant(ws, async (tx) => Promise.all((await referenceAssetIds(tx, sku.id as string, projectId)).map((id) => assetBytes(tx, id))));
-    const fingerprint = { labelText: (fp?.label_text as string) ?? null, closure: (fp?.closure as string) ?? null, paletteDistanceMax: 70 };
+    // The Visual Fingerprint's own constraints (§16): its similarity thresholds, dominant colours and — when the
+    // cut-out keyed cleanly — the exact product the deterministic checks locate in each frame.
+    const fingerprint = {
+      labelText: (fp?.label_text as string) ?? null,
+      closure: (fp?.closure as string) ?? null,
+      dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
+      thresholds: fidelityThresholds(fp?.thresholds),
+      cutout: imagery.cutout?.keyed ? imagery.cutout.bytes : null,
+    };
+    // The product's own views for the video model (§23 "preserves product truth", §24 multimodal references): the
+    // fingerprint's reference photos and, when it keyed cleanly, the exact cut-out — never only a generated frame.
+    const productRefs = [...(await Promise.all(refs.slice(0, VIDEO_PRODUCT_VIEWS).map((b) => toDataUrl(b)))), ...(imagery.cutout?.keyed ? [`data:image/png;base64,${imagery.cutout.bytes.toString('base64')}`] : [])];
     if (imagery.cutout && !imagery.cutout.keyed) checks.push({ check: 'product_fidelity', pass: true, hard: false, detail: `Your product photo couldn’t be cut out cleanly, so product shots use the photo itself. ${CLEAN_PHOTO_TIP}` });
 
     await withTempDir(async (dir) => {
@@ -684,8 +711,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                 task: 'video.scene',
                 subject: { type: 'scene', id: s.id },
                 inputRefs: { skuId: sku.id, sceneId: s.id, inputHash: hashes.get(s.id), frameVersionId: s.current_version_id ?? null, attempt },
-                prompt: `${s.visual_plan as string}. ${s.product_behavior ?? ''} Keep the product identical to the reference image. Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`,
-                references: [`data:image/png;base64,${frame.bytes.toString('base64')}`],
+                prompt: videoPrompt(s, attempt, productRefs.length),
+                references: [`data:image/png;base64,${frame.bytes.toString('base64')}`, ...productRefs],
                 seconds,
                 resolution: '720p',
                 ratio: '9:16',

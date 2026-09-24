@@ -4,9 +4,10 @@ import sharp from 'sharp';
 import { probe, withTempDir, extractFrames, ASPECT_SIZE, type Aspect } from '@arkiv/media';
 import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
+import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, labelTextSimilarity, type FidelityThresholds } from './fidelity';
 import { FidelityCheck } from './intel-schemas';
 import { llmJson } from './model-gateway';
-import { paletteDistance, toJpegBase64 } from './vision';
+import { toJpegBase64 } from './vision';
 
 /**
  * QA Gateway (§25). Provider success is not customer success: every output passes product, visual, claims,
@@ -30,7 +31,11 @@ export interface SceneQaInput {
   videoBytes?: Buffer;
   frameBytes?: Buffer;
   referenceBytes: Buffer[];
-  fingerprint: { labelText: string | null; closure: string | null; paletteDistanceMax: number };
+  /**
+   * The active Visual Fingerprint (§16): OCR label text, closure, dominant colours and its similarity thresholds
+   * (`visual_fingerprints.thresholds`), and the product cut-out the deterministic checks locate in the frame.
+   */
+  fingerprint: { labelText: string | null; closure: string | null; dominantColors?: string[]; thresholds?: FidelityThresholds; cutout?: Buffer | null };
   /** Test hook: markers in the visual plan make the mock inspector fail deterministically. */
   planText: string;
   attempt: number;
@@ -44,7 +49,10 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     const [mid] = await extractFrames(f, 1, dir);
     return sharp(mid!).toBuffer();
   }));
-  const dist = i.referenceBytes[0] ? await paletteDistance(frame, i.referenceBytes[0]) : 0;
+  const th = i.fingerprint.thresholds ?? DEFAULT_FIDELITY_THRESHOLDS;
+  // Deterministic signals first (independent of the inspector): shade and package count where the exact product
+  // can be located in the frame.
+  const det = i.fingerprint.cutout ? await fidelitySignals(frame, i.fingerprint.cutout, th) : null;
   const failMock = /\[\[qa:fidelity_always\]\]/.test(i.planText) || (/\[\[qa:fidelity\]\]/.test(i.planText) && i.attempt === 1);
   const insp = await llmJson({
     ctx: i.ctx,
@@ -55,7 +63,10 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     content: [
       ...(await Promise.all(i.referenceBytes.slice(0, 2).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 768) })))),
       { type: 'image', mediaType: 'image/jpeg', base64: await toJpegBase64(frame, 768) },
-      { type: 'text', text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}` },
+      {
+        type: 'text',
+        text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. Reference product colours: ${i.fingerprint.dominantColors?.length ? i.fingerprint.dominantColors.join(', ') : 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}`,
+      },
     ],
     schema: FidelityCheck,
     mock: () => ({
@@ -75,14 +86,34 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     maxTokens: 800,
   });
   const f = insp.data;
-  const identityFail = !f.sameProduct || (!!i.fingerprint.labelText && !f.labelTextMatches) || !f.closureMatches || f.productCount > 1;
+  // Label OCR diff: the text the inspector read against the fingerprint's OCR text, whatever its own verdict.
+  const labelSimilarity = i.fingerprint.labelText && f.labelTextRead ? labelTextSimilarity(i.fingerprint.labelText, f.labelTextRead) : null;
+  const reasons: string[] = [];
+  if (!f.sameProduct) reasons.push('not the same product');
+  if (i.fingerprint.labelText && !f.labelTextMatches) reasons.push('label text differs');
+  if (labelSimilarity != null && labelSimilarity < th.labelSimilarityMin && f.labelTextMatches) reasons.push(`label reads “${f.labelTextRead}”`);
+  if (!f.closureMatches) reasons.push('different closure');
+  if (f.productCount > 1) reasons.push(`${f.productCount} products in frame`);
+  for (const d of det?.failures.filter((x) => x.kind === 'count') ?? []) reasons.push(d.detail);
+  const identityFail = reasons.length > 0;
+  // §16: a materially wrong shade is a hard failure regardless of the overall visual score — whether the
+  // inspector saw it or the located product's colours moved beyond the fingerprint's thresholds.
+  const shade = det?.failures.find((x) => x.kind === 'shade') ?? null;
+  const colorFail = !f.colorMatches || !!shade;
+  const colorDetail = shade?.detail ?? 'Materially wrong shade: the product’s colour differs from the reference';
   return [
     {
       check: 'product_fidelity',
-      pass: !identityFail && f.colorMatches,
-      hard: identityFail,
-      detail: identityFail ? `Product identity mismatch: ${f.notes}` : f.colorMatches ? 'Product matches reference' : 'Product colour drift',
-      data: { ...f, paletteDistance: Math.round(dist) },
+      pass: !identityFail && !colorFail,
+      hard: identityFail || colorFail,
+      detail: identityFail ? `Product identity mismatch: ${reasons.join('; ')}${f.notes ? ` (${f.notes})` : ''}` : colorFail ? colorDetail : 'Product matches reference',
+      data: {
+        ...f,
+        labelSimilarity: labelSimilarity == null ? null : Math.round(labelSimilarity * 1000) / 1000,
+        deterministic: det,
+        paletteDistance: det?.paletteDistance ?? null,
+        thresholds: th,
+      },
     },
     {
       check: 'visual',

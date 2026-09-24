@@ -101,10 +101,14 @@ interface MockTask {
 export class MockVideo implements VideoProvider {
   readonly name = 'byteplus';
   private tasks = new Map<string, MockTask>();
+  /** The latest requests submitted, in order (tests inspect what a render was asked for). */
+  readonly requests: VideoRequest[] = [];
   /** Simulated latency before a task completes. */
   constructor(private readonly latencyMs = 50) {}
 
   async submit(req: VideoRequest): Promise<{ providerRequestId: string }> {
+    this.requests.push(req);
+    if (this.requests.length > 50) this.requests.shift();
     const fail = injected(req.prompt);
     if (fail === 'submit') throw new ProviderError(this.name, 'injected submit failure', true, 'server');
     const id = `mock-vid-${randomUUID()}`;

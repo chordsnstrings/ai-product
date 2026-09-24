@@ -11,7 +11,13 @@ import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, listClaims, proposeClaim } from './claims';
 import { recordAssetWatched } from './funnel';
 import { append, available } from './ledger';
-import { approveForProduction, blockedLines, produceProject } from './production';
+import { approveForProduction, blockedLines, hardFidelityFail, produceProject } from './production';
+import sharp from 'sharp';
+import { authorize } from './cost-governor';
+import { exactProductFrame, productImagery } from './composite';
+import { fidelityThresholds } from './fidelity';
+import { qaScene } from './qa';
+import { providers, type MockVideo } from '@arkiv/providers';
 import { editScene, generateStoryboard, selectConcept, storyboardView } from './storyboard';
 import { currentQuote } from './offers';
 import { ingestBytes } from './uploads';
@@ -99,9 +105,21 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       // Double-approve (webhook replay) is a no-op.
       expect((await approveForProduction(tx, ctx, projectId, 'taste')).replayed).toBe(true);
     });
+    const video = (await providers()).video as MockVideo;
+    const before = video.requests.length;
     expect(await produceProject(ctx, projectId)).toBe('complete');
     // Duplicate job delivery does not produce or charge twice.
     expect(await produceProject(ctx, projectId)).toBe('skipped');
+    // Each render is given the product's own views, not just its (generated) storyboard frame (§23, §24): the frame,
+    // the fingerprint's reference photo and the exact cut-out, with a prompt that points at them.
+    const renders = video.requests.slice(before);
+    expect(renders.length).toBeGreaterThan(0);
+    for (const r of renders) {
+      expect(r.references).toHaveLength(3);
+      expect(r.references[1]).toMatch(/^data:image\/jpeg;base64,/);
+      expect(r.references[2]).toMatch(/^data:image\/png;base64,/);
+      expect(r.prompt).toMatch(/the other 2 reference images show the exact product/);
+    }
     await withTenant(t.workspaceId, async (tx) => {
       const [p] = await tx`select state, qa_report, final_creative_id from projects where id = ${projectId}`;
       expect(p!.state).toBe('COMPLETE');
@@ -167,6 +185,30 @@ describe('Taste production (Launch Gate 1, second half)', () => {
     expect(p!.state).toBe('BLOCKED_COMPLIANCE');
     expect(blockedLines(p!.qa_report)).toEqual([expect.objectContaining({ line: 'I’ve used it for two weeks.', reason: expect.stringMatching(/AI-generated person/) })]);
   }, 120_000);
+
+  it('a materially wrong shade is a hard product-fidelity failure, whatever the inspector says (§16)', async () => {
+    const { t, ctx, skuId } = await previewToStoryboard();
+    const paid = { ...ctx, workspaceState: 'ACTIVE_PAID' as const };
+    const { imagery, fp, auth } = await withTenant(t.workspaceId, async (tx) => ({
+      imagery: await productImagery(tx, skuId),
+      fp: (await tx`select label_text, closure, dominant_colors, thresholds from visual_fingerprints where sku_id = ${skuId} and active`)[0]!,
+      auth: await authorize(tx, paid, { purpose: 'storyboard', skuId, lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 20_000, outputTokens: 2_000 }], idempotencyKey: 'qa-shade' }),
+    }));
+    // Thresholds come from the fingerprint (defaults written at analysis).
+    expect(fp.thresholds).toMatchObject({ paletteDistanceMax: 70, regionColorMax: 60 });
+    const fingerprint = { labelText: fp.label_text as string | null, closure: fp.closure as string | null, dominantColors: fp.dominant_colors as string[], thresholds: fidelityThresholds(fp.thresholds), cutout: imagery.cutout!.bytes };
+    const exact = (await exactProductFrame(imagery, { purpose: 'hero' }))!.bytes;
+    const recoloured = (await exactProductFrame({ ...imagery, cutout: { ...imagery.cutout!, bytes: await sharp(imagery.cutout!.bytes).modulate({ hue: 180, saturation: 2.5 }).png().toBuffer() } }, { purpose: 'hero' }))!.bytes;
+    const qa = (frameBytes: Buffer) => qaScene({ ctx, token: auth.token, sceneId: newId(), sceneText: 'hero shot', frameBytes, referenceBytes: [imagery.reference!.bytes], fingerprint, planText: 'hero shot', attempt: 1 });
+    const ok = await qa(exact);
+    expect(ok.find((c) => c.check === 'product_fidelity')).toMatchObject({ pass: true, data: { deterministic: { located: true, productCount: 1 } } });
+    const bad = (await qa(recoloured)).find((c) => c.check === 'product_fidelity')!;
+    // The (mock) inspector saw nothing wrong; the fingerprint's colour thresholds still fail the frame hard.
+    expect(bad.data).toMatchObject({ colorMatches: true, sameProduct: true });
+    expect(bad).toMatchObject({ pass: false, hard: true });
+    expect(bad.detail).toMatch(/Materially wrong shade/);
+    expect(hardFidelityFail([bad])).toBe(true);
+  }, 60_000);
 
   it('repairs once for free, then switches technique after repeated fidelity failure', async () => {
     const { t, ctx, projectId } = await previewToStoryboard({ visualPlanMarker: '[[qa:fidelity_always]]' });

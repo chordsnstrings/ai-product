@@ -150,14 +150,22 @@ export class SeedreamCutout implements SegmentationProvider {
 export class SeedanceVideo implements VideoProvider {
   readonly name = 'byteplus';
   private readonly ark: ArkClient;
-  constructor(apiKey: string, baseUrl: string) {
+  /**
+   * @param maxRefs how many reference images a request carries (the model takes many multimodal references, §24):
+   *   the scene frame first, then the product's own views, so a request over the cap keeps the most important.
+   */
+  constructor(
+    apiKey: string,
+    baseUrl: string,
+    private readonly maxRefs = 9,
+  ) {
     this.ark = new ArkClient(apiKey, baseUrl);
   }
   async submit(req: VideoRequest): Promise<{ providerRequestId: string }> {
     const flags = [`--duration ${req.seconds}`, `--resolution ${req.resolution}`, `--ratio ${req.ratio}`, '--watermark false'];
     if (req.seed != null) flags.push(`--seed ${req.seed}`);
     const content: unknown[] = [{ type: 'text', text: `${req.prompt} ${flags.join(' ')}` }];
-    for (const ref of req.references.slice(0, 4)) content.push({ type: 'image_url', image_url: { url: ref }, role: 'reference_image' });
+    for (const ref of req.references.slice(0, this.maxRefs)) content.push({ type: 'image_url', image_url: { url: ref }, role: 'reference_image' });
     const r = await this.ark.call<{ id: string }>('contents/generations/tasks', 'POST', { model: req.model, content });
     return { providerRequestId: r.id };
   }

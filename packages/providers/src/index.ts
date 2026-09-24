@@ -51,7 +51,7 @@ export async function providers(): Promise<ProviderSet> {
     image: new SeedreamImage(need('ARK_API_KEY'), e.ARK_BASE_URL),
     // Plan 06 Phase 1 #6 decision: background removal is a Seedream edit onto a flat backdrop, keyed in-process.
     segmentation: new SeedreamCutout(need('ARK_API_KEY'), e.ARK_BASE_URL),
-    video: new SeedanceVideo(need('ARK_API_KEY'), e.ARK_BASE_URL),
+    video: new SeedanceVideo(need('ARK_API_KEY'), e.ARK_BASE_URL, e.SEEDANCE_MAX_REFS),
     tts: new MiniMaxTts(need('MINIMAX_API_KEY'), e.MINIMAX_BASE_URL),
     // The fallback route is priced and recorded as Seed Speech, so only a Seed Speech adapter may serve it.
     ttsFallback: e.BYTEPLUS_SPEECH_APP_ID && e.BYTEPLUS_SPEECH_TOKEN ? new SeedSpeechTts(e.BYTEPLUS_SPEECH_APP_ID, e.BYTEPLUS_SPEECH_TOKEN) : null,
