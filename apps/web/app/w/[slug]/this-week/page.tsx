@@ -9,7 +9,7 @@ import { projectRoute } from '@/lib/project-route';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'This Week · Arkiv' };
+export const metadata: Metadata = { title: 'This Week' };
 
 const SLOT: Record<string, string> = { EXPLOIT: 'Exploit · build on what works', EXPAND: 'Expand · adjacent bet', EXPLORE: 'Explore · new territory' };
 const BASIS: Record<string, string> = { performance: 'Based on your results', context_limited: 'Limited performance data', cold_start: 'Based on your product and reviews — not performance yet' };

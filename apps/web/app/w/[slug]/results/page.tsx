@@ -8,7 +8,7 @@ import { ConnectAdsCard } from '@/components/connect-ads-card';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'Results · Arkiv' };
+export const metadata: Metadata = { title: 'Results' };
 
 /** A6: experiments with their signal state, plus learnings — scoped claims, never global truths. */
 export default async function Results({ params }: { params: Promise<{ slug: string }> }) {

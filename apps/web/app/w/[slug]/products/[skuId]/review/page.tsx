@@ -4,10 +4,14 @@ import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import type { SkuReviewBody } from '@arkiv/core';
 import { MetadataTable } from '@arkiv/ui';
-import { workspacePage } from '@/lib/tenant';
+import { skuTitle } from '@/lib/page-title';
+import { denyPage, workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'Creative review · Arkiv' };
+export async function generateMetadata({ params }: { params: Promise<{ slug: string; skuId: string }> }): Promise<Metadata> {
+  const { slug, skuId } = await params;
+  return skuTitle(slug, skuId, 'Creative review');
+}
 
 const STATE: Record<string, string> = {
   ACTIONABLE: 'Actionable',
@@ -36,7 +40,7 @@ export default async function Review({ params, searchParams }: { params: Promise
     const all = await tx`select id, kind, version, period_start, period_end, body, created_at from sku_reviews where sku_id = ${skuId} order by version desc`;
     return { sku, all, review: (v ? all.find((r) => Number(r.version) === v) : all[0]) ?? null };
   });
-  if (!d) notFound();
+  if (!d) return denyPage('sku', skuId, w);
   const r = d.review;
   const b = r ? (r.body as SkuReviewBody) : null;
   return (

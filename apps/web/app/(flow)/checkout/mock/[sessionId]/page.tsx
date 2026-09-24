@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation';
 import { billingGateway, type MockStripe } from '@arkiv/billing';
 import { MockPay } from './mock-pay';
 
-export const metadata: Metadata = { title: 'Test checkout · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Test checkout', robots: { index: false } };
 
 /** Development stand-in for Stripe Checkout. Unavailable whenever Stripe keys are configured. */
 export default async function Page({ params }: { params: Promise<{ sessionId: string }> }) {

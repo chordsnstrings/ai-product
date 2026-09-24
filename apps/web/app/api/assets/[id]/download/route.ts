@@ -3,7 +3,7 @@ import { withTenant } from '@arkiv/db';
 import { assetUrl, DELIVERY_HOLD_STATES, recordAssetExport } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { errorResponse } from '@/lib/http';
-import { projectAccess } from '@/lib/tenant';
+import { deny, projectAccess } from '@/lib/tenant';
 
 /** Tracked download: records ASSET_EXPORTED (activation, plan 04 L9) then redirects to a signed URL. */
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -20,9 +20,11 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       if (flagged) throw new DomainError('FORBIDDEN', 'This ad is no longer available for download. Contact support if you think this is a mistake.');
       // Only this project's finished exports: the event carries the project (and variant) it belongs to.
       const exported = await recordAssetExport(tx, a.ctx, id, projectId);
-      if (!exported) throw new DomainError('NOT_FOUND', 'That file is not part of this ad.');
+      if (!exported) return null;
       return assetUrl(tx, id, 600, (q.get('name') ?? 'arkiv-ad.mp4').replace(/[^\w.\-]/g, '_'));
     });
+    // An asset id that isn't one of this project's exports (another account's, or guessed): denied and logged (§48).
+    if (!url) return await deny('asset', id, a.user?.id ?? null);
     return NextResponse.redirect(url, 303);
   } catch (e) {
     return errorResponse(e);

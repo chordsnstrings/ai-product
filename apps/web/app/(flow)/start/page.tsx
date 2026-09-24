@@ -3,7 +3,7 @@ import { connection } from 'next/server';
 import { env } from '@arkiv/shared';
 import { UploadModule } from '@/components/upload-module';
 
-export const metadata: Metadata = { title: 'Start · Arkiv' };
+export const metadata: Metadata = { title: 'Start' };
 
 export default async function Page() {
   await connection(); // the Turnstile site key is runtime configuration, not baked in at build time

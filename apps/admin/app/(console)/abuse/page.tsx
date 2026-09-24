@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
 import { PROVISIONAL } from '@arkiv/shared';
-import { ABUSE_SIGNAL_KINDS, auditView, staffCan } from '@arkiv/core';
+import { ABUSE_SIGNAL_KINDS, auditView, PROBE_SPIKE_PER_HOUR, staffCan } from '@arkiv/core';
 import { ActButton, ActForm } from '@/components/act';
 import { ago, dt, money, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -19,6 +19,11 @@ export default async function Abuse() {
     audited: await auditView(tx, s, 'abuse'),
     signals: await tx`select kind, key, count(*)::int as n, max(at) as last, max(workspace_id::text) as ws, count(distinct workspace_id)::int as workspaces
                       from abuse_signals where at > now() - interval '7 days' group by 1, 2 order by n desc limit 100`,
+    // §48: denied lookups of objects outside the caller's account, per user or network — spikes are someone guessing ids.
+    probes: await tx`select key, count(*)::int as n, count(distinct detail->>'targetHash')::int as targets, max((detail->>'thisHour')::int) as peak,
+                            string_agg(distinct detail->>'target', ', ') as kinds, max(at) as last
+                     from abuse_signals where kind = 'cross_tenant_probe' and at > now() - interval '24 hours'
+                     group by key having max((detail->>'thisHour')::int) >= ${PROBE_SPIKE_PER_HOUR} order by peak desc limit 50`,
     farms: await tx`select substring(host(created_ip) from '^\\d+\\.\\d+\\.\\d+') as net, count(*)::int as n from magic_links where created_at > now() - interval '24 hours' and created_ip is not null group by 1 having count(*) > 10 order by 2 desc`,
     cogsOutliers: await tx`select l.workspace_id, w.name, w.state, sum(l.amount)::bigint as spend from ledger_entries l join workspaces w on w.id = l.workspace_id
                            where l.type = 'PROVIDER_COST_RECORDED' and w.state in ('PROVISIONAL','ACTIVE_FREE') and l.created_at > now() - interval '7 days' group by 1, 2, 3 having sum(l.amount) > 1000000 order by spend desc`,
@@ -63,6 +68,13 @@ export default async function Abuse() {
             ];
           })}
           empty="No abuse signals."
+        />
+      </Section>
+      <Section title={`Denied object-ID probes (24h, ≥${PROBE_SPIKE_PER_HOUR}/hour)`}>
+        <Table
+          head={['Who', 'Denials', 'Distinct ids', 'Peak / hour', 'Objects', 'Last']}
+          rows={d0.probes.map((x) => [<Mono key="k">{x.key as string}</Mono>, x.n as number, x.targets as number, x.peak as number, (x.kinds as string) ?? '—', ago(x.last)])}
+          empty="No spikes. Single denials (stale links, logged-out tabs) are in the signals above."
         />
       </Section>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>

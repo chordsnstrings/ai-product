@@ -3,7 +3,7 @@ import { withTenant } from '@arkiv/db';
 import { Empty, IndexRow, LinkButton } from '@arkiv/ui';
 import { workspacePage } from '@/lib/tenant';
 
-export const metadata: Metadata = { title: 'Products · Arkiv' };
+export const metadata: Metadata = { title: 'Products' };
 
 export default async function Products({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;

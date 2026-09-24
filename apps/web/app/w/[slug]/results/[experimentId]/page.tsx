@@ -6,11 +6,15 @@ import { experimentView } from '@arkiv/core';
 import { MeasurementContextCaveat, measurementContextLabel, type MeasurementContext } from '@arkiv/shared';
 import { Banner, SignalChip, VideoThumb } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
-import { workspacePage } from '@/lib/tenant';
+import { experimentTitle } from '@/lib/page-title';
+import { denyPage, workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 import { variantPreviewUrl } from '@/lib/variant-preview';
 
-export const metadata: Metadata = { title: 'Test results · Arkiv' };
+export async function generateMetadata({ params }: { params: Promise<{ slug: string; experimentId: string }> }): Promise<Metadata> {
+  const { slug, experimentId } = await params;
+  return experimentTitle(slug, experimentId, 'Test results');
+}
 
 const pct = (n: number | null) => (n == null ? '—' : `${(Number(n) * 100).toFixed(2)}%`);
 
@@ -35,7 +39,7 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
                              where v.experiment_id = ${experimentId} and c.source_deleted_at is not null`;
     return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs, deletedVariants: new Set(deleted.map((x) => x.id as string)) };
   });
-  if (!d) notFound();
+  if (!d) return denyPage('experiment', experimentId, w);
   // One table per measurement context and attribution window: different windows are different measurements (§30).
   const groups = [...new Map(d.results.map((r) => [`${r.measurement_context}|${r.attribution_window}`, { ctx: r.measurement_context as string, window: String(r.attribution_window ?? 'default') }])).values()];
   const windowLabel = (w: string) => (w === 'default' ? null : w.replace(/_/g, ' ').replace(/(\d+)d/g, '$1-day'));

@@ -6,10 +6,14 @@ import type { Platform, PlatformAsset } from '@arkiv/shared';
 import { SignalChip } from '@arkiv/ui';
 import { CreatorPacks } from '@/components/creator-packs';
 import { StudioClient } from '@/components/studio';
-import { workspacePage } from '@/lib/tenant';
+import { experimentTitle } from '@/lib/page-title';
+import { denyPage, workspacePage } from '@/lib/tenant';
 import { variantPreviewUrl } from '@/lib/variant-preview';
 
-export const metadata: Metadata = { title: 'Studio · Arkiv' };
+export async function generateMetadata({ params }: { params: Promise<{ slug: string; experimentId: string }> }): Promise<Metadata> {
+  const { slug, experimentId } = await params;
+  return experimentTitle(slug, experimentId, 'Studio');
+}
 
 const PLACEMENT_LABEL: Record<Platform, string> = { TIKTOK: 'TikTok', INSTAGRAM_REELS: 'Reels', FACEBOOK_FEED: 'Feed' };
 
@@ -55,7 +59,7 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
     const packs = (await listCreatorPacks(tx, experimentId)).map((p) => ({ id: p.id as string, expiresAt: new Date(p.expires_at as string).toISOString(), revokedAt: p.revoked_at ? new Date(p.revoked_at as string).toISOString() : null, views: Number(p.views), uploads: Number(p.uploads), createdAt: new Date(p.created_at as string).toISOString() }));
     return { e: v.experiment, sku, variants, results: v.results, bal: await balances(tx), disclosure, packs };
   });
-  if (!d) notFound();
+  if (!d) return denyPage('experiment', experimentId, w);
   const master = d.variants.find((v) => v.projectId);
   return (
     <>

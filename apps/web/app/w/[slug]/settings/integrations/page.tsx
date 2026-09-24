@@ -7,7 +7,7 @@ import { Banner } from '@arkiv/ui';
 import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 
-export const metadata: Metadata = { title: 'Integrations · Arkiv' };
+export const metadata: Metadata = { title: 'Integrations' };
 
 const INFO = {
   shopify: { name: 'Shopify', what: 'Imports product titles, prices, images and variants. Read-only (read_products).', configured: () => !!env().SHOPIFY_API_KEY },

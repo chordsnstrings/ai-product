@@ -5,7 +5,7 @@ import { LinkButton } from '@arkiv/ui';
 import { currentUser } from '@/lib/session';
 import { DecideOwnership } from './decide';
 
-export const metadata: Metadata = { title: 'Confirm new owner · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Confirm new owner', robots: { index: false } };
 
 /**
  * Plan 05 §2.2 Members: Arkiv support asked to transfer ownership; a current Owner confirms here, signed in, from

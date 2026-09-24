@@ -10,7 +10,9 @@ import {
   FARM_THRESHOLDS,
   normalizeCidr,
   noteFailedPayment,
+  noteAccessDenied,
   notePromptInjection,
+  PROBE_SPIKE_PER_HOUR,
   promptInjectionHits,
   recordAbuseSignal,
   sweepPreviewCogsOutliers,
@@ -161,5 +163,23 @@ describe('rights: freeze, expiry and complaint intake (plan 05 §15)', () => {
     // A redelivered email (new delivery id, same email id) does not open a second case.
     await withSystem((tx) => rightsCaseFromEmail(tx, evt.data));
     expect((await ownerPool()`select count(*)::int as n from rights_cases`)[0]!.n).toBe(1);
+  });
+});
+
+describe('cross-tenant object probes (standard §48 "Deny and log")', () => {
+  it('logs each denial with a hash of the id (never the id), and counts per user or network for the spike view', async () => {
+    const target = newId();
+    const userId = newId();
+    for (let i = 1; i <= 3; i++) expect(await noteAccessDenied({ userId, ip: '198.51.100.7', target: 'project', targetId: target })).toBe(i);
+    const rows = await signals('cross_tenant_probe');
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toMatchObject({ key: `user:${userId}`, workspace_id: null, detail: { target: 'project', network: 'ip:198.51.100', thisHour: 1, spike: false } });
+    expect(JSON.stringify(rows)).not.toContain(target);
+    expect((rows[0]!.detail as { targetHash: string }).targetHash).toMatch(/^[0-9a-f]{16}$/);
+    // Signed out: the network is the key. Past the threshold, the denial is marked as a spike.
+    for (let i = 0; i < PROBE_SPIKE_PER_HOUR; i++) await noteAccessDenied({ userId: null, ip: '203.0.113.9', target: 'asset', targetId: newId() });
+    const net = (await signals('cross_tenant_probe')).filter((r) => r.key === 'ip:203.0.113');
+    expect(net).toHaveLength(PROBE_SPIKE_PER_HOUR);
+    expect(net.at(-1)!.detail).toMatchObject({ spike: true, thisHour: PROBE_SPIKE_PER_HOUR });
   });
 });

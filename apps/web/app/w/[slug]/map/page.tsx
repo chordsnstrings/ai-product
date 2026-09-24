@@ -5,7 +5,7 @@ import { creativeMap } from '@arkiv/core';
 import { Empty, LinkButton } from '@arkiv/ui';
 import { workspacePage } from '@/lib/tenant';
 
-export const metadata: Metadata = { title: 'Creative Map · Arkiv' };
+export const metadata: Metadata = { title: 'Creative Map' };
 
 const t = (s: string) => s.replace(/_/g, ' ');
 

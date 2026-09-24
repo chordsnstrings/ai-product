@@ -9,7 +9,7 @@ import { CancelFlow } from '@/components/cancel-flow';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'Billing · Arkiv' };
+export const metadata: Metadata = { title: 'Billing' };
 
 const fmt = (d: string) => formatDate(d);
 

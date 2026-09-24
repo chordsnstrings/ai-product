@@ -5,7 +5,7 @@ import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared';
 import { currentUser } from '@/lib/session';
 import { LoginForm } from './login-form';
 
-export const metadata: Metadata = { title: 'Log in · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Log in', robots: { index: false } };
 
 export default async function Page({ searchParams }: { searchParams: Promise<{ next?: string; error?: string; challenge?: string }> }) {
   const sp = await searchParams;

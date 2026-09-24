@@ -5,7 +5,7 @@ import { ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'Brand · Arkiv' };
+export const metadata: Metadata = { title: 'Brand' };
 
 const MARKETS = [['US', 'United States'], ['CA', 'Canada'], ['GB', 'United Kingdom'], ['IE', 'Ireland'], ['AU', 'Australia'], ['NZ', 'New Zealand'], ['EU', 'European Union']] as const;
 const FIELD: Record<string, string> = { name: 'name', tone: 'tone', colors: 'colours', prohibited: 'never show or say', disclosures: 'disclosures', cta: 'call to action', market: 'market' };
