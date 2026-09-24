@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, mrrMovement } from '@arkiv/core';
+import { auditView, mrrMovement, reconciliationExceptions } from '@arkiv/core';
 import { PLANS, type PlanCode } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
 import { dt, Grid, Kpi, money, Mono, Page, Section, Table, Tabs } from '@/components/ui';
@@ -32,17 +32,7 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
                           from events where type in ('SUBSCRIPTION_STARTED','SUBSCRIPTION_CHANGED') and at > now() - interval '12 months' ${t()} group by 1 order by 1 desc`,
       oneTime: await tx`select to_char(date_trunc('month', paid_at, ${tz}) at time zone ${tz}, 'YYYY-MM') as month, kind, count(*)::int as n, sum(amount_micros)::bigint as amt from purchases where status in ('paid','refunded') ${t()} group by 1, 2 order by 1 desc`,
       unmatched: await tx`select id, type, received_at, attempts, payload->'data'->'object'->>'customer' as customer, payload->'data'->'object'->'metadata'->>'workspace_id' as meta_ws from stripe_events where status = 'unmatched' order by received_at`,
-      recon: await tx`
-        select 'Paid purchase without project progress' as issue, p.workspace_id, p.id::text as ref, p.paid_at as at from purchases p join projects pr on pr.id = p.project_id
-          where p.status = 'paid' and pr.state in ('STORYBOARD_READY') and p.paid_at < now() - interval '15 minutes'
-        union all
-        select 'Active subscription without period grant', s.workspace_id, s.id::text, s.current_period_start from subscriptions s
-          where s.status = 'active' and not exists (select 1 from ledger_entries l where l.workspace_id = s.workspace_id and l.type = 'CREDIT_GRANTED' and l.unit = 'creative_test' and l.period_key = to_char(s.current_period_start, 'YYYY-MM-DD'))
-        union all
-        select 'Workspace ACTIVE_PAID without subscription', w.id, w.slug, w.updated_at from workspaces w
-          where w.state = 'ACTIVE_PAID' and not exists (select 1 from subscriptions s where s.workspace_id = w.id and s.status in ('active','trialing','past_due'))
-        union all
-        select 'Stripe event failed processing', e.workspace_id, e.id, e.received_at from stripe_events e where e.status = 'failed'`,
+      recon: await reconciliationExceptions(tx, { includeTest: prefs.includeTest }),
       dunning: await tx`select w.id, w.name, s.plan_code, s.current_period_end, (select count(*) from email_log l where l.workspace_id = w.id and l.template = 'payment_failed')::int as emails
                         from workspaces w join subscriptions s on s.workspace_id = w.id and s.status = 'past_due' where (${prefs.includeTest} or not w.is_test) order by s.current_period_end`,
       disputes: await tx`select e.id, e.type, e.received_at, e.workspace_id, w.name from stripe_events e left join workspaces w on w.id = e.workspace_id where e.type like 'charge.dispute%' ${t('e.workspace_id')} order by e.received_at desc limit 50`,
@@ -75,7 +65,7 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
           </span>,
         ])} empty="No unmatched events. Metadata is never trusted alone: assignment needs a second approver." />
       ) : null}
-      {tab === 'recon' ? <Table head={['Issue', 'Workspace', 'Reference', 'Since']} rows={d0.recon.map((r) => [r.issue as string, <Link key="w" href={`/tenants/${r.workspace_id}?tab=billing`}>{String(r.workspace_id ?? '').slice(0, 8)}</Link>, <Mono key="r">{r.ref as string}</Mono>, dt(r.at)])} empty="Payments, grants and entitlements reconcile." /> : null}
+      {tab === 'recon' ? <Table head={['Issue', 'Workspace', 'Reference', 'Since']} rows={d0.recon.map((r) => [r.issue, r.workspaceId ? <Link key="w" href={`/tenants/${r.workspaceId}?tab=ledger`}>{r.workspaceId.slice(0, 8)}</Link> : '—', <Mono key="r">{r.ref}</Mono>, dt(r.at)])} empty="Payments, grants and entitlements reconcile." /> : null}
       {tab === 'dunning' ? <Table head={['Workspace', 'Plan', 'Period end', 'Payment-failed emails']} rows={d0.dunning.map((x) => [<Link key="w" href={`/tenants/${x.id}?tab=billing`}>{x.name as string}</Link>, x.plan_code as string, dt(x.current_period_end), x.emails as number])} empty="Nobody past due." /> : null}
       {tab === 'disputes' ? <Table head={['Received', 'Event', 'Workspace']} rows={d0.disputes.map((x) => [dt(x.received_at), x.type as string, x.workspace_id ? <Link key="w" href={`/tenants/${x.workspace_id}?tab=billing`}>{(x.name as string) ?? String(x.workspace_id).slice(0, 8)}</Link> : '—'])} empty="No disputes. Evidence pack: delivery timestamps, ASSET_EXPORTED events, consent record and IP are on the tenant's Billing tab." /> : null}
     </Page>

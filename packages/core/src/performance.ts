@@ -113,7 +113,13 @@ export async function ingestObservations(tx: Tx, ctx: TenantContext, integration
 async function markError(ctx: TenantContext, integrationId: string, e: ConnectorError) {
   await withTenant(ctx.workspaceId, async (tx) => {
     const status = e.kind === 'auth_revoked' ? 'revoked' : e.kind === 'rate_limited' ? 'active' : 'degraded';
-    await tx`update integrations set status = ${status}, error = ${tx.json({ kind: e.kind, message: e.message, at: new Date().toISOString() })} where id = ${integrationId}`;
+    const [i] = await tx`update integrations set status = ${status}, error = ${tx.json({ kind: e.kind, message: e.message, at: new Date().toISOString() })}
+                         where id = ${integrationId} and workspace_id = ${ctx.workspaceId} returning provider`;
+    // Rate-limit history per connection (plan 05 §2.2 Integrations): every throttle the platform answered with.
+    if (i && e.kind === 'rate_limited') {
+      await tx`insert into integration_rate_limits (workspace_id, integration_id, provider, message, retry_after_sec)
+               values (${ctx.workspaceId}, ${integrationId}, ${i.provider as string}, ${e.message.slice(0, 500)}, ${e.retryAfterSec ?? null})`;
+    }
     if (status !== 'active') {
       await emit(tx, ctx, 'INTEGRATION_DEGRADED', { type: 'integration', id: integrationId }, { kind: e.kind });
       await emit(tx, ctx, 'DATA_FRESHNESS_CHANGED', { type: 'integration', id: integrationId }, { status });

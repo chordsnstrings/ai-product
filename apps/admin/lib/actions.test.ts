@@ -1,9 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
-import { assertStaff, decideApproval, startBreakGlass } from '@arkiv/core';
+import { assertStaff, decideApproval, decideOwnershipTransfer, lookupInvite, startBreakGlass } from '@arkiv/core';
 import { MockStripe, setBillingGateway } from '@arkiv/billing';
-import { devOutbox } from '@arkiv/email';
+import { devOutbox, REDACTED_LINK, sendEmail } from '@arkiv/email';
 import { DataRequestKind, newId, type StaffRole } from '@arkiv/shared';
 import { ACTIONS, type ActionName } from './actions';
 import type { StaffUser } from './staff';
@@ -170,25 +170,70 @@ describe('danger zone and jobs actions', () => {
     await expect(act(sup, 'tenant.project_retry', { workspaceId: t.workspaceId, projectId: newId(), reason: 'retry' })).rejects.toThrow(/role/);
   });
 
-  it('transfer ownership emits one MEMBER_ROLE_CHANGED per member in the shared payload shape, and links to the profile page', async () => {
+  it('transfer ownership emails the current owner a confirmation link and changes roles only once they confirm', async () => {
     const t = await makeTenant();
     const [admin] = await ownerPool()`insert into users (email, email_verified_at) values ('next-owner@example.com', now()) returning id`;
     await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${admin!.id}, 'ADMIN')`;
     const o = await staff(['OPS']);
     devOutbox.length = 0;
-    await act(o, 'tenant.transfer_owner', { workspaceId: t.workspaceId, userId: admin!.id, reason: 'Ticket #88: owner left the company, confirmed by email' });
-    const roles = await ownerPool()`select user_id, role from memberships where workspace_id = ${t.workspaceId} order by role desc`;
-    expect(Object.fromEntries(roles.map((r) => [r.user_id, r.role]))).toEqual({ [admin!.id as string]: 'OWNER', [t.userId]: 'ADMIN' });
-    const ev = await ownerPool()`select subject_id, actor, payload, schema_version from events where workspace_id = ${t.workspaceId} and type = 'MEMBER_ROLE_CHANGED' order by payload->>'to' desc`;
-    expect(ev.map((e) => [e.subject_id, e.payload])).toEqual([
-      [admin!.id, { from: 'ADMIN', to: 'OWNER', transfer: true, byStaff: true, reason: 'Ticket #88: owner left the company, confirmed by email' }],
-      [t.userId, { from: 'OWNER', to: 'ADMIN', transfer: true, byStaff: true, reason: 'Ticket #88: owner left the company, confirmed by email' }],
-    ]);
-    expect(ev.every((e) => e.actor === `staff:${o.staffId}` && e.schema_version === 1)).toBe(true);
-    const mails = devOutbox.filter((m) => m.template === 'security_alert');
-    expect(mails.map((m) => m.to).sort()).toEqual([t.email, 'next-owner@example.com'].sort());
-    expect(mails.every((m) => (m.data as { url: string }).url.endsWith(`/w/${t.slug}/settings/profile`))).toBe(true);
+    const r = await act(o, 'tenant.transfer_owner', { workspaceId: t.workspaceId, userId: admin!.id, reason: 'Ticket #88: owner left the company' });
+    expect(String(r.message)).toMatch(/Nothing changes until an owner confirms/);
+    const roles = await ownerPool()`select user_id, role from memberships where workspace_id = ${t.workspaceId}`;
+    expect(Object.fromEntries(roles.map((x) => [x.user_id, x.role]))).toEqual({ [admin!.id as string]: 'ADMIN', [t.userId]: 'OWNER' });
+    const mail = devOutbox.find((m) => m.template === 'ownership_transfer_confirm');
+    expect(mail!.to).toBe(t.email);
+    const url = (mail!.data as { url: string }).url;
+    expect(url).toMatch(/\/ownership\/[A-Za-z0-9_-]{20,}$/);
+    // The log keeps the email's content for resend/preview, but never the confirmation link itself.
+    const [logged] = await ownerPool()`select id, data from email_log where template = 'ownership_transfer_confirm'`;
+    expect((logged!.data as { url: string }).url).toBe(REDACTED_LINK);
+    expect(ACTIONS['email.resend'].perm).toBe('email.manage');
+    await expect(act(await staff(['SUPPORT']), 'email.resend', { logId: logged!.id, requestId: newId(), reason: 'customer lost it' })).rejects.toThrow(/single-use link/);
+    // The owner confirms from the link (customer app), then the roles swap.
+    await decideOwnershipTransfer(url.split('/ownership/')[1]!, { id: t.userId }, true);
+    const after = await ownerPool()`select user_id, role from memberships where workspace_id = ${t.workspaceId}`;
+    expect(Object.fromEntries(after.map((x) => [x.user_id, x.role]))).toEqual({ [admin!.id as string]: 'OWNER', [t.userId]: 'ADMIN' });
     await expect(act(o, 'tenant.transfer_owner', { workspaceId: t.workspaceId, userId: admin!.id, reason: 'again please' })).rejects.toThrow(/already owns/);
+  });
+
+  it('resend invite issues a fresh link by email; resend email replays a stored email once per click', async () => {
+    const t = await makeTenant();
+    const sup = await staff(['SUPPORT']);
+    const [inv] = await ownerPool()`insert into invites (workspace_id, email, role, token_hash, invited_by, expires_at)
+                                    values (${t.workspaceId}, 'teammate@brand.com', 'MEMBER', 'old-hash', ${t.userId}, now() + interval '1 day') returning id`;
+    devOutbox.length = 0;
+    await act(sup, 'tenant.invite_resend', { workspaceId: t.workspaceId, inviteId: inv!.id });
+    const sent = devOutbox.find((m) => m.template === 'invite');
+    expect(sent!.to).toBe('teammate@brand.com');
+    const token = (sent!.data as { url: string }).url.split('/invite/')[1]!;
+    expect((await lookupInvite(token)).status).toBe('ok');
+    expect(await ownerPool()`select 1 from admin_audit_log where action = 'tenant.invite_resend' and workspace_id = ${t.workspaceId}`).toHaveLength(1);
+
+    // A stored transactional email is resent with the same content; a double click (same requestId) sends once.
+    await sendEmail('receipt', t.email, { productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: 'http://localhost/x' }, { idempotencyKey: 'orig-receipt', workspaceId: t.workspaceId });
+    const [log] = await ownerPool()`select id from email_log where idempotency_key = 'orig-receipt'`;
+    devOutbox.length = 0;
+    const requestId = newId();
+    const first = await act(sup, 'email.resend', { logId: log!.id, requestId, reason: 'customer can’t find it' });
+    const again = await act(sup, 'email.resend', { logId: log!.id, requestId, reason: 'customer can’t find it' });
+    expect([first.status, again.status]).toEqual(['logged', 'duplicate']);
+    expect(devOutbox.filter((m) => m.template === 'receipt').map((m) => (m.data as { productName: string }).productName)).toEqual(['Dew Serum']);
+    const fin = await staff(['FINANCE']);
+    expect(() => assertStaff(fin, ACTIONS['email.resend'].perm)).toThrow(/role/);
+  });
+
+  it('marking a connection degraded is audited and tells the customer’s freshness view', async () => {
+    const t = await makeTenant();
+    const [i] = await ownerPool()`insert into integrations (workspace_id, provider, external_account_id, status) values (${t.workspaceId}, 'meta', 'act_9', 'active') returning id`;
+    const o = await staff(['OPS']);
+    await act(o, 'tenant.integration_status', { workspaceId: t.workspaceId, integrationId: i!.id, status: 'degraded', reason: 'Meta token scope missing' });
+    const [row] = await ownerPool()`select status from integrations where id = ${i!.id}`;
+    expect(row!.status).toBe('degraded');
+    const ev = await ownerPool()`select type, actor from events where workspace_id = ${t.workspaceId} order by type`;
+    expect(ev.map((e) => e.type)).toEqual(['DATA_FRESHNESS_CHANGED', 'INTEGRATION_DEGRADED']);
+    expect(ev.every((e) => e.actor === `staff:${o.staffId}`)).toBe(true);
+    await ownerPool()`update integrations set status = 'disconnected' where id = ${i!.id}`;
+    await expect(act(o, 'tenant.integration_status', { workspaceId: t.workspaceId, integrationId: i!.id, status: 'active', reason: 'try again' })).rejects.toThrow(/only the customer/);
   });
 
   it('break-glass and claim review emails land on the access log and the SKU claims page', async () => {

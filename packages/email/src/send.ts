@@ -28,6 +28,37 @@ async function resendClient() {
   return new Resend(env().RESEND_API_KEY);
 }
 
+/**
+ * Templates whose link is a credential (sign-in, invite, signed download, ownership confirmation). Their link is
+ * never stored with the email log, and they can't be resent from the log: the console issues a fresh one instead
+ * (resend invite, send login link).
+ */
+export const SECRET_LINK_TEMPLATES: ReadonlySet<TemplateName> = new Set(['magic_link', 'invite', 'export_ready', 'ownership_transfer_confirm']);
+export const REDACTED_LINK = '[single-use link — not stored]';
+
+/** The template data kept on email_log (plan 05 §2.2 Emails "Resend, view rendered email"), minus credentials. */
+export function storedEmailData(template: TemplateName, data: unknown): Record<string, unknown> {
+  const d = { ...((data ?? {}) as Record<string, unknown>) };
+  if (SECRET_LINK_TEMPLATES.has(template)) for (const k of ['url', 'exportUrl']) if (k in d) d[k] = REDACTED_LINK;
+  return d;
+}
+export const canResendTemplate = (template: string) => isTemplateName(template) && !SECRET_LINK_TEMPLATES.has(template);
+
+// Every template, as a record so a new template can't be left out.
+const TEMPLATE_NAMES: Record<TemplateName, true> = {
+  magic_link: true, invite: true, receipt: true, asset_ready: true, offer_ending: true, storyboard_saved: true, new_concept: true,
+  export_ready: true, refund_issued: true, flag_expired: true, integration_disconnected: true, claim_review_result: true,
+  cancellation_confirmed: true, subscription_started: true, price_change_notice: true, payment_failed: true, security_alert: true,
+  weekly_brief: true, friday_summary: true, day30_review: true, staff_break_glass: true, ownership_transfer_confirm: true, intervention: true,
+};
+export const isTemplateName = (t: string): t is TemplateName => Object.hasOwn(TEMPLATE_NAMES, t);
+
+/** Render a template to what the recipient saw (subject + HTML), for the console's email view. */
+export async function renderEmail<T extends TemplateName>(template: T, data: TemplateMap[T], opts: { supportEmail?: string | null } = {}) {
+  const built = build(template, data, { supportEmail: opts.supportEmail ?? null });
+  return { subject: built.subject, stream: built.stream, html: await render(built.element as never) };
+}
+
 export async function sendEmail<T extends TemplateName>(template: T, to: string, data: TemplateMap[T], opts: SendOptions, tx?: Tx): Promise<SendResult> {
   const built = build(template, data);
   const run = async (t: Tx): Promise<SendResult> => {
@@ -37,7 +68,7 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
     if (sup && sup.stream === 'all' && built.stream === 'transactional' && template !== 'magic_link' && template !== 'security_alert') return { status: 'suppressed' };
     // email_log is tenant-scoped (RLS); the log row, the marketing frequency cap (per address, across
     // workspaces) and the dedupe go through a narrow SECURITY DEFINER function.
-    const [open] = await t`select id, outcome from email_log_open(${opts.workspaceId ?? null}, ${email}, ${template}, ${built.stream}, ${opts.idempotencyKey})`;
+    const [open] = await t`select id, outcome from email_log_open(${opts.workspaceId ?? null}, ${email}, ${template}, ${built.stream}, ${opts.idempotencyKey}, ${t.json(storedEmailData(template, data) as never)})`;
     if (open!.outcome === 'capped') return { status: 'capped' };
     if (open!.outcome === 'duplicate') return { status: 'duplicate' };
     const ins = [{ id: open!.id as string }];

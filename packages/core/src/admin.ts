@@ -4,13 +4,13 @@ import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { emit } from './events';
 import { adjust, type LedgerUnit } from './ledger';
-import { restoreFromScheduledPurge } from './lifecycle';
-import { Queues } from './outbox';
+import { restoreFromScheduledPurge, RISK_PLAYBOOKS } from './lifecycle';
+import { enqueue, Queues } from './outbox';
 import { retryProduction } from './production';
 import { transition } from './projects';
 import { retireSupersededRates } from './rates';
 import { planQuota, setting } from './settings';
-import { transitionWorkspace } from './workspaces';
+import { randomToken, sha256, transitionWorkspace } from './workspaces';
 
 /**
  * Admin domain (plan 05): permissions by staff role, append-only audit, break-glass for tenant content,
@@ -401,30 +401,53 @@ export async function addTenantNote(s: Staff, workspaceId: string, body: string,
   });
 }
 
+/** How long the current Owner has to answer a staff ownership-transfer request. */
+export const OWNERSHIP_TRANSFER_HOURS = 72;
+
 /**
- * Members tab 🔐 transfer ownership (plan 05 §2.2), on a written reason and the current owner's confirmation.
- * Emits one MEMBER_ROLE_CHANGED per member whose role changed, in the same payload shape the customer app
- * writes (EVENT_PAYLOADS), marked byStaff. Returns who to notify.
+ * Members tab 🔐 transfer ownership (plan 05 §2.2: "with written reason + customer email confirmation"). Staff
+ * file the request with a written reason; nothing changes until a current Owner confirms from the link emailed to
+ * them (decideOwnershipTransfer). A new request replaces a pending one. Returns the one-time token (for the email
+ * only; the database keeps its hash) and who to email.
  */
-export async function staffTransferOwnership(s: Staff, workspaceId: string, userId: string, reason: string) {
+export async function requestOwnershipTransfer(s: Staff, workspaceId: string, userId: string, reason: string) {
   assertStaff(s, 'tenant.state');
   if (reason.trim().length < 4) throw new DomainError('INVALID', 'A reason is required.');
   return withAdmin(async (tx) => {
-    const [w] = await tx`select slug from workspaces where id = ${workspaceId} for update`;
-    if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
-    const [m] = await tx`select role from memberships where workspace_id = ${workspaceId} and user_id = ${userId} for update`;
+    const [w] = await tx`select slug, name, state from workspaces where id = ${workspaceId} for update`;
+    if (!w || w.state === 'PURGED') throw new DomainError('NOT_FOUND', 'Workspace not found');
+    const [m] = await tx`select m.role, u.email, u.name from memberships m join users u on u.id = m.user_id where m.workspace_id = ${workspaceId} and m.user_id = ${userId}`;
     if (!m) throw new DomainError('NOT_FOUND', 'That user is not a member');
     if (m.role === 'OWNER') throw new DomainError('CONFLICT', 'That member already owns this workspace.');
-    const prev = await tx`update memberships set role = 'ADMIN' where workspace_id = ${workspaceId} and role = 'OWNER' returning user_id`;
-    await tx`update memberships set role = 'OWNER' where workspace_id = ${workspaceId} and user_id = ${userId}`;
-    await tx`update workspaces set membership_version = membership_version + 1 where id = ${workspaceId}`;
-    const ctx = staffCtx(s, workspaceId);
-    await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: userId }, { from: m.role as Role, to: 'OWNER', transfer: true, byStaff: true, reason });
-    for (const p of prev) await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: p.user_id as string }, { from: 'OWNER', to: 'ADMIN', transfer: true, byStaff: true, reason });
-    const previousOwners = prev.map((p) => p.user_id as string);
-    await audit(tx, s, 'tenant.transfer_owner', { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { owners: previousOwners, newOwnerRole: m.role }, after: { owners: [userId] } });
-    const emails = await tx`select email from users where id in ${tx([userId, ...previousOwners])}`;
-    return { slug: w.slug as string, previousOwners, notify: emails.map((e) => e.email as string) };
+    const owners = await tx`select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${workspaceId} and m.role = 'OWNER' and u.deleted_at is null`;
+    if (!owners.length) throw new DomainError('CONFLICT', 'This workspace has no owner who could confirm the transfer.');
+    const replaced = await tx`update ownership_transfers set status = 'cancelled', decided_at = now() where workspace_id = ${workspaceId} and status = 'pending' returning id`;
+    const token = randomToken();
+    const [t] = await tx`insert into ownership_transfers (workspace_id, to_user_id, requested_by, staff_name, reason, token_hash, expires_at)
+                         values (${workspaceId}, ${userId}, ${s.staffId}, ${s.name}, ${reason.trim()}, ${sha256(token)}, now() + make_interval(hours => ${OWNERSHIP_TRANSFER_HOURS}))
+                         returning id, expires_at`;
+    await audit(tx, s, 'tenant.transfer_owner_requested', { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { newOwnerRole: m.role, replaced: replaced.map((r) => r.id) }, after: { transferId: t!.id, toUserId: userId, expiresAt: t!.expires_at } });
+    return {
+      transferId: t!.id as string,
+      token,
+      expiresAt: t!.expires_at as string,
+      slug: w.slug as string,
+      workspaceName: w.name as string,
+      newOwner: { email: m.email as string, name: (m.name as string) ?? null },
+      notify: owners.map((o) => o.email as string),
+    };
+  });
+}
+
+/** Withdraw a pending ownership-transfer request (its emailed link stops working). */
+export async function cancelOwnershipTransfer(s: Staff, workspaceId: string, transferId: string, reason: string) {
+  assertStaff(s, 'tenant.state');
+  if (reason.trim().length < 4) throw new DomainError('INVALID', 'A reason is required.');
+  return withAdmin(async (tx) => {
+    const [t] = await tx`update ownership_transfers set status = 'cancelled', decided_at = now()
+                         where id = ${transferId} and workspace_id = ${workspaceId} and status = 'pending' returning to_user_id`;
+    if (!t) throw new DomainError('CONFLICT', 'That request is no longer pending.');
+    await audit(tx, s, 'tenant.transfer_owner_cancelled', { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { transferId, status: 'pending' }, after: { status: 'cancelled' } });
   });
 }
 
@@ -470,6 +493,45 @@ export async function suppressRiskFlag(s: Staff, workspaceId: string, flagId: st
     if (!f) throw new DomainError('NOT_FOUND', 'Risk flag not found');
     await audit(tx, s, 'risk.suppress', { type: 'risk_flag', id: flagId }, { workspaceId, reason, after: { indicator: f.indicator, suppressedUntil: f.suppressed_until } });
     return { indicator: f.indicator as string, suppressedUntil: f.suppressed_until as string };
+  });
+}
+
+/** A playbook can't be restarted for the same flag within this window (no double sends). */
+export const INTERVENTION_COOLDOWN_HOURS = 24;
+
+/**
+ * Risk tab / retention board "Start intervention playbook" (plan 05 §2.2, §17): the flag's playbook email goes to
+ * the workspace's owners and admins through the outbox, its in-app notice is posted to the workspace, and the start
+ * is recorded on the flag ({ playbook, at, by, emailed, notice }). Never a discount. Playbooks without a templated
+ * message (support sentiment) record the start so the follow-up is tracked.
+ */
+export async function startIntervention(s: Staff, workspaceId: string, flagId: string, opts: { email?: boolean; notice?: boolean; note?: string | null } = {}) {
+  assertStaff(s, 'tenant.flags');
+  return withAdmin(async (tx) => {
+    const [f] = await tx`select r.indicator, r.resolved_at, r.interventions, w.state from risk_flags r join workspaces w on w.id = r.workspace_id
+                         where r.id = ${flagId} and r.workspace_id = ${workspaceId} for update of r`;
+    if (!f) throw new DomainError('NOT_FOUND', 'Risk flag not found');
+    if (f.resolved_at) throw new DomainError('CONFLICT', 'This indicator is resolved or suppressed; there is nothing to act on.');
+    if (['SUSPENDED', 'LOCKED', 'PURGE_SCHEDULED', 'PURGED'].includes(f.state as string)) throw new DomainError('CONFLICT', `The workspace is ${String(f.state).toLowerCase()}; playbooks are paused.`);
+    const pb = RISK_PLAYBOOKS[f.indicator as RiskIndicator];
+    if (!pb) throw new DomainError('INVALID', `No playbook for ${f.indicator as string}`);
+    const past = (f.interventions as { at: string }[]) ?? [];
+    const last = past.map((p) => new Date(p.at).getTime()).sort((a, b) => b - a)[0];
+    if (last && Date.now() - last < INTERVENTION_COOLDOWN_HOURS * 3600_000) throw new DomainError('CONFLICT', `This playbook was started ${Math.round((Date.now() - last) / 60_000)} minutes ago.`);
+    const emailed = !!pb.email && opts.email !== false;
+    const notice = !!pb.notice && opts.notice !== false;
+    if (emailed) await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'intervention', indicator: f.indicator, flagId, run: past.length + 1 }, { singletonKey: `intervention:${flagId}:${past.length + 1}` });
+    if (notice) {
+      const source = `risk:${f.indicator as string}`;
+      await tx`update workspace_notices set dismissed_at = now() where workspace_id = ${workspaceId} and source = ${source} and dismissed_at is null`;
+      await tx`insert into workspace_notices (workspace_id, kind, source, title, body, link_path, link_label, created_by)
+               values (${workspaceId}, 'intervention', ${source}, ${pb.notice!.headline}, ${pb.notice!.body}, ${pb.notice!.path}, ${pb.notice!.cta}, ${`staff:${s.staffId}`})`;
+    }
+    const entry = { playbook: f.indicator as string, at: new Date().toISOString(), by: s.email, emailed, notice, note: opts.note?.trim() || null };
+    await tx`update risk_flags set interventions = interventions || ${tx.json([entry])} where id = ${flagId} and workspace_id = ${workspaceId}`;
+    await audit(tx, s, 'intervention.start', { type: 'risk_flag', id: flagId }, { workspaceId, reason: opts.note ?? null, after: entry });
+    const what = [emailed ? 'email queued to owners and admins' : null, notice ? 'in-app notice posted' : null].filter(Boolean).join(' and ');
+    return { ...entry, message: what ? `Playbook started: ${what}.` : 'Playbook started and recorded; follow up personally.' };
   });
 }
 
@@ -697,6 +759,61 @@ export async function mrrMovement(tx: Tx, days: number, opts: { includeTest?: bo
     from moves`;
   const r = { new: Number(m!.new), expansion: Number(m!.expansion), contraction: Number(m!.contraction), churned: Number(m!.churned) };
   return { ...r, net: r.new + r.expansion - r.contraction - r.churned };
+}
+
+export interface ReconciliationException {
+  issue: string;
+  workspaceId: string | null;
+  ref: string;
+  at: string | null;
+}
+
+/**
+ * §7 reconciliation report: Stripe payments ↔ ledger grants ↔ workspace entitlements. Each mismatch is an
+ * exception (paid but no entitlement, entitlement without payment, …). One definition for the Billing page and
+ * a tenant's Ledger tab (`workspaceId`, §2.2 "reconciliation status"). Runs as the staff role, whose policies see
+ * every tenant, so the workspace filter is explicit in every branch.
+ */
+export async function reconciliationExceptions(tx: Tx, opts: { workspaceId?: string | null; includeTest?: boolean } = {}): Promise<ReconciliationException[]> {
+  const ws = opts.workspaceId ?? null;
+  const scope = (col: string) => (ws ? tx`and ${tx(col)} = ${ws}` : opts.includeTest ? tx`` : tx`and (${tx(col)} is null or ${tx(col)} not in (select id from workspaces where is_test))`);
+  const rows = await tx`
+    select * from (
+      select 'Paid purchase without project progress' as issue, p.workspace_id, p.id::text as ref, p.paid_at as at
+        from purchases p join projects pr on pr.id = p.project_id and pr.workspace_id = p.workspace_id
+        where p.status = 'paid' and pr.state = 'STORYBOARD_READY' and p.paid_at < now() - interval '15 minutes' ${scope('p.workspace_id')}
+      union all
+      select 'Paid purchase without entitlement grant', p.workspace_id, p.id::text, p.paid_at from purchases p
+        where p.status = 'paid' and p.paid_at < now() - interval '15 minutes' ${scope('p.workspace_id')}
+          and not exists (select 1 from ledger_entries l where l.workspace_id = p.workspace_id and l.type = 'CREDIT_GRANTED'
+                            and l.unit = p.kind and l.reference = p.stripe_checkout_session_id)
+      union all
+      select 'Entitlement granted without a payment', l.workspace_id, l.id::text, l.created_at from ledger_entries l
+        where l.type = 'CREDIT_GRANTED' and l.unit in ('taste', 'standalone') and l.idempotency_key like 'pay:%' ${scope('l.workspace_id')}
+          and not exists (select 1 from purchases p where p.workspace_id = l.workspace_id and p.stripe_checkout_session_id = l.reference and p.status in ('paid', 'refunded'))
+      union all
+      select 'Period grant without a subscription', l.workspace_id, l.id::text, l.created_at from ledger_entries l
+        where l.type = 'CREDIT_GRANTED' and l.unit = 'creative_test' and l.idempotency_key like 'grant:%' ${scope('l.workspace_id')}
+          and not exists (select 1 from subscriptions s where s.workspace_id = l.workspace_id and l.idempotency_key like 'grant:' || s.stripe_subscription_id || ':%')
+      union all
+      select 'Active subscription without period grant', s.workspace_id, s.id::text, s.current_period_start from subscriptions s
+        where s.status = 'active' ${scope('s.workspace_id')}
+          and not exists (select 1 from ledger_entries l where l.workspace_id = s.workspace_id and l.type = 'CREDIT_GRANTED' and l.unit = 'creative_test'
+                            and l.period_key = to_char(s.current_period_start, 'YYYY-MM-DD'))
+      union all
+      -- One-off buyers are ACTIVE_PAID without a plan (restoreFromScheduledPurge keeps them paid), so only a
+      -- workspace with neither a live subscription nor a paid purchase is an exception.
+      select 'Workspace ACTIVE_PAID without subscription or payment', w.id, w.slug, w.updated_at from workspaces w
+        where w.state = 'ACTIVE_PAID' ${scope('w.id')}
+          and not exists (select 1 from subscriptions s where s.workspace_id = w.id and s.status in ('active','trialing','past_due'))
+          and not exists (select 1 from purchases p where p.workspace_id = w.id and p.status = 'paid')
+      union all
+      -- A failed event may not have been routed yet (workspace_id is set on success), so a tenant's view also
+      -- matches its Stripe customer.
+      select 'Stripe event failed processing', coalesce(e.workspace_id, ${ws}::uuid), e.id, e.received_at from stripe_events e where e.status = 'failed'
+        ${ws ? tx`and (e.workspace_id = ${ws} or (e.workspace_id is null and e.payload->'data'->'object'->>'customer' in (select customer_id from stripe_customers where workspace_id = ${ws})))` : scope('e.workspace_id')}
+    ) x order by at desc nulls last limit 500`;
+  return rows.map((r) => ({ issue: r.issue as string, workspaceId: (r.workspace_id as string) ?? null, ref: r.ref as string, at: (r.at as string) ?? null }));
 }
 
 /**

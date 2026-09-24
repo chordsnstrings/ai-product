@@ -1,7 +1,8 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
-import { activeBreakGlass, assertBreakGlass, audit, BREAK_GLASS_REASON_KINDS, BREAK_GLASS_REASON_LABEL, CANCELLABLE_BEFORE_DISPATCH, RISK_PLAYBOOKS, shouldMaskPii, staffCan, tenantHealth, type BreakGlassReasonKind } from '@arkiv/core';
+import { activeBreakGlass, assertBreakGlass, audit, BREAK_GLASS_REASON_KINDS, BREAK_GLASS_REASON_LABEL, CANCELLABLE_BEFORE_DISPATCH, reconciliationExceptions, RISK_PLAYBOOKS, shouldMaskPii, staffCan, tenantHealth, type BreakGlassReasonKind } from '@arkiv/core';
+import { canResendTemplate } from '@arkiv/email';
 import { newId, PLANS, RefundReason, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { ActButton, ActForm, type F } from '@/components/act';
 import { ago, d, dt, money, Mono, Page, Section, Table, Tabs, tm } from '@/components/ui';
@@ -9,6 +10,7 @@ import { estimateProjectRetry } from '@/lib/estimates';
 import { emailKey } from '@/lib/email-key';
 import { piiView, type PiiView } from '@/lib/mask';
 import { requireStaff } from '@/lib/staff';
+import { brandTree, claimCounts } from '@/lib/tenant-tree';
 
 export const metadata = { title: 'Tenant' };
 
@@ -66,7 +68,7 @@ export default async function Tenant({ params, searchParams }: { params: Promise
       {tab === 'ledger' ? <Ledger id={id} canAdjust={staffCan(s.roles, 'ledger.adjust')} /> : null}
       {tab === 'billing' ? <Billing id={id} canRefund={staffCan(s.roles, 'billing.refund')} pii={pii} /> : null}
       {tab === 'integrations' ? <Integrations id={id} canManage={staffCan(s.roles, 'integrations.manage')} /> : null}
-      {tab === 'emails' ? <Emails id={id} pii={pii} canUnsuppress={staffCan(s.roles, 'email.manage')} /> : null}
+      {tab === 'emails' ? <Emails id={id} pii={pii} canUnsuppress={staffCan(s.roles, 'email.manage')} canResend={staffCan(s.roles, 'email.manage')} /> : null}
       {tab === 'risk' ? <Risk id={id} canSuppress={staffCan(s.roles, 'tenant.flags')} /> : null}
       {tab === 'access' ? <Access id={id} /> : null}
       {tab === 'danger' ? <Danger id={id} w={w} canState={staffCan(s.roles, 'tenant.state')} canPurge={staffCan(s.roles, 'tenant.purge')} /> : null}
@@ -139,7 +141,10 @@ async function Members({ id, canManage, pii }: { id: string; canManage: boolean;
                              (select count(*) from passkeys where user_id = u.id)::int as passkeys, (select string_agg(provider, ',') from user_identities where user_id = u.id) as idents
                       from memberships m join users u on u.id = m.user_id where m.workspace_id = ${id} order by m.created_at`,
     invites: await tx`select id, email, role, expires_at, revoked_at, accepted_at from invites where workspace_id = ${id} order by created_at desc limit 20`,
+    transfers: await tx`select t.id, t.status, t.reason, t.staff_name, t.expires_at, t.created_at, t.decided_at, u.email as to_email
+                        from ownership_transfers t join users u on u.id = t.to_user_id where t.workspace_id = ${id} order by t.created_at desc limit 10`,
   }));
+  const pending = d0.transfers.find((t) => t.status === 'pending' && new Date(t.expires_at as string) > new Date());
   return (
     <>
       <Table head={['Member', 'Role', 'Sign-in', 'Last seen', '']} rows={d0.members.map((m) => [
@@ -149,7 +154,7 @@ async function Members({ id, canManage, pii }: { id: string; canManage: boolean;
         ago(m.last_seen),
         <span key="a" className="ak-row">
           <ActButton small action="user.force_logout" payload={{ userId: m.id }} reason>Force logout</ActButton>
-          {canManage && m.role !== 'OWNER' ? <ActButton small action="tenant.transfer_owner" payload={{ workspaceId: id, userId: m.id }} reason="Written reason + confirmation from the current owner (ticket #)">🔐 Make owner</ActButton> : null}
+          {canManage && m.role !== 'OWNER' ? <ActButton small action="tenant.transfer_owner" payload={{ workspaceId: id, userId: m.id }} confirm="Email the current owner(s) a confirmation link? Roles change only when an owner confirms." reason="Written reason (ticket #, who asked and why)">🔐 Request owner transfer</ActButton> : null}
         </span>,
       ])} />
       <Section title="Invites">
@@ -157,19 +162,39 @@ async function Members({ id, canManage, pii }: { id: string; canManage: boolean;
           pii.email(i.email),
           String(i.role).toLowerCase(),
           i.accepted_at ? 'accepted' : i.revoked_at ? 'revoked' : new Date(i.expires_at as string) < new Date() ? 'expired' : `pending · expires ${d(i.expires_at)}`,
-          !i.accepted_at && !i.revoked_at ? <ActButton key="r" small action="tenant.invite_revoke" payload={{ workspaceId: id, inviteId: i.id }}>Revoke</ActButton> : null,
+          !i.accepted_at && !i.revoked_at ? (
+            <span key="r" className="ak-row">
+              <ActButton small action="tenant.invite_resend" payload={{ workspaceId: id, inviteId: i.id }} confirm="Send a new invite link? The previous link stops working.">Resend</ActButton>
+              <ActButton small action="tenant.invite_revoke" payload={{ workspaceId: id, inviteId: i.id }}>Revoke</ActButton>
+            </span>
+          ) : null,
         ])} />
+      </Section>
+      <Section title="Ownership transfer requests" right={pending ? <span className="ak-chip ak-chip--warn">awaiting owner confirmation</span> : undefined}>
+        <Table head={['Requested', 'New owner', 'By', 'Reason', 'Status', '']} rows={d0.transfers.map((t) => {
+          const expired = t.status === 'pending' && new Date(t.expires_at as string) <= new Date();
+          return [
+            dt(t.created_at), pii.email(t.to_email), t.staff_name as string, <span key="r" className="ak-small">{t.reason as string}</span>,
+            expired ? `expired ${dt(t.expires_at)}` : t.status === 'pending' ? `pending until ${dt(t.expires_at)}` : `${t.status as string} ${dt(t.decided_at)}`,
+            canManage && t.status === 'pending' && !expired ? <ActButton key="c" small action="tenant.transfer_owner_cancel" payload={{ workspaceId: id, transferId: t.id }} reason>Withdraw</ActButton> : null,
+          ];
+        })} empty="No ownership transfer requests. The current owner confirms any transfer from an emailed link." />
       </Section>
     </>
   );
 }
 
 async function Skus({ id, staff, bg, canBg, canWrite }: { id: string; staff: Awaited<ReturnType<typeof requireStaff>>; bg: { write: boolean } | null; canBg: boolean; canWrite: boolean }) {
-  const meta = await withAdmin((tx) => tx`select s.id, s.catalogue_no, s.status, s.maturity, s.created_at,
-      (select count(*) from product_facts f where f.sku_id = s.id and f.status <> 'SUPERSEDED')::int as facts,
-      (select string_agg(status || ':' || n, ' ') from (select status, count(*) as n from claims c where c.sku_id = s.id group by status) x) as claims,
-      (select count(*) from assets a where a.sku_id = s.id)::int as assets, (select count(*) from experiments e where e.sku_id = s.id)::int as experiments
-    from skus s where s.workspace_id = ${id} order by s.catalogue_no`);
+  // §2.2 Brands & SKUs: a tree (brand → SKU) with counts of facts, claims by status, assets and experiments.
+  const meta = await withAdmin((tx) => tx`select s.id, s.catalogue_no, s.status, s.maturity, s.created_at, s.brand_id, b.name as brand,
+      (select count(*) from product_facts f where f.workspace_id = s.workspace_id and f.sku_id = s.id and f.status <> 'SUPERSEDED')::int as facts,
+      (select coalesce(jsonb_object_agg(status, n), '{}') from (select status, count(*)::int as n from claims c where c.workspace_id = s.workspace_id and c.sku_id = s.id group by status) x) as claims,
+      (select count(*) from assets a where a.workspace_id = s.workspace_id and a.sku_id = s.id and a.deleted_at is null)::int as assets,
+      (select count(*) from experiments e where e.workspace_id = s.workspace_id and e.sku_id = s.id)::int as experiments
+    from skus s left join brands b on b.id = s.brand_id and b.workspace_id = s.workspace_id
+    where s.workspace_id = ${id} order by b.name nulls last, s.catalogue_no`);
+  const brandsWithoutSkus = await withAdmin((tx) => tx`select b.id, b.name from brands b where b.workspace_id = ${id} and not exists (select 1 from skus s where s.workspace_id = b.workspace_id and s.brand_id = b.id) order by b.name`);
+  const tree = brandTree(meta, brandsWithoutSkus);
   let content: { skus: Record<string, unknown>[]; scenes: Record<string, unknown>[] } | null = null;
   if (bg) {
     content = await withAdmin(async (tx) => {
@@ -189,11 +214,17 @@ async function Skus({ id, staff, bg, canBg, canWrite }: { id: string; staff: Awa
   const no = (n: unknown) => String(n).padStart(3, '0');
   return (
     <>
-      <Table head={['No.', 'Status', 'Maturity', 'Facts', 'Claims by status', 'Assets', 'Experiments', 'Created']} rows={meta.map((m) => [no(m.catalogue_no), m.status as string, String(m.maturity).toLowerCase(), m.facts as number, <Mono key="c">{(m.claims as string) ?? '—'}</Mono>, m.assets as number, m.experiments as number, d(m.created_at)])} />
+      <Table head={['Brand / SKU', 'Status', 'Maturity', 'Facts', 'Claims by status', 'Assets', 'Experiments', 'Created']} rows={tree.flatMap((b) => [
+        [<strong key="b">{b.name}</strong>, `${b.skus.length} SKU${b.skus.length === 1 ? '' : 's'}`, '', b.facts, <Mono key="c">{claimCounts(b.claims)}</Mono>, b.assets, b.experiments, ''],
+        ...b.skus.map((m) => [
+          <span key="s" style={{ paddingLeft: 16 }}>└ {bg ? <Link href={`/tenants/${id}/skus/${m.id}`}>No. {no(m.catalogue_no)}</Link> : `No. ${no(m.catalogue_no)}`}</span>,
+          m.status as string, String(m.maturity).toLowerCase(), m.facts as number, <Mono key="c">{claimCounts(m.claims as Record<string, number>)}</Mono>, m.assets as number, m.experiments as number, d(m.created_at),
+        ]),
+      ])} empty="No brands or SKUs yet." />
       <Section title="Content (break-glass)">
         {content ? (
           <>
-            <Table head={['SKU', 'Name', 'Source', 'Claims']} rows={content.skus.map((c) => [<Mono key="i">{no(c.catalogue_no)}</Mono>, c.name as string, (c.source_url as string) ?? '—', ((c.claims as { w: string; s: string }[]) ?? []).map((x) => `“${x.w}” (${x.s})`).join('; ') || '—'])} />
+            <Table head={['SKU', 'Name', 'Source', 'Claims']} rows={content.skus.map((c) => [<Link key="i" href={`/tenants/${id}/skus/${c.id as string}`}><Mono>{no(c.catalogue_no)}</Mono></Link>, c.name as string, (c.source_url as string) ?? '—', ((c.claims as { w: string; s: string }[]) ?? []).map((x) => `“${x.w}” (${x.s})`).join('; ') || '—'])} />
             {bg?.write ? (
               <>
                 <h3 className="ak-label">Act on behalf · every change is recorded as Arkiv support in the customer’s history</h3>
@@ -328,13 +359,22 @@ async function Timeline({ id, projectId }: { id: string; projectId: string }) {
 }
 
 async function Ledger({ id, canAdjust }: { id: string; canAdjust: boolean }) {
-  const rows = await withAdmin((tx) => tx`select id, type, unit, amount, period_key, reason, actor, created_at,
-      sum(case when type in ('CREDIT_GRANTED','CREDIT_RESERVED','CREDIT_RELEASED','CREDIT_REFUNDED','CREDIT_EXPIRED','CREDIT_ADJUSTED') then amount else 0 end)
-        over (partition by unit order by id) as running
-    from ledger_entries where workspace_id = ${id} order by id desc limit 300`);
+  const { rows, recon } = await withAdmin(async (tx) => ({
+    rows: await tx`select id, type, unit, amount, period_key, reason, actor, created_at,
+        sum(case when type in ('CREDIT_GRANTED','CREDIT_RESERVED','CREDIT_RELEASED','CREDIT_REFUNDED','CREDIT_EXPIRED','CREDIT_ADJUSTED') then amount else 0 end)
+          over (partition by unit order by id) as running
+      from ledger_entries where workspace_id = ${id} order by id desc limit 300`,
+    // §2.2 "reconciliation status": the Billing page's exception list, for this tenant only.
+    recon: await reconciliationExceptions(tx, { workspaceId: id }),
+  }));
   return (
     <div className="ak-grid-2" style={{ alignItems: 'start', gridTemplateColumns: '2fr 1fr' }}>
+      <div>
+      <Section title="Reconciliation" right={<span className={`ak-chip ${recon.length ? 'ak-chip--risk' : 'ak-chip--ok'}`}>{recon.length ? `${recon.length} exception${recon.length === 1 ? '' : 's'}` : 'reconciled'}</span>}>
+        <Table head={['Issue', 'Reference', 'Since']} rows={recon.map((r) => [r.issue, <Mono key="r">{r.ref}</Mono>, dt(r.at)])} empty="Payments, ledger grants and entitlements agree." />
+      </Section>
       <Table head={['#', 'When', 'Type', 'Unit', 'Amount', 'Balance', 'Reason', 'Actor']} rows={rows.map((r) => [r.id as number, dt(r.created_at), <Mono key="t">{r.type as string}</Mono>, r.unit as string, <Mono key="a">{r.unit === 'usd_micros' ? money(r.amount, 4) : String(r.amount)}</Mono>, r.unit === 'usd_micros' ? '—' : String(r.running), <span key="r" className="ak-small">{(r.reason as string) ?? ''}</span>, <Mono key="ac">{String(r.actor).split(':')[0]}</Mono>])} empty="No ledger entries." />
+      </div>
       {canAdjust ? (
         <div className="ak-panel">
           <p className="ak-label">🔐 Ledger adjustment</p>
@@ -406,28 +446,71 @@ async function Billing({ id, canRefund, pii }: { id: string; canRefund: boolean;
 }
 
 async function Integrations({ id, canManage }: { id: string; canManage: boolean }) {
-  const rows = await withAdmin((tx) => tx`select id, provider, external_account_id, display_name, status, scopes, last_success_at, last_complete_date, cursor, error, token_expires_at from integrations where workspace_id = ${id} order by provider`);
+  const d0 = await withAdmin(async (tx) => ({
+    rows: await tx`select id, provider, external_account_id, display_name, status, scopes, last_success_at, last_complete_date, cursor, error, token_expires_at from integrations where workspace_id = ${id} order by provider`,
+    // Last 30 throttles per connection (§2.2 "rate-limit history").
+    limits: await tx`select integration_id, message, retry_after_sec, at from (
+                       select l.*, row_number() over (partition by l.integration_id order by l.at desc) as n from integration_rate_limits l where l.workspace_id = ${id}) x
+                     where n <= 30 order by at desc`,
+  }));
+  const limitsFor = (integrationId: unknown) => d0.limits.filter((l) => l.integration_id === integrationId);
   return (
-    <Table head={['Provider', 'Account', 'Status', 'Scopes', 'Last success', 'Complete to', 'Token expiry', 'Last error', '']} rows={rows.map((r) => [
-      r.provider as string, <Mono key="a">{r.external_account_id as string}</Mono>, r.status as string, (r.scopes as string[]).join(','), ago(r.last_success_at), d(r.last_complete_date), d(r.token_expires_at),
-      <span key="e" className="ak-small">{(r.error as { message?: string } | null)?.message ?? ''}</span>,
-      canManage && r.status !== 'disconnected' ? <span key="x" className="ak-row"><ActButton small action="tenant.integration_sync" payload={{ workspaceId: id, integrationId: r.id }}>Re-sync</ActButton><ActButton small action="tenant.integration_status" payload={{ workspaceId: id, integrationId: r.id, status: r.status === 'paused' ? 'active' : 'paused' }} reason>{r.status === 'paused' ? 'Resume' : 'Pause'}</ActButton></span> : null,
-    ])} />
+    <>
+      <Table head={['Provider', 'Account', 'Status', 'Scopes', 'Last success', 'Complete to', 'Cursor', 'Token expiry', 'Rate limits (30d)', 'Last error', '']} rows={d0.rows.map((r) => {
+        const err = r.error as { kind?: string; message?: string; at?: string } | null;
+        const recent = limitsFor(r.id).filter((l) => new Date(l.at as string).getTime() > Date.now() - 30 * 86400_000).length;
+        return [
+          r.provider as string, <Mono key="a">{r.external_account_id as string}</Mono>, r.status as string, (r.scopes as string[]).join(','), ago(r.last_success_at), d(r.last_complete_date),
+          <Mono key="c">{Object.keys((r.cursor as object) ?? {}).length ? JSON.stringify(r.cursor) : '—'}</Mono>,
+          d(r.token_expires_at),
+          recent,
+          err ? (
+            // §2.2 "view last raw error": the stored error as written by the connector.
+            <details key="e" className="ak-small"><summary>{err.kind ?? 'error'}: {(err.message ?? '').slice(0, 60)}</summary><pre className="ak-mono" style={{ whiteSpace: 'pre-wrap', fontSize: 11, maxWidth: 420 }}>{JSON.stringify(err, null, 2)}</pre></details>
+          ) : '',
+          canManage && r.status !== 'disconnected' ? (
+            <span key="x" className="ak-row">
+              <ActButton small action="tenant.integration_sync" payload={{ workspaceId: id, integrationId: r.id }}>Re-sync</ActButton>
+              <ActButton small action="tenant.integration_status" payload={{ workspaceId: id, integrationId: r.id, status: r.status === 'paused' ? 'active' : 'paused' }} reason>{r.status === 'paused' ? 'Resume' : 'Pause'}</ActButton>
+              {r.status !== 'degraded' && r.status !== 'revoked' ? <ActButton small danger action="tenant.integration_status" payload={{ workspaceId: id, integrationId: r.id, status: 'degraded' }} reason="Why is this connection degraded? (the customer sees it as needing attention)">Mark degraded</ActButton> : null}
+            </span>
+          ) : null,
+        ];
+      })} empty="No connections." />
+      <Section title="Rate-limit history (last 30 per connection)">
+        <Table head={['When', 'Connection', 'Retry after', 'Message']} rows={d0.limits.map((l) => {
+          const c = d0.rows.find((r) => r.id === l.integration_id);
+          return [dt(l.at), c ? `${c.provider as string} · ${c.external_account_id as string}` : String(l.integration_id).slice(0, 8), l.retry_after_sec != null ? `${l.retry_after_sec}s` : '—', <span key="m" className="ak-small">{(l.message as string) ?? ''}</span>];
+        })} empty="No rate limits recorded." />
+      </Section>
+    </>
   );
 }
 
-async function Emails({ id, pii, canUnsuppress }: { id: string; pii: PiiView; canUnsuppress: boolean }) {
-  const rows = await withAdmin((tx) => tx`select l.to_email, l.template, l.stream, l.status, l.created_at, (select reason from email_suppressions s where s.email = l.to_email) as suppressed
+async function Emails({ id, pii, canUnsuppress, canResend }: { id: string; pii: PiiView; canUnsuppress: boolean; canResend: boolean }) {
+  const rows = await withAdmin((tx) => tx`select l.id, l.to_email, l.template, l.stream, l.status, l.created_at, l.data is not null as has_data,
+      (select reason from email_suppressions s where s.email = l.to_email) as suppressed
     from email_log l where l.workspace_id = ${id} or l.to_email in (select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${id}) order by l.created_at desc limit 100`);
-  // The unsuppress button carries a hash of the address, never the address itself (masked views stay masked).
-  return <Table head={['When', 'To', 'Template', 'Stream', 'Status', '']} rows={rows.map((r) => [dt(r.created_at), pii.email(r.to_email), r.template as string, r.stream as string, r.status as string, r.suppressed && canUnsuppress ? <ActButton key="u" small action="email.unsuppress" payload={{ emailKey: emailKey(r.to_email as string) }} reason>Unsuppress ({r.suppressed as string})</ActButton> : r.suppressed ? `suppressed (${r.suppressed as string})` : null])} />;
+  // The unsuppress button carries a hash of the address, never the address itself (masked views stay masked);
+  // resend and the rendered view carry the log id.
+  return (
+    <Table head={['When', 'To', 'Template', 'Stream', 'Status', '']} rows={rows.map((r) => [
+      <Link key="w" href={`/tenants/${id}/emails/${r.id as string}`}>{dt(r.created_at)}</Link>,
+      pii.email(r.to_email), r.template as string, r.stream as string, r.status as string,
+      <span key="a" className="ak-row">
+        {canResend && r.has_data && canResendTemplate(r.template as string) ? <ActButton small action="email.resend" payload={{ logId: r.id, requestId: newId() }} reason="Why resend (ticket #)">Resend</ActButton> : null}
+        {r.suppressed && canUnsuppress ? <ActButton small action="email.unsuppress" payload={{ emailKey: emailKey(r.to_email as string) }} reason>Unsuppress ({r.suppressed as string})</ActButton> : r.suppressed ? `suppressed (${r.suppressed as string})` : null}
+      </span>,
+    ])} empty="No emails." />
+  );
 }
 
 async function Risk({ id, canSuppress }: { id: string; canSuppress: boolean }) {
   const d0 = await withAdmin(async (tx) => ({
     flags: await tx`select * from risk_flags where workspace_id = ${id} order by raised_at desc`,
     abuse: await tx`select kind, key, detail, at from abuse_signals where workspace_id = ${id} order by at desc limit 50`,
-    disputes: await tx`select type, received_at from stripe_events where workspace_id = ${id} and type like 'charge.dispute%' order by received_at desc`,
+    disputes: await tx`select id, status, reason, amount_cents, evidence_due_by, stripe_created_at from stripe_disputes where workspace_id = ${id} order by stripe_created_at desc nulls last`,
+    notices: await tx`select title, created_at, expires_at, dismissed_at from workspace_notices where workspace_id = ${id} order by created_at desc limit 10`,
   }));
   const status = (f: Record<string, unknown>) => {
     if (f.suppressed_reason) {
@@ -438,16 +521,26 @@ async function Risk({ id, canSuppress }: { id: string; canSuppress: boolean }) {
   };
   return (
     <>
-      <Table head={['Indicator', 'Evidence', 'Raised', 'Status', 'Playbook', '']} rows={d0.flags.map((f) => [
-        RISK_PLAYBOOKS[f.indicator as RiskIndicator]?.label ?? (f.indicator as string),
-        <Mono key="e">{JSON.stringify(f.evidence).slice(0, 140)}</Mono>,
-        dt(f.raised_at),
-        status(f),
-        <span key="p" className="ak-small">{RISK_PLAYBOOKS[f.indicator as RiskIndicator]?.intervention ?? '—'}</span>,
-        canSuppress && !f.resolved_at ? <ActForm key="s" inline action="tenant.risk_suppress" extra={{ workspaceId: id, flagId: f.id }} submit="Suppress" fields={[{ name: 'days', label: 'Days', type: 'number', defaultValue: 30, required: true }, { name: 'reason', label: 'Reason', required: true }]} /> : null,
-      ])} empty="No churn-risk indicators." />
+      <Table head={['Indicator', 'Evidence', 'Raised', 'Status', 'Playbook', '']} rows={d0.flags.map((f) => {
+        const pb = RISK_PLAYBOOKS[f.indicator as RiskIndicator];
+        const started = (f.interventions as { at: string; by: string; emailed: boolean; notice: boolean }[]) ?? [];
+        return [
+          pb?.label ?? (f.indicator as string),
+          <Mono key="e">{JSON.stringify(f.evidence).slice(0, 140)}</Mono>,
+          dt(f.raised_at),
+          status(f),
+          <span key="p" className="ak-small">{pb?.intervention ?? '—'}{started.length ? <><br />Started {started.map((x) => `${d(x.at)} by ${x.by}${x.emailed ? ' · email' : ''}${x.notice ? ' · in-app' : ''}`).join('; ')}</> : null}</span>,
+          canSuppress && !f.resolved_at ? (
+            <span key="s" className="ak-stack" style={{ ['--stack' as string]: '6px' }}>
+              <ActButton small action="intervention.start" payload={{ workspaceId: id, flagId: f.id }} confirm={pb?.email || pb?.notice ? `Start the playbook? ${[pb?.email ? 'Emails the owners and admins' : null, pb?.notice ? 'posts an in-app notice' : null].filter(Boolean).join(' and ')}.` : 'Record that you started the personal follow-up?'}>Start playbook</ActButton>
+              <ActForm inline action="tenant.risk_suppress" extra={{ workspaceId: id, flagId: f.id }} submit="Suppress" fields={[{ name: 'days', label: 'Days', type: 'number', defaultValue: 30, required: true }, { name: 'reason', label: 'Reason', required: true }]} />
+            </span>
+          ) : null,
+        ];
+      })} empty="No churn-risk indicators." />
+      <Section title="In-app notices"><Table head={['Posted', 'Notice', 'Status']} rows={d0.notices.map((n) => [dt(n.created_at), n.title as string, n.dismissed_at ? `dismissed ${dt(n.dismissed_at)}` : new Date(n.expires_at as string) < new Date() ? 'expired' : 'showing'])} empty="No notices posted." /></Section>
       <Section title="Abuse signals"><Table head={['When', 'Kind', 'Key', 'Detail']} rows={d0.abuse.map((a) => [dt(a.at), a.kind as string, <Mono key="k">{a.key as string}</Mono>, <Mono key="d">{JSON.stringify(a.detail).slice(0, 120)}</Mono>])} /></Section>
-      <Section title="Disputes"><Table head={['When', 'Event']} rows={d0.disputes.map((x) => [dt(x.received_at), x.type as string])} /></Section>
+      <Section title="Disputes"><Table head={['Opened', 'Dispute', 'Amount', 'Reason', 'Status', 'Evidence due']} rows={d0.disputes.map((x) => [dt(x.stripe_created_at), <Mono key="i">{x.id as string}</Mono>, money(Number(x.amount_cents) * 10_000), (x.reason as string) ?? '—', x.status as string, dt(x.evidence_due_by)])} empty="No disputes." /></Section>
     </>
   );
 }

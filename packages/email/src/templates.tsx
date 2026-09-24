@@ -81,6 +81,8 @@ export interface TemplateMap {
   friday_summary: { workspaceName: string; lines: string[]; url: string };
   day30_review: { productName: string; tested: number; actionable: number; url: string };
   staff_break_glass: { staffName: string; reason: string; when: string; url: string };
+  ownership_transfer_confirm: { workspaceName: string; newOwner: string; reason: string; url: string; expiresIn: string };
+  intervention: { label: string; headline: string; body: string; cta: string; url: string };
 }
 
 export type TemplateName = keyof TemplateMap;
@@ -287,6 +289,27 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: 
     case 'day30_review': {
       const m = d as TemplateMap['day30_review'];
       return { subject: `${m.productName} · 30-day creative review`, stream: 'transactional', element: (<L preview={`${m.tested} tests, ${m.actionable} actionable learnings`} label="SKU review"><H>Your first 30 days</H><Meta rows={[['Tests run', String(m.tested)], ['Actionable learnings', String(m.actionable)]]} /><Cta href={m.url}>Read the review</Cta></L>) };
+    }
+    case 'ownership_transfer_confirm': {
+      const m = d as TemplateMap['ownership_transfer_confirm'];
+      return {
+        subject: `Confirm: make ${m.newOwner} the owner of ${m.workspaceName}?`,
+        stream: 'transactional',
+        element: (
+          <L preview="Nothing changes unless you confirm." label="Ownership · your confirmation needed">
+            <H>Confirm the new owner</H>
+            <P>Arkiv support was asked to make {m.newOwner} the owner of {m.workspaceName}. You would become an admin. Nothing changes unless you confirm.</P>
+            <Meta rows={[['Workspace', m.workspaceName], ['New owner', m.newOwner], ['Reason given', m.reason], ['Link expires', `in ${m.expiresIn}`]]} />
+            <Cta href={m.url}>Review and confirm</Cta>
+            <P>{' '}</P>
+            <P>If you didn’t ask for this, decline on that page or ignore this email.</P>
+          </L>
+        ),
+      };
+    }
+    case 'intervention': {
+      const m = d as TemplateMap['intervention'];
+      return { subject: m.headline, stream: 'transactional', element: (<L preview={m.body.slice(0, 90)} label={m.label}><H>{m.headline}</H><P>{m.body}</P><Cta href={m.url}>{m.cta}</Cta></L>) };
     }
     case 'staff_break_glass': {
       const m = d as TemplateMap['staff_break_glass'];
