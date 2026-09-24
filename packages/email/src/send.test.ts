@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool } from '@arkiv/db';
 import { truncateAll } from '@arkiv/db/testing';
-import { canResendTemplate, devOutbox, REDACTED_LINK, renderEmail, sendEmail, storedEmailData } from './send';
+import { canResendTemplate, devOutbox, REDACTED_LINK, renderEmail, sendEmail, storedEmailData, unsubscribeLink, verifyUnsub } from './send';
 
 beforeEach(truncateAll);
 afterEach(async () => {
@@ -55,5 +55,22 @@ describe('compliance emails (plan 05 §14)', () => {
     const m = await renderEmail('media_review_result', { productName: 'Dew Serum', outcome: 'rejected', note: 'It shows a before/after comparison.', url: 'http://localhost/w/x/products/1' });
     expect(m.subject).toMatch(/won’t be used/);
     for (const t of ['claim_evidence_request', 'sku_out_of_scope', 'claims_guidance', 'media_review_result']) expect(canResendTemplate(t)).toBe(true);
+  });
+});
+
+describe('marketing unsubscribe (plan 04 L20 one-click unsubscribe)', () => {
+  it('links the recipient’s signed unsubscribe URL on marketing emails only', async () => {
+    const url = new URL(unsubscribeLink('buyer@example.com'));
+    // The route the List-Unsubscribe header and the footer point to exists (apps/web/app/api/unsubscribe) and takes `t`.
+    expect(url.pathname).toBe('/api/unsubscribe');
+    expect(verifyUnsub(url.searchParams.get('t')!)).toBe('buyer@example.com');
+
+    await sendEmail('new_concept', 'buyer@example.com', { productName: 'Dew Serum', url: 'http://localhost/x', hook: 'Glass skin in 3 drops' }, { idempotencyKey: 'unsub-footer-1' });
+    const marketing = devOutbox.at(-1)!;
+    expect(marketing.html).toContain('Unsubscribe');
+    expect(marketing.html).toContain(url.searchParams.get('t')!);
+
+    await sendEmail('receipt', 'buyer@example.com', { productName: 'Dew Serum', amount: '$19.00', description: 'One ad', url: 'http://localhost/x' }, { idempotencyKey: 'unsub-footer-2' });
+    expect(devOutbox.at(-1)!.html).not.toContain('/api/unsubscribe');
   });
 });
