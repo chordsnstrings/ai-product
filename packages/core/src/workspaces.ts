@@ -410,10 +410,16 @@ export async function transferOwnership(tx: Tx, ctx: TenantContext, toUserId: st
       stepDown = { userId: ctx.actor.id, from: me.role as Role };
     }
   }
-  await tx`update workspaces set membership_version = membership_version + 1 where id = ${ctx.workspaceId}`;
+  const [ver] = await tx`update workspaces set membership_version = membership_version + 1 where id = ${ctx.workspaceId} returning membership_version`;
   // One MEMBER_ROLE_CHANGED per member whose role changed, in the shared payload shape (EVENT_PAYLOADS).
   if (t.role !== 'OWNER') await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: toUserId }, { from: t.role as Role, to: 'OWNER', transfer: true });
   if (stepDown) await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: stepDown.userId }, { from: stepDown.from, to: 'ADMIN', transfer: true });
+  // Security email to the new and previous Owner (plan 03 A10 "security (… ownership change)"), sent after commit
+  // through the outbox like the staff-requested transfer's.
+  if (t.role !== 'OWNER' || stepDown) {
+    const userIds = [...new Set([toUserId, ...(stepDown ? [stepDown.userId] : [])])];
+    await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'ownership_transferred', userIds }, { singletonKey: `owner-transferred:self:${String(ver?.membership_version ?? toUserId)}` });
+  }
 }
 
 /**

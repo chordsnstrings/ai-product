@@ -4,6 +4,7 @@
 // sources and would otherwise compile JSX with the classic runtime ("React is not defined").
 import { Body, Button, Container, Head, Hr, Html, Img, Preview, Section, Text } from '@react-email/components';
 import type { ReactNode } from 'react';
+import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
 
 /** Arkiv email design (01-design-system §6/§7): paper background, serif headline, mono metadata, one CTA. */
 const C = { paper: '#F5F2EC', raised: '#FBFAF7', ink: '#1A1917', ink2: '#4A4742', stone: '#8A857D', rule: '#D6D1C7', accent: '#7A4A32' };
@@ -136,9 +137,9 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
         subject: title,
         stream: 'transactional',
         element: (
-          <L preview={`${title}. This link works for 15 minutes.`} label="Sign in">
+          <L preview={`${title}. This link works for ${MAGIC_LINK_TTL_MIN} minutes.`} label="Sign in">
             <H>{title}</H>
-            <P>{m.purpose === 'claim' ? 'Your storyboard is being prepared. Tap below to save your work and continue.' : 'Tap the button to continue. This link works once, for 15 minutes.'}</P>
+            <P>{m.purpose === 'claim' ? `Your ${m.productName ?? 'product'} catalogue and 3 ad ideas are saved. Tap below to sign in and build the storyboard. This link works once, for ${MAGIC_LINK_TTL_MIN} minutes.` : `Tap the button to continue. This link works once, for ${MAGIC_LINK_TTL_MIN} minutes.`}</P>
             <Cta href={m.url}>{m.purpose === 'claim' ? 'Save and continue' : 'Continue'}</Cta>
             <P>{' '}</P>
             <P>If you didn’t ask for this, you can ignore this email.</P>

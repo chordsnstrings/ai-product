@@ -36,6 +36,23 @@ export async function sweepRateLimits(tx: Tx): Promise<number> {
   return r.count;
 }
 
+/** How long sign-in records are kept (plan 05 §3 "login history, failed logins"; standard §40 data minimisation). */
+export const SIGN_IN_RECORD_DAYS = 180;
+
+/**
+ * Daily retention for sign-in records: failed attempts, finished (signed-out or expired) sessions and sign-in links
+ * older than SIGN_IN_RECORD_DAYS, and OAuth/passkey challenges a day after they expired. Live sessions are kept.
+ */
+export async function sweepSignInRecords(tx: Tx): Promise<number> {
+  const days = SIGN_IN_RECORD_DAYS;
+  const a = await tx`delete from login_attempts where at < now() - make_interval(days => ${days})`;
+  const s = await tx`delete from sessions where (revoked_at is not null or expires_at < now())
+                     and greatest(coalesce(revoked_at, expires_at), last_seen_at) < now() - make_interval(days => ${days})`;
+  const m = await tx`delete from magic_links where created_at < now() - make_interval(days => ${days})`;
+  const o = await tx`delete from oauth_states where expires_at < now() - interval '1 day'`;
+  return a.count + s.count + m.count + o.count;
+}
+
 /** Smallest active staff-set rate-limit factor for these keys (1 when none). */
 async function tightenFactor(t: Tx, keys: (string | null | undefined)[] | undefined): Promise<number> {
   const ks = [...new Set((keys ?? []).filter((k): k is string => !!k))];

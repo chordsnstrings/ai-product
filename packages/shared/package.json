@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./log": "./src/log.ts",
-    "./format": "./src/format.ts"
+    "./format": "./src/format.ts",
+    "./auth": "./src/auth.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

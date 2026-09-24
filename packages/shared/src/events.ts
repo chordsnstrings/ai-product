@@ -103,6 +103,9 @@ export const EventType = [
   'PRODUCT_ANALYZED',
   'CONCEPTS_READY',
   'ACCOUNT_CLAIMED',
+  // Plan 06 Phase 3 #8 "Passkeys (offered after first purchase)": the prompt was shown, and a passkey was added from it.
+  'PASSKEY_PROMPT_SHOWN',
+  'PASSKEY_ADDED',
   'STORYBOARD_READY',
   'CHECKOUT_STARTED',
   'TASTE_PAID',
@@ -325,6 +328,8 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   PRODUCT_ANALYZED: 'sku',
   CONCEPTS_READY: 'project',
   ACCOUNT_CLAIMED: 'workspace',
+  PASSKEY_PROMPT_SHOWN: null,
+  PASSKEY_ADDED: null,
   STORYBOARD_READY: 'project',
   CHECKOUT_STARTED: 'project',
   TASTE_PAID: 'project',

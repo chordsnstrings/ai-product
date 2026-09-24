@@ -17,6 +17,7 @@ export const ABUSE_SIGNAL_KINDS = {
   prohibited_upload: 'Non-skincare or prohibited product submitted',
   multi_sku_limit: 'Free-preview multi-SKU limit hit',
   prompt_injection: 'Prompt-injection attempt in imported text',
+  disposable_email: 'Sign-up with a disposable email domain (allowed, scored)',
 } as const;
 export type AbuseSignalKind = keyof typeof ABUSE_SIGNAL_KINDS;
 

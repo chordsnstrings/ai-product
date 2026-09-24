@@ -9,7 +9,7 @@ export interface LoginMeta {
   geo?: EdgeGeo | null;
 }
 
-export type LoginMethod = 'magic_link' | 'passkey' | 'google' | 'apple';
+export type LoginMethod = 'magic_link' | 'passkey' | 'google' | 'apple' | 'password';
 
 /**
  * A failed sign-in (plan 05 §3 Users "failed logins"): written in its own transaction, so it survives the failed
