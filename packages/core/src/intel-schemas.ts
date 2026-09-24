@@ -6,8 +6,8 @@ import { Taxonomy } from '@arkiv/shared';
 export const ProductExtraction = z.object({
   name: z.string().min(1).max(160),
   brand: z.string().max(120).nullable(),
-  category: z.enum(['serum', 'cleanser', 'moisturizer', 'eye', 'mask', 'facial_oil', 'toner', 'exfoliant', 'balm', 'skincare', 'not_skincare']),
-  sizeText: z.string().max(40).nullable(),
+  category: z.enum(['serum', 'cleanser', 'moisturizer', 'eye', 'mask', 'facial_oil', 'toner', 'exfoliant', 'balm', 'skincare', 'drug_or_sunscreen', 'not_skincare']),
+  sizeText: z.string().max(40).nullable().describe('Net size exactly as printed on the packaging in the photos; null if not visible'),
   format: z.string().max(60).nullable().describe('e.g. gel, cream, oil, lotion'),
   texture: z.string().max(120).nullable(),
   keyIngredients: z.array(z.string().max(60)).max(8),

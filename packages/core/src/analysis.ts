@@ -99,6 +99,51 @@ function factsFromStructured(p: ExtractedProduct, url: string | null): FactInput
   return f;
 }
 
+/** The advertised product's own words (name, description, store category, ingredients) — not menus or footers. */
+export function productScopeText(p: Pick<ExtractedProduct, 'name' | 'description' | 'productType' | 'ingredients'>): string {
+  return [p.name, p.productType, p.description?.slice(0, 3000), p.ingredients?.slice(0, 2000)].filter(Boolean).join(' \n ');
+}
+
+/** What the model read on the product itself (name, label, the brand's own claims), for the post-extraction scope check. */
+export const extractionScopeText = (x: Pick<ProductExtraction, 'name' | 'labelText' | 'claimsFound'>) =>
+  [x.name, x.labelText ?? '', ...x.claimsFound.map((c) => `${c.wording} ${c.sourceQuote}`)].join(' \n ');
+
+const words = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+
+/**
+ * Facts from the vision/text extraction, each labelled with what it really is (§15): a reading of the label is
+ * OBSERVED (photo_ocr), the model's interpretation is INFERRED (vision). The label's size and name are always
+ * recorded, so a label that disagrees with the page surfaces as a dispute instead of being dropped (§42). Key
+ * ingredients are OBSERVED only as the page's own INCI entries the model picked out; otherwise INFERRED.
+ */
+export function extractionFacts(x: ProductExtraction, extracted: ExtractedProduct | null, url: string | null, jobId: string | null): FactInput[] {
+  const label = x.labelText ? words(x.labelText) : '';
+  const nameOnLabel = !!label && label.includes(words(x.name));
+  const pageSrc = extracted?.source === 'shopify' ? 'shopify' : extracted?.source === 'json_ld' ? 'json_ld' : 'product_page';
+  const inci = extracted?.ingredients ? extracted.ingredients.split(/[,;\n]/).map((t) => t.trim()).filter(Boolean) : [];
+  const onPage = [...new Set(x.keyIngredients.flatMap((k) => {
+    const kk = words(k);
+    const hit = kk.length >= 3 ? inci.find((t) => words(t) === kk || (kk.length >= 4 && words(t).includes(kk))) : undefined;
+    return hit ? [hit] : [];
+  }))];
+  const vision = { sourceType: 'vision' as const, sourceId: jobId, state: 'INFERRED' as const };
+  const facts: FactInput[] = [
+    nameOnLabel
+      ? { key: 'name', valueText: x.name, sourceType: 'photo_ocr', sourceId: jobId, state: 'OBSERVED', confidence: 0.8 }
+      : { key: 'name', valueText: x.name, ...vision, confidence: 0.8 },
+    { key: 'category', valueText: x.category, ...vision, confidence: 0.85 },
+    { key: 'format', valueText: x.format, ...vision, confidence: 0.7 },
+    { key: 'texture', valueText: x.texture, ...vision, confidence: 0.6 },
+    onPage.length
+      ? { key: 'key_ingredients', valueText: onPage.join(', '), sourceType: pageSrc, sourceUrl: url, state: 'OBSERVED', confidence: 0.8 }
+      : { key: 'key_ingredients', valueText: x.keyIngredients.join(', ') || null, ...vision, confidence: 0.6 },
+    { key: 'label_text', valueText: x.labelText, sourceType: 'photo_ocr', sourceId: jobId, state: 'OBSERVED', confidence: x.assetQualityConfidence },
+    { key: 'packaging', valueJson: x.packaging, ...vision, confidence: 0.8 },
+  ];
+  if (x.sizeText) facts.push({ key: 'size', valueText: x.sizeText, sourceType: 'photo_ocr', sourceId: jobId, state: 'OBSERVED', confidence: 0.7 });
+  return facts;
+}
+
 export async function analyzeProduct(ctx: TenantContext, skuId: string, projectId: string): Promise<{ status: 'ready' | 'rejected' | 'needs_input' | 'skipped'; reason?: string }> {
   const ws = ctx.workspaceId;
   const sku = await withTenant(ws, async (tx) => {
@@ -162,10 +207,12 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
   }
   await withTenant(ws, (tx) => step(tx, ws, skuId, 'photos', 'done', `${photoIds.length} photo${photoIds.length > 1 ? 's' : ''}`));
 
-  // 3. Scope checks before any model spend.
-  const scopeText = `${extracted?.name ?? ''} ${extracted?.description ?? ''} ${extracted?.rawText.slice(0, 3000) ?? ''}`;
+  // 3. Scope checks before any model spend — on the advertised product's own fields only, never the whole page
+  //    (a serum page whose store menu lists "Sunscreen" is still a serum). Photo-only uploads are checked on
+  //    what the label says, after extraction.
+  const scopeText = extracted ? productScopeText(extracted) : '';
   const excluded = excludedProductReason(scopeText);
-  const other = extracted ? nonSkincareCategory(scopeText) : null;
+  const other = scopeText.trim() ? nonSkincareCategory(scopeText) : null;
   if (excluded || other) {
     const reason = excluded ?? `We’re built for skincare. This looks like ${other}.`;
     await withTenant(ws, async (tx) => {
@@ -226,29 +273,24 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       maxTokens: 2000,
     });
     const x = ext.data;
-    if (x.category === 'not_skincare') {
-      const reason = 'We’re built for skincare. This product doesn’t look like skincare.';
+    // §1: sunscreen/SPF and OTC drug products are out of scope — also when only the label shows it.
+    const labelExcluded =
+      x.category === 'drug_or_sunscreen'
+        ? (excludedProductReason(extractionScopeText(x)) ?? 'Sunscreen, SPF and OTC drug products (like acne treatments) are outside what we make ads for.')
+        : excludedProductReason(extractionScopeText(x));
+    if (x.category === 'not_skincare' || labelExcluded) {
+      const reason = labelExcluded ?? 'We’re built for skincare. This product doesn’t look like skincare.';
       await withTenant(ws, async (tx) => {
         await tx`update skus set status = 'rejected', reject_reason = ${reason} where id = ${skuId}`;
         await step(tx, ws, skuId, 'identify', 'failed', reason);
         await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason });
         await settle(tx, ctx, auth.authorizationId, 'consumed');
+        if (labelExcluded) await recordFunnel('SKU_REJECTED', { workspaceId: ws, props: { reason } }, tx);
       });
       return { status: 'rejected', reason };
     }
     await withTenant(ws, async (tx) => {
-      const vf: FactInput[] = [
-        { key: 'name', valueText: x.name, sourceType: 'vision', state: extracted?.name ? 'INFERRED' : 'OBSERVED', confidence: 0.8 },
-        { key: 'category', valueText: x.category, sourceType: 'vision', state: 'INFERRED', confidence: 0.85 },
-        { key: 'format', valueText: x.format, sourceType: 'vision', state: 'INFERRED', confidence: 0.7 },
-        { key: 'texture', valueText: x.texture, sourceType: 'vision', state: 'INFERRED', confidence: 0.6 },
-        { key: 'key_ingredients', valueText: x.keyIngredients.join(', ') || null, sourceType: extracted?.ingredients ? 'product_page' : 'vision', state: extracted?.ingredients ? 'OBSERVED' : 'INFERRED', confidence: 0.8 },
-        { key: 'label_text', valueText: x.labelText, sourceType: 'photo_ocr', state: 'OBSERVED', confidence: x.assetQualityConfidence },
-        { key: 'packaging', valueJson: x.packaging, sourceType: 'vision', state: 'INFERRED', confidence: 0.8 },
-      ];
-      if (!extracted?.sizeText && x.sizeText) vf.push({ key: 'size', valueText: x.sizeText, sourceType: 'photo_ocr', state: 'OBSERVED', confidence: 0.7 });
-      // Name from structured data wins; vision name only if nothing structured exists.
-      await recordFacts(tx, ctx, skuId, extracted?.name ? vf.filter((f) => f.key !== 'name') : vf);
+      await recordFacts(tx, ctx, skuId, extractionFacts(x, extracted, sku.source_url as string | null, ext.jobId));
       const name = extracted?.name ?? x.name;
       await tx`update skus set name = ${name}, category = ${x.category}, fidelity_confidence = ${x.assetQualityConfidence},
                  analysis = ${tx.json({ missingEvidence: x.missingEvidence, suggestedViews: x.suggestedViews, multipleProductsVisible: x.multipleProductsVisible } as never)}

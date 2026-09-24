@@ -11,6 +11,9 @@ Extract only what is observable in the supplied product page data and photos. Ne
 - "missingEvidence" lists facts a good ad would need that are absent (e.g. ingredient list, size).
 - "suggestedViews" lists extra photos that would materially improve product accuracy (transparent packaging,
   hidden closures, unreadable labels). Keep it short.
+- "sizeText" is the net size printed on the packaging itself, not the page's; null if it is not visible.
+- If the product is sunscreen / has an SPF, or is an OTC drug (a "Drug Facts" panel, benzoyl peroxide, adapalene,
+  hydroquinone, acne or pigment treatment), set category to "drug_or_sunscreen".
 - If the product is not cosmetic skincare, set category to "not_skincare".`;
 
 export const CONCEPTS_SYSTEM = `You are the senior Creative Director for performance ads of one US skincare product (Meta and TikTok).

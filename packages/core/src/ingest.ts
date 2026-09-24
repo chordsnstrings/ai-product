@@ -58,6 +58,8 @@ export interface ExtractedProduct {
   inStock?: boolean;
   ingredients?: string;
   sizeText?: string;
+  /** The store's own product type / category (Shopify product_type, JSON-LD category), for scope checks. */
+  productType?: string;
   shopifyProductId?: string;
   otherProducts?: { name: string; url: string }[];
   rawText: string;
@@ -135,8 +137,10 @@ function jsonLd(html: string): Partial<ExtractedProduct> | null {
             imageUrl: typeof o.image === 'string' ? o.image : undefined,
           }))
         : undefined;
+    const category = [p.category].flat().filter((c) => typeof c === 'string').join(' ');
     return {
       name: p.name ? decode(String(p.name)) : undefined,
+      productType: category ? decode(category) : undefined,
       description: p.description ? stripHtml(String(p.description)) : undefined,
       brand: typeof p.brand === 'string' ? p.brand : ((p.brand as Record<string, unknown> | undefined)?.name as string | undefined),
       priceMicros: toMicros(offer?.price ?? offer?.lowPrice),
@@ -165,6 +169,7 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
         title: string;
         body_html: string;
         vendor: string;
+        product_type?: string;
         images: { id?: number; src: string }[];
         options?: { name: string; position?: number }[];
         variants: {
@@ -193,6 +198,7 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
       name: product.title,
       description: stripHtml(product.body_html ?? ''),
       brand: product.vendor,
+      productType: product.product_type || undefined,
       priceMicros: toMicros(v0?.price),
       compareAtMicros: toMicros(v0?.compare_at_price),
       currency: 'USD',
@@ -241,6 +247,7 @@ export function parseProductHtml(html: string, pageUrl: string): ExtractedProduc
     name: ld?.name ?? og.name ?? (title ? decode(title).split('|')[0]!.trim() : undefined),
     description: ld?.description ?? og.description,
     brand: ld?.brand,
+    productType: ld?.productType,
     priceMicros: ld?.priceMicros ?? toMicros(og.price),
     currency: ld?.currency ?? og.currency,
     images: [...(ld?.images ?? []), ...(og.image ? [og.image] : [])].map((i) => new URL(i, pageUrl).toString()).filter((v, i, a) => a.indexOf(v) === i),

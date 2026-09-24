@@ -4,12 +4,14 @@ import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import { assetUrl, currentFacts, verifiedIngredients } from '@arkiv/core';
 import { MetadataTable, ProvenanceChip } from '@arkiv/ui';
-import { ActionForm } from '@/components/actions';
+import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Product · Arkiv' };
 
 const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', texture: 'Texture', ingredients: 'Ingredients', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
+/** Where a value that disagrees with the merchant's correction came from. */
+const SOURCE_WORDS: Record<string, string> = { shopify: 'Shopify', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label', import: 'Your import' };
 const TABS = ['facts', 'look', 'language', 'assets', 'history'] as const;
 
 /** A4 Product Brain: facts with provenance, visual fingerprint, customer language, assets, imported history. */
@@ -70,6 +72,20 @@ export default async function Product({ params, searchParams }: { params: Promis
                 <span>
                   {f.value.valueText ? (f.value.valueText.length > 240 ? `${f.value.valueText.slice(0, 240)}…` : f.value.valueText) : f.value.valueNumber != null ? String(f.value.valueNumber) : JSON.stringify(f.value.valueJson)}
                   {f.disputed ? <span className="ak-small ak-muted" style={{ display: 'block' }}>Disputed: {f.candidates.map((c) => `${c.valueText ?? c.valueNumber} (${c.sourceType})`).join(' vs ')}</span> : null}
+                  {f.sourceConflict ? (
+                    <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                      {SOURCE_WORDS[f.sourceConflict.fact.sourceType] ?? f.sourceConflict.fact.sourceType} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.fact.valueText ?? f.sourceConflict.fact.valueNumber}”
+                      {' '}({new Date(f.sourceConflict.fact.observedAt).toLocaleDateString()}).
+                      {canEdit ? (
+                        <span className="ak-row" style={{ gap: 8, marginTop: 4 }}>
+                          {f.sourceConflict.newer ? (
+                            <ActionButton slug={slug} action="fact" variant="text" body={{ skuId, key: k, value: f.value.valueText ?? String(f.value.valueNumber ?? '') }}>Keep yours</ActionButton>
+                          ) : null}
+                          <ActionButton slug={slug} action="fact-accept-source" variant="text" body={{ skuId, factId: f.sourceConflict.fact.id }}>Use store value</ActionButton>
+                        </span>
+                      ) : null}
+                    </span>
+                  ) : null}
                 </span>
               ),
               chip: <ProvenanceChip state={f.value.state as 'OBSERVED'} source={f.value.sourceType} />,
@@ -92,7 +108,7 @@ export default async function Product({ params, searchParams }: { params: Promis
             ) : null}
             <div className="ak-panel">
               <h2 className="ak-label">Correct a fact</h2>
-              <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. Shopify values that disagree are kept and marked disputed.</p>
+              <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. If your store says something different, we keep showing it next to your value so you can switch back.</p>
               <ActionForm slug={slug} action="fact" extra={{ skuId }} submit="Save" fields={[{ name: 'key', label: 'Field', type: 'select', options: Object.entries(LABEL).map(([value, label]) => ({ value, label })) }, { name: 'value', label: 'Value', type: 'textarea', required: true, max: 2000 }]} />
             </div>
             </div>

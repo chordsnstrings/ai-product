@@ -1,4 +1,4 @@
-import { detectSkincareCategory, nonSkincareCategory } from './compliance';
+import { detectSkincareCategory, excludedProductReason, nonSkincareCategory } from './compliance';
 import type { ConceptSet, Genome, ProductExtraction, Proposal, StoryboardPlan } from './intel-schemas';
 
 /**
@@ -23,10 +23,12 @@ const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >
 
 const INGREDIENTS = ['niacinamide', 'hyaluronic acid', 'ceramides', 'squalane', 'peptides', 'vitamin c', 'retinol', 'glycerin', 'panthenol', 'centella', 'bakuchiol', 'azelaic acid'];
 
-export function mockExtraction(input: { name?: string; description?: string; text: string; ingredients?: string; sizeText?: string }): ProductExtraction {
+export function mockExtraction(input: { name?: string; description?: string; text: string; ingredients?: string; sizeText?: string; labelText?: string | null }): ProductExtraction {
   const all = `${input.name ?? ''} ${input.description ?? ''} ${input.text}`;
   const notSkin = nonSkincareCategory(all);
-  const category = notSkin ? 'not_skincare' : detectSkincareCategory(all);
+  // Drug/SPF detection reads the product itself (name, description, INCI, label) — never the page's menus.
+  const drug = excludedProductReason(`${input.name ?? ''} ${input.description ?? ''} ${input.ingredients ?? ''} ${input.labelText ?? ''}`);
+  const category = drug ? 'drug_or_sunscreen' : notSkin ? 'not_skincare' : detectSkincareCategory(all);
   const lower = `${all} ${input.ingredients ?? ''}`.toLowerCase();
   const keyIngredients = INGREDIENTS.filter((i) => lower.includes(i)).slice(0, 5);
   const claimSentences = (input.description ?? '')
@@ -44,7 +46,7 @@ export function mockExtraction(input: { name?: string; description?: string; tex
     format,
     texture: /lightweight|weightless/i.test(all) ? 'lightweight, fast-absorbing' : format === 'cream' ? 'rich cream' : null,
     keyIngredients,
-    labelText: input.name ?? null,
+    labelText: input.labelText !== undefined ? input.labelText : (input.name ?? null),
     packaging: { type: packaging, closure: packaging === 'dropper_bottle' ? 'dropper' : packaging === 'pump_bottle' ? 'pump' : 'cap', transparent: false, colors: ['white'] },
     claimsFound: claimSentences,
     missingEvidence: [!input.ingredients ? 'Full ingredient list (INCI)' : null, !input.sizeText ? 'Product size' : null].filter(Boolean) as string[],

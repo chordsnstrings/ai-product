@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
 import {
+  acceptSourceFact,
   approveClaim,
   approveForProduction,
   assertCan,
@@ -157,6 +158,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       assertCan(ctx, 'sku.edit');
       const n = i.key.includes('price') ? Number(i.value.replace(/[^0-9.]/g, '')) : null;
       await t((tx) => decideFact(tx, ctx, i.skuId, i.key, n != null && n > 0 ? { number: n } : { text: i.value }));
+      return json({ ok: true });
+    }
+    case 'fact-accept-source': {
+      // "Use the store's value": a source reading that changed after the merchant's decision becomes the truth again.
+      const i = await body(req, z.object({ skuId: uuid, factId: uuid }));
+      await t((tx) => acceptSourceFact(tx, ctx, i.skuId, i.factId));
       return json({ ok: true });
     }
     case 'claim-propose': {
