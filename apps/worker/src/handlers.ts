@@ -1,6 +1,6 @@
 import { withSystem, withTenant } from '@arkiv/db';
 import { DomainError, type PlanCode } from '@arkiv/shared';
-import { STRIPE_CLAIM_STALE_MINUTES, refundProjectPurchase } from '@arkiv/billing';
+import { STRIPE_CLAIM_STALE_MINUTES, cancelSubscriptionsForPurge, refundProjectPurchase } from '@arkiv/billing';
 import {
   analyzeProduct,
   buildExport,
@@ -136,7 +136,8 @@ export const handlers: Record<string, Handler> = {
       await releaseJobLease(ctx.workspaceId, 'export', jobId);
     }
   },
-  [Queues.purgeWorkspace]: (_ctx, d) => purgeWorkspace(d.workspaceId as string),
+  // Stripe first (core can't import billing): a purged workspace must never be billed again.
+  [Queues.purgeWorkspace]: async (_ctx, d) => purgeWorkspace(d.workspaceId as string, { stripeSubscriptionsCancelled: await cancelSubscriptionsForPurge(d.workspaceId as string) }),
   [Queues.extractGenome]: (ctx, d) => extractGenome(ctx, d.creativeId as string),
   [Queues.customerThemes]: (ctx, d, jobId) => exclusive(ctx, Queues.customerThemes, `themes:${d.skuId as string}`, jobId, d, () => clusterThemes(ctx, d.skuId as string)),
   [Queues.transferSku]: (_ctx, d) => transferSku(d.transferId as string),

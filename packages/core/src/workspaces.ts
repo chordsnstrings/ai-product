@@ -58,6 +58,8 @@ export async function transitionWorkspace(
     update workspaces set state = ${to}, state_reason = ${reason},
       state_before_hold = ${holding ? from : null},
       state_before_purge = ${to === 'PURGE_SCHEDULED' ? from : null},
+      -- Leaving a scheduled purge any other way than the purge itself (a payment, a restore) cancels it.
+      purge_at = case when ${from} = 'PURGE_SCHEDULED' and ${to} <> 'PURGED' then null else purge_at end,
       cancelled_at = case when ${to} = 'CANCELLED' then now() else cancelled_at end
     where id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'WORKSPACE_STATE_CHANGED', { type: 'workspace', id: ctx.workspaceId }, { from, to, reason });

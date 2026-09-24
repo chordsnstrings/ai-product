@@ -27,7 +27,7 @@ import {
 } from './admin';
 import { authorize } from './cost-governor';
 import { holdJob } from './holds';
-import { append, available, balances } from './ledger';
+import { append, available, balances, expirePeriod, periodUsage } from './ledger';
 import { refreshRiskFlags } from './lifecycle';
 import { clearSettingsCache } from './settings';
 import { ctxFor } from './testing';
@@ -122,6 +122,32 @@ describe('four-eyes', () => {
     await withAdmin((tx) => append(tx, { workspaceId: t.workspaceId, actor: { kind: 'system', id: 't' } }, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 3, idempotencyKey: 'g', reason: 'grant' }));
     await requestOrExecute(fin, 'ledger.adjust', { workspaceId: t.workspaceId, unit: 'creative_test', amount: -1, nonce: newId() }, 'double grant');
     expect((await withTenant(t.workspaceId, (tx) => balances(tx))).creativeTests).toBe(2);
+  });
+
+  it('the overdraw check counts only the adjusted workspace, never another tenant’s credits (admin_rw sees all)', async () => {
+    const a = await makeTenant();
+    const b = await makeTenant();
+    const fin = await staff(['FINANCE']);
+    await withAdmin((tx) => append(tx, { workspaceId: b.workspaceId, actor: { kind: 'system', id: 't' } }, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 3, idempotencyKey: 'g-b', reason: 'grant' }));
+    await expect(requestOrExecute(fin, 'ledger.adjust', { workspaceId: a.workspaceId, unit: 'creative_test', amount: -1, nonce: newId() }, 'fix it')).rejects.toThrow(/negative/);
+    expect((await withTenant(a.workspaceId, (tx) => balances(tx))).creativeTests).toBe(0);
+    expect((await withTenant(b.workspaceId, (tx) => balances(tx))).creativeTests).toBe(3);
+  });
+
+  it('a Creative Test adjustment lands in the current plan period: the meter shows it and it expires with the period', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id, current_period_start, current_period_end)
+                      values (${t.workspaceId}, 'sub_adj', 'GROWTH', 'active', gen_random_uuid(), '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z')`;
+    const fin = await staff(['FINANCE']);
+    await requestOrExecute(fin, 'ledger.adjust', { workspaceId: t.workspaceId, unit: 'creative_test', amount: 2, nonce: newId() }, 'goodwill');
+    const [e] = await ownerPool()`select period_key from ledger_entries where workspace_id = ${t.workspaceId} and type = 'CREDIT_ADJUSTED'`;
+    expect(e!.period_key).toBe('2026-09-01');
+    await withTenant(t.workspaceId, async (tx) => {
+      expect(await available(tx, 'creative_test')).toBe(2);
+      expect((await periodUsage(tx, '2026-09-01')).remaining).toBe(2);
+      await expirePeriod(tx, { workspaceId: t.workspaceId, actor: { kind: 'system', id: 't' } }, '2026-09-01');
+      expect(await available(tx, 'creative_test')).toBe(0);
+    });
   });
 });
 

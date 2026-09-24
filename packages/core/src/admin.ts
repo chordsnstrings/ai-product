@@ -5,7 +5,7 @@ import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { emit } from './events';
 import { classifySubscriptionEvents, mrrTotals, subscriptionEvents } from './finance';
-import { adjust, type LedgerUnit } from './ledger';
+import { adjust, BALANCE_TYPES, periodUsage, type LedgerUnit } from './ledger';
 import { restoreFromScheduledPurge, RISK_PLAYBOOKS } from './lifecycle';
 import { enqueue, queuePolicy, Queues } from './outbox';
 import { retryProduction } from './production';
@@ -828,22 +828,18 @@ export async function tenantHealth(tx: Tx, workspaceId: string) {
       (select count(*) from memberships where workspace_id = ${workspaceId})::int as members,
       (select coalesce(sum(bytes), 0) from assets where workspace_id = ${workspaceId} and deleted_at is null)::bigint as bytes,
       (select count(*) from projects where workspace_id = ${workspaceId} and state in ${tx(ACTIVE_PRODUCTION_STATES as ProjectState[])})::int as rendering,
-      (select to_char(current_period_start, 'YYYY-MM-DD') from subscriptions where workspace_id = ${workspaceId} and status in ('active','trialing','past_due') order by created_at desc limit 1) as period,
+      (select to_char(current_period_start at time zone 'UTC', 'YYYY-MM-DD') from subscriptions where workspace_id = ${workspaceId} and status in ('active','trialing','past_due') order by created_at desc limit 1) as period,
       (select coalesce(array_agg(distinct indicator), '{}') from risk_flags where workspace_id = ${workspaceId} and resolved_at is null) as risks,
       (select extract(day from now() - max(s.last_seen_at))::int from sessions s join memberships m on m.user_id = s.user_id where m.workspace_id = ${workspaceId}) as idle_days,
       (select count(*) from events where workspace_id = ${workspaceId} and type = 'ASSET_EXPORTED' and at > now() - interval '30 days')::int as exports30,
       (select count(*) from projects where workspace_id = ${workspaceId} and state = 'PROVIDER_FAILED' and updated_at > now() - interval '7 days')::int as failed7`;
-  const [p] = u!.period
-    ? await tx`select coalesce(sum(amount) filter (where type = 'CREDIT_GRANTED'), 0)::int as granted,
-                      (coalesce(sum(-amount) filter (where type = 'CREDIT_RESERVED'), 0) - coalesce(sum(amount) filter (where type in ('CREDIT_RELEASED','CREDIT_REFUNDED')), 0))::int as used
-               from ledger_entries where workspace_id = ${workspaceId} and unit = 'creative_test' and period_key = ${u!.period as string}`
-    : [{ granted: 0, used: 0 }];
+  const p = u!.period ? await periodUsage(tx, u!.period as string, workspaceId) : { granted: 0, used: 0 };
   const quotas = [
     { key: 'brands', label: 'Brands', used: Number(u!.brands), limit: quota.brands },
     { key: 'members', label: 'Members', used: Number(u!.members), limit: quota.members },
     { key: 'storageGb', label: 'Storage (GB)', used: Math.round((Number(u!.bytes) / 1e9) * 100) / 100, limit: quota.storageGb },
     { key: 'renderConcurrency', label: 'Productions in flight', used: Number(u!.rendering), limit: quota.renderConcurrency },
-    { key: 'creativeTests', label: 'Creative Tests this period', used: Number(p!.used), limit: w.plan_code ? Math.max(Number(p!.granted), quota.creativeTestsPerMonth) : 0 },
+    { key: 'creativeTests', label: 'Creative Tests this period', used: Number(p.used), limit: w.plan_code ? Math.max(Number(p.granted), quota.creativeTestsPerMonth) : 0 },
   ];
   const risk = churnRisk((u!.risks as string[]) ?? []);
   const health = healthScore({
@@ -905,7 +901,7 @@ export async function reconciliationExceptions(tx: Tx, opts: { workspaceId?: str
       select 'Active subscription without period grant', s.workspace_id, s.id::text, s.current_period_start from subscriptions s
         where s.status = 'active' ${scope('s.workspace_id')}
           and not exists (select 1 from ledger_entries l where l.workspace_id = s.workspace_id and l.type = 'CREDIT_GRANTED' and l.unit = 'creative_test'
-                            and l.period_key = to_char(s.current_period_start, 'YYYY-MM-DD'))
+                            and l.period_key = to_char(s.current_period_start at time zone 'UTC', 'YYYY-MM-DD'))
       union all
       -- One-off buyers are ACTIVE_PAID without a plan (restoreFromScheduledPurge keeps them paid), so only a
       -- workspace with neither a live subscription nor a paid purchase is an exception.
@@ -913,6 +909,21 @@ export async function reconciliationExceptions(tx: Tx, opts: { workspaceId?: str
         where w.state = 'ACTIVE_PAID' ${scope('w.id')}
           and not exists (select 1 from subscriptions s where s.workspace_id = w.id and s.status in ('active','trialing','past_due'))
           and not exists (select 1 from purchases p where p.workspace_id = w.id and p.status = 'paid')
+      union all
+      -- workspaces.plan_code drives concurrency, quotas and cost caps; the subscription row is what Stripe bills.
+      select 'Workspace plan differs from its subscription', s.workspace_id, s.id::text, s.updated_at from subscriptions s
+        join workspaces w on w.id = s.workspace_id
+        where s.status in ('active','trialing','past_due') and w.plan_code is distinct from s.plan_code ${scope('s.workspace_id')}
+          and s.id = (select s2.id from subscriptions s2 where s2.workspace_id = s.workspace_id and s2.status in ('active','trialing','past_due') order by s2.created_at desc limit 1)
+      union all
+      -- §37 one derived balance: what the Cost Governor lets a subscriber spend equals the meter's "N left this
+      -- period" once earlier periods are expired (a period-less adjustment or an unexpired period breaks it).
+      select 'Creative Test balance differs from this period''s meter', s.workspace_id, s.id::text, s.current_period_start from subscriptions s
+        where s.status in ('active','trialing','past_due') and s.current_period_start is not null ${scope('s.workspace_id')}
+          and s.id = (select s2.id from subscriptions s2 where s2.workspace_id = s.workspace_id and s2.status in ('active','trialing','past_due') order by s2.created_at desc limit 1)
+          and (select coalesce(sum(l.amount), 0) from ledger_entries l where l.workspace_id = s.workspace_id and l.unit = 'creative_test' and l.type in ${tx([...BALANCE_TYPES])})
+              <> (select greatest(0, coalesce(sum(l.amount), 0)) from ledger_entries l where l.workspace_id = s.workspace_id and l.unit = 'creative_test'
+                    and l.type in ${tx([...BALANCE_TYPES])} and l.period_key = to_char(s.current_period_start at time zone 'UTC', 'YYYY-MM-DD'))
       union all
       -- A failed event may not have been routed yet (workspace_id is set on success), so a tenant's view also
       -- matches its Stripe customer.

@@ -159,7 +159,7 @@ describe('subscriptions (P11, plan 04 §3)', () => {
     await expect(withTenant(t.workspaceId, (tx) => startSubscriptionCheckout(tx, ctx, 'GROWTH', '00000000-0000-0000-0000-000000000000', { id: t.userId, email: t.email }))).rejects.toMatchObject({ code: 'INVALID' });
     const consentId = await withTenant(t.workspaceId, (tx) => recordAutoRenewConsent(tx, ctx, { userId: t.userId, plan: 'GROWTH', agreed: true, ip: '1.1.1.1' }));
     const [consent] = await ownerPool()`select text_snapshot from consent_records where id = ${consentId}`;
-    expect(consent!.text_snapshot).toMatch(/\$99 charged today and every month/);
+    expect(consent!.text_snapshot).toMatch(/^\$99\/month plus applicable sales tax, charged today and on the \d+(st|nd|rd|th) of each month/);
     const co = await withTenant(t.workspaceId, (tx) => startSubscriptionCheckout(tx, ctx, 'GROWTH', consentId, { id: t.userId, email: t.email }));
     await completeMockCheckout(co.sessionId);
     const paid = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
@@ -173,7 +173,7 @@ describe('subscriptions (P11, plan 04 §3)', () => {
     const up = await withTenant(t.workspaceId, (tx) => changePlan(tx, paid, 'SCALE'));
     expect(up.effective).toBe('now');
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'creative_test'))).toBeGreaterThan(7);
-    await withTenant(t.workspaceId, (tx) => setCancellation(tx, paid, true, 'seasonal'));
+    await withTenant(t.workspaceId, (tx) => setCancellation(tx, paid, true, { code: 'paused_ads', detail: 'seasonal' }));
     const [sub] = await ownerPool()`select cancel_at_period_end from subscriptions`;
     expect(sub!.cancel_at_period_end).toBe(true);
     await withTenant(t.workspaceId, (tx) => setCancellation(tx, paid, false));
@@ -184,7 +184,10 @@ describe('subscriptions (P11, plan 04 §3)', () => {
     const t = await makeTenant({ state: 'ACTIVE_PAID' });
     await ownerPool()`update workspaces set stripe_customer_id = 'cus_d' where id = ${t.workspaceId}`;
     await ownerPool()`insert into stripe_customers (customer_id, workspace_id) values ('cus_d', ${t.workspaceId})`;
-    await receiveStripeWebhook(JSON.stringify({ id: 'evt_disp', type: 'charge.dispute.created', data: { object: { id: 'dp_1', customer: 'cus_d', metadata: {} } } }), null);
+    await ownerPool()`insert into purchases (workspace_id, kind, amount_micros, stripe_checkout_session_id, stripe_payment_intent_id, status, created_by)
+                      values (${t.workspaceId}, 'taste', 19000000, 'cs_d', 'pi_x', 'paid', 'user:x')`;
+    // A Stripe Dispute carries no customer: only its charge and payment.
+    await receiveStripeWebhook(JSON.stringify({ id: 'evt_disp', type: 'charge.dispute.created', data: { object: { id: 'dp_1', charge: 'ch_x', payment_intent: 'pi_x' } } }), null);
     await processStripeEvent('evt_disp');
     const [w] = await ownerPool()`select state, state_before_hold from workspaces where id = ${t.workspaceId}`;
     expect(w).toMatchObject({ state: 'LOCKED', state_before_hold: 'ACTIVE_PAID' });

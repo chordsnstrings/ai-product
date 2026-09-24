@@ -22,7 +22,12 @@ export default async function Retention({ searchParams }: { searchParams: Promis
                     where r.resolved_at is null ${notTest(tx, prefs, 'r.workspace_id')} and (${!today} or r.raised_at >= date_trunc('day', now(), ${prefs.tz})) order by r.raised_at desc limit 300`,
     suppressed: await tx`select r.workspace_id, r.indicator, r.suppressed_reason, r.suppressed_until, w.name from risk_flags r join workspaces w on w.id = r.workspace_id
                          where r.suppressed_until > now() ${notTest(tx, prefs, 'r.workspace_id')} order by r.suppressed_until limit 100`,
-    reasons: await tx`select coalesce(payload->>'reason', 'no reason given') as reason, count(*)::int as n from events where type = 'SUBSCRIPTION_CHANGED' and payload->>'cancelAtPeriodEnd' = 'true' and at > now() - interval '90 days' ${notTest(tx, prefs)} group by 1 order by 2 desc`,
+    // The cancel flow's reason code (older events carried code and text merged in `reason`), with the free-text
+    // details given under each code.
+    reasons: await tx`select coalesce(payload->>'reasonCode', payload->>'reason', 'no reason given') as reason, count(*)::int as n,
+                             coalesce(array_agg(payload->>'detail' order by at desc) filter (where coalesce(payload->>'detail', '') <> ''), '{}') as details
+                      from events where type = 'SUBSCRIPTION_CHANGED' and (payload->>'cancelAtPeriodEnd' = 'true' or payload->>'immediate' = 'true')
+                        and at > now() - interval '90 days' ${notTest(tx, prefs)} group by 1 order by 2 desc`,
     cohorts: await tx`select to_char(date_trunc('week', created_at, ${prefs.tz}) at time zone ${prefs.tz}, 'YYYY-MM-DD') as week, count(*)::int as n,
                              count(*) filter (where status in ('active','trialing','past_due'))::int as still,
                              count(*) filter (where created_at < now() - interval '28 days' and (status in ('active','trialing','past_due') or updated_at > created_at + interval '28 days'))::int as w4
@@ -48,7 +53,7 @@ export default async function Retention({ searchParams }: { searchParams: Promis
         <Table head={['Workspace', 'Indicator', 'Reason', 'Suppressed until']} rows={d0.suppressed.map((x) => [<Link key="w" href={`/tenants/${x.workspace_id}?tab=risk`}>{x.name as string}</Link>, pb(x.indicator)?.label ?? (x.indicator as string), x.suppressed_reason as string, d(x.suppressed_until)])} empty="No active suppressions." />
       </Section>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-        <Section title="Cancellation reasons (90d)"><Table head={['Reason', 'Count']} rows={d0.reasons.map((r) => [r.reason as string, r.n as number])} empty="No cancellations." /></Section>
+        <Section title="Cancellation reasons (90d)"><Table head={['Reason', 'Count', 'What they said']} rows={d0.reasons.map((r) => [(r.reason as string).replace(/_/g, ' '), r.n as number, <span key="d" className="ak-small">{((r.details as string[]) ?? []).slice(0, 5).map((x) => `“${x.slice(0, 140)}”`).join(' · ') || '—'}</span>])} empty="No cancellations." /></Section>
         <Section title="Subscription cohorts (weekly)"><Table head={['Week', 'Started', 'Active now', 'Retained W4']} rows={d0.cohorts.map((c) => [c.week as string, c.n as number, c.still as number, c.w4 as number])} /></Section>
       </div>
     </Page>

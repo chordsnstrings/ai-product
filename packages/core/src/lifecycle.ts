@@ -104,12 +104,13 @@ const PURGE_ORDER = ['sku_reviews', 'scene_versions', 'scenes', 'storyboards', '
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,
  * consent, events) with personal data removed; write a purge certificate.
  */
-export async function purgeWorkspace(workspaceId: string): Promise<Record<string, number>> {
+export async function purgeWorkspace(workspaceId: string, opts: { stripeSubscriptionsCancelled?: string[] } = {}): Promise<Record<string, number>> {
   return withSystem(async (tx) => {
     const [w] = await tx`select state, purge_at from workspaces where id = ${workspaceId} for update`;
     if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
     if (w.state !== 'PURGE_SCHEDULED' || (w.purge_at && new Date(w.purge_at as string) > new Date())) throw new DomainError('CONFLICT', 'Workspace is not due for purge');
-    const counts: Record<string, number> = {};
+    // Stripe subscriptions ended before the purge (the worker does it: core can't call Stripe) are on the certificate.
+    const counts: Record<string, number> = { stripe_subscriptions_cancelled: opts.stripeSubscriptionsCancelled?.length ?? 0 };
     const undeletable: string[] = [];
     await tx`delete from shopify_shops where workspace_id = ${workspaceId}`;
     // Golden cases built (with consent) from this tenant's production output go with the tenant.
@@ -318,7 +319,7 @@ export async function computeRisk(tx: Tx, workspaceId: string): Promise<RiskSign
                                   coalesce(sum(amount) filter (where type = 'CREDIT_CONSUMED'), 0)::int as consumed
                            from ledger_entries where workspace_id = ${ws} and unit = 'creative_test' and period_key is not null
                            group by period_key order by period_key desc limit 3`;
-  const [curSub] = await tx`select to_char(current_period_start, 'YYYY-MM-DD') as k from subscriptions where workspace_id = ${ws} and status in ('active','trialing','past_due') order by created_at desc limit 1`;
+  const [curSub] = await tx`select to_char(current_period_start at time zone 'UTC', 'YYYY-MM-DD') as k from subscriptions where workspace_id = ${ws} and status in ('active','trialing','past_due') order by created_at desc limit 1`;
   const [friction] = await tx`select max(at) as at from events where workspace_id = ${ws} and type = 'PROJECT_STATE_CHANGED'
                               and payload->>'to' = 'NEEDS_USER_ACTION' and at > now() - interval '30 days'`;
   out.push(

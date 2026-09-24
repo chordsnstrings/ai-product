@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { Tx } from '@arkiv/db';
 import { COST_LIMITS, DomainError, FREE_EXPLORATION, PLANS, PRICES, type Micros, type PlanCode } from '@arkiv/shared';
 import type { TenantContext } from './context';
-import { append, available, providerSpendSince, type LedgerUnit } from './ledger';
+import { append, available, currentPeriodKey, expirePeriod, lockEntitlement, periodExpired, providerSpendSince, type LedgerUnit } from './ledger';
 import { estimate as priceEstimate, loadRates, type CostLine, type Estimate } from './rates';
 import { isFlagOn } from './flags';
 import { isFreeTier } from './outbox';
@@ -135,11 +135,22 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
   const ceiling = await ceilingFor(tx, input.purpose);
   if (ceiling !== null) {
     let prior = 0;
+    if (input.purpose === 'free_preview' && ctx.workspaceState === 'PROVISIONAL') {
+      // Plan 02 §4: the free-preview COGS cap is per provisional workspace, across every product previewed in it.
+      // Past it, generating stops and the visitor is asked to sign up (not a dead end).
+      const [r] = await tx`select coalesce(sum(case when status = 'active' then max_cost_micros else spent_micros end), 0)::bigint as n
+                           from cost_authorizations
+                           where workspace_id = ${ctx.workspaceId} and purpose = 'free_preview' and status in ('active','settled')`;
+      const spent = Number(r!.n);
+      if (spent + est.totalMicros > ceiling) {
+        throw new DomainError('PAYMENT_REQUIRED', 'Save your work to continue.', { needsAccount: true, ceilingMicros: ceiling, priorMicros: spent, estimateMicros: est.totalMicros, reason: 'free_preview_workspace_cap' });
+      }
+    }
     if (input.purpose === 'free_preview' && input.skuId) {
       // Active holds count at their ceiling; settled ones at what was actually spent.
       const [r] = await tx`select coalesce(sum(case when status = 'active' then max_cost_micros else spent_micros end), 0)::bigint as n
                            from cost_authorizations
-                           where purpose = 'free_preview' and estimate->>'skuId' = ${input.skuId}
+                           where workspace_id = ${ctx.workspaceId} and purpose = 'free_preview' and estimate->>'skuId' = ${input.skuId}
                              and status in ('active','settled')`;
       prior = Number(r!.n);
     }
@@ -193,7 +204,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     ? (PLANS[plan].creativeTestsPerMonth * COST_LIMITS.CREATIVE_TEST_CEILING) / 30
     : COST_LIMITS.CREATIVE_TEST_CEILING;
   const since = new Date(Date.now() - 24 * 3600_000);
-  const spent24h = await providerSpendSince(tx, since);
+  const spent24h = await providerSpendSince(tx, since, ctx.workspaceId);
   const cap = Math.max(expectedDaily * COST_LIMITS.DAILY_ANOMALY_MULTIPLE, COST_LIMITS.CREATIVE_TEST_CEILING * 2);
   if (spent24h + est.totalMicros > cap) {
     throw new DomainError('UNAVAILABLE', "We're reviewing unusual activity on this workspace. Your work is saved.", {
@@ -203,9 +214,14 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     });
   }
 
-  // 3. Entitlement.
+  // 3. Entitlement. Checked and reserved under the workspace's entitlement lock (held to commit), so concurrent
+  //    productions can't both reserve the last unit (x-races-01). A Creative Test is reserved against the period
+  //    that is current once the lock is held: a renewal that committed meanwhile moved it on (x-races-08).
+  let periodKey = input.entitlement?.periodKey ?? null;
   if (input.entitlement && input.entitlement.amount > 0) {
-    const have = await available(tx, input.entitlement.unit);
+    await lockEntitlement(tx, ctx.workspaceId);
+    if (input.entitlement.unit === 'creative_test' && periodKey) periodKey = (await currentPeriodKey(tx, ctx.workspaceId)) ?? periodKey;
+    const have = await available(tx, input.entitlement.unit, ctx.workspaceId);
     if (have < input.entitlement.amount) {
       throw new DomainError('PAYMENT_REQUIRED', 'No remaining entitlement for this production', {
         unit: input.entitlement.unit,
@@ -238,7 +254,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
       amount: -input.entitlement.amount,
       authorizationId: auth!.id,
       projectId: input.projectId,
-      periodKey: input.entitlement.periodKey ?? null,
+      periodKey,
       // Keyed on the authorization itself: a retry creates a new authorization and must reserve again. (Keying on
       // the request key let a retried production skip its reservation — found by the chaos suite.)
       idempotencyKey: `reserve:${auth!.id}`,
@@ -342,6 +358,11 @@ export async function settle(tx: Tx, ctx: TenantContext, authorizationId: string
         amount: Number(a.entitlement_amount),
         idempotencyKey: `settle:${authorizationId}`,
       });
+      // A test returned to a period that has already ended expires with it (no rollover): it never becomes
+      // spendable in the next period (x-races-08).
+      if (base.unit === 'creative_test' && base.periodKey && (await periodExpired(tx, ctx.workspaceId, base.periodKey))) {
+        await expirePeriod(tx, ctx, base.periodKey);
+      }
     }
   }
   return true;

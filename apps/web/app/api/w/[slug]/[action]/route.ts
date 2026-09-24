@@ -37,7 +37,7 @@ import {
   updateBrandBrain,
   weekOf,
 } from '@arkiv/core';
-import { billingGateway, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
+import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
 import { DomainError, env, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, json, route } from '@/lib/http';
@@ -245,11 +245,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       return json({ ...r, live: billingGateway().live, publishableKey: billingGateway().live ? (env().STRIPE_PUBLISHABLE_KEY ?? null) : null });
     }
     case 'cancel': {
-      const i = await body(req, z.object({ reason: z.string().max(60).nullish(), detail: z.string().max(500).nullish() }));
-      const r = await t((tx) => setCancellation(tx, ctx, true, [i.reason, i.detail].filter(Boolean).join(' — ') || null));
+      // The reason code and the free text are kept apart, so the console can count cancellations by code.
+      const i = await body(req, z.object({ reason: z.enum(CANCEL_REASONS).nullish(), detail: z.string().max(500).nullish() }));
+      const r = await t((tx) => setCancellation(tx, ctx, true, { code: i.reason ?? null, detail: i.detail ?? null }));
       if (w.user) {
         const plan = PLANS[(ctx.planCode as PlanCode) ?? 'LAUNCH'];
-        await sendEmail('cancellation_confirmed', w.user.email, { planName: plan?.name ?? 'Your plan', endsOn: new Date(r.endsAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric' }), exportUrl: `${env().APP_URL}/w/${slug}/settings/data` }, { idempotencyKey: `cancel:${ctx.workspaceId}:${r.endsAt}` });
+        // A past-due plan ends today (immediate cancel); otherwise access runs to the end of the paid period.
+        const endsOn = r.immediate ? 'today' : new Date(r.endsAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+        await sendEmail('cancellation_confirmed', w.user.email, { planName: plan?.name ?? 'Your plan', endsOn, exportUrl: `${env().APP_URL}/w/${slug}/settings/data` }, { idempotencyKey: `cancel:${ctx.workspaceId}:${r.immediate ? 'now' : r.endsAt}` });
       }
       return json(r);
     }

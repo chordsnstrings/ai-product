@@ -16,6 +16,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const url = await withTenant(a.ctx.workspaceId, async (tx) => {
       const [asset] = await tx`select id, lineage from assets where id = ${id}`;
       if (!asset) throw new Error('not found');
+      // Plan 02 B9: a refunded ad stays downloadable, unless its payment was refunded as fraudulent.
+      const [flagged] = await tx`select 1 from purchases where workspace_id = ${a.ctx.workspaceId} and project_id = ${q.get('project') ?? ''} and fraud_flagged_at is not null limit 1`;
+      if (flagged) throw new DomainError('FORBIDDEN', 'This ad is no longer available for download. Contact support if you think this is a mistake.');
       await emit(tx, a.ctx, 'ASSET_EXPORTED', { type: 'asset', id }, { aspect: (asset.lineage as { aspect?: string })?.aspect ?? null });
       const visitorId = await projectVisitor(tx, a.ctx.workspaceId, q.get('project') ?? '');
       await recordFunnel('ASSET_EXPORTED', { workspaceId: a.ctx.workspaceId, visitorId, props: { aspect: (asset.lineage as { aspect?: string })?.aspect ?? null } }, tx);

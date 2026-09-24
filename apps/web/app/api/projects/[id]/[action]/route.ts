@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
 import { acceptSourceFact, cancelProduction, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
-import { startProductionCheckout } from '@arkiv/billing';
+import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
@@ -26,13 +26,25 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
   switch (action) {
     case 'concepts': {
       // Drafting runs in the worker (§34); the funnel polls GET /api/projects/:id until the batch appears.
-      const r = await withTenant(a.ctx.workspaceId, (tx) => requestConcepts(tx, a.ctx, id));
+      // A checkout still open for the storyboard being replaced is closed once the change is made (a payment
+      // already made is still honoured for the storyboard it was for).
+      const r = await withTenant(a.ctx.workspaceId, async (tx) => {
+        const out = await requestConcepts(tx, a.ctx, id);
+        if (!a.provisional) await closeOpenCheckouts(tx, a.ctx, id);
+        return out;
+      });
       return json({ ok: true, queued: true, ...r }, 202);
     }
     case 'select': {
       if (a.provisional) throw new DomainError('FORBIDDEN', 'Save your work to see the storyboard.', { needsAccount: true });
       const { conceptId } = await body(req, z.object({ conceptId: z.string().uuid() }));
-      const r = await withTenant(a.ctx.workspaceId, (tx) => selectConcept(tx, a.ctx, id, conceptId));
+      // Choosing another concept replaces the storyboard: a checkout still open for the old one is closed, so
+      // nobody pays for a storyboard that is gone (a payment already made is honoured for the one it was for).
+      const r = await withTenant(a.ctx.workspaceId, async (tx) => {
+        const out = await selectConcept(tx, a.ctx, id, conceptId);
+        if (!out.replayed) await closeOpenCheckouts(tx, a.ctx, id);
+        return out;
+      });
       return json(r);
     }
     case 'checkout': {
