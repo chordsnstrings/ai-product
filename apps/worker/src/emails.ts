@@ -110,6 +110,13 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
     case 'invite':
       await sendEmail('invite', String(data.email), { url: `${app}/invite/${data.token}`, workspaceName: w!.name, inviterName: String(data.inviterName ?? 'A teammate'), role: String(data.role) }, { idempotencyKey: `${jobId}:invite`, workspaceId: ws });
       return;
+    case 'day30_review': {
+      const [r] = await withTenant(ws, (tx) => tx`select id, sku_id, body from sku_reviews where id = ${data.reviewId as string}`);
+      if (!r) return;
+      const b = r.body as { sku: { name: string }; summary: { tested: number; actionable: number } };
+      await send('day30_review', { productName: b.sku.name, tested: b.summary.tested, actionable: b.summary.actionable, url: `${base}/products/${r.sku_id}/review` }, await recipients(ws, ['OWNER', 'ADMIN']));
+      return;
+    }
     case 'weekly_brief': {
       const recs = await withTenant(ws, (tx) => tx`select proposal->>'hypothesis' as h, slot from recommendations where week_of = ${data.week as string} and status = 'open' order by score desc limit 3`);
       if (recs.length) await send('weekly_brief', { workspaceName: w!.name, week: String(data.week), recommendations: recs.map((r) => ({ hypothesis: r.h as string, slot: r.slot as string })), url: `${base}/this-week` });

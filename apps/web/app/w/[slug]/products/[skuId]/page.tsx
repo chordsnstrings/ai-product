@@ -53,6 +53,7 @@ export default async function Product({ params, searchParams }: { params: Promis
         <h1 className="ak-h1" style={{ margin: 0 }}>{d.sku.name as string}</h1>
         <div className="ak-row">
           <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/products/${skuId}/claims`}>Claims</Link>
+          <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/products/${skuId}/review`}>Review</Link>
           <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/map?sku=${skuId}`}>Map</Link>
         </div>
       </div>

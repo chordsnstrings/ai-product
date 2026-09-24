@@ -12,7 +12,9 @@ import {
   JOB_HOLD_STATES,
   systemContext,
   type TenantContext,
+  createSkuReview,
   duePurges,
+  dueSkuReviews,
   evaluateCanaries,
   expiredFlagAlerts,
   expireOffers,
@@ -56,6 +58,22 @@ const notHeld = (tx: Parameters<Parameters<typeof withSystem>[0]>[0]) => tx`not 
 export const sweepQueue = (key: string) => `cron-${key}`;
 
 export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> }> = {
+  // Standard §9 Day 30 / §11 month-end: write each due SKU Creative Review (deterministic, no spend) in its own
+  // workspace and email the owners once per review.
+  'sku-reviews': {
+    cron: '15 7 * * *',
+    run: async () => {
+      const due = await withSystem((tx) => dueSkuReviews(tx));
+      let n = 0;
+      for (const d of due) {
+        const id = await withTenant(d.workspaceId, (tx) => createSkuReview(tx, sysCtx(d.workspaceId, 'sku-reviews'), d.skuId, d.kind, { start: d.start, end: d.end }));
+        if (!id) continue;
+        await withSystem((tx) => enqueueFor(tx, d.workspaceId, 'send-email', { template: 'day30_review', reviewId: id }, `sku-review:${id}`));
+        n++;
+      }
+      return n;
+    },
+  },
   'sweep-authorizations': { cron: '* * * * *', run: () => withSystem((tx) => sweepExpiredAuthorizations(tx)) },
   'sweep-offers': { cron: '* * * * *', run: () => withSystem((tx) => expireOffers(tx)) },
   // L8/L20: a single honest reminder 15 minutes before the Taste window closes; then T+24h and T+3d nudges.

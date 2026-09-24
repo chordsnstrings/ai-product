@@ -46,3 +46,23 @@ begin
 end $$;
 revoke all on function arkiv_anonymize_user_events(uuid, text) from public;
 grant execute on function arkiv_anonymize_user_events(uuid, text) to system_rw;
+
+-- ───────────── SKU Creative Review (standard §9 Day 30, §11 month-end) ─────────────
+-- "Summarize tested hypotheses, evidence, contradictions, untested space and recommended portfolio." One review per
+-- SKU, kind and period end, kept as written (a later review is a new version, never an edit).
+create table sku_reviews (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null,
+  sku_id uuid not null,
+  kind text not null check (kind in ('day30', 'month_end')),
+  period_start timestamptz not null,
+  period_end timestamptz not null,
+  version int not null,
+  body jsonb not null,
+  created_at timestamptz not null default now(),
+  unique (workspace_id, id),
+  unique (workspace_id, sku_id, kind, period_end),
+  foreign key (workspace_id, sku_id) references skus(workspace_id, id) on delete cascade on update cascade
+);
+create index on sku_reviews (workspace_id, sku_id, created_at desc);
+select arkiv_tenant_table('sku_reviews'); insert into table_registry values ('sku_reviews', 'tenant');

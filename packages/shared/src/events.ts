@@ -80,6 +80,8 @@ export const EventType = [
   'INTEGRATION_DISCONNECTED',
   // Platform event: staff moved a SKU between workspaces with the owner's consent (plan 05 §2.3); one per side.
   'SKU_TRANSFERRED',
+  // Standard §9/§11: the Day-30 / month-end SKU Creative Review was written.
+  'SKU_REVIEW_CREATED',
   // Funnel (plan 04 §1) — server-side source of truth
   'LP_VIEWED',
   'UPLOAD_STARTED',
@@ -297,6 +299,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   INTEGRATION_DEGRADED: 'integration',
   INTEGRATION_DISCONNECTED: 'integration',
   SKU_TRANSFERRED: 'sku',
+  SKU_REVIEW_CREATED: 'sku',
   LP_VIEWED: null,
   UPLOAD_STARTED: null,
   UPLOAD_COMPLETED: 'sku',
