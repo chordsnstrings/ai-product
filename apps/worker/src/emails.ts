@@ -115,6 +115,20 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
     case 'integration_disconnected':
       await send('integration_disconnected', { provider: String(data.provider), url: `${base}/settings/integrations`, workspaceName: w!.name });
       return;
+    case 'integration_expiring': {
+      const on = new Date(String(data.expiresAt));
+      const expiresOn = Number.isNaN(on.getTime()) ? 'soon' : on.toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: (w!.timezone as string | null) ?? 'UTC' });
+      await send('integration_expiring', { provider: String(data.provider), url: `${base}/settings/integrations`, workspaceName: w!.name, expiresOn });
+      return;
+    }
+    case 'shop_transfer_request': {
+      // Filed by another workspace for a store routed here; only this workspace's owners decide (plan 02 §3 layer 8).
+      const [r] = await withTenant(ws, (tx) => tx`select shop_domain, requester_email, status from shop_transfer_requests where id = ${data.requestId as string} and from_workspace_id = ${ws}`);
+      if (!r || r.status !== 'pending') return;
+      const [local, domain] = String(r.requester_email).split('@');
+      await send('shop_transfer_request', { shop: r.shop_domain as string, requester: domain ? `${(local ?? '').slice(0, 1)}•••@${domain}` : 'Someone', url: `${base}/settings/integrations`, workspaceName: w!.name }, await recipients(ws, ['OWNER']));
+      return;
+    }
     case 'export_ready': {
       // A delivery released after a hold carries the asset, not a (long expired) signed link.
       const url = data.assetId ? await withTenant(ws, (tx) => assetUrl(tx, data.assetId as string, 24 * 3600, 'arkiv-export.zip')) : String(data.url);

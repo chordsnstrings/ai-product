@@ -32,7 +32,7 @@ describe('Shopify webhook verification (plan 05 §16)', () => {
     expect(rows).toMatchObject([
       { shop_domain: 'gone.myshopify.com', checked: true, webhook_health: { ok: false, error: expect.stringMatching(/revoked/) } },
       { shop_domain: 'ok.myshopify.com', checked: true, webhook_health: { ok: true, missing: [], repaired: [] } },
-      { shop_domain: 'partial.myshopify.com', checked: true, webhook_health: { ok: true, missing: ['products/create', 'products/update'], repaired: ['products/create', 'products/update'] } },
+      { shop_domain: 'partial.myshopify.com', checked: true, webhook_health: { ok: true, missing: ['products/create', 'products/update', 'products/delete'], repaired: ['products/create', 'products/update', 'products/delete'] } },
     ]);
     expect((await client.list('partial.myshopify.com', 'shpat_x')).filter((w) => w.address === address).map((w) => w.topic).sort()).toEqual([...SHOPIFY_WEBHOOK_TOPICS].sort());
   });

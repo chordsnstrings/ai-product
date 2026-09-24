@@ -142,3 +142,30 @@ describe('growth and finance sweeps (plan 05 §5–§7)', () => {
     expect(runs).toEqual([{ status: 'skipped', error: 'Stripe is not configured (mock gateway)' }]);
   });
 });
+
+describe('sync-integrations sweep (§28 scheduled reconciliation; integ-27, x-races-16)', () => {
+  it('retries degraded connections once their backoff has passed, leaves permission/schema errors alone, and keeps one pending sync per connection', async () => {
+    const t = await makeTenant();
+    const add = async (account: string, status: string, error: Record<string, unknown> | null) => {
+      const [i] = await ownerPool()`insert into integrations (workspace_id, provider, external_account_id, status, token_enc, error)
+                                    values (${t.workspaceId}, 'meta', ${account}, ${status}, 'v1.x.y.z', ${error ? ownerPool().json(error as never) : null}) returning id`;
+      return i!.id as string;
+    };
+    const active = await add('a', 'active', null);
+    const due = await add('b', 'degraded', { kind: 'network', failures: 5, nextRetryAt: new Date(Date.now() - 60_000).toISOString() });
+    await add('c', 'degraded', { kind: 'network', failures: 5, nextRetryAt: new Date(Date.now() + 3600_000).toISOString() });
+    await add('d', 'degraded', { kind: 'partial_scopes', failures: 1 });
+    await add('e', 'degraded', { kind: 'schema_changed', failures: 1 });
+    await add('f', 'revoked', null);
+    expect(await sweeps['sync-integrations']!.run()).toBe(2);
+    expect(await sweeps['sync-integrations']!.run()).toBe(2); // the pending job is not duplicated
+    const jobs = await ownerPool()`select payload->>'integrationId' as id, singleton_key from outbox where queue = 'sync-integration'`;
+    expect(jobs.map((j) => j.id).sort()).toEqual([active, due].sort());
+    expect(jobs.map((j) => j.singleton_key).sort()).toEqual([`sync:${active}`, `sync:${due}`].sort());
+  });
+
+  it('freshness and token-expiry sweeps are scheduled daily', () => {
+    expect(sweeps['integration-freshness']!.cron).toMatch(/^\d+ \d+ \* \* \*$/);
+    expect(sweeps['integration-token-expiry']!.cron).toMatch(/^\d+ \d+ \* \* \*$/);
+  });
+});

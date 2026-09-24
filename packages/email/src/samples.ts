@@ -18,6 +18,8 @@ export function templateSamples(appUrl: string): { [K in TemplateName]: Template
     refund_issued: { amount: '$19.00', description: 'Dew Serum · 15-second ad', note: 'We couldn’t produce your ad to our quality standard, so you don’t pay for it.', url: `${w}/settings/billing` },
     flag_expired: { flagKey: 'kill.free_preview', owner: 'ops', expiredOn: '2026-09-20', url: `${appUrl}/flags` },
     integration_disconnected: { provider: 'Meta', url: `${w}/settings/integrations`, workspaceName: 'Sample Brand' },
+    integration_expiring: { provider: 'Meta', url: `${w}/settings/integrations`, workspaceName: 'Sample Brand', expiresOn: 'October 1' },
+    shop_transfer_request: { shop: 'sample-brand.myshopify.com', requester: 'j•••@example.com', url: `${w}/settings/integrations`, workspaceName: 'Sample Brand' },
     claim_review_result: { claim: 'Visibly smoother skin in 2 weeks', outcome: 'Approved with a qualifier', url: `${w}/claims` },
     claim_evidence_request: { claim: 'Clinically proven to reduce redness', productName: 'Calm Balm', note: 'Please upload the study summary and panel size.', url: `${w}/claims` },
     sku_out_of_scope: { productName: 'Daily SPF 50', reason: 'Sunscreens are regulated as OTC drugs and are outside what we make ads for.', url: `${w}/products` },

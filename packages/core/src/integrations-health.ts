@@ -153,3 +153,14 @@ export function contractResultsByProvider(report: { testResults?: { assertionRes
   }
   return out;
 }
+
+/**
+ * Register the webhook topics a newly connected shop is missing (§28 "re-sync on webhook"), right after OAuth;
+ * the nightly verification repairs anything this misses. Returns the topics registered.
+ */
+export async function registerShopifyWebhooks(shop: string, token: string, client: ShopifyWebhookClient = shopifyWebhookClient()): Promise<string[]> {
+  const address = `${env().APP_URL}/api/webhooks/shopify`;
+  const missing = missingShopifyWebhooks(await client.list(shop, token), address);
+  for (const topic of missing) await client.create(shop, token, topic, address);
+  return missing;
+}

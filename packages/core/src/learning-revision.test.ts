@@ -108,7 +108,7 @@ describe('CSV imports stay per platform (§48 "never average into one universal 
   it('keeps a variant’s Meta and TikTok CSV rows in separate results and scopes each learning to its platform', async () => {
     const x = await runningExperiment();
     const csv = (platform: 'meta' | 'tiktok', hold: [number, number, number]) => {
-      const head = platform === 'meta' ? 'Day,Ad name,Ad ID,Impressions,Link clicks,Amount spent (USD),Purchases,3-second video plays,Video plays at 75%' : 'By Day,Ad name,Ad ID,Impressions,Clicks (destination),Cost,Conversions,Video views,Video views at 75%';
+      const head = platform === 'meta' ? 'Day,Ad name,Ad ID,Impressions,Link clicks,Amount spent (USD),Purchases,3-second video plays,Video plays at 75%' : 'By Day,Ad name,Ad ID,Impressions,Clicks (destination),Cost,Complete payment,Video views,Video views at 75%';
       const lines = [head];
       for (let d = 1; d <= 6; d++) x.variants.forEach((v, i) => lines.push(`${day(d + 1)},Serum ${v.code},${platform}-${i},4000,48,48.00,1,2400,${Math.round(2400 * hold[i]!)}`));
       return parsePerformanceCsv(lines.join('\n'), platform);

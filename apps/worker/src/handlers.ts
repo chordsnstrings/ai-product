@@ -20,6 +20,7 @@ import {
   Queues,
   recomposeProject,
   syncIntegration,
+  syncShopifyProduct,
   transferSku,
   weekOf,
   enqueue,
@@ -107,6 +108,7 @@ export const handlers: Record<string, Handler> = {
   // One sync per integration at a time: a request arriving mid-run waits for it (one queued follow-up).
   [Queues.syncIntegration]: (ctx, d, jobId) =>
     exclusive(ctx, Queues.syncIntegration, `sync:${d.integrationId as string}`, jobId, d, () => syncIntegration(ctx, d.integrationId as string, { full: !!d.full })),
+  [Queues.syncShopifyProduct]: (ctx, d) => syncShopifyProduct(ctx, d.integrationId as string, d.productId as string),
   [Queues.computeResults]: async (ctx, d) => {
     // Serialized per experiment: a second run waits for the first to commit, then recomputes on fresh data.
     const r = await withTenant(ctx.workspaceId, async (tx) => {

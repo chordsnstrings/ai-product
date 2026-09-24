@@ -63,3 +63,30 @@ describe('midweek signal update (standard §11)', () => {
     expect((sent[0]!.data as { changes: unknown[] }).changes).toEqual([{ test: 'Glow Serum: Texture-first opening lifts hold rate', from: 'GATHERING_SIGNAL', to: 'ACTIONABLE' }]);
   });
 });
+
+describe('integration emails (plan 03 A10, plan 05 §16, plan 02 §3 layer 8)', () => {
+  it('asks the owners to reconnect before a token expires, and the owner (only) to decide a store transfer', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const [a] = await ownerPool()`insert into users (email) values ('admin@brand.com') returning id`;
+    await ownerPool()`insert into memberships (workspace_id, user_id, role) values (${t.workspaceId}, ${a!.id}, 'ADMIN')`;
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
+    await sendQueuedEmail(ctx, { template: 'integration_expiring', provider: 'Meta', expiresAt: '2026-10-01T12:00:00Z' }, 'job-e');
+    const exp = devOutbox.filter((x) => x.template === 'integration_expiring');
+    expect(exp.map((x) => x.to).sort()).toEqual(['admin@brand.com', t.email].sort());
+    expect(exp[0]!.subject).toBe('Reconnect Meta before October 1');
+
+    const other = await makeTenant({ email: 'jordan@elsewhere.example' });
+    const [r] = await ownerPool()`insert into shop_transfer_requests (workspace_id, from_workspace_id, shop_domain, requested_by, requester_email)
+                                  values (${other.workspaceId}, ${t.workspaceId}, 'glow.myshopify.com', ${other.userId}, 'jordan@elsewhere.example') returning id`;
+    await sendQueuedEmail(ctx, { template: 'shop_transfer_request', requestId: r!.id }, 'job-t');
+    const tr = devOutbox.filter((x) => x.template === 'shop_transfer_request');
+    expect(tr.map((x) => x.to)).toEqual([t.email]);
+    expect(tr[0]!.data).toMatchObject({ shop: 'glow.myshopify.com', requester: 'j•••@elsewhere.example' });
+    // Decided already, or not addressed to this workspace: nothing is sent.
+    await ownerPool()`update shop_transfer_requests set status = 'rejected' where id = ${r!.id}`;
+    await sendQueuedEmail(ctx, { template: 'shop_transfer_request', requestId: r!.id }, 'job-t2');
+    await ownerPool()`update shop_transfer_requests set status = 'pending' where id = ${r!.id}`;
+    await sendQueuedEmail(ctxFor(other.workspaceId, other.userId), { template: 'shop_transfer_request', requestId: r!.id }, 'job-t3');
+    expect(devOutbox.filter((x) => x.template === 'shop_transfer_request')).toHaveLength(1);
+  });
+});

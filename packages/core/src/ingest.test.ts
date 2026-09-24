@@ -204,8 +204,8 @@ describe('product page parsing (fixtures)', () => {
     } }));
     expect(p?.priceMicros).toBe(38_000_000); // the product-level fact is still the first variant…
     expect(p?.variants).toEqual([
-      { externalId: '71', title: '30 ml / Light', options: { Size: '30 ml', Shade: 'Light' }, priceMicros: 38_000_000, compareAtMicros: undefined, sku: 'GS30L', gtin: '111', available: true, imageUrl: 'https://cdn/30.jpg' },
-      { externalId: '72', title: '50 ml / Light', options: { Size: '50 ml', Shade: 'Light' }, priceMicros: 52_000_000, compareAtMicros: 58_000_000, sku: 'GS50L', gtin: undefined, available: false, imageUrl: 'https://cdn/50.jpg' },
+      { externalId: 'gid://shopify/ProductVariant/71', title: '30 ml / Light', options: { Size: '30 ml', Shade: 'Light' }, priceMicros: 38_000_000, compareAtMicros: undefined, sku: 'GS30L', gtin: '111', available: true, imageUrl: 'https://cdn/30.jpg' },
+      { externalId: 'gid://shopify/ProductVariant/72', title: '50 ml / Light', options: { Size: '50 ml', Shade: 'Light' }, priceMicros: 52_000_000, compareAtMicros: 58_000_000, sku: 'GS50L', gtin: undefined, available: false, imageUrl: 'https://cdn/50.jpg' },
     ]); // …but each variant keeps its own, so creative can use the right one.
   });
 
@@ -224,7 +224,7 @@ describe('product page parsing (fixtures)', () => {
     const p = parseShopifyProduct(JSON.stringify({ product: { id: 99, title: 'Cloud Cream', body_html: '<b>Rich</b> cream', vendor: 'Nimbus', images: [{ src: 'https://cdn/x.jpg' }], variants: [{ title: '50 ml', price: '42.00', compare_at_price: '48.00', sku: 'CC50' }] } }));
     expect(p?.priceMicros).toBe(42_000_000);
     expect(p?.compareAtMicros).toBe(48_000_000);
-    expect(p?.shopifyProductId).toBe('99');
+    expect(p?.shopifyProductId).toBe('gid://shopify/Product/99'); // the Admin API's id form, so a later store sync matches (§42)
     expect(shopifyJsonUrl(new URL('https://nimbus.shop/products/cloud-cream?variant=1'))).toBe('https://nimbus.shop/products/cloud-cream.json');
   });
 });

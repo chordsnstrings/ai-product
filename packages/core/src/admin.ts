@@ -648,7 +648,7 @@ export async function cancelProjectBeforeDispatch(s: Staff, workspaceId: string,
  * Everything else (analysis, storyboards, production, hook variants, genome, themes, recommendations) goes
  * through the Cost Governor and may only be retried by roles holding jobs.manage.
  */
-export const NO_SPEND_QUEUES: ReadonlySet<string> = new Set([Queues.sendEmail, Queues.syncIntegration, Queues.computeResults, Queues.processUpload, Queues.exportWorkspace]);
+export const NO_SPEND_QUEUES: ReadonlySet<string> = new Set([Queues.sendEmail, Queues.syncIntegration, Queues.syncShopifyProduct, Queues.computeResults, Queues.processUpload, Queues.exportWorkspace]);
 
 export type OpsCommandKind = 'job.retry' | 'job.bulk_retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks' | 'stripe.reconcile' | 'taxonomy.remap';
 

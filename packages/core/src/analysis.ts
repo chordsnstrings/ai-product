@@ -86,6 +86,37 @@ export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPrevi
   return { skuId, projectId, catalogueNo: no };
 }
 
+/**
+ * A store-imported SKU's product as the analysis reads it: the current Shopify facts (name, description, brand,
+ * price, ingredients/size from metafields, images), in the shape a page import produces.
+ */
+export async function shopifyExtracted(tx: Tx, skuId: string): Promise<ExtractedProduct> {
+  const rows = await tx`select distinct on (normalized_key) normalized_key, value_text, value_number, value_json from product_facts
+                        where sku_id = ${skuId} and source_type = 'shopify' and status <> 'SUPERSEDED' order by normalized_key, observed_at desc`;
+  const f = new Map(rows.map((r) => [r.normalized_key as string, r]));
+  const text = (k: string) => (f.get(k)?.value_text as string | null | undefined) ?? undefined;
+  const money = (k: string) => (f.get(k)?.value_number != null ? Math.round(Number(f.get(k)!.value_number) * 1_000_000) : undefined);
+  const [sku] = await tx`select shopify_product_id from skus where id = ${skuId}`;
+  const images = f.get('images')?.value_json;
+  return {
+    source: 'shopify',
+    name: text('name'),
+    description: text('description'),
+    brand: text('brand'),
+    productType: text('product_type'),
+    priceMicros: money('price'),
+    compareAtMicros: money('compare_at_price'),
+    currency: ((f.get('price')?.value_json as { currency?: string } | null)?.currency) ?? undefined,
+    images: Array.isArray(images) ? (images as string[]) : [],
+    sku: text('sku_code'),
+    gtin: text('gtin'),
+    ingredients: text('ingredients'),
+    sizeText: text('size'),
+    shopifyProductId: (sku?.shopify_product_id as string | null) ?? undefined,
+    rawText: text('description') ?? '',
+  };
+}
+
 function factsFromStructured(p: ExtractedProduct, url: string | null): FactInput[] {
   const src = p.source === 'shopify' ? 'shopify' : p.source === 'json_ld' ? 'json_ld' : 'product_page';
   const f: FactInput[] = [];
@@ -160,7 +191,10 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
 
   // 1. Structured import (preferred source of truth, §16).
   let extracted: ExtractedProduct | null = null;
-  if (sku.source_url) {
+  if (sku.source_kind === 'shopify') {
+    // Created from the connected store: its facts are already recorded (Shopify API), so the page isn't read.
+    extracted = await withTenant(ws, (tx) => shopifyExtracted(tx, skuId));
+  } else if (sku.source_url) {
     await withTenant(ws, (tx) => step(tx, ws, skuId, 'read_page', 'active'));
     try {
       extracted = await importProductUrl(sku.source_url as string);
@@ -175,7 +209,12 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
           }
         }
         await step(tx, ws, skuId, 'read_page', 'done', extracted!.name ? `Found “${extracted!.name}”` : 'Page read');
-        await tx`update skus set shopify_product_id = ${extracted!.shopifyProductId ?? null} where id = ${skuId}`;
+        // One SKU per store product (§42 "Duplicate import"): a product already in the catalogue keeps its SKU as
+        // the match; this import stays unlinked rather than competing for it.
+        if (extracted!.shopifyProductId) {
+          await tx`update skus set shopify_product_id = ${extracted!.shopifyProductId} where id = ${skuId}
+                   and not exists (select 1 from skus o where o.shopify_product_id = ${extracted!.shopifyProductId} and o.id <> ${skuId})`;
+        }
       });
     } catch (e) {
       // Blocked/JS-only pages fall back to photos without losing the URL (§42, plan 03 P2).
