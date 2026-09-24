@@ -29,6 +29,7 @@ import { qaClaims, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaim
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
+import { factsForStatements, mapStatements, statementCheck } from './statements';
 
 export const PRODUCTION_STEPS = [
   { key: 'prepare', label: 'Preparing your product' },
@@ -923,12 +924,16 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         for (const s of scenes) await tx`update scenes set claim_ids = ${claimIds.get(s.id)!}::uuid[] where id = ${s.id}`;
       });
       for (const slot of slots) slot.entry.claimIds = claimIds.get(slot.entry.sceneId) ?? [];
-      if (!claimCheck.pass || testimonials) {
+      // Launch Gate 2: every factual statement traces to a ProductFact, an approved claim or a merchant decision.
+      const statementMap = mapStatements(lines, mapping, await withTenant(ws, (tx) => factsForStatements(tx, sku.id as string)));
+      const statements = statementCheck(statementMap);
+      checks.push(statements);
+      if (!claimCheck.pass || testimonials || !statements.pass) {
         await withTenant(ws, async (tx) => {
           await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
           // The lines and why are in the QA report (shown with a compliant alternative); the reason is customer copy.
-          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: [claimCheck.pass ? null : claimCheck.detail, testimonials?.detail].filter(Boolean).join(' | '), code: 'claims_blocked' });
-          await tx`update projects set qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
+          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: [claimCheck.pass ? null : claimCheck.detail, testimonials?.detail, statements.pass ? null : statements.detail].filter(Boolean).join(' | ').slice(0, 1000), code: 'claims_blocked' });
+          await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), statementMap } as never)} where id = ${projectId}`;
           await settle(tx, ctx, auth.authorizationId, 'released');
         });
         return;
@@ -1092,11 +1097,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const [cr] = await tx`
           insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
-            ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0 } as never)},
+            ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
             1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
-        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
+        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');
         await settle(tx, ctx, auth.authorizationId, 'consumed');
@@ -1318,8 +1323,10 @@ export async function finishAfterEdit(tx: Tx, ctx: TenantContext, projectId: str
   const [sku] = await tx`select name from skus where id = ${p.sku_id}`;
   const check = await claimsQaForExports(tx, p.sku_id as string, await adLines(tx, p.storyboard_id as string), ASPECTS, { names: [sku?.name as string, (await brandBrainFor(tx, p.sku_id as string))?.name ?? null] });
   const testimonials = testimonialCheck(await tx`select production_mode, shows_human_skin, spoken_line, overlay_text from scenes where storyboard_id = ${p.storyboard_id}`);
-  if (!check.pass || testimonials) {
-    const lines = blockedLines({ checks: [check, ...(testimonials ? [testimonials] : [])] });
+  // Launch Gate 2 on the edited lines too: a fact nothing backs would only stop production again.
+  const statements = statementCheck(mapStatements(await adLines(tx, p.storyboard_id as string), (check.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? [], await factsForStatements(tx, p.sku_id as string)));
+  if (!check.pass || testimonials || !statements.pass) {
+    const lines = blockedLines({ checks: [check, ...(testimonials ? [testimonials] : []), ...(statements.pass ? [] : [statements])] });
     throw new DomainError('GATE_BLOCKED', `“${lines[0]?.line ?? 'A line'}” still can’t be used: ${lines[0]?.reason ?? check.detail}`, { lines });
   }
   await approveForProduction(tx, ctx, projectId, unit);

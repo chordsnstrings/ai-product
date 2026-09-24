@@ -11,7 +11,7 @@ import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, listClaims, proposeClaim } from './claims';
 import { recordAssetWatched } from './funnel';
 import { append, available } from './ledger';
-import { approveForProduction, blockedLines, hardFidelityFail, produceProject } from './production';
+import { approveForProduction, blockedLines, finishAfterEdit, hardFidelityFail, produceProject, reopenForEdit } from './production';
 import sharp from 'sharp';
 import { authorize } from './cost-governor';
 import { exactProductFrame, productImagery } from './composite';
@@ -274,4 +274,33 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       expect((await listClaims(tx, skuId)).length).toBeGreaterThan(0);
     });
   }, 120_000);
+
+  it('traces every factual statement to a product fact or claim, and stops on one nothing backs (Launch Gate 2)', async () => {
+    const { t, ctx, projectId, storyboardId } = await previewToStoryboard();
+    // A concentration no fact or claim backs, put in an overlay directly (bypassing the editor).
+    await ownerPool()`update scenes set overlay_text = 'With 10% niacinamide' where storyboard_id = ${storyboardId} and purpose = 'routine'`;
+    await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'taste', amount: 1, idempotencyKey: 'pay:gate2' });
+      await approveForProduction(tx, ctx, projectId, 'taste');
+    });
+    expect(await produceProject(ctx, projectId)).toBe('failed');
+    const [p] = await ownerPool()`select state, qa_report from projects where id = ${projectId}`;
+    expect(p!.state).toBe('BLOCKED_COMPLIANCE');
+    const report = p!.qa_report as { statementMap: { text: string; status: string; unsourced: string[] }[] };
+    expect(report.statementMap.find((m) => m.text === 'With 10% niacinamide')).toMatchObject({ status: 'unsourced', unsourced: ['10%', 'niacinamide'] });
+    expect(blockedLines(p!.qa_report).map((l) => l.line)).toContain('With 10% niacinamide');
+    expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
+    // Fixing the line is checked before production goes again: the unsourced fact is refused up front.
+    await ownerPool()`insert into purchases (workspace_id, project_id, kind, amount_micros, status, created_by, paid_at) values (${t.workspaceId}, ${projectId}, 'taste', 19000000, 'paid', 'test', now())`;
+    await withTenant(t.workspaceId, (tx) => reopenForEdit(tx, ctx, projectId));
+    await expect(withTenant(t.workspaceId, (tx) => finishAfterEdit(tx, ctx, projectId))).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+    await ownerPool()`update scenes set overlay_text = 'AM + PM, after cleansing' where storyboard_id = ${storyboardId} and purpose = 'routine'`;
+    await withTenant(t.workspaceId, (tx) => finishAfterEdit(tx, ctx, projectId));
+    expect(await produceProject(ctx, projectId)).toBe('complete');
+    const [done] = await ownerPool()`select p.qa_report, c.genome from projects p join creatives c on c.id = p.final_creative_id where p.id = ${projectId}`;
+    const map = (done!.qa_report as { statementMap: { status: string }[] }).statementMap;
+    expect(map.length).toBeGreaterThan(3);
+    expect(map.every((m) => m.status !== 'unsourced')).toBe(true);
+    expect((done!.genome as { lineage: { statementMap: unknown[] } }).lineage.statementMap).toEqual(map);
+  }, 240_000);
 });
