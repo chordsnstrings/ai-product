@@ -13,6 +13,7 @@ export * from './allowlist';
 export * from './abuse';
 export * from './rights';
 export * from './integrations-health';
+export * from './retention';
 export * from './ledger';
 export * from './rates';
 export * from './cost-governor';

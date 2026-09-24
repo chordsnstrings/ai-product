@@ -16,7 +16,7 @@ export interface SendOptions {
 }
 
 export interface SendResult {
-  status: 'sent' | 'suppressed' | 'duplicate' | 'logged' | 'capped';
+  status: 'sent' | 'suppressed' | 'duplicate' | 'logged' | 'capped' | 'paused';
   providerId?: string | null;
 }
 
@@ -55,8 +55,8 @@ const TEMPLATE_NAMES: Record<TemplateName, true> = {
 export const isTemplateName = (t: string): t is TemplateName => Object.hasOwn(TEMPLATE_NAMES, t);
 
 /** Render a template to what the recipient saw (subject + HTML), for the console's email view. */
-export async function renderEmail<T extends TemplateName>(template: T, data: TemplateMap[T], opts: { supportEmail?: string | null } = {}) {
-  const built = build(template, data, { supportEmail: opts.supportEmail ?? null });
+export async function renderEmail<T extends TemplateName>(template: T, data: TemplateMap[T], opts: { supportEmail?: string | null; unsubscribeUrl?: string | null } = {}) {
+  const built = build(template, data, { supportEmail: opts.supportEmail ?? null, unsubscribeUrl: opts.unsubscribeUrl ?? null });
   return { subject: built.subject, stream: built.stream, html: await render(built.element as never) };
 }
 
@@ -67,6 +67,8 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
     const [sup] = await t`select stream from email_suppressions where email = ${email}`;
     if (sup && (sup.stream === 'all' || sup.stream === built.stream) && built.stream === 'marketing') return { status: 'suppressed' };
     if (sup && sup.stream === 'all' && built.stream === 'transactional' && template !== 'magic_link' && template !== 'security_alert') return { status: 'suppressed' };
+    // Complaint-rate guard (plan 05 §18): while the marketing stream is paused, marketing email isn't sent at all.
+    if (built.stream === 'marketing' && (await marketingPaused(t))) return { status: 'paused' };
     // email_log is tenant-scoped (RLS); the log row, the marketing frequency cap (per address, across
     // workspaces) and the dedupe go through a narrow SECURITY DEFINER function.
     const [open] = await t`select id, outcome from email_log_open(${opts.workspaceId ?? null}, ${email}, ${template}, ${built.stream}, ${opts.idempotencyKey}, ${t.json(storedEmailData(template, data) as never)})`;
@@ -157,16 +159,37 @@ export function verifyResendWebhook(body: string, headers: { id: string | null; 
   });
 }
 
-export async function handleResendEvent(evt: { type: string; data: { email_id?: string; to?: string[] } }) {
+/** Complaint rate above this (30 days, marketing stream) pauses marketing sends (plan 05 §18). */
+export const MARKETING_COMPLAINT_THRESHOLD = 0.001;
+
+/** Is the marketing stream paused (setting `email.marketing_paused` holds the pause record; null/absent = running)? */
+export async function marketingPaused(t: Tx): Promise<boolean> {
+  const [p] = await t`select value from platform_settings where key = 'email.marketing_paused'`;
+  return !!p && typeof p.value === 'object' && p.value !== null;
+}
+
+export interface ResendEvent {
+  type: string;
+  data: { email_id?: string; to?: string[]; bounce?: { type?: string } };
+}
+
+export async function handleResendEvent(evt: ResendEvent) {
   await globalTx(async (t) => {
     if (evt.data.email_id) {
       await t`select email_log_event(${evt.data.email_id}, ${evt.type.replace('email.', '')}, ${t.json({ type: evt.type, at: new Date().toISOString() })})`;
     }
+    const hardBounce = evt.type === 'email.bounced' && !/transient|soft/i.test(evt.data.bounce?.type ?? '');
     if (evt.type === 'email.bounced' || evt.type === 'email.complained') {
       for (const to of evt.data.to ?? []) {
         await t`insert into email_suppressions (email, reason, stream) values (${to.toLowerCase()}, ${evt.type === 'email.bounced' ? 'hard_bounce' : 'complaint'}, 'all')
                 on conflict (email) do update set reason = excluded.reason, stream = 'all'`;
       }
     }
+    // A hard bounce on an Owner's address raises the tenant banner; a later delivery to it clears it (plan 05 §18).
+    if (hardBounce || evt.type === 'email.delivered') {
+      for (const to of evt.data.to ?? []) await t`select email_owner_bounce(${to.toLowerCase()}, ${hardBounce})`;
+    }
+    // Each complaint re-checks the 30-day marketing complaint rate; above the threshold marketing pauses (audited).
+    if (evt.type === 'email.complained') await t`select email_marketing_complaint_check(${MARKETING_COMPLAINT_THRESHOLD})`;
   });
 }

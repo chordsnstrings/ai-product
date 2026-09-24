@@ -22,7 +22,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
       const u = await periodUsage(tx, new Date(sub.current_period_start as string).toISOString().slice(0, 10));
       meter = `${u.remaining} of ${u.granted} tests left · renews ${new Date(sub.current_period_end as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
     }
-    const [ws] = await tx`select state, purge_at from workspaces where id = ${w.ctx.workspaceId}`;
+    const [ws] = await tx`select state, purge_at, owner_email_bouncing_at, plan_code from workspaces where id = ${w.ctx.workspaceId}`;
     // In-app notices from Arkiv (retention playbooks, plan 05 §17), until dismissed or expired.
     const notices = await tx`select id, title, body, link_path, link_label from workspace_notices
                              where workspace_id = ${w.ctx.workspaceId} and dismissed_at is null and expires_at > now() order by created_at desc limit 2`;
@@ -40,6 +40,10 @@ export default async function WorkspaceLayout({ children, params }: { children: 
         <StatusBanner />
         {ws?.state === 'PURGE_SCHEDULED' ? (
           <Banner tone="risk">This workspace is scheduled for deletion on {new Date(ws.purge_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}. <Link href={`/w/${slug}/settings/data`}>Cancel deletion</Link></Banner>
+        ) : null}
+        {ws?.owner_email_bouncing_at ? (
+          // Plan 05 §18 / 02 M13: mail to the Owner's address bounced, so billing and security notices aren't arriving.
+          <Banner tone="warn">Email to this workspace’s owner is bouncing, so receipts and security notices aren’t arriving. {w.ctx.role === 'OWNER' ? <Link href={`/w/${slug}/settings/profile`}>Update your email address</Link> : 'Ask the owner to update their email address.'}</Banner>
         ) : null}
         {ws?.state === 'PAST_DUE' ? <Banner tone="warn">Your last payment failed. <Link href={`/w/${slug}/settings/billing`}>Update your card</Link> to keep producing tests.</Banner> : null}
         {stale.length ? <Banner tone="warn">{stale.map((s) => s.provider).join(', ')} data is older than 7 days — recommendations are using a reduced basis. <Link href={`/w/${slug}/settings/integrations`}>Check connections</Link></Banner> : null}

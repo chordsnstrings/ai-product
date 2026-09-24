@@ -142,7 +142,7 @@ begin
   return n;
 end $$;
 revoke all on function email_owner_bounce(citext, boolean) from public;
-grant execute on function email_owner_bounce(citext, boolean) to app_rw, system_rw;
+grant execute on function email_owner_bounce(citext, boolean) to app_rw, system_rw, admin_rw;
 
 -- Complaint rate guard: marketing complaints over marketing sends in the last 30 days. Above the threshold the
 -- marketing stream is paused (platform setting email.marketing_paused, read by every send), a platform alert is

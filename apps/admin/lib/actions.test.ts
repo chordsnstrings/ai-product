@@ -677,6 +677,39 @@ describe('prompts, evals and golden sets (plan 05 §11)', () => {
   });
 });
 
+describe('email & lifecycle actions (plan 05 §18)', () => {
+  it('test-sends any template with its sample data, and resumes paused marketing with an audit record', async () => {
+    const g = await staff(['GROWTH']);
+    for (const template of ['day30_review', 'intervention', 'claims_guidance']) {
+      expect(String((await act(g, 'email.test', { template })).message)).toMatch(/^Sent to/);
+      expect(devOutbox.at(-1)).toMatchObject({ to: g.email, template });
+    }
+    await expect(act(g, 'email.test', { template: 'nope' })).rejects.toThrow(/Unknown template/);
+    await expect(act(g, 'email.marketing_resume', { reason: 'list cleaned' })).rejects.toThrow(/not paused/);
+    await ownerPool()`insert into platform_settings (key, value) values ('email.marketing_paused', '{"at":"2026-09-24T00:00:00Z","rate":0.002}')`;
+    await ownerPool()`insert into platform_alerts (kind, subject_type, subject_id, message) values ('email.marketing_paused', 'email_stream', 'marketing', 'paused')`;
+    try {
+      await act(g, 'email.marketing_resume', { reason: 'removed purchased list segment' });
+      const [p] = await ownerPool()`select value from platform_settings where key = 'email.marketing_paused'`;
+      expect(p!.value).toBeNull();
+      expect(await ownerPool()`select 1 from platform_alerts where kind = 'email.marketing_paused' and resolved_at is null`).toHaveLength(0);
+      const [a] = await ownerPool()`select reason, before from admin_audit_log where action = 'email.marketing_resume'`;
+      expect(a).toMatchObject({ reason: 'removed purchased list segment', before: { rate: 0.002 } });
+    } finally {
+      await ownerPool()`delete from platform_settings where key = 'email.marketing_paused'`;
+    }
+  });
+
+  it('unsuppressing an owner address lifts the workspace bounce banner', async () => {
+    const t = await makeTenant({ email: 'bouncy@brand.example' });
+    await ownerPool()`update workspaces set owner_email_bouncing_at = now() where id = ${t.workspaceId}`;
+    await ownerPool()`insert into email_suppressions (email, reason, stream) values ('bouncy@brand.example', 'hard_bounce', 'all')`;
+    await act(await staff(['SUPPORT']), 'email.unsuppress', { email: 'bouncy@brand.example', reason: 'address fixed by customer' });
+    const [w] = await ownerPool()`select owner_email_bouncing_at from workspaces where id = ${t.workspaceId}`;
+    expect(w!.owner_email_bouncing_at).toBeNull();
+  });
+});
+
 describe('integrations health actions (plan 05 §16)', () => {
   it('an API-version switch flag needs a passing contract run; app status is recorded and audited', async () => {
     const eng = await staff(['ENGINEERING']);

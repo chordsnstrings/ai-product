@@ -1,6 +1,6 @@
 import { withSystem, withTenant } from '@arkiv/db';
 import { reconcileStripe } from '@arkiv/billing';
-import { sendEmail } from '@arkiv/email';
+import { sendEmail, sequence } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import {
   ANALYSIS_STATES,
@@ -91,23 +91,27 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
     cron: '* * * * *',
     run: () =>
       withSystem(async (tx) => {
+        // Timing comes from the lifecycle sequence registry (packages/email sequences.ts), shown in the console.
+        const endingMin = Math.round(-sequence('offer_ending').delayHours * 60);
+        const savedH = sequence('storyboard_saved').delayHours;
+        const conceptH = sequence('new_concept').delayHours;
         // Fragments over the project alias `p` (fresh per query).
         const underCap = () => tx`(select count(distinct l.template) from email_log l where l.workspace_id = p.workspace_id
                                      and l.idempotency_key like 'recovery:' || p.id::text || ':%') < ${RECOVERY_EMAIL_CAP}`;
         const notPurchased = () => tx`not exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.status = 'paid')`;
         const due = await tx`select o.id, o.workspace_id from offers o join projects p on p.id = o.project_id and p.workspace_id = o.workspace_id
                              where o.type = 'TASTE' and o.status = 'active'
-                               and o.expires_at between now() + interval '13 minutes' and now() + interval '16 minutes'
+                               and o.expires_at between now() + make_interval(mins => ${endingMin - 2}) and now() + make_interval(mins => ${endingMin + 1})
                                and ${notPurchased()} and ${underCap()}`;
         for (const o of due) await enqueueFor(tx, o.workspace_id as string, 'send-email', { template: 'offer_ending', offerId: o.id }, `offer-ending:${o.id}`);
         const stale = await tx`select p.id, p.workspace_id from projects p where p.state = 'STORYBOARD_READY' and p.kind = 'preview'
-                               and p.updated_at between now() - interval '25 hours' and now() - interval '24 hours'
+                               and p.updated_at between now() - make_interval(hours => ${savedH + 1}) and now() - make_interval(hours => ${savedH})
                                and ${notPurchased()} and ${underCap()}`;
         for (const p of stale) await enqueueFor(tx, p.workspace_id as string, 'send-email', { template: 'storyboard_saved', projectId: p.id }, `saved:${p.id}`);
         // T+3d: a new concept for the same SKU (≈ one concepts call, no render), then the new_concept email.
         const cold = await tx`select p.id, p.workspace_id from projects p join workspaces w on w.id = p.workspace_id
                               where p.state = 'STORYBOARD_READY' and p.kind = 'preview' and w.state in ('ACTIVE_FREE','ACTIVE_PAID')
-                                and p.updated_at between now() - interval '73 hours' and now() - interval '72 hours'
+                                and p.updated_at between now() - make_interval(hours => ${conceptH + 1}) and now() - make_interval(hours => ${conceptH})
                                 and ${notPurchased()} and ${underCap()}`;
         for (const p of cold) await enqueueFor(tx, p.workspace_id as string, 'recovery-concept', { projectId: p.id }, `recovery-concept:${p.id}`);
         return due.length + stale.length + cold.length;

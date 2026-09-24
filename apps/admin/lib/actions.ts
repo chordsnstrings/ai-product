@@ -77,7 +77,7 @@ import {
   validateRateTable,
 } from '@arkiv/core';
 import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
-import { canResendTemplate, sendEmail, type TemplateName } from '@arkiv/email';
+import { canResendTemplate, isTemplateName, sendEmail, templateSamples, type TemplateName } from '@arkiv/email';
 import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
@@ -1083,6 +1083,8 @@ export const ACTIONS = {
                                   where ${i.email ? tx`email = ${i.email.toLowerCase()}` : tx`encode(sha256(convert_to(lower(email::text), 'UTF8')), 'hex') = ${i.emailKey!}`}
                                   returning email, reason, stream, created_at`;
         if (!before) throw new DomainError('NOT_FOUND', 'That address isn’t suppressed.');
+        // A deliverable address again: any Owner bounce banner for it is lifted (plan 05 §18).
+        await tx`select email_owner_bounce(${before.email as string}, false)`;
         await audit(tx, s, 'email.unsuppress', { type: 'email', id: before.email as string }, { reason: i.reason, before });
       }),
   }),
@@ -1099,11 +1101,34 @@ export const ACTIONS = {
       if (!row.data) throw new DomainError('CONFLICT', 'This email was sent before its content was recorded, so it can’t be resent.');
       const res = await sendEmail(row.template as TemplateName, row.to_email as string, row.data as never, { idempotencyKey: `resend:${i.logId}:${i.requestId}`, workspaceId: (row.workspace_id as string) ?? null });
       await withAdmin((tx) => audit(tx, s, 'email.resend', { type: 'email_log', id: i.logId }, { workspaceId: (row.workspace_id as string) ?? null, reason: i.reason, before: { template: row.template, status: row.status }, after: { outcome: res.status } }));
-      const said = { sent: 'Resent.', logged: 'Resent (logged; no provider configured here).', duplicate: 'Already resent.', suppressed: 'Not sent: the address is suppressed. Unsuppress it first.', capped: 'Not sent: marketing frequency cap reached for this address.' }[res.status];
+      const said = { sent: 'Resent.', logged: 'Resent (logged; no provider configured here).', duplicate: 'Already resent.', suppressed: 'Not sent: the address is suppressed. Unsuppress it first.', capped: 'Not sent: marketing frequency cap reached for this address.', paused: 'Not sent: marketing email is paused (complaint rate). Resume it on the Email page first.' }[res.status];
       return { status: res.status, message: said };
     },
   }),
-  'email.test': a({ perm: 'email.read', schema: z.object({ template: z.enum(['magic_link', 'receipt', 'asset_ready', 'weekly_brief', 'cancellation_confirmed']) }), run: async (s, i) => { const samples = { magic_link: { url: `${env().APP_URL}/auth/magic/test`, purpose: 'login' as const }, receipt: { productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: env().APP_URL }, asset_ready: { productName: 'Dew Serum', url: env().APP_URL, catalogueNo: '014' }, weekly_brief: { workspaceName: 'Sample Brand', week: 'Week 39', recommendations: [{ hypothesis: 'Texture close-ups beat talking heads for serums', slot: 'EXPLOIT' }], url: env().APP_URL }, cancellation_confirmed: { planName: 'Growth', endsOn: 'October 23', exportUrl: env().APP_URL } }; await sendEmail(i.template, s.email, samples[i.template] as never, { idempotencyKey: `test:${i.template}:${newId()}` }); return { message: `Sent to ${s.email}` }; } }),
+  /* §18 preview with sample data and test-send to staff: every template, with its sample data, to the staff member. */
+  'email.test': a({
+    perm: 'email.read',
+    schema: z.object({ template: z.string().refine(isTemplateName, 'Unknown template') }),
+    run: async (s, i) => {
+      const template = i.template as TemplateName;
+      const r = await sendEmail(template, s.email, templateSamples(env().APP_URL)[template] as never, { idempotencyKey: `test:${template}:${newId()}` });
+      return { message: r.status === 'sent' || r.status === 'logged' ? `Sent to ${s.email}` : `Not sent (${r.status}) to ${s.email}` };
+    },
+  }),
+  /* §18 complaint-rate guard: marketing sends paused automatically; staff resume once the cause is dealt with. */
+  'email.marketing_resume': a({
+    perm: 'email.manage',
+    schema: z.object({ reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select value from platform_settings where key = 'email.marketing_paused' for update`;
+        if (!b || b.value === null) throw new DomainError('CONFLICT', 'Marketing email is not paused.');
+        await tx`update platform_settings set value = 'null'::jsonb, updated_by = ${s.staffId}, updated_at = now() where key = 'email.marketing_paused'`;
+        await tx`update platform_alerts set resolved_at = now(), resolved_by = ${s.staffId}, resolution = ${i.reason} where kind = 'email.marketing_paused' and resolved_at is null`;
+        await audit(tx, s, 'email.marketing_resume', { type: 'setting', id: 'email.marketing_paused' }, { reason: i.reason, before: b.value, after: null });
+        return { message: 'Marketing email resumed.' };
+      }),
+  }),
 
   /* ── Flags, settings, banner ── */
   'flag.set': a({
