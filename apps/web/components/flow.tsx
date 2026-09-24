@@ -8,6 +8,8 @@ import type { ProjectView } from '@/lib/views';
 type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null } };
 
 const usd = (micros: number) => `$${(micros / 1_000_000).toFixed(micros % 1_000_000 === 0 ? 0 : 2)}`;
+/** Below this photo-quality confidence the P4 screen offers an extra view (plan 03 P4, "only if fidelity confidence is low"). */
+const LOW_FIDELITY = 0.6;
 const PRODUCING = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA'];
 
 function useProject(id: string, active: (v: View | null) => boolean) {
@@ -80,6 +82,60 @@ function MissingFacts({ projectId, fields, onSaved }: { projectId: string; field
         </form>
       ))}
       {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
+/** Views the analyst may suggest, in customer words. */
+const VIEW_WORDS: Record<string, string> = { front: 'the front', side: 'a side view', back: 'the back label', swatch: 'a swatch of the product', closure: 'the cap or pump', in_hand: 'the product in hand' };
+
+/**
+ * Add photos to this same product (§13: keep the entered URL, ask for images without a restart; P4 "Add a
+ * side/back photo for sharper product accuracy"). Up to 6 at a time; the server decides whether they resume the
+ * analysis or become extra reference views.
+ */
+function PhotoAdder({ projectId, title, why, cta, onAdded }: { projectId: string; title: string; why: string; cta: string; onAdded: () => void }) {
+  const ref = useRef<HTMLInputElement>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  function pick(list: FileList | null) {
+    if (!list) return;
+    const imgs = [...list].filter((f) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name));
+    if (!imgs.length) return setErr('Choose a photo (JPG or PNG).');
+    setErr(null);
+    setFiles((prev) => [...prev, ...imgs].slice(0, 6));
+  }
+  async function send() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const fd = new FormData();
+      for (const f of files) fd.append('photos', f);
+      await api(`/api/projects/${projectId}/photos`, fd);
+      setFiles([]);
+      setDone(true);
+      onAdded();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+  }
+  if (done) return <p className="ak-small ak-muted" role="status">Thanks — we’ve added your photos.</p>;
+  return (
+    <div className="ak-panel ak-stack">
+      <h2 className="ak-label">{title}</h2>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>{why}</p>
+      <div className="ak-row" style={{ flexWrap: 'wrap' }}>
+        <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => ref.current?.click()}>Choose photos</button>
+        <input ref={ref} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden onChange={(e) => pick(e.target.files)} />
+        {files.map((f, i) => (
+          <span key={i} className="ak-chip">{f.name.slice(0, 18)} <button type="button" className="ak-textbtn" aria-label={`Remove ${f.name}`} onClick={() => setFiles(files.filter((_, j) => j !== i))}>×</button></span>
+        ))}
+      </div>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      <div><Button size="sm" disabled={!files.length || busy} onClick={() => void send()}>{busy ? 'Adding…' : cta}</Button></div>
     </div>
   );
 }
@@ -228,8 +284,20 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
               {failed ? (
                 <div className="ak-stack">
                   <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
-                  <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
-                  <div><Button onClick={() => void retryAnalysis()}>Try again</Button></div>
+                  {v.sku.sourceUrl ? <p className="ak-small ak-muted" style={{ margin: 0, overflowWrap: 'anywhere' }}>Your link is saved: {v.sku.sourceUrl}</p> : null}
+                  <PhotoAdder
+                    projectId={projectId}
+                    title={v.sku.usablePhotos ? 'Add a plain photo of the product' : 'Add 1–3 photos of your product'}
+                    why="We use them to match your packaging exactly in the ad and to read the label (name, size, claims). The front, plus the back label if you have it."
+                    cta="Add photos and continue"
+                    onAdded={() => { resume(); refresh(); }}
+                  />
+                  {v.sku.usablePhotos ? (
+                    <>
+                      <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
+                      <div><Button variant="secondary" onClick={() => void retryAnalysis()}>Try again</Button></div>
+                    </>
+                  ) : null}
                 </div>
               ) : !v.sku.ingredientsVerified ? (
                 <div className="ak-panel ak-stack">
@@ -237,6 +305,15 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <p className="ak-small ak-muted" style={{ margin: 0 }}>We didn’t find an ingredient list on your page or label, so we won’t suggest ingredient-led ads or guess ingredients from the category.</p>
                   <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Key ingredients', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
                 </div>
+              ) : null}
+              {!failed && ready && v.sku.addedViews === 0 && v.sku.suggestedViews.length > 0 && (v.sku.fidelityConfidence ?? 1) < LOW_FIDELITY ? (
+                <PhotoAdder
+                  projectId={projectId}
+                  title="Add a side/back photo for sharper product accuracy"
+                  why={`Optional — ${v.sku.suggestedViews.map((x) => VIEW_WORDS[x] ?? x).join(', ')} would help us keep your packaging exact in every scene.`}
+                  cta="Add photos"
+                  onAdded={refresh}
+                />
               ) : null}
               {!failed && v.sku.variants.length > 1 ? <VariantPicker projectId={projectId} v={v} onSaved={refresh} /> : null}
               {!failed && v.sku.missingEvidence.length ? (

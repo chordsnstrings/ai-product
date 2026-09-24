@@ -86,6 +86,15 @@ function useTurnstile(siteKey: string | null | undefined) {
   return { box, token };
 }
 
+const MARKETPLACE_RE = /(^|\.)(amazon|walmart|ebay)\.[a-z.]+$/i;
+const hostOf = (u: string) => {
+  try {
+    return new URL(u).hostname;
+  } catch {
+    return '';
+  }
+};
+
 /**
  * P2 upload (plan 04 L2/L5/L6/L19): photo or link, no account, starts immediately. Mobile camera + library are
  * first-class; the URL field uses the url keyboard; errors keep what the user entered.
@@ -127,6 +136,8 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
   async function submit(e?: React.FormEvent) {
     e?.preventDefault();
     if (!validUrl && !files.length) return setError('Paste your product link or add a photo.');
+    // Mirrors isMarketplaceUrl in @arkiv/core (the server checks again).
+    if (validUrl && !files.length && MARKETPLACE_RE.test(hostOf(url.trim()))) return setError('Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.');
     setState('busy');
     setError(null);
     try {

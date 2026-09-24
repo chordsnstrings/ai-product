@@ -29,7 +29,9 @@ import type { WorkspaceState } from '@arkiv/shared';
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
 export async function projectView(workspaceId: string, projectId: string) {
   return withTenant(workspaceId, async (tx) => {
-    const [p] = await tx`select p.*, s.name as sku_name, s.catalogue_no, s.status as sku_status, s.reject_reason, s.analysis, s.fidelity_confidence
+    const [p] = await tx`select p.*, s.name as sku_name, s.catalogue_no, s.status as sku_status, s.reject_reason, s.analysis, s.fidelity_confidence, s.source_url,
+                                (select count(*)::int from assets a where a.sku_id = s.id and a.kind = 'product_photo' and a.deleted_at is null
+                                   and coalesce(a.review_status, 'none') not in ('pending','rejected')) as usable_photos
                          from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
     if (!p) return null;
     const skuSteps = await listSteps(tx, p.sku_id as string);
@@ -145,6 +147,15 @@ export async function projectView(workspaceId: string, projectId: string) {
         ingredientsVerified: verifiedIngredients(facts).verified,
         /** Sizes/shades with their own price and availability (§42); the project records which one it advertises. */
         variants: variants.map((x) => ({ id: x.id, title: x.title, size: x.size, shade: x.shade, priceMicros: x.priceMicros, available: x.available })),
+        /** The link the merchant entered, kept when reading it failed (§13 "preserve the entered URL"). */
+        sourceUrl: (p.source_url as string) ?? null,
+        /** Product photos production may use; none means the analysis is waiting for a photo. */
+        usablePhotos: Number(p.usable_photos ?? 0),
+        /** How sure the analyst was that the photos show the product clearly (0–1), for the P4 extra-view prompt. */
+        fidelityConfidence: p.fidelity_confidence == null ? null : Number(p.fidelity_confidence),
+        /** Views the analyst suggested (e.g. "back label"), and how many the merchant has added since. */
+        suggestedViews: ((p.analysis as { suggestedViews?: string[] } | null)?.suggestedViews ?? []).slice(0, 4),
+        addedViews: Number((p.analysis as { addedViews?: number } | null)?.addedViews ?? 0),
         /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
         missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
       },

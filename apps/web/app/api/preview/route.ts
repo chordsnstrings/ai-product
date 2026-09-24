@@ -1,5 +1,5 @@
 import { withTenant, globalTx } from '@arkiv/db';
-import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, recordFunnelOnce, resolveProvisional, startPreview, uploadFailureCategory, type TenantContext } from '@arkiv/core';
+import { allowKey, createProvisionalWorkspace, hit, ingestBytes, isMarketplaceUrl, MARKETPLACE_MESSAGE, recordFunnel, recordFunnelOnce, resolveProvisional, startPreview, uploadFailureCategory, type TenantContext } from '@arkiv/core';
 import { DomainError, env } from '@arkiv/shared';
 import { clientIp, json, route } from '@/lib/http';
 import { currentUser, provisionalToken, setProvisionalCookie, visitorId } from '@/lib/session';
@@ -32,6 +32,8 @@ export const POST = route(async (req) => {
 async function startUpload(req: Request, form: FormData, input: { url: string | null; photos: File[]; vid: string }) {
   const { url, photos, vid } = input;
   const ip = clientIp(req);
+  // A marketplace link alone is refused now, with what to do instead, rather than dead-ending after the preview starts.
+  if (url && isMarketplaceUrl(url) && !photos.length) throw new DomainError('INVALID', MARKETPLACE_MESSAGE);
 
   if (env().TURNSTILE_SECRET) {
     // Bots: invisible challenge on submit only (plan 03 P1 edge cases). The form sends the token (UploadModule).
