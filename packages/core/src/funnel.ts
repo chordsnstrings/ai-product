@@ -1,5 +1,8 @@
 import { globalTx, type Tx } from '@arkiv/db';
 import { DomainError, type EventType } from '@arkiv/shared';
+import { assertCan } from './authz';
+import type { TenantContext } from './context';
+import { emit } from './events';
 import { setting } from './settings';
 
 /** Server-side funnel events (plan 04 §1) — the source of truth; client analytics are secondary. */
@@ -21,6 +24,45 @@ export async function recordFunnel(
             ${data.variant ?? null}, ${data.utm ? t.json(data.utm) : null}, ${t.json((data.props ?? {}) as never)})`;
   if (tx) await run(tx);
   else await globalTx(run);
+}
+
+/** How long one upload attempt's start counts for (the intent beacon and the submit are one start). */
+export const UPLOAD_START_WINDOW_SECONDS = 30 * 60;
+
+/**
+ * Record a funnel stage at most once per visitor per window (plan 04 §1 S2 "upload started"): the upload intent
+ * beacon (first photo or link added) and the submit are the same start, so whichever arrives first counts. Returns
+ * whether it was recorded. Events without a visitor are always recorded.
+ */
+export async function recordFunnelOnce(
+  type: EventType,
+  data: { visitorId?: string | null; workspaceId?: string | null; page?: string | null; variant?: string | null; utm?: Record<string, string> | null; props?: Record<string, unknown> },
+  windowSeconds = UPLOAD_START_WINDOW_SECONDS,
+  tx?: Tx,
+): Promise<boolean> {
+  const run = async (t: Tx) => {
+    const [r] = await t`select record_funnel_once(${type}, ${data.visitorId ?? null}, ${windowSeconds}, ${data.workspaceId ?? null}, ${data.page ?? null},
+                                                  ${data.variant ?? null}, ${data.utm ? t.json(data.utm) : null}, ${t.json((data.props ?? {}) as never)}) as recorded`;
+    return !!r?.recorded;
+  };
+  return tx ? run(tx) : globalTx(run);
+}
+
+/**
+ * P10 "Watch": the customer played their finished ad (standard §7 "Watch/export — realized value"; plan 03 P10
+ * ASSET_WATCHED {seconds}). Recorded once per project, as a domain event on the export and a funnel stage.
+ */
+export async function recordAssetWatched(tx: Tx, ctx: TenantContext, projectId: string, assetId: string, seconds: number): Promise<boolean> {
+  assertCan(ctx, 'workspace.view');
+  const [p] = await tx`select p.state, c.final_asset_ids from projects p left join creatives c on c.id = p.final_creative_id and c.workspace_id = p.workspace_id
+                       where p.id = ${projectId} and p.workspace_id = ${ctx.workspaceId} for update of p`;
+  if (!p || p.state !== 'COMPLETE' || !((p.final_asset_ids as string[] | null) ?? []).includes(assetId)) throw new DomainError('NOT_FOUND', 'Not found');
+  const [seen] = await tx`select 1 from events where workspace_id = ${ctx.workspaceId} and type = 'ASSET_WATCHED' and refs->>'projectId' = ${projectId} limit 1`;
+  if (seen) return false;
+  const s = Math.max(0, Math.min(3600, Math.round(seconds)));
+  await emit(tx, ctx, 'ASSET_WATCHED', { type: 'asset', id: assetId }, { seconds: s }, { projectId });
+  await recordFunnel('ASSET_WATCHED', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { seconds: s } }, tx);
+  return true;
 }
 
 /**
@@ -173,7 +215,9 @@ export async function tasteCohorts(tx: Tx, opts: { by: CohortBy; days: number; t
     with first_touch as (select distinct on (visitor_id) visitor_id, coalesce(page, '(none)') as page from funnel_events
                          where type = 'LP_VIEWED' and visitor_id is not null order by visitor_id, at)
     select ${dim} as cohort, count(distinct p.workspace_id)::int as taste,
-           count(distinct p.workspace_id) filter (where exists (select 1 from subscriptions s where s.workspace_id = p.workspace_id and s.created_at > p.paid_at))::int as subscribed
+           count(distinct p.workspace_id) filter (where exists (select 1 from subscriptions s where s.workspace_id = p.workspace_id and s.created_at > p.paid_at))::int as subscribed,
+           count(distinct p.workspace_id) filter (where exists (select 1 from subscriptions s where s.workspace_id = p.workspace_id and s.created_at > p.paid_at
+                                                                and s.created_at <= p.paid_at + interval '14 days'))::int as subscribed14
     from purchases p
     join projects pr on pr.id = p.project_id and pr.workspace_id = p.workspace_id
     join skus sk on sk.id = pr.sku_id and sk.workspace_id = pr.workspace_id
@@ -181,7 +225,7 @@ export async function tasteCohorts(tx: Tx, opts: { by: CohortBy; days: number; t
     left join first_touch ft on ft.visitor_id = sk.origin_visitor_id
     where p.kind = 'taste' and p.status in ('paid', 'refunded') and p.paid_at > now() - make_interval(days => ${opts.days}) ${testFilter(tx, opts.includeTest, 'p.workspace_id')}
     group by 1 order by 1 desc`;
-  return rows.map((r) => ({ cohort: r.cohort as string, taste: Number(r.taste), subscribed: Number(r.subscribed) }));
+  return rows.map((r) => ({ cohort: r.cohort as string, taste: Number(r.taste), subscribed: Number(r.subscribed), subscribedWithin14d: Number(r.subscribed14) }));
 }
 
 /** Payment fee allocation for Taste contribution (Appendix C): basis points + fixed per charge, platform settings. */
@@ -352,4 +396,81 @@ export async function importAdSpend(tx: Tx, input: AdSpendRow[], by: { staffId: 
     n += r.count;
   }
   return n;
+}
+
+// ───────────── Stage timing, plan mix and Month 2+ (standard §7; plan 04 §1 targets) ─────────────
+
+/** Stage-to-stage timings with their plan 04 §1 targets (S4 ≤ 45s after upload, S6 ≤ 90s after the account). */
+export const STAGE_LATENCY_TARGETS = [
+  { key: 'concepts_after_upload', label: 'S4 · concepts after upload', from: 'UPLOAD_COMPLETED', to: 'CONCEPTS_READY', targetMs: 45_000 },
+  { key: 'storyboard_after_account', label: 'S6 · storyboard after account', from: 'ACCOUNT_CLAIMED', to: 'STORYBOARD_READY', targetMs: 90_000 },
+] as const;
+
+export interface StageLatency {
+  key: string;
+  label: string;
+  targetMs: number;
+  n: number;
+  p50Ms: number | null;
+  p90Ms: number | null;
+  /** Share of workspaces that reached the stage within the target. */
+  withinTarget: number | null;
+}
+
+/**
+ * p50/p90 time between two stages per workspace (first `from` in the window → first `to` after it). Workspaces that
+ * never reached `to` are left out of the percentiles (they're the drop-off, shown elsewhere).
+ */
+export async function stageLatency(tx: Tx, opts: { days: number; includeTest?: boolean }): Promise<StageLatency[]> {
+  const out: StageLatency[] = [];
+  for (const s of STAGE_LATENCY_TARGETS) {
+    const [r] = await tx`
+      with f as (select workspace_id, min(at) as at from funnel_events where type = ${s.from} and workspace_id is not null
+                   and at > now() - make_interval(days => ${opts.days}) ${testFilter(tx, opts.includeTest, 'workspace_id')} group by workspace_id),
+           d as (select f.workspace_id, extract(epoch from (select min(t.at) from funnel_events t where t.workspace_id = f.workspace_id and t.type = ${s.to} and t.at >= f.at) - f.at) * 1000 as ms from f)
+      select count(ms)::int as n, percentile_cont(0.5) within group (order by ms) as p50, percentile_cont(0.9) within group (order by ms) as p90,
+             count(ms) filter (where ms <= ${s.targetMs})::int as within
+      from d where ms is not null`;
+    const n = Number(r?.n ?? 0);
+    out.push({ key: s.key, label: s.label, targetMs: s.targetMs, n, p50Ms: r?.p50 == null ? null : Math.round(Number(r.p50)), p90Ms: r?.p90 == null ? null : Math.round(Number(r.p90)), withinTarget: n ? Number(r!.within) / n : null });
+  }
+  return out;
+}
+
+/** Subscription plan mix (standard §7 "Taste → plan conversion, plan mix"): live subscriptions by plan. */
+export async function planMix(tx: Tx, opts: { includeTest?: boolean } = {}) {
+  const rows = await tx`select plan_code, count(*)::int as n from subscriptions
+                        where status in ('active', 'trialing', 'past_due') ${testFilter(tx, opts.includeTest, 'workspace_id')} group by plan_code order by plan_code`;
+  const total = rows.reduce((t, r) => t + Number(r.n), 0);
+  return rows.map((r) => ({ plan: r.plan_code as string, subscribers: Number(r.n), share: total ? Number(r.n) / total : 0 }));
+}
+
+/**
+ * Month 2+ (standard §7 "Retention, experiment count, performance-linked tests — measures whether the product
+ * became workflow"): subscribers past their first month, how many are still subscribed, experiments per such
+ * subscriber in the last 30 days, and the share of recent experiments with performance linked to their variants.
+ */
+export async function monthTwoPlus(tx: Tx, opts: { includeTest?: boolean } = {}) {
+  const [r] = await tx`
+    with subs as (select workspace_id, min(created_at) as started, bool_or(status in ('active', 'trialing', 'past_due')) as live
+                  from subscriptions where true ${testFilter(tx, opts.includeTest, 'workspace_id')} group by workspace_id),
+         m2 as (select * from subs where started < now() - interval '30 days')
+    select (select count(*)::int from m2) as cohort,
+           (select count(*)::int from m2 where live) as retained,
+           (select count(*)::int from experiments e join m2 on m2.workspace_id = e.workspace_id and m2.live where e.created_at > now() - interval '30 days') as experiments_30d,
+           (select count(*)::int from experiments e join subs on subs.workspace_id = e.workspace_id where e.created_at > now() - interval '90 days') as experiments_90d,
+           (select count(*)::int from experiments e join subs on subs.workspace_id = e.workspace_id where e.created_at > now() - interval '90 days'
+              and exists (select 1 from variants v join performance_observations o on o.workspace_id = v.workspace_id and o.variant_id = v.id
+                          where v.workspace_id = e.workspace_id and v.experiment_id = e.id)) as linked_90d`;
+  const cohort = Number(r!.cohort);
+  const retained = Number(r!.retained);
+  const e90 = Number(r!.experiments_90d);
+  return {
+    subscribersPastMonthOne: cohort,
+    retained,
+    retention: cohort ? retained / cohort : null,
+    experimentsPerSubscriberMonth: retained ? Number(r!.experiments_30d) / retained : null,
+    experiments90d: e90,
+    performanceLinkedShare: e90 ? Number(r!.linked_90d) / e90 : null,
+  };
 }

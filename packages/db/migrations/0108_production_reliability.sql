@@ -38,3 +38,26 @@ alter table creatives add column ai_generated boolean not null default false;
 alter table creatives add column synthetic_people boolean not null default false;
 -- The storyboard prompt now tells the Creative Director that generated people never speak as customers.
 update model_routes set prompt_version = 'storyboard@1.1.0' where task = 'creative_director.storyboard' and prompt_version = 'storyboard@1.0.0';
+
+-- ───────────── Funnel: one upload start per visitor attempt (standard §7, plan 04 §1 S2) ─────────────
+-- Upload intent is recorded when the visitor first adds a photo or link (a beacon), and again when the form is
+-- submitted — whichever comes first counts, once per visitor per window. app_rw may only insert funnel events,
+-- so the "already recorded?" check runs here, serialized per visitor and type.
+create or replace function record_funnel_once(p_type text, p_visitor text, p_window_secs int, p_workspace uuid, p_page text,
+                                              p_variant text, p_utm jsonb, p_props jsonb) returns boolean
+language plpgsql volatile security definer set search_path = public as $$
+begin
+  if p_visitor is null then
+    insert into funnel_events (type, visitor_id, workspace_id, page, variant, utm, props) values (p_type, null, p_workspace, p_page, p_variant, p_utm, coalesce(p_props, '{}'));
+    return true;
+  end if;
+  perform pg_advisory_xact_lock(hashtext('funnel-once:' || p_type || ':' || p_visitor));
+  if exists (select 1 from funnel_events where type = p_type and visitor_id = p_visitor and at > now() - make_interval(secs => p_window_secs)) then
+    return false;
+  end if;
+  insert into funnel_events (type, visitor_id, workspace_id, page, variant, utm, props) values (p_type, p_visitor, p_workspace, p_page, p_variant, p_utm, coalesce(p_props, '{}'));
+  return true;
+end $$;
+revoke all on function record_funnel_once from public;
+grant execute on function record_funnel_once to app_rw, system_rw;
+create index funnel_events_visitor_type on funnel_events (visitor_id, type, at) where visitor_id is not null;

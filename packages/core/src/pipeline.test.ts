@@ -2,11 +2,13 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { newId } from '@arkiv/shared';
 import { probe, withTempDir } from '@arkiv/media';
 import { assetBytes } from './assets';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, listClaims, proposeClaim } from './claims';
+import { recordAssetWatched } from './funnel';
 import { append, available } from './ledger';
 import { approveForProduction, blockedLines, produceProject } from './production';
 import { editScene, generateStoryboard, selectConcept, storyboardView } from './storyboard';
@@ -135,6 +137,16 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       expect(tags.comment).toMatch(/AI-generated people/);
       expect(tags.description).toBe('ai_generated=true; synthetic_people=true; synthetic_voice=true');
     });
+
+    // Standard §7 funnel: the Taste was delivered, then the finished ad was watched (recorded once per project).
+    expect(await ownerPool()`select workspace_id, props from funnel_events where type = 'TASTE_DELIVERED'`).toEqual([{ workspace_id: t.workspaceId, props: { kind: 'taste' } }]);
+    const [cr] = await ownerPool()`select c.final_asset_ids from projects p join creatives c on c.id = p.final_creative_id where p.id = ${projectId}`;
+    const primary = (cr!.final_asset_ids as string[])[0]!;
+    expect(await withTenant(t.workspaceId, (tx) => recordAssetWatched(tx, ctx, projectId, primary, 4.4))).toBe(true);
+    expect(await withTenant(t.workspaceId, (tx) => recordAssetWatched(tx, ctx, projectId, primary, 15))).toBe(false);
+    await expect(withTenant(t.workspaceId, (tx) => recordAssetWatched(tx, ctx, projectId, newId(), 5))).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(await ownerPool()`select subject_id, payload, refs->>'projectId' as project from events where type = 'ASSET_WATCHED'`).toEqual([{ subject_id: primary, payload: { seconds: 4 }, project: projectId }]);
+    expect(await ownerPool()`select workspace_id, props from funnel_events where type = 'ASSET_WATCHED'`).toEqual([{ workspace_id: t.workspaceId, props: { seconds: 4 } }]);
   }, 120_000);
 
   it('an AI-generated person never speaks as a customer: the editor refuses it and production stops on it (§40)', async () => {

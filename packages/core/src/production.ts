@@ -22,6 +22,7 @@ import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoi
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
+import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
@@ -920,6 +921,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         // An experiment's master is its control variant; a one-off ad has no variant (COMPOSITION_COMPLETED only).
         if (p.variant_id) await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: p.variant_id as string }, { creativeId: cr!.id, exports: exportAssets, master: true }, refs);
         await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets }, refs);
+        // Standard §7 "Taste delivered — QA pass and delivery success": a paid one-off ad passed final QA.
+        if (p.kind === 'taste' || p.kind === 'standalone') {
+          await recordFunnel('TASTE_DELIVERED', { workspaceId: ws, visitorId: await projectVisitor(tx, ws, projectId), props: { kind: p.kind } }, tx);
+        }
         await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
         if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
       });

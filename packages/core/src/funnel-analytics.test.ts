@@ -1,8 +1,13 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, ownerPool, withAdmin } from '@arkiv/db';
+import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { DomainError, newId } from '@arkiv/shared';
-import { cacByCampaign, deviceClass, funnelBySlice, importAdSpend, parseAdSpendCsv, recordFunnel, tasteCohorts, uploadDropoff, uploadFailureCategory } from './funnel';
+import {
+  cacByCampaign, deviceClass, funnelBySlice, importAdSpend, monthTwoPlus, parseAdSpendCsv, planMix, recordFunnel, recordFunnelOnce, stageLatency, tasteCohorts,
+  uploadDropoff, uploadFailureCategory,
+} from './funnel';
+import { saveIntegration } from './performance';
+import { ctxFor } from './testing';
 
 beforeEach(truncateAll);
 afterAll(closeAll);
@@ -98,11 +103,18 @@ describe('cohorts and CAC (plan 05 §4, Appendix C)', () => {
   it('breaks Taste → subscription conversion down by landing page and concept type', async () => {
     await buyer();
     const byPage = await withAdmin((tx) => tasteCohorts(tx, { by: 'page', days: 30, tz: 'UTC' }));
-    expect(byPage).toEqual([{ cohort: 'texture', taste: 1, subscribed: 1 }]);
+    expect(byPage).toEqual([{ cohort: 'texture', taste: 1, subscribed: 1, subscribedWithin14d: 1 }]);
     const byConcept = await withAdmin((tx) => tasteCohorts(tx, { by: 'concept', days: 30, tz: 'UTC' }));
-    expect(byConcept).toEqual([{ cohort: 'texture_demo', taste: 1, subscribed: 1 }]);
+    expect(byConcept).toEqual([{ cohort: 'texture_demo', taste: 1, subscribed: 1, subscribedWithin14d: 1 }]);
     const byWeek = await withAdmin((tx) => tasteCohorts(tx, { by: 'week', days: 30, tz: 'UTC' }));
     expect(byWeek).toHaveLength(1);
+  });
+
+  it('S10 counts only subscriptions within 14 days of the Taste purchase (plan 04 §1)', async () => {
+    const b = await buyer();
+    await ownerPool()`update purchases set paid_at = now() - interval '25 days' where workspace_id = ${b.workspaceId}`;
+    await ownerPool()`update subscriptions set created_at = now() - interval '5 days' where workspace_id = ${b.workspaceId}`;
+    expect(await withAdmin((tx) => tasteCohorts(tx, { by: 'page', days: 30, tz: 'UTC' }))).toEqual([{ cohort: 'texture', taste: 1, subscribed: 1, subscribedWithin14d: 0 }]);
   });
 
   it('joins imported ad spend to attributed buyers: media CAC per Taste buyer and effective subscriber CAC', async () => {
@@ -129,6 +141,84 @@ describe('cohorts and CAC (plan 05 §4, Appendix C)', () => {
     expect(() => parseAdSpendCsv('date,campaign,spend,source\n09/01/2026,a,10,meta')).toThrow(/Line 2/);
     expect(() => parseAdSpendCsv('date,campaign,spend,source\n2026-09-01,a,-3,meta')).toThrow(/Line 2/);
     expect(parseAdSpendCsv('Date,Campaign name,Amount spent (USD),Platform\n2026-09-01,"Launch, v2","1,234.50",TikTok')).toEqual([{ date: '2026-09-01', source: 'tiktok', campaign: 'Launch, v2', adId: '', spendMicros: 1_234_500_000 }]);
+  });
+
+  it('records an upload start once per visitor attempt: the intent beacon and the submit are one start', async () => {
+    expect(await recordFunnelOnce('UPLOAD_STARTED', { visitorId: 'va', page: 'texture', props: { method: 'photos', via: 'intent' } })).toBe(true);
+    expect(await recordFunnelOnce('UPLOAD_STARTED', { visitorId: 'va', page: 'texture', props: { method: 'photos', via: 'submit' } })).toBe(false);
+    // Concurrent beacons from two tabs: still one.
+    const r = await Promise.all([1, 2, 3, 4].map(() => recordFunnelOnce('UPLOAD_STARTED', { visitorId: 'vb', props: { via: 'intent' } })));
+    expect(r.filter(Boolean)).toHaveLength(1);
+    // A new attempt after the window is a new start; events without a visitor are always recorded.
+    await funnel('UPLOAD_STARTED', { visitor: 'vc', at: ago(40) });
+    expect(await recordFunnelOnce('UPLOAD_STARTED', { visitorId: 'vc' })).toBe(true);
+    expect(await recordFunnelOnce('UPLOAD_STARTED', { visitorId: null })).toBe(true);
+    expect(await recordFunnelOnce('UPLOAD_STARTED', { visitorId: null })).toBe(true);
+    const rows = await ownerPool()`select visitor_id, count(*)::int as n from funnel_events where type = 'UPLOAD_STARTED' group by 1 order by 1 nulls last`;
+    expect(rows).toEqual([{ visitor_id: 'va', n: 1 }, { visitor_id: 'vb', n: 1 }, { visitor_id: 'vc', n: 2 }, { visitor_id: null, n: 2 }]);
+    const [va] = await ownerPool()`select page, props from funnel_events where visitor_id = 'va'`;
+    expect(va).toEqual({ page: 'texture', props: { method: 'photos', via: 'intent' } });
+  });
+
+  it('measures stage timing against the plan 04 §1 targets (S4 ≤ 45s, S6 ≤ 90s)', async () => {
+    const base = Date.now() - 3_600_000;
+    const at = (s: number) => new Date(base + s * 1000);
+    const a = await makeTenant();
+    const b = await makeTenant();
+    const c = await makeTenant();
+    await funnel('UPLOAD_COMPLETED', { ws: a.workspaceId, at: at(0) });
+    await funnel('CONCEPTS_READY', { ws: a.workspaceId, at: at(30) });
+    await funnel('CONCEPTS_READY', { ws: a.workspaceId, at: at(500) }); // "Try 3 more" later: the first batch counts
+    await funnel('UPLOAD_COMPLETED', { ws: b.workspaceId, at: at(0) });
+    await funnel('CONCEPTS_READY', { ws: b.workspaceId, at: at(60) });
+    await funnel('UPLOAD_COMPLETED', { ws: c.workspaceId, at: at(0) }); // never got concepts: not a timing
+    await funnel('ACCOUNT_CLAIMED', { ws: a.workspaceId, at: at(100) });
+    await funnel('STORYBOARD_READY', { ws: a.workspaceId, at: at(180) });
+    const rows = await withAdmin((tx) => stageLatency(tx, { days: 7 }));
+    expect(rows).toEqual([
+      { key: 'concepts_after_upload', label: expect.any(String), targetMs: 45_000, n: 2, p50Ms: 45_000, p90Ms: 57_000, withinTarget: 0.5 },
+      { key: 'storyboard_after_account', label: expect.any(String), targetMs: 90_000, n: 1, p50Ms: 80_000, p90Ms: 80_000, withinTarget: 1 },
+    ]);
+    await ownerPool()`update workspaces set is_test = true where id = ${b.workspaceId}`;
+    expect((await withAdmin((tx) => stageLatency(tx, { days: 7 })))[0]).toMatchObject({ n: 1, p50Ms: 30_000, withinTarget: 1 });
+  });
+
+  it('reports plan mix and Month 2+ retention, test cadence and performance-linked tests (standard §7)', async () => {
+    const sub = async (ws: string, plan: string, status: string, daysAgo: number) =>
+      ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id, created_at)
+                  values (${ws}, ${'sub_' + newId()}, ${plan}, ${status}, gen_random_uuid(), now() - make_interval(days => ${daysAgo}))`;
+    const kept = await makeTenant({ state: 'ACTIVE_PAID' });
+    const left = await makeTenant({ state: 'ACTIVE_PAID' });
+    const fresh = await makeTenant({ state: 'ACTIVE_PAID' });
+    await sub(kept.workspaceId, 'GROWTH', 'active', 45);
+    await sub(left.workspaceId, 'LAUNCH', 'canceled', 60);
+    await sub(fresh.workspaceId, 'LAUNCH', 'active', 3);
+    expect(await withAdmin((tx) => planMix(tx))).toEqual([
+      { plan: 'GROWTH', subscribers: 1, share: 0.5 },
+      { plan: 'LAUNCH', subscribers: 1, share: 0.5 },
+    ]);
+    const sku = await makeSku(kept.workspaceId);
+    const experiment = async () => {
+      const [e] = await ownerPool()`insert into experiments (workspace_id, sku_id, hypothesis, primary_variable, mode, created_by)
+                                    values (${kept.workspaceId}, ${sku}, 'Texture beats claim', 'hook', 'CONTROLLED', 'test') returning id`;
+      const [v] = await ownerPool()`insert into variants (workspace_id, experiment_id, label, code, role) values (${kept.workspaceId}, ${e!.id}, 'A', ${'AK-' + newId().slice(0, 6)}, 'control') returning id`;
+      return { experimentId: e!.id as string, variantId: v!.id as string };
+    };
+    const linked = await experiment();
+    await experiment();
+    await ownerPool()`insert into performance_observations (workspace_id, platform, account_id, ad_id, variant_id, date, currency, measurement_context)
+                      values (${kept.workspaceId}, 'meta', 'act_1', 'ad_1', ${linked.variantId}, current_date, 'USD', 'META_PAID_ATTRIBUTED')`;
+    expect(await withAdmin((tx) => monthTwoPlus(tx))).toEqual({
+      subscribersPastMonthOne: 2, retained: 1, retention: 0.5, experimentsPerSubscriberMonth: 2, experiments90d: 2, performanceLinkedShare: 0.5,
+    });
+  });
+
+  it('records a Meta or TikTok connection as the ad-account stage, not a Shopify store', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
+    await withTenant(t.workspaceId, (tx) => saveIntegration(tx, ctx, { provider: 'meta', externalAccountId: 'act_1', token: 'tok', scopes: ['ads_read'] }));
+    await withTenant(t.workspaceId, (tx) => saveIntegration(tx, ctx, { provider: 'shopify', externalAccountId: 'shop-1.myshopify.com', token: 'tok', scopes: ['read_products'] }));
+    expect(await ownerPool()`select type, workspace_id, props from funnel_events`).toEqual([{ type: 'AD_ACCOUNT_CONNECTED', workspace_id: t.workspaceId, props: { provider: 'meta' } }]);
   });
 
   it('records funnel events server-side (smoke)', async () => {

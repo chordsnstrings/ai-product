@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { cacByCampaign, FUNNEL_SLICES, funnelBySlice, staffCan, tasteCohorts, uploadDropoff, type CohortBy, type FunnelSlice } from '@arkiv/core';
+import { cacByCampaign, FUNNEL_SLICES, funnelBySlice, monthTwoPlus, planMix, stageLatency, staffCan, tasteCohorts, uploadDropoff, type CohortBy, type FunnelSlice } from '@arkiv/core';
 import { ActForm } from '@/components/act';
 import { d, FilterChip, money, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs, daysFrom } from '@/lib/prefs';
@@ -7,13 +7,19 @@ import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Funnel' };
 
-const STAGES = ['LP_VIEWED', 'UPLOAD_STARTED', 'UPLOAD_COMPLETED', 'CONCEPTS_READY', 'ACCOUNT_CLAIMED', 'STORYBOARD_READY', 'CHECKOUT_STARTED', 'TASTE_PAID', 'ASSET_EXPORTED', 'SUBSCRIPTION_STARTED'];
+// Standard §7 funnel stages, in order.
+const STAGES = [
+  'LP_VIEWED', 'UPLOAD_STARTED', 'UPLOAD_COMPLETED', 'SKU_VALIDATED', 'CONCEPTS_READY', 'ACCOUNT_CLAIMED', 'STORYBOARD_READY', 'CHECKOUT_STARTED',
+  'TASTE_PAID', 'TASTE_DELIVERED', 'ASSET_WATCHED', 'ASSET_EXPORTED', 'AD_ACCOUNT_CONNECTED', 'SUBSCRIPTION_STARTED',
+];
+const secs = (ms: number | null) => (ms == null ? '—' : `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`);
 const COHORTS: [CohortBy, string][] = [['week', 'by week'], ['page', 'by landing page'], ['concept', 'by concept type chosen']];
 const SLICE_LABEL: Partial<Record<FunnelSlice, string>> = { ad_id: 'ad creative', returning: 'new vs returning', offer: 'offer variant', in_app: 'in-app browser' };
 
 /**
  * Plan 05 §4: server-side funnel events are the source of truth (ad blockers can't hide them). Funnel by stage and
- * slice, upload drop-off by reason, Taste → subscription cohorts, and CAC from imported ad spend (Appendix C).
+ * slice, stage timing against the plan 04 §1 targets, upload drop-off by reason, Taste → subscription cohorts (S10:
+ * within 14 days), plan mix, Month 2+ (standard §7), and CAC from imported ad spend (Appendix C).
  */
 export default async function Funnel({ searchParams }: { searchParams: Promise<{ by?: string; days?: string; cohort?: string }> }) {
   const s = await requireStaff('analytics.read');
@@ -28,6 +34,9 @@ export default async function Funnel({ searchParams }: { searchParams: Promise<{
     dropoff: await uploadDropoff(tx, { days, includeTest: prefs.includeTest }),
     cohort: await tasteCohorts(tx, { by: cohortBy, days: Math.max(days, 120), tz: prefs.tz, includeTest: prefs.includeTest }),
     cac: await cacByCampaign(tx, { days, includeTest: prefs.includeTest }),
+    latency: await stageLatency(tx, { days, includeTest: prefs.includeTest }),
+    plans: await planMix(tx, { includeTest: prefs.includeTest }),
+    month2: await monthTwoPlus(tx, { includeTest: prefs.includeTest }),
     imports: await tx`select import_batch, min(date) as from_date, max(date) as to_date, count(*)::int as n, sum(spend_micros)::bigint as micros, max(created_at) as at
                       from ad_spend group by import_batch order by max(created_at) desc limit 5`,
   }));
@@ -46,12 +55,39 @@ export default async function Funnel({ searchParams }: { searchParams: Promise<{
     >
       <Table head={['Slice', ...STAGES.map((x) => x.replace(/_/g, ' ').toLowerCase()), 'LP→Taste']} rows={names.map((n) => [n, ...STAGES.map((x) => get(n, x)), pct(get(n, 'LP_VIEWED') ? get(n, 'TASTE_PAID') / get(n, 'LP_VIEWED') : NaN)])} empty="No funnel events yet." />
       {by === 'offer' ? <p className="ak-small ak-muted">Offer is set when the storyboard is priced, so earlier stages fall under “(no offer yet)”.</p> : null}
+      <Section title="Stage timing (plan 04 §1 targets)">
+        <Table
+          head={['Stage', 'Target', 'p50', 'p90', 'Within target', 'Workspaces']}
+          rows={d0.latency.map((l) => [l.label, `≤ ${secs(l.targetMs)}`, secs(l.p50Ms), secs(l.p90Ms), l.withinTarget == null ? '—' : pct(l.withinTarget), l.n])}
+          empty="No timings yet."
+        />
+      </Section>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
         <Section title="Drop-off: upload → concepts">
           <Table head={['Reason', 'Visitors / workspaces']} rows={d0.dropoff.map((f) => [f.reason.replace(/_/g, ' '), f.n])} empty="No drop-off recorded." />
         </Section>
         <Section title="Taste → subscription cohorts" right={<span className="ak-row" style={{ gap: 6 }}>{COHORTS.map(([k, label]) => <FilterChip key={k} on={k === cohortBy} href={q({ cohort: k })}>{label}</FilterChip>)}</span>}>
-          <Table head={[cohortBy === 'week' ? 'Week' : cohortBy === 'page' ? 'Landing page' : 'Concept type', 'Taste buyers', 'Subscribed after', 'Rate']} rows={d0.cohort.map((c) => [c.cohort, c.taste, c.subscribed, pct(c.subscribed / c.taste)])} empty="No Taste buyers yet." />
+          <Table
+            head={[cohortBy === 'week' ? 'Week' : cohortBy === 'page' ? 'Landing page' : 'Concept type', 'Taste buyers', 'Subscribed ≤ 14 days (S10)', 'Rate ≤ 14 days', 'Subscribed ever']}
+            rows={d0.cohort.map((c) => [c.cohort, c.taste, c.subscribedWithin14d, pct(c.subscribedWithin14d / c.taste), c.subscribed])}
+            empty="No Taste buyers yet."
+          />
+        </Section>
+      </div>
+      <div className="ak-grid-2" style={{ alignItems: 'start' }}>
+        <Section title="Plan mix (live subscriptions)">
+          <Table head={['Plan', 'Subscribers', 'Share']} rows={d0.plans.map((p) => [p.plan, p.subscribers, pct(p.share)])} empty="No subscribers yet." />
+        </Section>
+        <Section title="Month 2+ (retention and workflow)">
+          <Table
+            head={['Measure', 'Value']}
+            rows={[
+              ['Subscribers past month one', d0.month2.subscribersPastMonthOne],
+              ['Still subscribed', d0.month2.retention == null ? '—' : `${d0.month2.retained} (${pct(d0.month2.retention)})`],
+              ['Tests per retained subscriber, last 30 days', d0.month2.experimentsPerSubscriberMonth == null ? '—' : d0.month2.experimentsPerSubscriberMonth.toFixed(1)],
+              ['Tests with performance linked (last 90 days)', d0.month2.performanceLinkedShare == null ? '—' : `${pct(d0.month2.performanceLinkedShare)} of ${d0.month2.experiments90d}`],
+            ]}
+          />
         </Section>
       </div>
       <Section title="CAC by campaign (Appendix C)">

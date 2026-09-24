@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { cancelProduction, decideFact, finishAfterEdit, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { cancelProduction, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -17,6 +17,7 @@ import { projectAccess } from '@/lib/tenant';
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
+ *   watched   – the finished ad was played (P10 "Watch", standard §7); recorded once per project
  */
 export const POST = route(async (req, { params }: { params: Promise<{ id: string; action: string }> }) => {
   const { id, action } = await params;
@@ -68,6 +69,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const { variantId } = await body(req, z.object({ variantId: z.string().uuid().nullable() }));
       const v = await withTenant(a.ctx.workspaceId, (tx) => selectVariant(tx, a.ctx, id, variantId));
       return json({ ok: true, variant: v });
+    }
+    case 'watched': {
+      const { assetId, seconds } = await body(req, z.object({ assetId: z.string().uuid(), seconds: z.number().min(0).max(3600) }));
+      const recorded = await withTenant(a.ctx.workspaceId, (tx) => recordAssetWatched(tx, a.ctx, id, assetId, seconds));
+      return json({ ok: true, recorded });
     }
     case 'retry-analysis': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));

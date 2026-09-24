@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, ClaimChip, Ledger, LinkButton, MetadataTable, ProvenanceChip, Rail } from '@arkiv/ui';
 import { api, OfferExpiry, Sheet, StickyCta, usePoll } from '@arkiv/ui/client';
 import type { ProjectView } from '@/lib/views';
@@ -760,6 +760,29 @@ export function AiDisclosureSteps({ disclosure }: { disclosure: ProjectView['dis
   );
 }
 
+/** P10 "Watch" (standard §7): the finished ad counts as watched once it has played for 3 seconds or to the end. */
+function WatchedVideo({ projectId, assetId, src }: { projectId: string; assetId: string; src: string }) {
+  const sent = useRef(false);
+  const report = (seconds: number) => {
+    if (sent.current) return;
+    sent.current = true;
+    fetch(`/api/projects/${projectId}/watched`, { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ assetId, seconds: Math.round(seconds) }) }).catch(() => {});
+  };
+  return (
+    <video
+      src={src}
+      controls
+      playsInline
+      preload="metadata"
+      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+      onTimeUpdate={(e) => {
+        if (e.currentTarget.currentTime >= 3) report(e.currentTarget.currentTime);
+      }}
+      onEnded={(e) => report(e.currentTarget.duration || e.currentTarget.currentTime)}
+    />
+  );
+}
+
 const ASPECT: Record<string, string> = { '9x16': 'TikTok · Reels · Stories (9:16)', '4x5': 'Feed (4:5)', '1x1': 'Square (1:1)' };
 
 export function DeliverFlow({ projectId }: { projectId: string }) {
@@ -775,7 +798,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
   return (
     <Shell step={4} title="Your ad is ready" sub={`${v.sku.name} · 15 seconds · checked for product accuracy and claims.`}>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-        <div className="ak-well ak-well--916">{primary ? <video src={primary.url} controls playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : null}</div>
+        <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} /> : null}</div>
         <div className="ak-stack">
           <h2 className="ak-label">Download</h2>
           {v.exports.map((e) => (

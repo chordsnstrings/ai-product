@@ -93,8 +93,12 @@ export const EventType = [
   'STORYBOARD_READY',
   'CHECKOUT_STARTED',
   'TASTE_PAID',
+  // Standard §7 "Taste delivered — QA pass and delivery success": a paid one-off ad reached COMPLETE.
+  'TASTE_DELIVERED',
   'ASSET_WATCHED',
   'ASSET_EXPORTED',
+  // Standard §7 "Ad account connected — Meta/TikTok connection rate".
+  'AD_ACCOUNT_CONNECTED',
   'SUBSCRIPTION_STARTED',
 ] as const;
 export type EventType = (typeof EventType)[number];
@@ -301,8 +305,10 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   STORYBOARD_READY: 'project',
   CHECKOUT_STARTED: 'project',
   TASTE_PAID: 'project',
+  TASTE_DELIVERED: 'project',
   ASSET_WATCHED: 'asset',
   ASSET_EXPORTED: 'asset',
+  AD_ACCOUNT_CONNECTED: 'integration',
   SUBSCRIPTION_STARTED: 'subscription',
 };
 

@@ -1,5 +1,5 @@
 import { withTenant, globalTx } from '@arkiv/db';
-import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, resolveProvisional, startPreview, uploadFailureCategory, type TenantContext } from '@arkiv/core';
+import { allowKey, createProvisionalWorkspace, hit, ingestBytes, recordFunnel, recordFunnelOnce, resolveProvisional, startPreview, uploadFailureCategory, type TenantContext } from '@arkiv/core';
 import { DomainError, env } from '@arkiv/shared';
 import { clientIp, json, route } from '@/lib/http';
 import { currentUser, provisionalToken, setProvisionalCookie, visitorId } from '@/lib/session';
@@ -18,7 +18,8 @@ export const POST = route(async (req) => {
   const page = (form.get('page') as string) ?? null;
   const variant = (form.get('variant') as string) ?? null;
   const method = url ? 'url' : 'photos';
-  await recordFunnel('UPLOAD_STARTED', { visitorId: vid, page, variant, props: { method } });
+  // Usually already recorded by the upload intent beacon (/api/funnel/upload-start); one start per attempt.
+  await recordFunnelOnce('UPLOAD_STARTED', { visitorId: vid, page, variant, props: { method, via: 'submit' } });
   try {
     return await startUpload(req, form, { url, photos, vid });
   } catch (e) {
