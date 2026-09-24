@@ -1,31 +1,36 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { RISK_PLAYBOOKS, staffCan } from '@arkiv/core';
+import { auditView, RISK_PLAYBOOKS, staffCan } from '@arkiv/core';
 import type { RiskIndicator } from '@arkiv/shared';
 import { ActForm } from '@/components/act';
 import { ago, d, Mono, Page, Section, Table } from '@/components/ui';
+import { consolePrefs } from '@/lib/prefs';
+import { notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Retention' };
 
 /** Churn-risk board (plan 05 §17): indicators with evidence and date, each mapped to a value intervention — never an automatic discount (standard §10). */
-export default async function Retention() {
+export default async function Retention({ searchParams }: { searchParams: Promise<{ since?: string }> }) {
   const s = await requireStaff('retention.read');
   const canSuppress = staffCan(s.roles, 'tenant.flags');
+  const today = (await searchParams).since === 'today';
+  const prefs = await consolePrefs();
   const d0 = await withAdmin(async (tx) => ({
+    audited: await auditView(tx, s, 'retention', { since: today ? 'today' : null, includeTest: prefs.includeTest }),
     flags: await tx`select r.id, r.workspace_id, r.indicator, r.evidence, r.raised_at, w.name, w.plan_code from risk_flags r join workspaces w on w.id = r.workspace_id
-                    where r.resolved_at is null and not w.is_test order by r.raised_at desc limit 300`,
+                    where r.resolved_at is null ${notTest(tx, prefs, 'r.workspace_id')} and (${!today} or r.raised_at >= date_trunc('day', now(), ${prefs.tz})) order by r.raised_at desc limit 300`,
     suppressed: await tx`select r.workspace_id, r.indicator, r.suppressed_reason, r.suppressed_until, w.name from risk_flags r join workspaces w on w.id = r.workspace_id
-                         where r.suppressed_until > now() and not w.is_test order by r.suppressed_until limit 100`,
-    reasons: await tx`select coalesce(payload->>'reason', 'no reason given') as reason, count(*)::int as n from events where type = 'SUBSCRIPTION_CHANGED' and payload->>'cancelAtPeriodEnd' = 'true' and at > now() - interval '90 days' group by 1 order by 2 desc`,
-    cohorts: await tx`select to_char(date_trunc('week', created_at), 'YYYY-MM-DD') as week, count(*)::int as n,
+                         where r.suppressed_until > now() ${notTest(tx, prefs, 'r.workspace_id')} order by r.suppressed_until limit 100`,
+    reasons: await tx`select coalesce(payload->>'reason', 'no reason given') as reason, count(*)::int as n from events where type = 'SUBSCRIPTION_CHANGED' and payload->>'cancelAtPeriodEnd' = 'true' and at > now() - interval '90 days' ${notTest(tx, prefs)} group by 1 order by 2 desc`,
+    cohorts: await tx`select to_char(date_trunc('week', created_at, ${prefs.tz}) at time zone ${prefs.tz}, 'YYYY-MM-DD') as week, count(*)::int as n,
                              count(*) filter (where status in ('active','trialing','past_due'))::int as still,
                              count(*) filter (where created_at < now() - interval '28 days' and (status in ('active','trialing','past_due') or updated_at > created_at + interval '28 days'))::int as w4
-                      from subscriptions where created_at > now() - interval '120 days' group by 1 order by 1 desc`,
+                      from subscriptions where created_at > now() - interval '120 days' ${notTest(tx, prefs)} group by 1 order by 1 desc`,
   }));
   const pb = (i: unknown) => RISK_PLAYBOOKS[i as RiskIndicator];
   return (
-    <Page title="Retention & customer success" sub="Churn-risk board: indicators with evidence and a mapped value intervention.">
+    <Page title="Retention & customer success" sub={today ? <>Indicators raised today ({prefs.tz}). <Link href="/retention">Show all open indicators</Link></> : 'Churn-risk board: indicators with evidence and a mapped value intervention.'}>
       <Table head={['Workspace', 'Plan', 'Indicator', 'Evidence', 'Since', 'Playbook', '']} rows={d0.flags.map((f) => [
         <Link key="w" href={`/tenants/${f.workspace_id}?tab=risk`}>{f.name as string}</Link>, (f.plan_code as string)?.toLowerCase() ?? '—', pb(f.indicator)?.label ?? (f.indicator as string),
         <Mono key="e">{JSON.stringify(f.evidence).slice(0, 100)}</Mono>, ago(f.raised_at), <span key="p" className="ak-small">{pb(f.indicator)?.intervention ?? '—'}</span>,

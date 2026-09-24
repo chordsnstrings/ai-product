@@ -12,7 +12,9 @@ import {
   expirePeriod,
   periodUsage,
   Queues,
+  projectVisitor,
   recordFunnel,
+  workspaceVisitor,
   redeemOffer,
   transition,
   transitionWorkspace,
@@ -82,7 +84,7 @@ export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projec
              on conflict (stripe_checkout_session_id) do nothing`;
   }
   await emit(tx, ctx, 'CHECKOUT_STARTED', { type: 'project', id: projectId }, { kind, priceMicros: quote.priceMicros });
-  await recordFunnel('CHECKOUT_STARTED', { workspaceId: ctx.workspaceId, props: { kind } }, tx);
+  await recordFunnel('CHECKOUT_STARTED', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, projectId), props: { kind } }, tx);
   return { sessionId: session.id, clientSecret: session.clientSecret, url: session.url, quote };
 }
 
@@ -319,7 +321,7 @@ async function onPaymentCompleted(tx: Tx, ctx: TenantContext, cs: Stripe.Checkou
   if (ctx.workspaceState === 'ACTIVE_FREE') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'one-off purchase');
   await approveForProduction(tx, { ...ctx, workspaceState: 'ACTIVE_PAID' }, pu.project_id as string, unit);
   await emit(tx, ctx, 'TASTE_PAID', { type: 'project', id: pu.project_id as string }, { kind: unit, amountMicros: Number(pu.amount_micros) });
-  await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, props: { kind: unit } }, tx);
+  await recordFunnel('TASTE_PAID', { workspaceId: ctx.workspaceId, visitorId: await projectVisitor(tx, ctx.workspaceId, pu.project_id as string), props: { kind: unit } }, tx);
   await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'receipt', purchaseId: pu.id });
   return 'processed';
 }
@@ -336,7 +338,7 @@ async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Che
   await tx`update workspaces set plan_code = ${plan} where id = ${ctx.workspaceId}`;
   if (ctx.workspaceState !== 'ACTIVE_PAID') await transitionWorkspace(tx, ctx, 'ACTIVE_PAID', 'subscription started');
   await emit(tx, ctx, 'SUBSCRIPTION_STARTED', { type: 'subscription', id: subRow!.id as string }, { plan, stripeSubscriptionId: subId });
-  await recordFunnel('SUBSCRIPTION_STARTED', { workspaceId: ctx.workspaceId, props: { plan } }, tx);
+  await recordFunnel('SUBSCRIPTION_STARTED', { workspaceId: ctx.workspaceId, visitorId: await workspaceVisitor(tx, ctx.workspaceId), props: { plan } }, tx);
   await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'subscription_started', plan });
   return 'processed';
 }

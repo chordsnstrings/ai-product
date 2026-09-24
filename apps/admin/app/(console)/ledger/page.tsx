@@ -1,30 +1,37 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
+import { auditView } from '@arkiv/core';
 import { dt, money, Mono, Page, pct, Section, Table, Tabs } from '@/components/ui';
+import { consolePrefs, daysFrom } from '@/lib/prefs';
+import { notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Ledger & COGS' };
 
 /** Plan 05 §8: never editable; corrections are new rows. COGS by provider/model/workspace; margin; stranded reservations. */
-export default async function Ledger({ searchParams }: { searchParams: Promise<{ tab?: string; ws?: string; type?: string }> }) {
-  await requireStaff('ledger.read');
+export default async function Ledger({ searchParams }: { searchParams: Promise<{ tab?: string; ws?: string; type?: string; days?: string }> }) {
+  const s = await requireStaff('ledger.read');
   const sp = await searchParams;
   const tab = sp.tab ?? 'cogs';
+  const prefs = await consolePrefs();
+  const days = daysFrom(sp.days, prefs);
+  const tz = prefs.tz;
   const d0 = await withAdmin(async (tx) => ({
+    audited: await auditView(tx, s, 'ledger', { tab, days, ws: sp.ws, type: sp.type, includeTest: prefs.includeTest }),
     byModel: await tx`select j.provider, j.model, j.task, count(*)::int as calls, coalesce(sum(j.actual_micros), 0)::bigint as spend, avg(j.latency_ms)::int as latency,
                              count(*) filter (where j.status = 'failed')::int as failed
-                      from provider_jobs j where j.created_at > now() - interval '30 days' group by 1, 2, 3 order by spend desc`,
+                      from provider_jobs j where j.created_at > now() - make_interval(days => ${days}) ${notTest(tx, prefs, 'j.workspace_id')} group by 1, 2, 3 order by spend desc`,
     trend: await tx`
-      with spend as (select date_trunc('week', created_at) as wk, sum(amount)::bigint as spend,
+      with spend as (select date_trunc('week', created_at, ${tz}) as wk, sum(amount)::bigint as spend,
                             coalesce(sum(amount) filter (where reason ilike '%retry%' or reason ilike '%repair%'), 0)::bigint as retry_spend
-                     from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > now() - interval '12 weeks' group by 1),
-           ex as (select date_trunc('week', at) as wk, count(*)::int as exports from events where type = 'COMPOSITION_COMPLETED' and at > now() - interval '12 weeks' group by 1)
-      select to_char(s.wk, 'YYYY-MM-DD') as week, s.spend, coalesce(ex.exports, 0) as exports, s.retry_spend from spend s left join ex on ex.wk = s.wk order by s.wk desc`,
+                     from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > now() - interval '12 weeks' ${notTest(tx, prefs)} group by 1),
+           ex as (select date_trunc('week', at, ${tz}) as wk, count(*)::int as exports from events where type = 'COMPOSITION_COMPLETED' and at > now() - interval '12 weeks' ${notTest(tx, prefs)} group by 1)
+      select to_char(s.wk at time zone ${tz}, 'YYYY-MM-DD') as week, s.spend, coalesce(ex.exports, 0) as exports, s.retry_spend from spend s left join ex on ex.wk = s.wk order by s.wk desc`,
     margin: await tx`select w.id, w.name, w.plan_code,
                             coalesce((select sum(amount_micros) from purchases p where p.workspace_id = w.id and p.status = 'paid' and p.paid_at > now() - interval '30 days'), 0)::bigint
                               + case w.plan_code when 'LAUNCH' then 49000000 when 'GROWTH' then 99000000 when 'SCALE' then 199000000 else 0 end * (w.state in ('ACTIVE_PAID','PAST_DUE'))::int as revenue,
                             coalesce((select sum(amount) from ledger_entries l where l.workspace_id = w.id and l.type = 'PROVIDER_COST_RECORDED' and l.created_at > now() - interval '30 days'), 0)::bigint as cogs
-                     from workspaces w where not w.is_test order by cogs desc limit 100`,
+                     from workspaces w where (${prefs.includeTest} or not w.is_test) order by cogs desc limit 100`,
     stranded: await tx`select a.id, a.workspace_id, a.purpose, a.max_cost_micros, a.spent_micros, a.expires_at, a.status, w.name from cost_authorizations a join workspaces w on w.id = a.workspace_id
                        where a.status = 'active' and a.expires_at < now() order by a.expires_at limit 100`,
     sweeps: await tx`select type, count(*)::int as n from ledger_entries where actor like 'system:%' and type in ('CREDIT_RELEASED','CREDIT_EXPIRED') and created_at > now() - interval '7 days' group by 1`,
@@ -32,12 +39,12 @@ export default async function Ledger({ searchParams }: { searchParams: Promise<{
                                           where (${sp.ws ?? ''} = '' or l.workspace_id::text = ${sp.ws ?? ''}) and (${sp.type ?? ''} = '' or l.type = ${sp.type ?? ''}) order by l.id desc limit 300` : [],
   }));
   return (
-    <Page title="Usage ledger & COGS">
-      <Tabs base="/ledger" current={tab} tabs={[['cogs', 'COGS'], ['margin', 'Margin'], ['stranded', 'Stranded reservations'], ['explorer', 'Ledger explorer']]} />
+    <Page title="Usage ledger & COGS" sub={`COGS by model over the last ${days === 1 ? 'day' : `${days} days`} · weeks in ${tz} · test accounts ${prefs.includeTest ? 'included' : 'excluded'}`}>
+      <Tabs label="Ledger sections" base="/ledger" current={tab} params={{ days: sp.days }} tabs={[['cogs', 'COGS'], ['margin', 'Margin'], ['stranded', 'Stranded reservations'], ['explorer', 'Ledger explorer']]} />
       {tab === 'cogs' ? (
         <>
           <Table head={['Week', 'Provider spend', 'Exports', 'Cost / usable export', 'QA retry share']} rows={d0.trend.map((t) => [t.week as string, money(t.spend), t.exports as number, Number(t.exports) ? money(Number(t.spend) / Number(t.exports)) : '—', pct(Number(t.spend) ? Number(t.retry_spend) / Number(t.spend) : NaN)])} empty="No provider spend yet." />
-          <Section title="By provider / model / task (30d)">
+          <Section title={`By provider / model / task (${days}d)`}>
             <Table head={['Provider', 'Model', 'Task', 'Calls', 'Failed', 'Spend', 'Avg latency']} rows={d0.byModel.map((m) => [m.provider as string, <Mono key="m">{m.model as string}</Mono>, m.task as string, m.calls as number, m.failed as number, money(m.spend), m.latency ? `${m.latency}ms` : '—'])} />
           </Section>
         </>

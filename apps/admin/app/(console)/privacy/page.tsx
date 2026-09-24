@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
 import { DataRequestKind } from '@arkiv/shared';
+import { auditView } from '@arkiv/core';
 import { ActForm } from '@/components/act';
 import { dt, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -9,8 +10,9 @@ export const metadata = { title: 'Data requests' };
 
 /** Plan 05 §21: statutory due dates (CCPA 45 days), purge certificates. */
 export default async function Privacy() {
-  await requireStaff('privacy.manage');
+  const s = await requireStaff('privacy.manage');
   const d0 = await withAdmin(async (tx) => ({
+    audited: await auditView(tx, s, 'privacy'),
     requests: await tx`select * from data_requests order by (status in ('open','in_progress')) desc, due_at`,
     certs: await tx`select * from purge_certificates order by completed_at desc limit 50`,
   }));

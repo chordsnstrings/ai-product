@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
-import { analyzeProduct, available, generateStoryboard, ingestBytes, selectConcept, startPreview } from '@arkiv/core';
+import { analyzeProduct, available, funnelBySlice, generateStoryboard, ingestBytes, moveProvisionalSkus, recordFunnel, selectConcept, startPreview } from '@arkiv/core';
 import { ctxFor, productPhoto } from '@arkiv/core/testing';
 import {
   changePlan,
@@ -135,4 +135,39 @@ describe('subscriptions (P11, plan 04 §3)', () => {
     const [w] = await ownerPool()`select state, state_before_hold from workspaces where id = ${t.workspaceId}`;
     expect(w).toMatchObject({ state: 'LOCKED', state_before_hold: 'ACTIVE_PAID' });
   });
+});
+
+describe('funnel attribution across a preview merge (plan 04 §1, plan 05 §4)', () => {
+  it('credits later stages of a preview moved into an existing account to the previewing visitor', async () => {
+    const V = 'vis-texture';
+    const V0 = 'vis-founder';
+    // The existing account first arrived earlier from the founder page and tried a product then.
+    const existing = await makeTenant();
+    await recordFunnel('LP_VIEWED', { visitorId: V0, page: 'founder' });
+    await recordFunnel('UPLOAD_COMPLETED', { visitorId: V0, workspaceId: existing.workspaceId });
+    // Today the same person, signed out, lands on the texture page and previews a product.
+    await recordFunnel('LP_VIEWED', { visitorId: V, page: 'texture' });
+    const prov = await makeTenant({ state: 'PROVISIONAL' });
+    const pctx = ctxFor(prov.workspaceId, prov.userId, 'OWNER', 'PROVISIONAL');
+    const asset = await withTenant(prov.workspaceId, async (tx) => ingestBytes(tx, pctx, await productPhoto(), 'product_photo', null));
+    const { skuId, projectId } = await withTenant(prov.workspaceId, (tx) => startPreview(tx, pctx, { photoAssetIds: [asset.id], visitorId: V }));
+    await analyzeProduct(pctx, skuId, projectId);
+    // Signing in as the existing user moves the SKU (and its project) into their workspace.
+    await moveProvisionalSkus(prov.workspaceId, existing.workspaceId, existing.userId);
+    const ctx = ctxFor(existing.workspaceId, existing.userId);
+    const [c] = await ownerPool()`select id from concepts where project_id = ${projectId} order by idx limit 1`;
+    const { storyboardId } = await withTenant(existing.workspaceId, (tx) => selectConcept(tx, ctx, projectId, c!.id as string));
+    await generateStoryboard(ctx, projectId, storyboardId, c!.id as string);
+    const co = await withTenant(existing.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: existing.userId, email: existing.email }));
+    await completeMockCheckout(co.sessionId);
+    const later = await ownerPool()`select type, visitor_id, workspace_id from funnel_events where type in ('STORYBOARD_READY','CHECKOUT_STARTED','TASTE_PAID') order by id`;
+    expect(later.map((e) => `${e.type}:${e.visitor_id}`)).toEqual([`STORYBOARD_READY:${V}`, `CHECKOUT_STARTED:${V}`, `TASTE_PAID:${V}`]);
+    expect(later.every((e) => e.workspace_id === existing.workspaceId)).toBe(true);
+    // The console's funnel credits the payment to the texture page, not the account's original first touch.
+    const slices = await withAdmin((tx) => funnelBySlice(tx, { by: 'page', days: 30 }));
+    const n = (slice: string, type: string) => slices.find((r) => r.slice === slice && r.type === type)?.n ?? 0;
+    expect(n('texture', 'TASTE_PAID')).toBe(1);
+    expect(n('texture', 'STORYBOARD_READY')).toBe(1);
+    expect(n('founder', 'TASTE_PAID')).toBe(0);
+  }, 90_000);
 });

@@ -286,9 +286,19 @@ export async function transferOwnership(tx: Tx, ctx: TenantContext, toUserId: st
   const [t] = await tx`select role from memberships where user_id = ${toUserId}`;
   if (!t) throw notFound('New owner must already be a member');
   await tx`update memberships set role = 'OWNER' where user_id = ${toUserId}`;
-  if (ctx.actor.kind === 'user') await tx`update memberships set role = 'ADMIN' where user_id = ${ctx.actor.id}`;
+  // The outgoing owner steps down to Admin (not when they name themselves).
+  let stepDown: { userId: string; from: Role } | null = null;
+  if (ctx.actor.kind === 'user' && ctx.actor.id !== toUserId) {
+    const [me] = await tx`select role from memberships where user_id = ${ctx.actor.id} for update`;
+    if (me && me.role !== 'ADMIN') {
+      await tx`update memberships set role = 'ADMIN' where user_id = ${ctx.actor.id}`;
+      stepDown = { userId: ctx.actor.id, from: me.role as Role };
+    }
+  }
   await tx`update workspaces set membership_version = membership_version + 1 where id = ${ctx.workspaceId}`;
-  await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: toUserId }, { to: 'OWNER', transfer: true });
+  // One MEMBER_ROLE_CHANGED per member whose role changed, in the shared payload shape (EVENT_PAYLOADS).
+  if (t.role !== 'OWNER') await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: toUserId }, { from: t.role as Role, to: 'OWNER', transfer: true });
+  if (stepDown) await emit(tx, ctx, 'MEMBER_ROLE_CHANGED', { type: 'user', id: stepDown.userId }, { from: stepDown.from, to: 'ADMIN', transfer: true });
 }
 
 /** Next catalogue number: `No. 001` stamp for each SKU (design M4). */

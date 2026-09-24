@@ -10,7 +10,7 @@ test('staff can sign in and use the console', async ({ page }) => {
   await page.getByLabel('Email').fill(c.email);
   await page.getByLabel('Password').fill(c.password);
   await page.getByLabel('Authenticator code').fill(totp(c.secret));
-  await page.getByRole('button', { name: 'Sign in' }).click();
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Platform Pulse' })).toBeVisible();
   await headingOutline(page);
   await page.getByRole('link', { name: 'Tenants' }).click();
@@ -36,3 +36,36 @@ test('staff can sign in and use the console', async ({ page }) => {
   // the stale-session 🔐 path is exercised by tests/smoke/admin.ts.
   expect(dialogs.some((m) => /reason/i.test(m))).toBe(true);
 });
+
+/**
+ * WCAG 1.4.10 reflow / 1.4.4 resize: at 320 CSS px (400% zoom) and 640 px (200% zoom) the rail is hidden, so the
+ * console must offer the same navigation through the Menu button, without horizontal page scroll.
+ */
+for (const width of [320, 640]) {
+  test(`console navigation stays reachable at ${width}px`, async ({ page }) => {
+    const c = staffCreds();
+    await page.setViewportSize({ width, height: 800 });
+    await page.goto(`${ADMIN}/login`);
+    await page.getByLabel('Email').fill(c.email);
+    await page.getByLabel('Password').fill(c.password);
+    await page.getByLabel('Authenticator code').fill(totp(c.secret));
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Platform Pulse' })).toBeVisible();
+    await expect(page.getByRole('navigation', { name: 'Console', exact: true })).toBeHidden();
+    const menu = page.getByRole('dialog', { name: 'Console' });
+    // The button works once the page has hydrated; retry the click until the sheet opens.
+    const openMenu = () => expect(async () => {
+      await page.getByRole('button', { name: /^Menu/ }).click();
+      await expect(menu).toBeVisible({ timeout: 1000 });
+    }).toPass();
+    await openMenu();
+    await menu.getByRole('link', { name: 'Tenants' }).click();
+    await expect(page.getByRole('heading', { name: 'Tenants' })).toBeVisible();
+    await expect(menu).toBeHidden();
+    await expect(page.getByLabel('Search tenants')).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'no horizontal page scroll').toBe(true);
+    await openMenu();
+    await menu.getByRole('link', { name: 'Audit log' }).click();
+    await expect(page.getByRole('heading', { name: 'Audit log' })).toBeVisible();
+  });
+}

@@ -15,7 +15,8 @@ import { dismissRecommendation } from './recommendations';
 import { requestFrameRegeneration, setSceneLock } from './storyboard';
 import { productPhoto } from './testing';
 import { createUpload, ingestBytes } from './uploads';
-import { changeRole, removeMember } from './workspaces';
+import { changeRole, removeMember, transferOwnership } from './workspaces';
+import { emit } from './events';
 
 beforeEach(truncateAll);
 afterAll(closeAll);
@@ -145,6 +146,20 @@ describe('member management matrix (plan 02 §1.1: Admin ✓ except Owners)', ()
     await expect(withTenant(t.workspaceId, (tx) => changeRole(tx, admin, t.userId, 'ADMIN'))).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(withTenant(t.workspaceId, (tx) => removeMember(tx, admin, t.userId))).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(withTenant(t.workspaceId, (tx) => changeRole(tx, admin, m1, 'OWNER'))).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  it('an Owner transfer records one MEMBER_ROLE_CHANGED per changed member, in the shared payload shape (§36)', async () => {
+    const t = await makeTenant({ plan: 'SCALE', state: 'ACTIVE_PAID' });
+    const m1 = await addMember(t.workspaceId, 'MEMBER');
+    await withTenant(t.workspaceId, (tx) => transferOwnership(tx, ctxOf(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), m1));
+    const ev = await ownerPool()`select subject_id, payload from events where workspace_id = ${t.workspaceId} and type = 'MEMBER_ROLE_CHANGED' order by payload->>'to' desc`;
+    expect(ev.map((e) => [e.subject_id, e.payload])).toEqual([
+      [m1, { from: 'MEMBER', to: 'OWNER', transfer: true }],
+      [t.userId, { from: 'OWNER', to: 'ADMIN', transfer: true }],
+    ]);
+    // emit() refuses the shapes older staff paths wrote for the same event type.
+    await expect(withTenant(t.workspaceId, (tx) => emit(tx, ctxOf(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), 'MEMBER_ROLE_CHANGED', { type: 'user', id: m1 }, { to: 'OWNER', from: [t.userId] }))).rejects.toThrow(/MEMBER_ROLE_CHANGED payload does not match/);
+    await expect(withTenant(t.workspaceId, (tx) => emit(tx, ctxOf(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), 'CLAIM_RESTRICTED', null, { unblocked: true, reason: 'x' }))).rejects.toThrow(/CLAIM_RESTRICTED payload/);
   });
 
   it('a Member cannot manage anyone', async () => {

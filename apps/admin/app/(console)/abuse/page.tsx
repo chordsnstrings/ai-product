@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
 import { PROVISIONAL } from '@arkiv/shared';
+import { auditView } from '@arkiv/core';
 import { ActButton, ActForm } from '@/components/act';
 import { ago, dt, money, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -9,8 +10,9 @@ export const metadata = { title: 'Abuse & rights' };
 
 /** Plan 05 §15. */
 export default async function Abuse() {
-  await requireStaff('abuse.manage');
+  const s = await requireStaff('abuse.manage');
   const d0 = await withAdmin(async (tx) => ({
+    audited: await auditView(tx, s, 'abuse'),
     signals: await tx`select kind, key, count(*)::int as n, max(at) as last, max(workspace_id::text) as ws from abuse_signals where at > now() - interval '7 days' group by 1, 2 order by n desc limit 100`,
     farms: await tx`select substring(host(created_ip) from '^\\d+\\.\\d+\\.\\d+') as net, count(*)::int as n from magic_links where created_at > now() - interval '24 hours' and created_ip is not null group by 1 having count(*) > 10 order by 2 desc`,
     cogsOutliers: await tx`select l.workspace_id, w.name, w.state, sum(l.amount)::bigint as spend from ledger_entries l join workspaces w on w.id = l.workspace_id
