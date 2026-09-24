@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { MOCK_IDENTITIES, mockIdpEnabled } from '@arkiv/auth';
 
-export const metadata: Metadata = { title: 'Mock sign-in · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Mock sign-in', robots: { index: false } };
 
 /**
  * The mock Google/Apple consent screen (PROVIDERS_MODE=mock only): pick a test identity — including the Apple

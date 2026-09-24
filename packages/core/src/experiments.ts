@@ -5,7 +5,8 @@ import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
 import { confoundRunning, LIVE_STATES, recordExperimentApproval, setExperimentState } from './experiment-state';
-import { authorizeFromQuote } from './render-quotes';
+import { authorizeFromQuote, renderQuote } from './render-quotes';
+import { available, lockEntitlement } from './ledger';
 import type { Proposal } from './intel-schemas';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { recordFatigue } from './fatigue';
@@ -70,6 +71,37 @@ export async function createExperiment(
 ) {
   assertCan(ctx, 'experiment.create');
   const p = input.proposal;
+  const projectId = newId();
+  const x = await insertExperiment(tx, ctx, { ...input, projectId });
+  await tx`insert into projects (id, workspace_id, sku_id, experiment_id, variant_id, kind, state, created_by)
+           values (${projectId}, ${ctx.workspaceId}, ${input.skuId}, ${x.experimentId}, ${x.masterVariantId}, 'creative_test', 'CONCEPTS_READY', ${actorString(ctx)})`;
+  const [concept] = await tx`insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, prompt_version, model)
+                             values (${ctx.workspaceId}, ${input.skuId}, ${projectId}, 1, 'A', ${tx.json(p as never)}, true, 'recommendation', 'n/a') returning id`;
+  // Storyboard straight away (the approval boundary before expensive production, §13).
+  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${concept!.id}, 'generating') returning id`;
+  await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: concept!.id, storyboard_id: sb!.id } });
+  await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true }, { priority: priorityFor(ctx) });
+  const expRefs = { experimentId: x.experimentId, skuId: input.skuId, projectId, variantId: x.masterVariantId, storyboardId: sb!.id as string, recommendationId: input.recommendationId ?? null };
+  await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: x.experimentId }, { mode: x.mode, slot: input.slot, primaryVariable: x.primaryVariable, declaredVariable: p.primaryVariable }, expRefs);
+  if (input.recommendationId) {
+    await tx`update recommendations set status = 'accepted', experiment_id = ${x.experimentId} where id = ${input.recommendationId}`;
+    await emit(tx, ctx, 'RECOMMENDATION_ACCEPTED', { type: 'recommendation', id: input.recommendationId }, { experimentId: x.experimentId }, expRefs);
+  }
+  return { experimentId: x.experimentId, projectId, storyboardId: sb!.id as string };
+}
+
+/**
+ * The experiment rows for a proposal whose master is `projectId`: the experiment, an optional control, the master
+ * variant (the project) and up to two hook variants. Shared by a new test (createExperiment) and a product added
+ * through the free preview that a subscriber makes with one of their Creative Tests (produceWithCreativeTest).
+ */
+async function insertExperiment(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { skuId: string; proposal: Proposal; projectId: string; recommendationId?: string | null; slot?: 'EXPLOIT' | 'EXPAND' | 'EXPLORE' | null; controlCreativeId?: string | null },
+) {
+  const p = input.proposal;
   const declared = p.primaryVariable;
   const primaryVariable = input.controlCreativeId ? declared : 'hook';
   const controlled = declared === 'hook' || !!input.controlCreativeId;
@@ -97,10 +129,9 @@ export async function createExperiment(
                                    ${input.controlCreativeId}, '{}', ${HELD_DEFAULT}) returning id`;
     await tx`update experiments set control_variant_id = ${cid!.id} where id = ${expId}`;
   }
-  const projectId = newId();
   const [master] = await tx`
     insert into variants (workspace_id, experiment_id, label, code, role, project_id, changed_variables, held_constant, genes)
-    values (${ctx.workspaceId}, ${expId}, ${p.hookOptions[0]!}, ${code(i++)}, 'variant', ${projectId},
+    values (${ctx.workspaceId}, ${expId}, ${p.hookOptions[0]!}, ${code(i++)}, 'variant', ${input.projectId},
             ${input.controlCreativeId ? [declared] : []}, ${mode === 'CONTROLLED' ? HELD_DEFAULT : []}, ${tx.json({ ...genes, hook: p.hookOptions[0] } as never)})
     returning id`;
   for (const hook of p.hookOptions.slice(1, 3)) {
@@ -108,22 +139,59 @@ export async function createExperiment(
              values (${ctx.workspaceId}, ${expId}, ${hook}, ${code(i++)}, 'variant', ${['hook']},
                      ${[...HELD_DEFAULT, 'scenes_2_plus', 'voiceover']}, ${tx.json({ ...genes, hook } as never)})`;
   }
-  await tx`insert into projects (id, workspace_id, sku_id, experiment_id, variant_id, kind, state, created_by)
-           values (${projectId}, ${ctx.workspaceId}, ${input.skuId}, ${expId}, ${master!.id}, 'creative_test', 'CONCEPTS_READY', ${actorString(ctx)})`;
-  const [concept] = await tx`insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, prompt_version, model)
-                             values (${ctx.workspaceId}, ${input.skuId}, ${projectId}, 1, 'A', ${tx.json(p as never)}, true, 'recommendation', 'n/a') returning id`;
-  // Storyboard straight away (the approval boundary before expensive production, §13).
-  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${concept!.id}, 'generating') returning id`;
-  await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: concept!.id, storyboard_id: sb!.id } });
-  await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
-  await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true }, { priority: priorityFor(ctx) });
-  const expRefs = { experimentId: expId, skuId: input.skuId, projectId, variantId: master!.id as string, storyboardId: sb!.id as string, recommendationId: input.recommendationId ?? null };
-  await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: expId }, { mode, slot: input.slot, primaryVariable, declaredVariable: declared }, expRefs);
-  if (input.recommendationId) {
-    await tx`update recommendations set status = 'accepted', experiment_id = ${expId} where id = ${input.recommendationId}`;
-    await emit(tx, ctx, 'RECOMMENDATION_ACCEPTED', { type: 'recommendation', id: input.recommendationId }, { experimentId: expId }, expRefs);
+  return { experimentId: expId, masterVariantId: master!.id as string, mode, primaryVariable };
+}
+
+/** Project states in which a project is already being (or has been) produced. */
+const PRODUCTION_OR_DONE = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA', 'COMPLETE'];
+
+/**
+ * A subscriber made a storyboard through the product funnel (/start → ideas → storyboard) and produces it with one of
+ * their plan's Creative Tests instead of paying the standalone price (§5: Standalone is "one standard finished ad
+ * outside a subscription"). The funnel project becomes the master of a new experiment for its chosen idea, then the
+ * test's spend is approved exactly as in Studio: a render quote priced against this storyboard, the Cost Governor
+ * authorization made from it in this transaction (the Creative Test is reserved there), and the approval recorded
+ * once. A replay (double click, retried request) returns the experiment without spending again.
+ */
+export async function produceWithCreativeTest(tx: Tx, ctx: TenantContext, projectId: string): Promise<{ experimentId: string; projectId: string; replayed: boolean }> {
+  assertCan(ctx, 'spend.creative_test');
+  const [p] = await tx`select id, state, kind, sku_id, experiment_id, storyboard_id, selected_concept_id, entitlement_unit from projects
+                       where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  if (PRODUCTION_OR_DONE.includes(p.state as string)) {
+    if (p.entitlement_unit === 'creative_test' && p.experiment_id) return { experimentId: p.experiment_id as string, projectId, replayed: true };
+    throw new DomainError('CONFLICT', 'This ad is already in production.');
   }
-  return { experimentId: expId, projectId, storyboardId: sb!.id as string };
+  if (p.state !== 'STORYBOARD_READY' || !p.storyboard_id) throw new DomainError('CONFLICT', 'The storyboard isn’t ready yet.');
+  // Reopened after a blocked line: it was already paid for or already used a test, so it is finished, not bought again.
+  if (p.entitlement_unit) throw new DomainError('CONFLICT', 'This ad is already paid for — finish it from the storyboard.');
+  const [paid] = await tx`select 1 from purchases where project_id = ${projectId} and workspace_id = ${ctx.workspaceId} and status = 'paid'`;
+  if (paid) throw new DomainError('CONFLICT', 'Already paid — production is starting.');
+  await lockEntitlement(tx, ctx.workspaceId);
+  if ((await available(tx, 'creative_test', ctx.workspaceId)) < 1) {
+    throw new DomainError('PAYMENT_REQUIRED', 'No Creative Tests left this period. Upgrade, wait for your plan to renew, or make this ad outside your plan.');
+  }
+  let experimentId = p.experiment_id as string | null;
+  if (!experimentId) {
+    const [c] = await tx`select proposal from concepts where id = ${p.selected_concept_id} and project_id = ${projectId}`;
+    if (!c) throw new DomainError('CONFLICT', 'Choose an idea first.');
+    const proposal = c.proposal as Proposal;
+    const x = await insertExperiment(tx, ctx, { skuId: p.sku_id as string, proposal, projectId });
+    experimentId = x.experimentId;
+    // The funnel project becomes the test's master: its production is a Creative Test from here on.
+    await tx`update projects set experiment_id = ${experimentId}, variant_id = ${x.masterVariantId}, kind = 'creative_test' where id = ${projectId}`;
+    await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: experimentId }, { mode: x.mode, slot: null, primaryVariable: x.primaryVariable, declaredVariable: proposal.primaryVariable, source: 'funnel' }, {
+      experimentId,
+      skuId: p.sku_id as string,
+      projectId,
+      variantId: x.masterVariantId,
+      storyboardId: p.storyboard_id as string,
+    });
+  }
+  const q = await renderQuote(tx, ctx, experimentId);
+  if (q.blockedReason) throw new DomainError(q.entitlementAvailable ? 'CONFLICT' : 'PAYMENT_REQUIRED', q.blockedReason);
+  await approveExperiment(tx, ctx, experimentId, { quoteId: q.quoteId });
+  return { experimentId, projectId, replayed: false };
 }
 
 /**

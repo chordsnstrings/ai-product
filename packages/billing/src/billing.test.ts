@@ -60,6 +60,17 @@ describe('Taste checkout (P7/P8, plan 02 B1–B5)', () => {
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
   }, 60_000);
 
+  it('refuses a one-off checkout while the workspace has Creative Tests left (standard §5: standalone is outside a plan)', async () => {
+    const { t, ctx, projectId } = await storyboardReady();
+    await withTenant(t.workspaceId, async (tx) => {
+      const { append } = await import('@arkiv/core');
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'creative_test', amount: 2, periodKey: '2026-09-01', idempotencyKey: 'grant:co' });
+    });
+    await expect(withTenant(t.workspaceId, (tx) => startProductionCheckout(tx, ctx, projectId, { id: t.userId, email: t.email }))).rejects.toMatchObject({ code: 'CONFLICT', details: { useCreativeTest: true } });
+    expect(gw.sessions.size).toBe(0);
+    expect((await ownerPool()`select count(*)::int as n from purchases where project_id = ${projectId}`)[0]!.n).toBe(0);
+  }, 60_000);
+
   it('ignores duplicate webhooks and parks unknown customers in the unmatched queue', async () => {
     const e = { id: 'evt_dup', type: 'checkout.session.completed', data: { object: { id: 'cs_x', mode: 'payment', customer: 'cus_unknown', metadata: {} } } };
     const a = await receiveStripeWebhook(JSON.stringify(e), null);

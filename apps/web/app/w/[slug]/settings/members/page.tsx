@@ -6,7 +6,7 @@ import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'Members · Arkiv' };
+export const metadata: Metadata = { title: 'Members' };
 
 export default async function Members({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;

@@ -5,7 +5,7 @@ import { LinkButton } from '@arkiv/ui';
 import { requireUser } from '@/lib/session';
 import { ClaimChoice } from './choice';
 
-export const metadata: Metadata = { title: 'Save your product · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Save your product', robots: { index: false } };
 
 const WRITABLE = ['OWNER', 'ADMIN', 'MEMBER'];
 

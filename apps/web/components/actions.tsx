@@ -3,7 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useState, type ReactNode } from 'react';
 import { Banner, Button, Field as FormField, Input, Select, splitConfirm, Textarea } from '@arkiv/ui';
-import { api, confirmSheet, Sheet, toast } from '@arkiv/ui/client';
+import { api, confirmSheet, Sheet, toast, useSubmissionKey } from '@arkiv/ui/client';
 
 type Variant = 'primary' | 'secondary' | 'accent' | 'text';
 
@@ -15,6 +15,7 @@ export function ActionButton({ slug, action, body, children, variant = 'secondar
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const submission = useSubmissionKey();
   async function run() {
     if (confirm) {
       const ok = await confirmSheet({ ...splitConfirm(confirm), danger, confirmLabel: typeof children === 'string' ? children : 'Confirm' });
@@ -23,7 +24,8 @@ export function ActionButton({ slug, action, body, children, variant = 'secondar
     setBusy(true);
     setErr(null);
     try {
-      const r = await api<{ next?: string | null; url?: string }>(`/api/w/${slug}/${action}`, body ?? {});
+      const r = await api<{ next?: string | null; url?: string }>(`/api/w/${slug}/${action}`, body ?? {}, 'POST', { idempotencyKey: submission.key() });
+      submission.next();
       if (r.url) window.location.assign(r.url);
       else if (r.next ?? next) router.push((r.next ?? next)!);
       else {
@@ -67,6 +69,8 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // One key per submission: a doubled or retried submit of the same form returns the first answer (§39).
+  const submission = useSubmissionKey();
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
@@ -88,7 +92,8 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
         }
         payload = o;
       }
-      const r = await api<{ next?: string }>(`/api/w/${slug}/${action}`, payload);
+      const r = await api<{ next?: string }>(`/api/w/${slug}/${action}`, payload, 'POST', { idempotencyKey: submission.key() });
+      submission.next();
       (e.target as HTMLFormElement).reset();
       toast('Saved');
       onDone?.(r);

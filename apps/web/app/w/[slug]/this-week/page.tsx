@@ -5,10 +5,11 @@ import { balances, resolveRationale, weekOf, type RationaleItem } from '@arkiv/c
 import { Banner, Empty, LinkButton, SignalChip } from '@arkiv/ui';
 import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
 import { ConnectAdsCard } from '@/components/connect-ads-card';
+import { projectRoute } from '@/lib/project-route';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'This Week · Arkiv' };
+export const metadata: Metadata = { title: 'This Week' };
 
 const SLOT: Record<string, string> = { EXPLOIT: 'Exploit · build on what works', EXPAND: 'Expand · adjacent bet', EXPLORE: 'Explore · new territory' };
 const BASIS: Record<string, string> = { performance: 'Based on your results', context_limited: 'Limited performance data', cold_start: 'Based on your product and reviews — not performance yet' };
@@ -67,7 +68,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
     const skus = await tx`select id, name, catalogue_no, status from skus where status <> 'rejected' order by catalogue_no`;
     const recs = await tx`select r.*, s.name as sku_name, s.catalogue_no from recommendations r join skus s on s.id = r.sku_id
                           where r.status = 'open' and r.week_of >= ${weekOf(new Date(Date.now() - 7 * 86400_000))} order by r.week_of desc, r.score desc limit 9`;
-    const jobs = await tx`select p.id, p.state, p.kind, s.name, e.id as experiment_id from projects p join skus s on s.id = p.sku_id left join experiments e on e.id = p.experiment_id
+    const jobs = await tx`select p.id, p.state, p.kind, p.entitlement_unit, s.name, e.id as experiment_id from projects p join skus s on s.id = p.sku_id left join experiments e on e.id = p.experiment_id
                           where p.state in ('STORYBOARD_APPROVED','RENDER_RESERVED','RENDERING','QA_RUNNING','COMPOSING','PLATFORM_VARIANTS','FINAL_QA','CONCEPT_SELECTED','STORYBOARD_READY')
                           order by p.updated_at desc limit 8`;
     const changes = await tx`select type, subject_type, subject_id, payload, at from events where type in ${tx(SIGNIFICANT)} and at > now() - interval '14 days' order by at desc limit 10`;
@@ -149,7 +150,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
         <section className="ak-section">
           <h2 className="ak-label">In progress</h2>
           {data.jobs.map((j) => (
-            <Link key={j.id as string} className="ak-index-row" href={j.experiment_id ? `/w/${slug}/studio/${j.experiment_id}` : j.state === 'STORYBOARD_READY' ? `/storyboard/${j.id}` : `/produce/${j.id}`}>
+            <Link key={j.id as string} className="ak-index-row" href={projectRoute(j.state as string, j.id as string, { experimentId: j.experiment_id as string | null, slug, entitlementUnit: j.entitlement_unit as string | null })}>
               <span>{j.name as string}</span>
               <span className="ak-index">{String(j.state).replace(/_/g, ' ').toLowerCase()}</span>
             </Link>

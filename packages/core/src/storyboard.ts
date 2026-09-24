@@ -26,7 +26,8 @@ import { toDataUrl } from './vision';
 
 const FRAME = { width: 1080, height: 1920 };
 const MAX_GENERATED_FRAMES = 2;
-const FREE_FRAME_REGENERATIONS = 3;
+/** Free "Change picture" redraws per storyboard before a purchase (plan 03 P7). */
+export const FREE_FRAME_REGENERATIONS = 3;
 
 export const STORYBOARD_STEPS = [
   { key: 'plan', label: 'Writing the storyboard' },
@@ -47,7 +48,8 @@ export async function selectConcept(tx: Tx, ctx: TenantContext, projectId: strin
     throw new DomainError('CONFLICT', 'This ad is already in production.');
   if (isFreeTier(ctx)) {
     // Each chosen concept draws a new storyboard: bounded per product before a purchase (standard §5).
-    const [n] = await tx`select count(*)::int as n from storyboards sb join projects pr on pr.id = sb.project_id where pr.sku_id = ${c.sku_id}`;
+    // A storyboard we failed to draw doesn't count: the customer never got it.
+    const [n] = await tx`select count(*)::int as n from storyboards sb join projects pr on pr.id = sb.project_id where pr.sku_id = ${c.sku_id} and sb.status <> 'failed'`;
     if (n!.n >= FREE_EXPLORATION.STORYBOARDS_PER_SKU) {
       throw new DomainError('PAYMENT_REQUIRED', 'Produce this one to keep exploring — you’ve drawn all the free storyboards for this product.', { freeLimit: 'storyboards' });
     }
@@ -208,10 +210,37 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     await withTenant(ws, async (tx) => {
       await settle(tx, ctx, auth.authorizationId, 'consumed');
       await tx`update storyboards set status = 'failed' where id = ${storyboardId}`;
-      await step(tx, ws, storyboardId, 'frames', 'failed', e instanceof DomainError && e.code === 'GATE_BLOCKED' ? e.message : 'Something went wrong. We’re retrying.');
+      // Honest copy (§14): nothing retries this storyboard by itself — the customer can try again (retryStoryboard)
+      // or pick another idea, and nothing was charged for it.
+      await step(tx, ws, storyboardId, 'frames', 'failed', e instanceof DomainError && e.code === 'GATE_BLOCKED' ? e.message : STORYBOARD_FAILED_COPY);
     });
     throw e;
   }
+}
+
+export const STORYBOARD_FAILED_COPY = 'We couldn’t finish this storyboard. Nothing was charged.';
+/** Draws of one idea's storyboard we failed before we stop offering "Try again" (each try has a provider cost). */
+export const STORYBOARD_RETRY_LIMIT = 3;
+
+/**
+ * "Try again" on a storyboard we failed to draw (plan 03 P7 edge; standard §14): a fresh storyboard for the same
+ * idea, drawn by the worker like the first (the Taste offer's clock still starts only at STORYBOARD_READY, §5).
+ * Bounded per project, and a replay while the new one is being drawn returns it instead of queuing another.
+ */
+export async function retryStoryboard(tx: Tx, ctx: TenantContext, projectId: string) {
+  assertCan(ctx, 'sku.edit');
+  const [p] = await tx`select p.state, p.storyboard_id, p.selected_concept_id, sb.status as sb_status from projects p
+                       left join storyboards sb on sb.id = p.storyboard_id where p.id = ${projectId} and p.workspace_id = ${ctx.workspaceId} for update of p`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  if (p.sb_status === 'generating') return { storyboardId: p.storyboard_id as string, replayed: true };
+  if (p.state !== 'CONCEPT_SELECTED' || p.sb_status !== 'failed' || !p.selected_concept_id) throw new DomainError('CONFLICT', 'This storyboard doesn’t need another try.');
+  const [f] = await tx`select count(*)::int as n from storyboards where project_id = ${projectId} and concept_id = ${p.selected_concept_id} and status = 'failed'`;
+  if (Number(f!.n) >= STORYBOARD_RETRY_LIMIT) throw new DomainError('CONFLICT', 'We couldn’t draw this idea. Pick another idea — nothing was charged.', { pickAnother: true });
+  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${p.selected_concept_id}, 'generating') returning id`;
+  await tx`update projects set storyboard_id = ${sb!.id} where id = ${projectId}`;
+  await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: p.selected_concept_id, actor: ctx.actor }, { singletonKey: `sb:${sb!.id}`, priority: priorityFor(ctx) });
+  return { storyboardId: sb!.id as string, replayed: false };
 }
 
 /**

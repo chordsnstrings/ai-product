@@ -1,11 +1,14 @@
 import type { Metadata } from 'next';
 import { globalTx } from '@arkiv/db';
 import { setting } from '@arkiv/core';
+import { projectTitle } from '@/lib/page-title';
 import { env } from '@arkiv/shared';
 import { CheckoutFlow } from '@/components/flow';
 import { requireUser } from '@/lib/session';
 
-export const metadata: Metadata = { title: 'Checkout · Arkiv', robots: { index: false } };
+export async function generateMetadata({ params }: { params: Promise<{ projectId: string }> }): Promise<Metadata> {
+  return projectTitle((await params).projectId, 'Checkout', { robots: { index: false } });
+}
 
 export default async function Page({ params }: { params: Promise<{ projectId: string }> }) {
   const { projectId } = await params;

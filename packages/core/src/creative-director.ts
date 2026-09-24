@@ -207,7 +207,7 @@ export function gateProposal(
   approved: string[],
   names: (string | null | undefined)[] = [],
   opts: { packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean; pad?: boolean; prohibited?: readonly string[] } = {},
-): { ok: boolean; reasons: string[]; cleaned: Proposal; removed: { hooks: number; claims: number } } {
+): { ok: boolean; reasons: string[]; cleaned: Proposal; removed: { hooks: number; claims: number }; droppedClaims: string[]; paddedHooks: number } {
   const reasons: string[] = [];
   const { packetIds } = opts;
   const ingredientBlocked = opts.ingredientsVerified === false && isIngredientLed(p);
@@ -237,16 +237,38 @@ export function gateProposal(
   const brandBanned = [p.bodyStrategy, p.hypothesis].map((t) => prohibitedIn(t, prohibited)).find(Boolean);
   if (brandBanned) reasons.push(`strategy uses “${brandBanned}”, which the brand never shows or says`);
   const blockedStrategy = claimBlocked || !!brandBanned;
+  const droppedClaims: string[] = [];
   const cleanClaims = p.claimWordings.filter((w) => {
     const ok = approved.some((a) => a.toLowerCase().includes(w.toLowerCase()) || w.toLowerCase().includes(a.toLowerCase()));
-    if (!ok) reasons.push(`claim not approved: "${w}"`);
+    if (!ok) {
+      reasons.push(`claim not approved: "${w}"`);
+      droppedClaims.push(w);
+    }
     return ok;
   });
   const removed = { hooks: p.hookOptions.length - cleanHooks.length, claims: p.claimWordings.length - cleanClaims.length };
-  // Concepts the merchant is choosing between are padded with neutral hooks; a recommendation is not (`pad: false`):
-  // it is refused instead, so a gate can't be hidden behind filler (§20).
-  if (opts.pad !== false) while (cleanHooks.length < 3) cleanHooks.push(['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'][cleanHooks.length]!);
-  return { ok: !blockedStrategy && !ingredientBlocked, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds }, removed };
+  // An idea whose every opening line failed the gates is refused, never shown behind a filler headline (plan 03 P5
+  // "never pad with junk"): the merchant would be choosing an idea we can't say.
+  const noHook = cleanHooks.length === 0;
+  if (noHook) reasons.push('no compliant opening line');
+  // Concepts the merchant is choosing between get neutral alternates after a real hook (never as the headline);
+  // a recommendation is not padded (`pad: false`): it is refused instead, so a gate can't be hidden (§20).
+  let paddedHooks = 0;
+  if (opts.pad !== false && !noHook) {
+    const fillers = ['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'].filter((f) => !cleanHooks.includes(f));
+    while (cleanHooks.length < 3 && fillers.length) {
+      cleanHooks.push(fillers.shift()!);
+      paddedHooks++;
+    }
+  }
+  return {
+    ok: !blockedStrategy && !ingredientBlocked && !noHook,
+    reasons,
+    cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds },
+    removed,
+    droppedClaims,
+    paddedHooks,
+  };
 }
 
 /** Three concepts must differ in hypothesis (angle or primary variable), not just copy (§13). */
@@ -307,7 +329,7 @@ export async function generateConcepts(run: ConceptRun) {
       const [c] = await tx`
         insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, pick_reason, gate_results, prompt_version, model, brand_brain_version_id)
         values (${run.ctx.workspaceId}, ${run.skuId}, ${run.projectId}, ${run.batch}, ${letters[i]!}, ${tx.json(g.cleaned as never)},
-          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons } as never)}, ${res!.promptVersion}, ${res!.model}, ${brandBrainVersionId})
+          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons, droppedClaims: g.droppedClaims, paddedHooks: g.paddedHooks } as never)}, ${res!.promptVersion}, ${res!.model}, ${brandBrainVersionId})
         on conflict (workspace_id, project_id, batch, idx) do update set proposal = excluded.proposal
         returning id`;
       ids.push(c!.id as string);

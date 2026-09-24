@@ -6,7 +6,7 @@ import { currentUser } from '@/lib/session';
 import { ConfirmMagic } from './confirm';
 import { ResendMagic } from './resend';
 
-export const metadata: Metadata = { title: 'Sign in · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Sign in', robots: { index: false } };
 
 /**
  * GET never consumes (mail scanners prefetch links, some of them running scripts); only pressing Continue POSTs

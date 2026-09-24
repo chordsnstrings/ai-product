@@ -3,7 +3,7 @@ import { withTenant } from '@arkiv/db';
 import { workspacePage } from '@/lib/tenant';
 import { formatDateTime } from '@arkiv/shared/format';
 
-export const metadata: Metadata = { title: 'Access log · Arkiv' };
+export const metadata: Metadata = { title: 'Access log' };
 
 /** "Our support team viewed this workspace on 23 Sep, 14:02 for ticket #812" (plan 05 §0.3). */
 const WHY: Record<string, string> = { ticket: 'support ticket', incident: 'incident', compliance_review: 'compliance review' };

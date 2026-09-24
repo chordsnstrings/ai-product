@@ -6,6 +6,7 @@ import {
   isFlagOn,
   append,
   approveForProduction,
+  available,
   assertCan,
   assertStockCleared,
   billingStateChange,
@@ -78,6 +79,10 @@ export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projec
   await assertStockCleared(tx, p.sku_id as string);
   const [paid] = await tx`select id from purchases where project_id = ${projectId} and status = 'paid'`;
   if (paid) throw new DomainError('CONFLICT', 'Already paid — production is starting.');
+  // §5: the standalone price is for an ad outside a subscription. A workspace with Creative Tests left makes it with
+  // one of them (produceWithCreativeTest) instead of being charged for it.
+  const tests = await available(tx, 'creative_test', ctx.workspaceId);
+  if (tests > 0) throw new DomainError('CONFLICT', `You have ${tests} Creative Test${tests === 1 ? '' : 's'} left on your plan — make this ad with one of them instead.`, { useCreativeTest: true });
   const quote = await currentQuote(tx);
   const kind = quote.kind;
   const customerId = await ensureCustomer(tx, ctx, user.email);

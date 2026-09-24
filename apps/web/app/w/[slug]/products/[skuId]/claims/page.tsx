@@ -5,9 +5,13 @@ import { withTenant } from '@arkiv/db';
 import { claimMarket, listClaims } from '@arkiv/core';
 import { ClaimChip } from '@arkiv/ui';
 import { ActionForm, SheetButton } from '@/components/actions';
-import { workspacePage } from '@/lib/tenant';
+import { skuTitle } from '@/lib/page-title';
+import { denyPage, workspacePage } from '@/lib/tenant';
 
-export const metadata: Metadata = { title: 'Claims · Arkiv' };
+export async function generateMetadata({ params }: { params: Promise<{ slug: string; skuId: string }> }): Promise<Metadata> {
+  const { slug, skuId } = await params;
+  return skuTitle(slug, skuId, 'Claims');
+}
 
 /** Stored as canonical platform codes; META covers Instagram Reels + Facebook/Instagram feed. */
 const CLAIM_PLATFORM_OPTIONS = [
@@ -33,7 +37,7 @@ export default async function Claims({ params }: { params: Promise<{ slug: strin
     const ev = await tx`select claim_id, evidence_type, expiry_date, created_at from claim_evidence where claim_id in ${tx(claims.length ? claims.map((c) => c.id) : ['00000000-0000-0000-0000-000000000000'])}`;
     return { sku, claims, ev, market: await claimMarket(tx, skuId) };
   });
-  if (!d) notFound();
+  if (!d) return denyPage('sku', skuId, w);
   const canApprove = ['OWNER', 'ADMIN'].includes(w.ctx.role);
   const canEdit = canApprove || w.ctx.role === 'MEMBER';
   const groups = ORDER.map((s) => ({ s, items: d.claims.filter((c) => c.status === s) })).filter((g) => g.items.length);

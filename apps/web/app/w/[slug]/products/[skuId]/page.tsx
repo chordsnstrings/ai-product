@@ -7,10 +7,14 @@ import { MetadataTable, SpecimenCard } from '@arkiv/ui';
 import { ProvenanceChip } from '@arkiv/ui/client';
 import { formatDate } from '@arkiv/shared/format';
 import { ActionButton, ActionForm } from '@/components/actions';
-import { workspacePage } from '@/lib/tenant';
 import { disputeChoices } from '@/lib/flow-helpers';
+import { skuTitle } from '@/lib/page-title';
+import { denyPage, workspacePage } from '@/lib/tenant';
 
-export const metadata: Metadata = { title: 'Product · Arkiv' };
+export async function generateMetadata({ params }: { params: Promise<{ slug: string; skuId: string }> }): Promise<Metadata> {
+  const { slug, skuId } = await params;
+  return skuTitle(slug, skuId, 'Product');
+}
 
 const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', key_ingredients: 'Key ingredients', ingredients: 'Ingredients (INCI)', texture: 'Texture', format: 'Format', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
 /** Where a value that disagrees with the merchant's correction came from. */
@@ -47,7 +51,7 @@ export default async function Product({ params, searchParams }: { params: Promis
       imported,
     };
   });
-  if (!d) notFound();
+  if (!d) return denyPage('sku', skuId, w);
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
   return (
     <>

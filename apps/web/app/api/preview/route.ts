@@ -1,7 +1,7 @@
 import { globalTx, withTenant } from '@arkiv/db';
 import { abuseGate, allowKey, ingestBytes, isMarketplaceUrl, MARKETPLACE_MESSAGE, recordAbuseSignalSafe, recordFunnel, recordFunnelOnce, startPreview, uploadFailureCategory } from '@arkiv/core';
 import { DomainError, env } from '@arkiv/shared';
-import { clientFingerprint, json, route } from '@/lib/http';
+import { clientFingerprint, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
 import { previewContext } from '@/lib/preview-context';
 import { visitorId } from '@/lib/session';
 import { verifyTurnstile } from '@arkiv/auth';
@@ -64,7 +64,11 @@ async function startUpload(req: Request, form: FormData, input: { url: string | 
     const a = await withTenant(ctx.workspaceId, async (tx) => ingestBytes(tx, ctx, Buffer.from(await f.arrayBuffer()), 'product_photo', null, { filename: f.name }));
     assetIds.push(a.id);
   }
-  const r = await withTenant(ctx.workspaceId, (tx) => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip })).catch(async (e) => {
+  // §39/§35: one preview per submission. The key is scoped to this (provisional or signed-in) workspace; a double
+  // submit or a retried request returns the first product instead of creating a second SKU and project.
+  const key = idempotencyKeyOf(req);
+  const request = { url, uploaded, photos: photos.map(fileIdentity) };
+  const r = await withTenant(ctx.workspaceId, (tx) => withIdempotency(tx, ctx.workspaceId, 'preview', key, request, () => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip }))).catch(async (e) => {
     // The free-preview multi-SKU heuristic (plan 05 §15): recorded for trust & safety (the refusal itself rolled back).
     if (e instanceof DomainError && e.code === 'PAYMENT_REQUIRED' && (e.details as { needsAccount?: boolean } | undefined)?.needsAccount) {
       await recordAbuseSignalSafe({ kind: 'multi_sku_limit', key: allowKey.ip(ip) ?? allowKey.ws(ctx.workspaceId)!, workspaceId: ctx.workspaceId, detail: { workspace: ctx.workspaceId } });

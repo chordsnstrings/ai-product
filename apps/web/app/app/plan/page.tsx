@@ -9,7 +9,7 @@ import { Banner } from '@arkiv/ui';
 import { ThemeScope } from '@arkiv/ui/client';
 import { PlanPicker } from '@/components/plan-picker';
 
-export const metadata: Metadata = { title: 'Choose a plan · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Choose a plan', robots: { index: false } };
 
 /** P11 in-app: plan choice + the auto-renewal consent box (ROSCA / CA ARL) before any subscription checkout. */
 export default async function Page({ searchParams }: { searchParams: Promise<{ plan?: string }> }) {

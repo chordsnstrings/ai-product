@@ -18,6 +18,7 @@ export const ABUSE_SIGNAL_KINDS = {
   multi_sku_limit: 'Free-preview multi-SKU limit hit',
   prompt_injection: 'Prompt-injection attempt in imported text',
   disposable_email: 'Sign-up with a disposable email domain (allowed, scored)',
+  cross_tenant_probe: 'Object ID from another account, or guessed (denied)',
 } as const;
 export type AbuseSignalKind = keyof typeof ABUSE_SIGNAL_KINDS;
 
@@ -46,6 +47,29 @@ export async function tally(tx: Tx, key: string, windowSeconds: number): Promise
     on conflict (key, window_start) do update set count = rate_limits.count + 1
     returning count`;
   return Number(row!.count);
+}
+
+// ───────────── Cross-tenant object probes (standard §48) ─────────────
+
+/** Denied object-ID lookups per user (or network, signed out) per hour at which the console shows a spike. */
+export const PROBE_SPIKE_PER_HOUR = 20;
+export type ProbeTarget = 'workspace' | 'project' | 'asset' | 'sku' | 'experiment';
+
+/**
+ * §48 "Cross-tenant object or API ID guessed: authorize every read/write server-side against workspace ownership.
+ * Deny and log." The caller has already denied (a 404, so existence can't be probed); this logs it: one
+ * `cross_tenant_probe` signal per denial (who, which network, what kind of object and a hash of its id — never the
+ * id itself) and a per-user/network hourly counter the console reads as a spike. Best-effort: logging never fails
+ * or slows the request's own answer.
+ */
+export async function noteAccessDenied(p: { userId: string | null; ip: string | null; target: ProbeTarget; targetId: string }): Promise<number> {
+  const key = p.userId ? `user:${p.userId}` : (allowKey.ip(p.ip) ?? 'ip:unknown');
+  const targetHash = createHash('sha256').update(p.targetId).digest('hex').slice(0, 16);
+  return sideTx(async (tx) => {
+    const n = await tally(tx, `probe:${key}`, 3600);
+    await recordAbuseSignal(tx, { kind: 'cross_tenant_probe', key, detail: { target: p.target, targetHash, network: allowKey.ip(p.ip), thisHour: n, spike: n >= PROBE_SPIKE_PER_HOUR } });
+    return n;
+  }).catch(() => 0);
 }
 
 // ───────────── Client fingerprint (network, device, ASN) ─────────────

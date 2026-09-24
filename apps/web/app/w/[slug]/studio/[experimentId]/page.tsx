@@ -6,10 +6,14 @@ import type { Platform, PlatformAsset } from '@arkiv/shared';
 import { SignalChip } from '@arkiv/ui';
 import { CreatorPacks } from '@/components/creator-packs';
 import { StudioClient } from '@/components/studio';
-import { workspacePage } from '@/lib/tenant';
+import { experimentTitle } from '@/lib/page-title';
+import { denyPage, workspacePage } from '@/lib/tenant';
 import { variantPreviewUrl } from '@/lib/variant-preview';
 
-export const metadata: Metadata = { title: 'Studio · Arkiv' };
+export async function generateMetadata({ params }: { params: Promise<{ slug: string; experimentId: string }> }): Promise<Metadata> {
+  const { slug, experimentId } = await params;
+  return experimentTitle(slug, experimentId, 'Studio');
+}
 
 const PLACEMENT_LABEL: Record<Platform, string> = { TIKTOK: 'TikTok', INSTAGRAM_REELS: 'Reels', FACEBOOK_FEED: 'Feed' };
 
@@ -56,7 +60,7 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
     const footage = await listCreatorFootage(tx, experimentId);
     return { e: v.experiment, sku, variants, results: v.results, bal: await balances(tx), disclosure, packs, footage };
   });
-  if (!d) notFound();
+  if (!d) return denyPage('experiment', experimentId, w);
   const master = d.variants.find((v) => v.projectId);
   return (
     <>

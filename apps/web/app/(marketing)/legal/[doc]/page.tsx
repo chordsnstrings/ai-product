@@ -1,3 +1,4 @@
+import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { globalTx } from '@arkiv/db';
@@ -54,6 +55,12 @@ function RecipientTable({ rows }: { rows: readonly DataRecipient[] }) {
       </table>
     </div>
   );
+}
+
+/** Each legal page has its own title (WCAG 2.4.2): Terms and Privacy never share the home page's. */
+export async function generateMetadata({ params }: { params: Promise<{ doc: string }> }): Promise<Metadata> {
+  const d = DOCS[(await params).doc];
+  return d ? { title: d.title } : {};
 }
 
 export default async function LegalPage({ params }: { params: Promise<{ doc: string }> }) {

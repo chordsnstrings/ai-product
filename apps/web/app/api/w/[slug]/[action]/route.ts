@@ -51,7 +51,7 @@ import {
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
 import { CSV_PLATFORMS, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
-import { body, clientIp, json, route } from '@/lib/http';
+import { body, clientIp, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
 const uuid = z.string().uuid();
@@ -67,6 +67,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
   const w = await workspaceBySlug(slug);
   const ctx = w.ctx;
   const t = <T>(fn: Parameters<typeof withTenant<T>>[1]) => withTenant<T>(ctx.workspaceId, fn);
+  // §39: creates carry the client's Idempotency-Key (one per submission); a replay returns the first answer.
+  const idemKey = idempotencyKeyOf(req);
+  const once = <T>(tx: Parameters<Parameters<typeof withTenant<T>>[1]>[0], request: unknown, fn: () => Promise<T>) => withIdempotency(tx, ctx.workspaceId, action, idemKey, request, fn);
 
   // Multipart actions first (files). Each one is authorised by role, here or inside the core function.
   if (MULTIPART.has(action)) {
@@ -83,7 +86,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const tz = z.string().trim().max(64).regex(/^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+)*$/).optional().parse((form.get('timezone') as string | null) || undefined) ?? null;
         const rows = parsePerformanceCsv(await file.text(), platform, { timezone: tz });
         if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
-        const r = await t((tx) => ingestObservations(tx, ctx, null, rows));
+        const r = await t((tx) => once(tx, { platform, tz, file: fileIdentity(file), rows: rows.length }, () => ingestObservations(tx, ctx, null, rows)));
         return json({ ok: true, ...r });
       }
       case 'evidence': {
@@ -97,10 +100,13 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const hasFile = file instanceof File && file.size > 0;
         if (!hasFile && !/^https?:\/\/\S+$/i.test(location ?? '')) throw new DomainError('INVALID', 'Attach the document, or paste a link to it. A description alone isn’t evidence.');
         assertCan(ctx, 'sku.edit');
-        await t(async (tx) => {
-          const assetId = hasFile ? (await ingestBytes(tx, ctx, Buffer.from(await (file as File).arrayBuffer()), 'evidence_doc', null, { filename: (file as File).name })).id : null;
-          await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, expiry, wording });
-        });
+        await t((tx) =>
+          once(tx, { claimId, type, applicability, location, wording, expiry, file: fileIdentity(file) }, async () => {
+            const assetId = hasFile ? (await ingestBytes(tx, ctx, Buffer.from(await (file as File).arrayBuffer()), 'evidence_doc', null, { filename: (file as File).name })).id : null;
+            await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, expiry, wording });
+            return { ok: true };
+          }),
+        );
         return json({ ok: true });
       }
       case 'import-creative': {
@@ -108,10 +114,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const skuId = uuid.parse(form.get('skuId'));
         const copy = z.string().trim().min(3).max(2000).parse(form.get('copy'));
         assertCan(ctx, 'sku.create');
-        const id = await t(async (tx) => {
-          const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
-          return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform: (form.get('platform') as 'meta' | 'tiktok') || null, adId: (form.get('adId') as string) || null });
-        });
+        const platform = (form.get('platform') as 'meta' | 'tiktok') || null;
+        const adId = (form.get('adId') as string) || null;
+        const id = await t((tx) =>
+          once(tx, { skuId, copy, platform, adId, file: fileIdentity(file) }, async () => {
+            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
+            return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId });
+          }),
+        );
         return json({ ok: true, creativeId: id });
       }
     }
@@ -121,12 +131,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     /* ── This Week ── */
     case 'rec-accept': {
       const { id } = await body(req, z.object({ id: uuid }));
-      const r = await t(async (tx) => {
-        const [rec] = await tx`select * from recommendations where id = ${id} and status = 'open' for update`;
-        if (!rec) throw new DomainError('CONFLICT', 'This recommendation was already handled.');
-        // A refresh of a fatigued winner runs the winner as the control (§45 "controlled refresh").
-        return createExperiment(tx, ctx, { skuId: rec.sku_id as string, proposal: Proposal.parse(rec.proposal), recommendationId: id, slot: rec.slot as 'EXPLOIT', controlCreativeId: (rec.control_creative_id as string | null) ?? null });
-      });
+      const r = await t((tx) =>
+        once(tx, { id }, async () => {
+          const [rec] = await tx`select * from recommendations where id = ${id} and status = 'open' for update`;
+          if (!rec) throw new DomainError('CONFLICT', 'This recommendation was already handled.');
+          // A refresh of a fatigued winner runs the winner as the control (§45 "controlled refresh").
+          return createExperiment(tx, ctx, { skuId: rec.sku_id as string, proposal: Proposal.parse(rec.proposal), recommendationId: id, slot: rec.slot as 'EXPLOIT', controlCreativeId: (rec.control_creative_id as string | null) ?? null });
+        }),
+      );
       return json({ ...r, next: `/w/${slug}/studio/${r.experimentId}` });
     }
     case 'rec-dismiss': {
@@ -232,7 +244,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'claim-propose': {
       const i = await body(req, z.object({ skuId: uuid, wording: z.string().trim().min(3).max(200) }));
       assertCan(ctx, 'sku.edit');
-      return json(await t((tx) => proposeClaim(tx, ctx, i.skuId, { wording: i.wording, origin: 'merchant' })));
+      return json(await t((tx) => once(tx, i, () => proposeClaim(tx, ctx, i.skuId, { wording: i.wording, origin: 'merchant' }))));
     }
     case 'claim-approve': {
       // Scope values are normalised (and unknown ones refused) by approveClaim: TIKTOK, META (= Reels + Feed), YOUTUBE, ORGANIC…
@@ -244,10 +256,13 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       assertCan(ctx, 'sku.edit');
       const items = parseReviewPaste(i.text);
       if (!items.length) throw new DomainError('INVALID', 'We couldn’t find any reviews in that text.');
-      await t(async (tx) => {
-        await importSignals(tx, ctx, i.skuId, items);
-        await enqueue(tx, ctx.workspaceId, Queues.customerThemes, { skuId: i.skuId, actor: ctx.actor }, { singletonKey: `themes:${i.skuId}` });
-      });
+      await t((tx) =>
+        once(tx, i, async () => {
+          await importSignals(tx, ctx, i.skuId, items);
+          await enqueue(tx, ctx.workspaceId, Queues.customerThemes, { skuId: i.skuId, actor: ctx.actor }, { singletonKey: `themes:${i.skuId}` });
+          return { imported: items.length };
+        }),
+      );
       return json({ ok: true, imported: items.length });
     }
     /* ── Members ── */

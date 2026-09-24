@@ -49,7 +49,7 @@ test('anonymous visitor to delivered ad', async ({ page }) => {
   await build.first().click();
 
   // P6: save gate — value first, then a light ask.
-  await expect(page.getByRole('dialog', { name: /Save your work/ })).toBeVisible();
+  await expect(page.getByRole('dialog', { name: /^Save .+ and see its storyboard$/ })).toBeVisible();
   const email = `e2e-${Date.now()}@example.com`;
   await page.getByLabel('Work email').fill(email);
   await page.getByRole('button', { name: 'Email me a sign-in link' }).click();
@@ -59,10 +59,8 @@ test('anonymous visitor to delivered ad', async ({ page }) => {
   // Scanner-safe (plan 03 Part C): loading the link consumes nothing; pressing Continue does.
   await expect(page.getByRole('heading', { name: 'Sign in to Arkiv' })).toBeVisible();
   await page.getByRole('button', { name: 'Continue' }).click();
-  await page.waitForURL(`**/concepts/${projectId}`);
 
-  // Signed in: build the storyboard.
-  await page.getByRole('button', { name: 'Build this storyboard' }).first().click();
+  // Signed in: the idea picked before the save gate is carried through — its storyboard starts without choosing again.
   await page.waitForURL(`**/storyboard/${projectId}`);
   const makeAd = page.locator('#offer').getByRole('link', { name: /Make my ad/ });
   await expect(makeAd).toBeVisible({ timeout: 180_000 });

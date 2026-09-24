@@ -7,6 +7,7 @@ import { formatDate, formatTime } from '@arkiv/shared/format';
 import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
 import { EmailLinkForm } from './email-link';
 import { registerPasskey } from './profile';
+import { projectRoute } from '@/lib/project-route';
 import type { ProjectView } from '@/lib/views';
 import { awaitingPayment, conceptCost, disputeChoices, tapBox, tensionSourceWords } from '@/lib/flow-helpers';
 import type { CreativeGoal } from '@arkiv/shared';
@@ -146,6 +147,10 @@ function MissingFacts({ projectId, fields, onSaved }: { projectId: string; field
     </div>
   );
 }
+
+/** How clearly the photos show the product, in words (the analyst's fidelity confidence, 0–1). */
+const photoQuality = (c: number) =>
+  c >= 0.8 ? 'Good — we can match your packaging closely.' : c >= LOW_FIDELITY ? 'Fair — clear enough to match your packaging.' : 'Low — the product may look less exact in generated scenes.';
 
 /** Views the analyst may suggest, in customer words. */
 const VIEW_WORDS: Record<string, string> = { front: 'the front', side: 'a side view', back: 'the back label', swatch: 'a swatch of the product', closure: 'the cap or pump', in_hand: 'the product in hand' };
@@ -545,6 +550,16 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Ingredient list', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
                 </div>
               ) : null}
+              {!failed && v.sku.fidelityConfidence != null ? (
+                // Standard §8 Product Brain confirmation: asset-quality confidence, and whether more views would help.
+                <p className="ak-small" style={{ margin: 0 }}>
+                  <span className="ak-label">Photo quality</span>{' '}
+                  {photoQuality(v.sku.fidelityConfidence)}
+                  {v.sku.fidelityConfidence < LOW_FIDELITY && v.sku.suggestedViews.length && v.sku.addedViews === 0
+                    ? ` — ${v.sku.suggestedViews.map((x) => VIEW_WORDS[x] ?? x).join(', ')} would make the product sharper in your ad.`
+                    : ''}
+                </p>
+              ) : null}
               {!failed && ready && v.sku.addedViews === 0 && v.sku.suggestedViews.length > 0 && (v.sku.fidelityConfidence ?? 1) < LOW_FIDELITY ? (
                 <PhotoAdder
                   projectId={projectId}
@@ -622,6 +637,24 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
   const [gateDismissed, setGateDismissed] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // The idea chosen before the save gate (plan 03 P6) comes back as ?select=<concept> after sign-in: it is picked
+  // for the merchant, once, instead of asking them to choose again.
+  const carried = useRef(false);
+  useEffect(() => {
+    if (!v || v.access.provisional || carried.current) return;
+    const sel = new URLSearchParams(window.location.search).get('select');
+    if (!sel) return;
+    carried.current = true;
+    window.history.replaceState(null, '', `/concepts/${projectId}`);
+    if (!v.concepts.some((c) => c.id === sel)) return;
+    setBusy(sel);
+    api(`/api/projects/${projectId}/select`, { conceptId: sel })
+      .then(() => window.location.assign(`/storyboard/${projectId}`))
+      .catch((e) => {
+        setBusy(null);
+        setErr((e as Error).message);
+      });
+  }, [v, projectId]);
   if (!v) return error ? <PreviewUnavailable projectId={projectId} error={error} /> : <Loading />;
 
   async function choose(conceptId: string) {
@@ -657,7 +690,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
     // While the save gate is open, steps 1–2 are done (plan 04 L4: we ask for the account after the value).
     <Shell
       step={gate ? 3 : 2}
-      title="Three ways to test this product"
+      title={v.concepts.length > 0 && v.concepts.length < 3 ? `${v.concepts.length === 1 ? 'One way' : 'Two ways'} to test this product` : 'Three ways to test this product'}
       sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.{v.access.provisional ? null : ' Your concepts are saved in your archive.'}</>}
     >
       {err ? <Banner tone="risk">{err}</Banner> : null}
@@ -673,6 +706,12 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
             </label>
           ))}
         </fieldset>
+      ) : null}
+      {v.concepts.length > 0 && v.concepts.length < 3 && !drafting ? (
+        // Plan 03 P5: after a retry, fewer than three passed our claims and diversity checks — say so, never pad.
+        <Banner>
+          We found {v.concepts.length === 1 ? 'one strong direction' : 'two strong directions'} for this product, not three — the others didn’t pass our claims checks, and we don’t fill the gap with weaker ideas.
+        </Banner>
       ) : null}
       {v.concepts.length === 0 ? (
         <p className="ak-muted">Drafting ideas…</p>
@@ -699,6 +738,12 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
                   <dt>Cost</dt><dd>{cost}{c.estimatedGenerationClass === 'premium' ? <span className="ak-chip" style={{ marginLeft: 4 }}>Premium production</span> : null}</dd>
                 </dl>
                 <WhyThis c={c} pickReason={c.isPick ? c.pickReason : null} />
+                {c.needsEvidence ? (
+                  <p className="ak-small" style={{ margin: 0 }}>
+                    <span className="ak-chip ak-chip--warn" title={c.droppedClaims.map((w) => `“${w}”`).join(', ')}>A claim needs your evidence</span>{' '}
+                    <span className="ak-muted">We’ll use a compliant line in the storyboard. Add evidence in Claims to use it later.</span>
+                  </p>
+                ) : null}
                 <Button block variant={c.isPick ? 'primary' : 'secondary'} disabled={!!busy} onClick={() => choose(c.id)} id={c.isPick ? 'cta' : undefined}>
                   {busy === c.id ? 'Building storyboard…' : 'Build this storyboard'}
                 </Button>
@@ -725,7 +770,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
             setGateDismissed(true);
           }
         }}
-        next={`/concepts/${projectId}`}
+        next={gate ? `/concepts/${projectId}?select=${gate}` : `/concepts/${projectId}`}
         productName={v.sku.name}
         providers={providers}
       />
@@ -740,7 +785,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
 export function SaveGate({ open, onOpenChange, next, productName, providers }: { open: boolean; onOpenChange: (o: boolean) => void; next: string; productName: string; providers: { google: boolean; apple: boolean } }) {
   const n = encodeURIComponent(next);
   return (
-    <Sheet open={open} onOpenChange={onOpenChange} title="Save your work to continue" description={`Your ${productName} catalogue and ideas are kept. No card needed.`}>
+    <Sheet open={open} onOpenChange={onOpenChange} title={`Save ${productName} and see its storyboard`} description={`Your ${productName} catalogue and ideas are kept, and we’ll draw the idea you picked as soon as you’re in. No card needed.`}>
       <EmailLinkForm next={next} label="Work email" submitLabel="Email me a sign-in link" ttlMinutes={MAGIC_LINK_TTL_MIN} sentNote="We sent a sign-in link. It opens right back here — or keep this tab open and it will follow along.">
         {providers.apple || providers.google ? (
           <div className="ak-row" style={{ justifyContent: 'center' }}>
@@ -781,6 +826,16 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
   const taste = q.kind === 'taste' && q.status === 'active' && !expired;
   // Reopened after the claims check blocked a line: already paid for, so finishing needs no checkout (surf-35).
   const resumable = v.project.resumable;
+  // A subscriber with Creative Tests left makes this ad with one of them; the one-off price is for an ad outside the
+  // plan (standard §5), shown only once none are left.
+  const testsLeft = v.plan.creativeTestsLeft;
+  const withTest = testsLeft > 0;
+  const ready = !!sb && sb.status !== 'generating' && sb.status !== 'failed';
+  const freeLeft = sb?.freeRegenerationsLeft ?? 0;
+
+  if (sb?.status === 'failed') {
+    return <StoryboardFailed projectId={projectId} detail={sb.steps.find((s) => s.status === 'failed')?.detail ?? null} onRetry={() => { resume(); refresh(); }} />;
+  }
 
   async function call(url: string, body: unknown) {
     setErr(null);
@@ -809,6 +864,11 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         </Banner>
       ) : null}
       {!sb || sb.status === 'generating' ? <LiveLedger steps={sb?.steps ?? []} /> : null}
+      {ready && sb!.scenes.length > 0 && !resumable ? (
+        <p className="ak-small ak-muted" id="free-changes">
+          {freeLeft > 0 ? `Picture changes: free · ${freeLeft} of ${sb!.freeRegenerationsTotal} left.` : 'Free picture changes used — words are still free to edit; pictures can be adjusted after production.'}
+        </p>
+      ) : null}
       {sb && sb.scenes.length ? (
         <div className="ak-scroll-row" role="list">
           {sb.scenes.map((s) => (
@@ -832,14 +892,14 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
-      {sb && sb.status !== 'generating' && v.project.revisionFree && !resumable ? (
+      {ready && v.project.revisionFree && !resumable ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
           <h2 className="ak-label">Make it again — free</h2>
           <p className="ak-small ak-muted">This re-plan is on us, because your first ad didn’t show your product accurately. Check the scenes, then we’ll make it — nothing to pay.</p>
           <Button block id="cta" disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/produce-free`, {})) window.location.assign(`/produce/${projectId}`); }}>Make my ad</Button>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && resumable ? (
+      {ready && resumable ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
           <h2 className="ak-label">Finish your ad</h2>
           <p className="ak-small ak-muted">You’ve already paid for this ad, so there’s nothing more to pay. We check your changes, then produce it — scenes that were already made are reused.</p>
@@ -847,16 +907,44 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           <div style={{ marginTop: 12 }}><CancelProduction projectId={projectId} v={v} onChange={() => window.location.assign(`/produce/${projectId}`)} /></div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && !resumable && !v.project.revisionFree ? (
+      {ready && !resumable && !v.project.revisionFree && withTest ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="offer">
           <div className="ak-between" style={{ alignItems: 'start', flexWrap: 'wrap', gap: 24 }}>
             <div>
               <h2 className="ak-label">Make this ad</h2>
+              <p className="ak-h2" style={{ margin: 0 }}>1 Creative Test</p>
+              <p className="ak-small ak-muted">Included in your plan · {testsLeft} left this period. Nothing more to pay.</p>
+            </div>
+            <ul className="ak-small" style={{ margin: 0, paddingLeft: 18 }}>
+              <li>One finished 15-second ad with voiceover and captions</li>
+              <li>Hook variants to test, and exports for TikTok, Reels, Feed and Square</li>
+              <li>Your real packaging, checked scene by scene</li>
+              <li>Every claim checked against FDA cosmetic rules</li>
+              <li>If we can’t deliver an ad that passes our checks, the Creative Test comes back to you</li>
+            </ul>
+          </div>
+          <div style={{ marginTop: 24 }}>
+            <Button block id="cta" disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/produce-with-test`, {})) window.location.assign(`/produce/${projectId}`); }}>
+              {busy ? 'Starting…' : `Produce with 1 of ${testsLeft} Creative Test${testsLeft === 1 ? '' : 's'}`}
+            </Button>
+            <p className="ak-small ak-muted" style={{ textAlign: 'center' }}>Ready in about 10 minutes.</p>
+          </div>
+        </section>
+      ) : null}
+      {ready && !resumable && !v.project.revisionFree && !withTest ? (
+        <section className="ak-panel" style={{ marginTop: 40 }} id="offer">
+          <div className="ak-between" style={{ alignItems: 'start', flexWrap: 'wrap', gap: 24 }}>
+            <div>
+              <h2 className="ak-label">{v.plan.subscribed ? 'Make this ad outside your plan' : 'Make this ad'}</h2>
               <p className="ak-price">
                 {usd(q.priceMicros)}
                 {taste && q.referencePriceMicros ? <span className="ak-strike ak-muted" style={{ marginLeft: 12, fontSize: '0.5em' }}>{usd(q.referencePriceMicros)}</span> : null}
               </p>
-              <p className="ak-small ak-muted">{taste ? 'Intro price for your first ad. One-time — no subscription.' : 'One-time — no subscription.'}</p>
+              <p className="ak-small ak-muted">
+                {v.plan.subscribed
+                  ? 'You’ve used this period’s Creative Tests. A one-time payment for this ad — your plan doesn’t change.'
+                  : taste ? 'Intro price for your first ad. One-time — no subscription.' : 'One-time — no subscription.'}
+              </p>
               {taste && v.bonus.offered ? <p className="ak-small" style={{ margin: 0 }}>+ An alternate opening hook, free with this price</p> : null}
               {taste && q.expiresAt ? <OfferExpiry expiresAt={q.expiresAt} serverNow={v.serverNow} onExpire={() => { setExpired(true); refresh(); }} /> : null}
             </div>
@@ -874,9 +962,13 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           </div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && !resumable && !v.project.revisionFree ? (
+      {ready && !resumable && !v.project.revisionFree ? (
         <StickyCta watchId="cta" mobileOnly>
-          <LinkButton href={`/checkout/${projectId}`} block>Make my ad · {usd(q.priceMicros)}</LinkButton>
+          {withTest ? (
+            <Button block disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/produce-with-test`, {})) window.location.assign(`/produce/${projectId}`); }}>Produce with 1 Creative Test</Button>
+          ) : (
+            <LinkButton href={`/checkout/${projectId}`} block>Make my ad · {usd(q.priceMicros)}</LinkButton>
+          )}
         </StickyCta>
       ) : null}
 
@@ -890,18 +982,64 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           </form>
         ) : null}
       </Sheet>
-      <Sheet open={!!regen} onOpenChange={(o) => !o && setRegen(null)} title="Change this picture" description="Describe what to change. Your product stays exactly as it is.">
-        {regen ? (
+      <Sheet
+        open={!!regen}
+        onOpenChange={(o) => !o && setRegen(null)}
+        title="Change this picture"
+        description={
+          freeLeft > 0
+            ? `Free · ${freeLeft} of ${sb?.freeRegenerationsTotal ?? 3} changes left. Describe what to change — your product stays exactly as it is.`
+            : 'You’ve used the free picture changes for this storyboard.'
+        }
+      >
+        {regen && freeLeft > 0 ? (
           <form className="ak-stack" onSubmit={async (e) => { e.preventDefault(); if (await call(`/api/scenes/${regen.id}/regenerate`, { projectId, instruction: regen.text })) { setRegen(null); resume(); } }}>
             <label className="ak-field">
               <span className="ak-label">What to change</span>
               <textarea className="ak-textarea" maxLength={200} placeholder="e.g. warmer morning light, marble counter" value={regen.text} onChange={(e) => setRegen({ ...regen, text: e.target.value })} />
             </label>
             {err ? <p className="ak-error" role="alert">{err}</p> : null}
-            <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Sending…' : 'Redraw'}</Button>
+            <Button type="submit" disabled={busy || !regen.text.trim()}>{busy ? 'Sending…' : 'Redraw · free'}</Button>
           </form>
+        ) : regen ? (
+          <div className="ak-stack">
+            <p className="ak-small" style={{ margin: 0 }}>The words are still free to edit — use “Edit words” on any scene. The picture can be adjusted after production.</p>
+            <Button variant="secondary" onClick={() => setRegen(null)}>OK</Button>
+          </div>
         ) : null}
       </Sheet>
+    </Shell>
+  );
+}
+
+/**
+ * We failed to draw the storyboard (plan 03 P7 edge; standard §14 honesty): no offer and no checkout — the offer's
+ * clock starts only at STORYBOARD_READY (§5). The customer can try again or pick another idea; nothing was charged.
+ */
+function StoryboardFailed({ projectId, detail, onRetry }: { projectId: string; detail: string | null; onRetry: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<{ message: string; pickAnother: boolean } | null>(null);
+  async function retry() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/storyboard-retry`, {});
+      onRetry();
+    } catch (e) {
+      setErr({ message: (e as Error).message, pickAnother: !!(e as { details?: { pickAnother?: boolean } }).details?.pickAnother });
+    }
+    setBusy(false);
+  }
+  return (
+    <Shell step={3} title="We couldn’t finish this storyboard" sub="Nothing was charged. Try again, or pick another idea for this product.">
+      <div className="ak-stack" style={{ maxWidth: 560 }}>
+        {detail && !/nothing was charged/i.test(detail) ? <Banner tone="warn">{detail}</Banner> : null}
+        {err ? <Banner tone="risk">{err.message}</Banner> : null}
+        <div className="ak-row" style={{ flexWrap: 'wrap' }}>
+          {err?.pickAnother ? null : <Button disabled={busy} onClick={() => void retry()} id="cta">{busy ? 'Starting again…' : 'Try again'}</Button>}
+          <LinkButton href={`/concepts/${projectId}`} variant="secondary">Pick another idea</LinkButton>
+        </div>
+      </div>
     </Shell>
   );
 }
@@ -974,6 +1112,8 @@ export function CheckoutFlow({ projectId, publishableKey, supportEmail }: { proj
       })
       .catch((e) => {
         if ((e as { details?: { needsAccount?: boolean } }).details?.needsAccount) window.location.assign(`/login?next=${encodeURIComponent(`/checkout/${projectId}`)}`);
+        // A plan with Creative Tests left makes this ad with one of them (§5): back to the storyboard's test button.
+        else if ((e as { details?: { useCreativeTest?: boolean } }).details?.useCreativeTest) window.location.assign(`/storyboard/${projectId}#offer`);
         else if ((e as { status?: number }).status === 409 && /already/i.test((e as Error).message)) window.location.assign(`/produce/${projectId}`);
         else setErr((e as Error).message);
       });
@@ -1020,19 +1160,22 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
   const [confirmed, setConfirmed] = useState(false);
   const wasWaiting = useRef(false);
   const wait = v ? awaitingPayment(v) : null;
+  // Not in production yet (the storyboard is still being drawn, or is ready and nothing was paid or started): the
+  // storyboard page shows that, not an empty production ledger (A1 active jobs link here by state).
+  const prePayment = !!v && (['PRODUCT_UPLOADED', 'PRODUCT_ANALYZED', 'BRIEF_READY', 'CONCEPTS_READY', 'CONCEPT_SELECTED'].includes(v.project.state) || wait === 'unpaid');
   useEffect(() => {
-    if (v?.project.state === 'COMPLETE') window.location.replace(`/deliver/${projectId}`);
-  }, [v?.project.state, projectId]);
+    if (!v) return;
+    if (v.project.state === 'COMPLETE') window.location.replace(`/deliver/${projectId}`);
+    else if (prePayment) window.location.replace(projectRoute(v.project.state, projectId));
+  }, [v, prePayment, projectId]);
   useEffect(() => {
-    if (wait === 'unpaid') window.location.replace(`/storyboard/${projectId}`);
     if (wait === 'confirming') wasWaiting.current = true;
     else if (wasWaiting.current && v && PRODUCING.includes(v.project.state)) {
       wasWaiting.current = false;
       setConfirmed(true);
     }
-  }, [wait, v, projectId]);
-  if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
-  if (wait === 'unpaid') return <Loading />;
+  }, [wait, v]);
+  if (!v || prePayment) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
   const waitingPayment = wait === 'confirming';
   const paused = v.project.paused;
   const stopped = !paused && STOPPED.includes(v.project.state);

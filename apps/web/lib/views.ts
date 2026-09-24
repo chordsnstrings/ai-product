@@ -2,6 +2,7 @@ import { withTenant, type Tx } from '@arkiv/db';
 import {
   ANALYSIS_KEY_FACTS,
   assetUrl,
+  available,
   blockedLines,
   bonusHookDue,
   bonusHooks,
@@ -11,6 +12,7 @@ import {
   currentQuote,
   customerQaSummary,
   DELIVERY_HOLD_STATES,
+  FREE_FRAME_REGENERATIONS,
   IN_PRODUCTION,
   listClaims,
   listSteps,
@@ -43,7 +45,7 @@ export async function projectView(workspaceId: string, projectId: string) {
     const claims = await listClaims(tx, p.sku_id as string);
     const [fp] = await tx`select cutout_asset_id, label_text, package_type, closure from visual_fingerprints where sku_id = ${p.sku_id} and active`;
     const [maxBatch] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
-    const concepts = await tx`select id, idx, proposal, is_pick, pick_reason, batch from concepts where project_id = ${projectId} and batch = ${maxBatch!.b} order by idx`;
+    const concepts = await tx`select id, idx, proposal, is_pick, pick_reason, batch, gate_results from concepts where project_id = ${projectId} and batch = ${maxBatch!.b} order by idx`;
     let storyboard: Awaited<ReturnType<typeof storyboardBlock>> | null = null;
     if (p.storyboard_id) storyboard = await storyboardBlock(tx, p.storyboard_id as string);
     // Project-subject steps also hold queued concept requests ("concepts.batch.N"); production shows only its own.
@@ -53,6 +55,10 @@ export async function projectView(workspaceId: string, projectId: string) {
       .filter((s) => String(s.step_key).startsWith('concepts.batch.'))
       .sort((a, b) => Number(String(b.step_key).split('.').pop()) - Number(String(a.step_key).split('.').pop()))[0];
     const quote = await currentQuote(tx);
+    // A subscriber's storyboard is made with one of their plan's Creative Tests; the one-off price applies only
+    // when none are left ("outside your plan", §5).
+    const [sub] = await tx`select plan_code from subscriptions where workspace_id = ${workspaceId} and status in ('active','trialing','past_due') order by created_at desc limit 1`;
+    const creativeTestsLeft = Math.max(0, await available(tx, 'creative_test', workspaceId));
     const [purchase] = await tx`select status, kind, amount_micros from purchases where project_id = ${projectId} order by created_at desc limit 1`;
     let exports: { aspect: string; assetId: string; url: string; download: string }[] = [];
     // What in the delivered ad is AI-generated (standard §40), for the platform disclosure steps on delivery.
@@ -203,12 +209,27 @@ export async function projectView(workspaceId: string, projectId: string) {
       steps: skuSteps.map(stepJson),
       facts: factRows,
       claims: claims.map((c) => ({ id: c.id, wording: c.preferredWording, status: c.status, reason: c.blockReason, qualifier: c.mandatoryQualifier })),
-      concepts: concepts.map((c) => ({ ...(c.proposal as Proposal), id: c.id as string, idx: c.idx as string, isPick: c.is_pick as boolean, pickReason: c.pick_reason as string | null, batch: Number(c.batch) })),
+      concepts: concepts.map((c) => {
+        const dropped = droppedClaims(c.gate_results);
+        return {
+          ...(c.proposal as Proposal),
+          id: c.id as string,
+          idx: c.idx as string,
+          isPick: c.is_pick as boolean,
+          pickReason: c.pick_reason as string | null,
+          batch: Number(c.batch),
+          /** The idea leaned on a claim the Claims Vault can't support yet (plan 03 P5): the storyboard uses a compliant line. */
+          needsEvidence: dropped.length > 0,
+          droppedClaims: dropped,
+        };
+      }),
       /** Latest "try 3 more" request, drafted by the worker: the UI polls until it is done or failed. */
       conceptRequest: conceptStep ? { batch: Number(String(conceptStep.step_key).split('.').pop()), status: conceptStep.status as string, detail: (conceptStep.detail as string) ?? null } : null,
       storyboard,
       productionSteps: productionSteps.map(stepJson),
       quote,
+      /** The workspace's plan, for "Produce with 1 of N Creative Tests" instead of the one-off checkout. */
+      plan: { subscribed: !!sub, planCode: (sub?.plan_code as string | undefined) ?? null, creativeTestsLeft },
       purchase: purchase ? { status: purchase.status as string, kind: purchase.kind as string, amountMicros: Number(purchase.amount_micros) } : null,
       exports,
       // An offer bonus is shown only when the offer carries it (what is shown is what is delivered, §8).
@@ -220,6 +241,14 @@ export async function projectView(workspaceId: string, projectId: string) {
       upsell: { growthName: PLANS.GROWTH.name, growthTestsPerMonth: PLANS.GROWTH.creativeTestsPerMonth },
     };
   });
+}
+
+/** Claims the concept gate dropped because they aren't approved yet (older rows kept only the reasons). */
+function droppedClaims(gate: unknown): string[] {
+  const g = (gate ?? {}) as { droppedClaims?: unknown; reasons?: unknown };
+  if (Array.isArray(g.droppedClaims)) return g.droppedClaims.map(String).slice(0, 3);
+  const reasons = Array.isArray(g.reasons) ? (g.reasons as unknown[]).map(String) : [];
+  return reasons.map((r) => /^claim not approved: "(.*)"$/.exec(r)?.[1]).filter((x): x is string => !!x).slice(0, 3);
 }
 
 /** Honest "still working" copy for a slow step, from the estimate recorded when it started (plan 03 P3). */
@@ -250,9 +279,15 @@ async function storyboardBlock(tx: Tx, storyboardId: string) {
                          join scenes s on s.id = ps.subject_id where s.storyboard_id = ${storyboardId} and ps.step_key like 'frame.v%'
                          order by ps.subject_id, ps.started_at desc nulls last`;
   const regenByScene = new Map(regen.map((r) => [r.subject_id as string, { status: r.status as string, detail: (r.detail as string) ?? null }]));
+  // "Free · N of 3 left" (plan 03 P7, standard §13 "shows billable implications before render"): changes made plus
+  // changes still being drawn, the same count the server enforces.
+  const inflight = [...regenByScene.values()].filter((r) => r.status === 'pending' || r.status === 'active').length;
+  const used = v.scenes.reduce((n, s) => n + Number(s.free_regenerations_used), 0) + inflight;
   return {
     id: storyboardId,
     status: v.storyboard.status as string,
+    freeRegenerationsLeft: Math.max(0, FREE_FRAME_REGENERATIONS - used),
+    freeRegenerationsTotal: FREE_FRAME_REGENERATIONS,
     hook: (v.storyboard.hook_text as string) ?? null,
     cta: (v.storyboard.cta_text as string) ?? null,
     steps: steps.map(stepJson),

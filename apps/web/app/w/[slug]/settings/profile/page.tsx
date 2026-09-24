@@ -11,7 +11,7 @@ import { DeleteAccount, MeButton, NameForm, PasskeyRegister, PasswordSettings, S
 import { ThemeToggle } from '@/components/theme-toggle';
 import { parseTheme, THEME_COOKIE } from '@/lib/theme';
 
-export const metadata: Metadata = { title: 'Profile · Arkiv' };
+export const metadata: Metadata = { title: 'Profile' };
 
 const PROVIDERS = [
   { id: 'google', label: 'Google' },

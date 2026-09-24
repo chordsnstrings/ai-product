@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { z } from 'zod';
-import { globalTx } from '@arkiv/db';
-import { isFlagOn, type ClientFingerprint } from '@arkiv/core';
+import { globalTx, type Tx } from '@arkiv/db';
+import { idempotent, isFlagOn, type ClientFingerprint } from '@arkiv/core';
 import { DomainError, env, httpStatusFor } from '@arkiv/shared';
 import { currentRequestId, logger, setLogService, withLogContext } from '@arkiv/shared/log';
 
@@ -90,6 +90,31 @@ export async function body<T>(req: Request, schema: z.ZodType<T>): Promise<T> {
   if (!r.success) throw new DomainError('INVALID', r.error.issues[0]?.message ?? 'Invalid request', { issues: r.error.issues.slice(0, 5) });
   return r.data;
 }
+
+/**
+ * The request's Idempotency-Key header (standard §39 "every externally triggered create action receives an
+ * idempotency key scoped to workspace + operation"), or null when the client sent none. A malformed key is refused.
+ */
+export function idempotencyKeyOf(req: Request): string | null {
+  const k = req.headers.get('idempotency-key');
+  if (k == null || k === '') return null;
+  if (!/^[A-Za-z0-9._:-]{8,100}$/.test(k)) throw new DomainError('INVALID', 'Invalid Idempotency-Key');
+  return k;
+}
+
+/**
+ * Run a create once per (workspace, operation, key), inside the caller's tenant transaction: a replay with the same
+ * key and request returns the stored answer and creates nothing; the same key with a different request is a
+ * conflict. Without a key the create just runs (older clients, scripts). A create that fails stores nothing, so a
+ * retry with the same key runs again.
+ */
+export async function withIdempotency<T>(tx: Tx, workspaceId: string, operation: string, key: string | null, request: unknown, fn: () => Promise<T>): Promise<T> {
+  if (!key) return fn();
+  return (await idempotent(tx, workspaceId, operation, key, request, fn)).result;
+}
+
+/** What identifies an uploaded file in an idempotent request (its bytes are not hashed). */
+export const fileIdentity = (f: unknown) => (f instanceof File && f.size > 0 ? { name: f.name, size: f.size, type: f.type } : null);
 
 /** Who is asking, for the abuse detectors (plan 05 §15): IP, device hints and the ASN when the edge supplies one. */
 export function clientFingerprint(req: Request): ClientFingerprint {

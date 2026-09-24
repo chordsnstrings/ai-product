@@ -1,0 +1,12 @@
+{
+  "$comment": "First-load JS budgets (gzip kB) for the marketing and funnel routes (plan 06 Phase 0 D2), checked in CI by scripts/bundle-budget.ts after next build: today's size plus a little headroom, so a regression fails the build. Lower them as the bundles shrink. / and /for/<slug> are served by the static campaign page. targetKb is the design goal (plan 01: landing JS ≤ 90 kB) — reported, not enforced, while the framework runtime alone is above it.",
+  "routes": [
+    { "route": "/ and /for/[slug]", "entry": "(marketing)/lp/[slug]/[variant]/page", "maxKb": 190, "targetKb": 90 },
+    { "route": "/for/[slug] (preview)", "entry": "(marketing)/for/[slug]/page", "maxKb": 190 },
+    { "route": "/pricing", "entry": "(marketing)/pricing/page", "maxKb": 182 },
+    { "route": "/start/[projectId]", "entry": "(flow)/start/[projectId]/page", "maxKb": 205 },
+    { "route": "/concepts/[projectId]", "entry": "(flow)/concepts/[projectId]/page", "maxKb": 205 },
+    { "route": "/storyboard/[projectId]", "entry": "(flow)/storyboard/[projectId]/page", "maxKb": 205 },
+    { "route": "/checkout/[projectId]", "entry": "(flow)/checkout/[projectId]/page", "maxKb": 205 }
+  ]
+}

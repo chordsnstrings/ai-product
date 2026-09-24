@@ -5,7 +5,7 @@ import { currentUser } from '@/lib/session';
 import { LogoutButton } from '@/components/logout-button';
 import { AcceptInvite } from './accept';
 
-export const metadata: Metadata = { title: 'Invitation · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Invitation', robots: { index: false } };
 
 export default async function Page({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
