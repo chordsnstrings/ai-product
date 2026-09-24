@@ -6,7 +6,7 @@ import { authorize, settle } from './cost-governor';
 import { emit } from './events';
 import { ThemeSet } from './intel-schemas';
 import { mockThemes } from './mock-intel';
-import { llmJson } from './model-gateway';
+import { llmJson, routedLines } from './model-gateway';
 import { THEMES_SYSTEM } from './prompts';
 
 /**
@@ -71,8 +71,8 @@ export async function clusterThemes(ctx: TenantContext, skuId: string) {
   const signals = await withTenant(ws, (tx) => tx`select id, text, observed_at from customer_signals where sku_id = ${skuId}
                                                  order by observed_at desc nulls last limit 400`);
   if (signals.length < 3) return 0;
-  const auth = await withTenant(ws, (tx) =>
-    authorize(tx, ctx, { purpose: 'storyboard', lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 30_000, outputTokens: 2_000 }], idempotencyKey: `themes:${skuId}:${signals.length}:${new Date().toISOString().slice(0, 10)}` }),
+  const auth = await withTenant(ws, async (tx) =>
+    authorize(tx, ctx, { purpose: 'storyboard', lines: await routedLines(tx, ws, [{ task: 'customer_language.themes', kind: 'llm', inputTokens: 30_000, outputTokens: 2_000 }]), idempotencyKey: `themes:${skuId}:${signals.length}:${new Date().toISOString().slice(0, 10)}` }),
   );
   try {
     const texts = signals.map((s) => s.text as string);

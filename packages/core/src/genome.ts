@@ -6,7 +6,7 @@ import { authorize, settle } from './cost-governor';
 import { emit } from './events';
 import { Genome } from './intel-schemas';
 import { mockGenome } from './mock-intel';
-import { llmJson } from './model-gateway';
+import { llmJson, routedLines } from './model-gateway';
 import { enqueue, Queues } from './outbox';
 import { GENOME_SYSTEM } from './prompts';
 
@@ -38,8 +38,8 @@ export async function extractGenome(ctx: TenantContext, creativeId: string) {
   const cr = await withTenant(ws, async (tx) => (await tx`select * from creatives where id = ${creativeId}`)[0]);
   if (!cr || cr.genome) return false;
   const copy = String((cr.platform_refs as Record<string, unknown>)?.copy ?? '');
-  const auth = await withTenant(ws, (tx) =>
-    authorize(tx, ctx, { purpose: 'storyboard', lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 3_000, outputTokens: 600 }], idempotencyKey: `genome:${creativeId}` }),
+  const auth = await withTenant(ws, async (tx) =>
+    authorize(tx, ctx, { purpose: 'storyboard', lines: await routedLines(tx, ws, [{ task: 'genome.extract', kind: 'llm', inputTokens: 3_000, outputTokens: 600 }]), idempotencyKey: `genome:${creativeId}` }),
   );
   try {
     const r = await llmJson({

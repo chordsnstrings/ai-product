@@ -24,6 +24,13 @@ export interface AuthorizeInput {
   entitlement?: { unit: Exclude<LedgerUnit, 'usd_micros'>; amount: number; periodKey?: string | null } | null;
   ttlMinutes?: number;
   idempotencyKey: string;
+  /**
+   * Reserve even while `kill.renders` is on. Nothing is dispatched (the Model Gateway refuses renders while the
+   * switch is on); the caller holds the customer's place and queues (§44 "preserve reservation").
+   */
+  reserveWhileRendersPaused?: boolean;
+  /** Planning data stored with the estimate (e.g. a production's QA repair reserve) for a resumed run to read. */
+  meta?: Record<string, unknown>;
 }
 
 export interface Authorization {
@@ -67,7 +74,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     throw new DomainError('CONFLICT', 'Authorization already issued for this request', { authorizationId: existing.id });
   }
 
-  if (await isFlagOn(tx, 'kill.renders') && input.purpose !== 'free_preview' && input.purpose !== 'storyboard') {
+  if (!input.reserveWhileRendersPaused && input.purpose !== 'free_preview' && input.purpose !== 'storyboard' && (await isFlagOn(tx, 'kill.renders'))) {
     throw new DomainError('UNAVAILABLE', 'Production is paused for maintenance. Your place is held.');
   }
   if (input.purpose === 'free_preview' && (await isFlagOn(tx, 'kill.free_preview'))) {
@@ -132,7 +139,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
     insert into cost_authorizations (workspace_id, project_id, purpose, token_hash, idempotency_key, rate_table_versions,
       estimate, max_cost_micros, entitlement_unit, entitlement_amount, expires_at)
     values (${ctx.workspaceId}, ${input.projectId ?? null}, ${input.purpose}, ${hashToken(token)}, ${input.idempotencyKey},
-      ${tx.json(est.rateVersions)}, ${tx.json({ ...est, skuId: input.skuId ?? null } as never)}, ${est.totalMicros},
+      ${tx.json(est.rateVersions)}, ${tx.json({ ...(input.meta ?? {}), ...est, skuId: input.skuId ?? null } as never)}, ${est.totalMicros},
       ${input.entitlement?.unit ?? null}, ${input.entitlement?.amount ?? 0}, now() + make_interval(mins => ${ttl}))
     on conflict (workspace_id, idempotency_key) do nothing
     returning id`;
