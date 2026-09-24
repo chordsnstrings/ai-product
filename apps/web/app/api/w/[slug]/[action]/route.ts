@@ -14,7 +14,7 @@ import {
   connectSelectedAccounts,
   decideShopTransfer,
   requestShopTransfer,
-  createCreatorPack,
+  acceptCreatorFootage, createCreatorPack,
   createExperiment,
   decideConfounder,
   decideFact,
@@ -163,6 +163,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const r = await t((tx) => createCreatorPack(tx, ctx, experimentId));
       // The link is shown once: only its hash is stored.
       return json({ ok: true, id: r.id, url: new URL(`/pack/${r.token}`, env().APP_URL).toString(), expiresAt: r.expiresAt });
+    }
+    case 'creator-footage-accept': {
+      // §26: the merchant takes creator footage into the test it answers (Owner/Admin, rights attested on accept).
+      const { assetId } = await body(req, z.object({ assetId: uuid }));
+      const r = await t((tx) => acceptCreatorFootage(tx, ctx, assetId));
+      return json({ ok: true, ...r });
     }
     case 'creator-pack-revoke': {
       const { id } = await body(req, z.object({ id: uuid }));

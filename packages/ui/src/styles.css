@@ -384,3 +384,8 @@ button.ak-chip { cursor: pointer; }
 .ak-cell[data-signal='gathering'] { background: color-mix(in srgb, var(--stone) 10%, transparent); }
 .ak-cell[data-signal='weakening'] { background: color-mix(in srgb, var(--risk) 10%, transparent); }
 .ak-cell-glyph { margin-left: 4px; color: var(--ink-2); }
+
+/* Printable pages (plan 03 A7 Creator Pack): drop interactive-only parts and the site chrome on paper. */
+@media print {
+  .ak-no-print, .ak-sticky, body > * > header, body > * > footer { display: none !important; }
+}
