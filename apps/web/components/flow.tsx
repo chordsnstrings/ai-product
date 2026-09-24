@@ -620,7 +620,7 @@ export function WhyThis({ c, pickReason }: { c: Pick<ConceptCard, 'whyNow' | 'cu
         <dt>Why now</dt><dd>{c.whyNow}</dd>
         <dt>Evidence</dt><dd>{tensionSourceWords(c.customerTensionSource)}: {c.customerTension}</dd>
         <dt>The gap</dt><dd>It changes only the {String(c.primaryVariable).replace(/_/g, ' ')} to test the {String(c.angle).replace(/_/g, ' ').toLowerCase()} angle.</dd>
-        {pickReason ? <><dt>Our pick</dt><dd>{pickReason}</dd></> : null}
+        {pickReason ? <><dt>Why we’d test it first</dt><dd>{pickReason}</dd></> : null}
         <dt>If it loses</dt><dd>{c.ifTestFails}</dd>
       </dl>
     </details>
