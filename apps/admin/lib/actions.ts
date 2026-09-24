@@ -7,6 +7,12 @@ import {
   addTenantNote,
   approveClaim,
   assertBreakGlass,
+  confirmSkuExclusion,
+  escalateBlockedPattern,
+  keepClaimRestricted,
+  requestClaimEvidence,
+  resolveImpliedFlag,
+  reviewAsset,
   assertStaff,
   audit,
   blockClaim,
@@ -26,7 +32,11 @@ import {
   staffCtx,
   staffTenantCtx,
   evalDatasetFor,
-  GOLDEN,
+  jobErrorClass,
+  assertCandidatePrompt,
+  addGoldenCase,
+  retireGoldenCase,
+  DATASETS,
   importAdSpend,
   importProviderInvoice,
   parseAdSpendCsv,
@@ -117,6 +127,14 @@ function parseRoles(raw: string): StaffRole[] {
   const unknown = roles.filter((r) => !(StaffRole as readonly string[]).includes(r));
   if (unknown.length) throw new DomainError('INVALID', `Unknown role ${unknown.join(', ')}. Roles: ${StaffRole.join(', ')}.`);
   return roles as StaffRole[];
+}
+
+/** Every routed call is priced before dispatch (Cost Governor): a candidate model needs a published rate. */
+async function assertPublishedRate(task: string, model: string) {
+  const [r] = await withAdmin((tx) => tx`select r.provider, exists (select 1 from provider_rate_tables t where t.provider = r.provider and t.model = ${model} and t.status = 'published' and t.effective_from <= now()) as priced
+                                         from model_routes r where r.task = ${task}`);
+  if (!r) throw new DomainError('NOT_FOUND', 'Unknown route');
+  if (!r.priced) throw new DomainError('CONFLICT', `No published rate for ${r.provider as string}/${model}. Publish one first; calls can't be priced without it.`);
 }
 
 async function ownerEmails(workspaceId: string) {
@@ -453,11 +471,15 @@ export const ACTIONS = {
     schema: z.object({ task: z.string(), open: z.boolean(), reopenMinutes: z.coerce.number().int().min(1).max(7 * 24 * 60).optional(), reason }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        const [b] = await tx`select circuit_open, circuit_until from model_routes where task = ${i.task}`;
+        const [b] = await tx`select circuit_open, circuit_until, circuit_auto, circuit_reason from model_routes where task = ${i.task}`;
         if (!b) throw new DomainError('NOT_FOUND', 'Unknown route');
-        const [a0] = await tx`update model_routes set circuit_open = ${i.open},
+        // A circuit staff open (or touch) is theirs: the breaker sweep no longer closes it on its own. Re-opening an
+        // open circuit only updates its ETA; the error window restarts at every open/close.
+        const [a0] = await tx`update model_routes set circuit_open = ${i.open}, circuit_auto = false,
+                                circuit_reason = ${i.open ? i.reason : null},
+                                circuit_changed_at = case when circuit_open is distinct from ${i.open} then now() else circuit_changed_at end,
                                 circuit_until = ${i.open && i.reopenMinutes ? tx`now() + make_interval(mins => ${i.reopenMinutes})` : i.open ? tx`circuit_until` : null},
-                                updated_at = now() where task = ${i.task} returning circuit_open, circuit_until`;
+                                updated_at = now() where task = ${i.task} returning circuit_open, circuit_until, circuit_auto, circuit_reason`;
         await audit(tx, s, i.open ? 'route.circuit_open' : 'route.circuit_close', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: a0 });
       }),
   }),
@@ -504,8 +526,10 @@ export const ACTIONS = {
         });
       }
       // Plan 05 §10: a passing golden-set eval for exactly this template × model within 7 days.
-      const model = i.model ?? (cur.model as string);
-      const promptVersion = i.promptVersion ?? (cur.prompt_version as string);
+      const model = i.model || (cur.model as string);
+      const promptVersion = i.promptVersion || (cur.prompt_version as string);
+      // Git is the source of prompts (plan 05 §11): only a registered version of the route's template can go live.
+      assertCandidatePrompt(cur.prompt_version as string, promptVersion);
       const dataset = evalDatasetFor(i.task);
       if (!dataset) throw new DomainError('CONFLICT', `No golden dataset covers ${i.task} yet. Add one (plan 05 §11) before changing this route.`);
       const [ev] = await withAdmin((tx) => tx`select id from eval_runs where task = ${i.task} and model = ${model} and prompt_version = ${promptVersion} and dataset = ${dataset}
@@ -577,15 +601,20 @@ export const ACTIONS = {
       let model: string;
       let promptVersion: string;
       let dataset: string;
-      if (i.task) {
-        const [route] = await withAdmin((tx) => tx`select model, prompt_version from model_routes where task = ${i.task!}`);
+      // A model dataset picked on its own runs on its route's live template × model.
+      const routeTask = i.task || (i.dataset ? DATASETS[i.dataset]?.task : undefined);
+      if (routeTask) {
+        const [route] = await withAdmin((tx) => tx`select model, prompt_version from model_routes where task = ${routeTask}`);
         if (!route) throw new DomainError('NOT_FOUND', 'Unknown route');
-        const ds = evalDatasetFor(i.task);
-        if (!ds) throw new DomainError('CONFLICT', `No golden dataset covers ${i.task} yet.`);
-        if (i.dataset && i.dataset !== ds) throw new DomainError('INVALID', `${i.task} is gated by the ${ds} dataset.`);
-        [task, model, promptVersion, dataset] = [i.task, i.model || (route.model as string), i.promptVersion || (route.prompt_version as string), ds];
+        const ds = evalDatasetFor(routeTask);
+        if (!ds) throw new DomainError('CONFLICT', `No golden dataset covers ${routeTask} yet.`);
+        if (i.dataset && i.dataset !== ds) throw new DomainError('INVALID', `${routeTask} is gated by the ${ds} dataset.`);
+        [task, model, promptVersion, dataset] = [routeTask, i.model || (route.model as string), i.promptVersion || (route.prompt_version as string), ds];
+        assertCandidatePrompt(route.prompt_version as string, promptVersion);
+        // Model runs are priced before dispatch like any call: the candidate needs a published rate.
+        if (DATASETS[ds]?.kind === 'model') await assertPublishedRate(routeTask, model);
       } else {
-        if (!i.dataset || !GOLDEN[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset');
+        if (!i.dataset || !DATASETS[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset');
         [task, model, promptVersion, dataset] = [i.dataset, 'deterministic', 'rules', i.dataset];
       }
       const [r] = await withAdmin((tx) => tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, ${promptVersion}, ${model}, ${dataset}, 'queued', ${s.staffId}) returning id`);
@@ -594,9 +623,56 @@ export const ACTIONS = {
     },
   }),
 
+  /* Golden datasets (plan 05 §11): a synthetic reproduction, or — under break-glass, with the tenant's explicit
+     consent — a case from a production failure (QA disagreement, claims decision). */
+  'golden.add': a({
+    perm: 'golden.add',
+    schema: z.object({
+      dataset: z.string(),
+      input: z.string().trim().min(1).max(4000),
+      expected: z.string().trim().min(1).max(60),
+      note: z.string().max(500).optional(),
+      source: z.enum(['synthetic', 'production']),
+      workspaceId: uuid.optional(),
+      consentRef: z.string().max(200).optional(),
+      projectId: uuid.optional(),
+      claimId: uuid.optional(),
+    }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const origin = { ...(i.projectId ? { projectId: i.projectId } : {}), ...(i.claimId ? { claimId: i.claimId } : {}) };
+        const id = await addGoldenCase(tx, s, { ...i, origin });
+        return { id, message: `Added to ${i.dataset}. The next eval of that dataset includes it.` };
+      }),
+  }),
+  'golden.retire': a({ perm: 'golden.add', schema: z.object({ id: uuid, reason }), run: (s, i) => withAdmin((tx) => retireGoldenCase(tx, s, i.id, i.reason)) }),
+
   /* ── Jobs ── */
   // SUPPORT may retry no-spend queues only; requestOpsCommand enforces the queue check.
-  'job.retry': a({ perm: 'jobs.retry_nospend', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.retry', i, i.reason).then(() => ({ message: 'Retry queued' })) }),
+  // A spending queue's retry needs the fresh estimate the operator saw (confirmEstimateMicros), or, when the job never
+  // reached an authorization, an explicit confirmSpend; requestOpsCommand re-prices at current rates and checks.
+  'job.retry': a({
+    perm: 'jobs.retry_nospend',
+    schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), confirmEstimateMicros: z.coerce.number().int().min(0).optional(), confirmSpend: z.boolean().optional(), reason }),
+    run: (s, i) => requestOpsCommand(s, 'job.retry', i, i.reason).then(() => ({ message: 'Retry queued' })),
+  }),
+  // §12 "bulk retry by error class": the failed jobs of one no-spend queue whose error has this class.
+  'job.bulk_retry': a({
+    perm: 'jobs.manage',
+    reauth: true,
+    schema: z.object({ queue: z.string(), errorClass: z.string().min(1).max(120), reason }),
+    run: async (s, i) => {
+      const failed = await withAdmin((tx) =>
+        tx.savepoint((sp) => sp`select id, output from pgboss.job where name = ${i.queue} and state = 'failed' order by completed_on desc limit 1000`).catch(() => {
+          throw new DomainError('UNAVAILABLE', 'Queue tables aren’t visible yet — the worker grants read access when it starts.');
+        }),
+      );
+      const jobIds = failed.filter((j) => jobErrorClass(j.output) === i.errorClass).map((j) => j.id as string).slice(0, 500);
+      if (!jobIds.length) throw new DomainError('NOT_FOUND', 'No failed jobs of that class on this queue.');
+      await requestOpsCommand(s, 'job.bulk_retry', { queue: i.queue, errorClass: i.errorClass, jobIds }, i.reason);
+      return { message: `Retry of ${jobIds.length} job${jobIds.length === 1 ? '' : 's'} queued (held workspaces are skipped).` };
+    },
+  }),
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),
   'dlq.requeue': a({ perm: 'jobs.manage', reauth: true, schema: z.object({ queue: z.string(), limit: z.number().int().min(1).max(1000).default(100), reason }), run: (s, i) => requestOpsCommand(s, 'dlq.requeue', { queue: i.queue, limit: i.limit }, i.reason).then(() => ({ message: 'Redrive queued' })) }),
 
@@ -629,10 +705,22 @@ export const ACTIONS = {
   /* ── Claims (tenant routed these to our compliance team; views are audited as content access) ── */
   'claim.decide': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('TIKTOK,META'), markets: z.string().optional(), reason }),
+    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock', 'keep_restricted', 'request_evidence']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('TIKTOK,META'), markets: z.string().optional(), reason }),
     run: async (s, i) => {
       if (i.decision === 'unblock') return requestOrExecute(s, 'claim.unblock', { workspaceId: i.workspaceId, claimId: i.claimId }, i.reason);
+      if (i.decision === 'keep_restricted' || i.decision === 'request_evidence') {
+        // §14: the claim stays restricted either way; "request more evidence" emails the brand what we need.
+        const r = await withAdmin((tx) => (i.decision === 'keep_restricted' ? keepClaimRestricted : requestClaimEvidence)(tx, s, i.workspaceId, i.claimId, i.reason));
+        const url = appUrl(await workspaceSlug(i.workspaceId), `/products/${r.skuId}/claims`);
+        for (const to of await ownerEmails(i.workspaceId)) {
+          if (i.decision === 'request_evidence') await sendEmail('claim_evidence_request', to, { claim: r.claim, productName: r.productName, note: i.reason, url }, { idempotencyKey: `claimev:${i.claimId}:${newId()}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+          else await sendEmail('claim_review_result', to, { claim: r.claim, outcome: `Kept restricted: ${i.reason}`, url }, { idempotencyKey: `claimrev:${i.claimId}:keep:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+        }
+        return { message: i.decision === 'request_evidence' ? 'Evidence requested; the brand has been emailed. The claim stays restricted meanwhile.' : 'Kept restricted; the brand sees the reason in its Claims Vault.' };
+      }
       return withAdmin(async (tx) => {
+        const [owned] = await tx`select 1 from claims where id = ${i.claimId} and workspace_id = ${i.workspaceId}`;
+        if (!owned) throw new DomainError('NOT_FOUND', 'Claim not found');
         const ctx = { workspaceId: i.workspaceId, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, actor: { kind: 'staff' as const, id: s.staffId }, requestId: newId() };
         if (i.decision === 'block') await blockClaim(tx, ctx, i.claimId, i.reason);
         else {
@@ -648,6 +736,49 @@ export const ACTIONS = {
         const url = c ? appUrl(c.slug as string, `/products/${c.sku_id as string}/claims`) : `${env().APP_URL}/app`;
         for (const to of await ownerEmails(i.workspaceId)) await sendEmail('claim_review_result', to, { claim: c?.preferred_wording as string, outcome: i.decision === 'block' ? `Blocked: ${i.reason}` : 'Approved for use', url }, { idempotencyKey: `claimrev:${i.claimId}:${i.decision}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
       });
+    },
+  }),
+  /* §14 queues: implied-claim flags, repeated blocked claims, drug/OTC hits, before/after and minors media. */
+  'implied_flag.resolve': a({
+    perm: 'claims.review',
+    schema: z.object({ workspaceId: uuid, projectId: uuid, verdict: z.enum(['confirmed', 'dismissed']), reason }),
+    run: (s, i) => withAdmin((tx) => resolveImpliedFlag(tx, s, i.workspaceId, i.projectId, i.verdict, i.reason)).then(() => ({ message: i.verdict === 'confirmed' ? 'Confirmed: follow up with the brand before this ad runs.' : 'Dismissed as a false positive.' })),
+  }),
+  'blocked_pattern.escalate': a({
+    perm: 'claims.review',
+    schema: z.object({ workspaceId: uuid, reason }),
+    run: async (s, i) => {
+      const r = await withAdmin((tx) => escalateBlockedPattern(tx, s, i.workspaceId, i.reason));
+      const [w] = await withAdmin((tx) => tx`select name, slug from workspaces where id = ${i.workspaceId}`);
+      for (const to of await ownerEmails(i.workspaceId)) {
+        await sendEmail('claims_guidance', to, { workspaceName: (w?.name as string) ?? 'your workspace', blocked: r.blocked, examples: r.examples, url: appUrl(w!.slug as string, '/products') }, { idempotencyKey: `claims-guidance:${i.workspaceId}:${new Date().toISOString().slice(0, 10)}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      }
+      return { message: `Escalated; guidance sent to the brand’s owners (${r.blocked} blocked claims in 30 days).` };
+    },
+  }),
+  'sku.confirm_exclusion': a({
+    perm: 'claims.review',
+    schema: z.object({ workspaceId: uuid, skuId: uuid, reason }),
+    run: async (s, i) => {
+      const r = await withAdmin((tx) => confirmSkuExclusion(tx, s, i.workspaceId, i.skuId, i.reason));
+      const url = appUrl(await workspaceSlug(i.workspaceId), '/products');
+      for (const to of await ownerEmails(i.workspaceId)) await sendEmail('sku_out_of_scope', to, { productName: r.productName, reason: r.reason, url }, { idempotencyKey: `out-of-scope:${i.skuId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      return { message: 'Exclusion confirmed; the owner was told the product is outside V1 scope.' };
+    },
+  }),
+  'asset.review': a({
+    perm: 'claims.review',
+    schema: z.object({ workspaceId: uuid, assetId: uuid, verdict: z.enum(['approved', 'rejected']), reason }),
+    run: async (s, i) => {
+      const r = await withAdmin(async (tx) => {
+        // Looking at the media is looking at tenant content: break-glass first (plan 05 §0.3).
+        await assertBreakGlass(tx, s, i.workspaceId, `media review ${i.assetId}`);
+        return reviewAsset(tx, s, i.workspaceId, i.assetId, i.verdict, i.reason);
+      });
+      const url = appUrl(await workspaceSlug(i.workspaceId), r.skuId ? `/products/${r.skuId}` : '/products');
+      const note = i.verdict === 'approved' ? 'Our team checked it and it can be used in your ads.' : 'Our team checked it: it shows a before/after comparison or a person who may be under 18, which we can’t use in ads. Your other photos are unaffected.';
+      for (const to of await ownerEmails(i.workspaceId)) await sendEmail('media_review_result', to, { productName: r.productName, outcome: i.verdict, note, url }, { idempotencyKey: `media-review:${i.assetId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      return { message: i.verdict === 'approved' ? 'Approved: the media can be used.' : 'Rejected: it is never used in production.' };
     },
   }),
   'claim.check': a({ perm: 'claims.review', schema: z.object({ text: z.string().min(1).max(300) }), run: async (_s, i) => ({ message: JSON.stringify(classifyClaim(i.text)) }) }),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { shouldMaskPii } from '@arkiv/core';
-import { maskEmail, maskIp, maskName, maskText, maskUserAgent, piiView } from './mask';
+import { maskEmail, maskIp, maskJobPayload, maskName, maskText, maskUserAgent, piiView } from './mask';
 
 describe('PII masking for SUPPORT (plan 05 §0.2)', () => {
   it('masks emails, IPs, devices and names', () => {
@@ -25,5 +25,20 @@ describe('PII masking for SUPPORT (plan 05 §0.2)', () => {
     expect(shouldMaskPii(['FINANCE'])).toBe(false);
     expect(shouldMaskPii(['SUPER_ADMIN'])).toBe(false);
     expect(shouldMaskPii(['SUPPORT', 'ANALYST'])).toBe(true);
+  });
+});
+
+describe('job payloads on the job detail page (plan 05 §12)', () => {
+  type Tree = { [k: string]: Tree & string };
+  it('always redacts secrets, masks personal fields, and masks free text for masked viewers', () => {
+    const data = { workspaceId: 'ws-1', projectId: 'p-1', token: 'abc', apiKey: 'k', nested: { authorization: 'Bearer x', email: 'jane@acme.com', phone: '+15551234567' }, note: 'call jane@acme.com', list: [{ password: 'p' }] };
+    const clear = maskJobPayload(data, false) as Tree;
+    expect(clear).toMatchObject({ workspaceId: 'ws-1', projectId: 'p-1', token: '[redacted]', apiKey: '[redacted]', note: 'call jane@acme.com' });
+    expect(clear.nested).toMatchObject({ authorization: '[redacted]', email: 'j•••@a•••.com' });
+    expect(clear.nested!.phone).not.toContain('555123');
+    expect(JSON.stringify(clear.list)).toBe('[{"password":"[redacted]"}]');
+    const masked = maskJobPayload(data, true) as Tree;
+    expect(masked.note).toBe('call j•••@a•••.com');
+    expect(masked.workspaceId).toBe('ws-1');
   });
 });

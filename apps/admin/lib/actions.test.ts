@@ -553,3 +553,69 @@ describe('growth and finance consoles (plan 05 §5–§10)', () => {
     }
   });
 });
+
+describe('compliance queues (plan 05 §14)', () => {
+  it('keeps a restricted claim restricted, requests evidence by email, and never touches another workspace’s claim', async () => {
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const [c] = await ownerPool()`insert into claims (workspace_id, sku_id, canonical_meaning, preferred_wording, claim_category, risk_level, status, origin)
+                                  values (${t.workspaceId}, ${sku}, 'reduces redness', 'Clinically proven to reduce redness', 'efficacy', 'high', 'RESTRICTED', 'merchant') returning id`;
+    const comp = await staff(['COMPLIANCE']);
+    devOutbox.length = 0;
+    const r = await act(comp, 'claim.decide', { workspaceId: t.workspaceId, claimId: c!.id, decision: 'request_evidence', reason: 'Send the clinical study summary.' });
+    expect(String(r.message)).toMatch(/Evidence requested/);
+    expect(devOutbox.find((m) => m.template === 'claim_evidence_request')).toMatchObject({ to: t.email, data: { claim: 'Clinically proven to reduce redness', note: 'Send the clinical study summary.' } });
+    await act(comp, 'claim.decide', { workspaceId: t.workspaceId, claimId: c!.id, decision: 'keep_restricted', reason: 'Study used a different formula.' });
+    expect(devOutbox.find((m) => m.template === 'claim_review_result')).toMatchObject({ data: { outcome: 'Kept restricted: Study used a different formula.' } });
+    const [after] = await ownerPool()`select status, compliance_note from claims where id = ${c!.id}`;
+    expect(after).toEqual({ status: 'RESTRICTED', compliance_note: 'Study used a different formula.' });
+    const other = await makeTenant();
+    await expect(act(comp, 'claim.decide', { workspaceId: other.workspaceId, claimId: c!.id, decision: 'block', reason: 'wrong tenant' })).rejects.toThrow(/not found/);
+    expect((await ownerPool()`select status from claims where id = ${c!.id}`)[0]!.status).toBe('RESTRICTED');
+  });
+
+  it('confirms an out-of-scope SKU and tells the owner; media decisions need break-glass', async () => {
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId, 'Clear Skin Acne Gel');
+    await ownerPool()`update skus set status = 'rejected', reject_reason = 'Acne treatments are OTC drugs' where id = ${sku}`;
+    const comp = await staff(['COMPLIANCE']);
+    devOutbox.length = 0;
+    await act(comp, 'sku.confirm_exclusion', { workspaceId: t.workspaceId, skuId: sku, reason: 'benzoyl peroxide listed' });
+    expect(devOutbox.find((m) => m.template === 'sku_out_of_scope')).toMatchObject({ to: t.email, data: { productName: 'Clear Skin Acne Gel' } });
+    const [a] = await ownerPool()`insert into assets (workspace_id, sku_id, kind, storage_key, mime, bytes, checksum_sha256, source, review_status, review_flags)
+                                  values (${t.workspaceId}, ${sku}, 'product_photo', ${`t/${t.workspaceId}/x-${newId()}`}, 'image/jpeg', 1, 'x', 'upload', 'pending', ${ownerPool().json({ beforeAfter: true, possibleMinor: false, sources: ['vision'] })}) returning id`;
+    await expect(act(comp, 'asset.review', { workspaceId: t.workspaceId, assetId: a!.id, verdict: 'rejected', reason: 'before/after' })).rejects.toThrow(/break-glass/);
+    await startBreakGlass(comp, t.workspaceId, { reasonKind: 'compliance_review', reason: 'before/after media review' });
+    await act(comp, 'asset.review', { workspaceId: t.workspaceId, assetId: a!.id, verdict: 'rejected', reason: 'before/after' });
+    expect((await ownerPool()`select review_status from assets where id = ${a!.id}`)[0]!.review_status).toBe('rejected');
+    expect(devOutbox.find((m) => m.template === 'media_review_result')).toMatchObject({ data: { outcome: 'rejected' } });
+  });
+});
+
+describe('prompts, evals and golden sets (plan 05 §11)', () => {
+  it('runs a model dataset on its route, refuses unregistered prompt versions, and adds golden cases', async () => {
+    const eng = await staff(['ENGINEERING']);
+    await act(eng, 'eval.run', { dataset: 'extract.packaging' });
+    const [run] = await ownerPool()`select task, model, prompt_version, dataset from eval_runs order by created_at desc limit 1`;
+    expect(run).toMatchObject({ task: 'extract.product_facts', dataset: 'extract.packaging', prompt_version: 'extract-product@1.1.0' });
+    await expect(act(eng, 'eval.run', { task: 'extract.product_facts', promptVersion: 'extract-product@7.0.0' })).rejects.toThrow(/registered version/);
+    await expect(act(eng, 'eval.run', { task: 'extract.product_facts', model: 'unpriced-model' })).rejects.toThrow(/No published rate/);
+    await expect(act(eng, 'route.update', { task: 'creative_director.storyboard', rolloutPct: '5', promptVersion: 'storyboard@3.0.0', reason: 'typo' })).rejects.toThrow(/registered version/);
+    const r = await act(eng, 'golden.add', { dataset: 'reviews.deceptive', input: 'I swear my wrinkles vanished.', expected: 'block', source: 'synthetic' });
+    expect(String(r.message)).toMatch(/Added to reviews.deceptive/);
+    await act(eng, 'golden.retire', { id: r.id, reason: 'duplicate case' });
+    expect((await ownerPool()`select retired_at is not null as retired from golden_cases where id = ${r.id as string}`)[0]!.retired).toBe(true);
+  });
+
+  it('a manual circuit is staff-owned: the breaker never closes it on its own', async () => {
+    const ops = await staff(['OPS']);
+    try {
+      await ownerPool()`update model_routes set circuit_auto = true where task = 'video.scene'`;
+      await act(ops, 'route.circuit', { task: 'video.scene', open: true, reopenMinutes: 30, reason: 'provider incident' });
+      const [r] = await ownerPool()`select circuit_open, circuit_auto, circuit_reason, circuit_changed_at is not null as changed from model_routes where task = 'video.scene'`;
+      expect(r).toEqual({ circuit_open: true, circuit_auto: false, circuit_reason: 'provider incident', changed: true });
+    } finally {
+      await ownerPool()`update model_routes set circuit_open = false, circuit_auto = false, circuit_until = null, circuit_reason = null, circuit_changed_at = null where task = 'video.scene'`;
+    }
+  });
+});
