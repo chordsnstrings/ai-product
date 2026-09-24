@@ -301,18 +301,53 @@ async function planRun(
   scenes: SceneRow[],
   versions: VersionRow[],
   imagery: Awaited<ReturnType<typeof productImagery>>,
-): Promise<{ routes: ProductionRoutes; rates: Map<string, RateTable>; plan: ProductionPlan }> {
+  opts: { apply?: boolean } = {},
+): Promise<{ routes: ProductionRoutes; rates: Map<string, RateTable>; plan: ProductionPlan; replanned: string[] }> {
   const routes = await productionRoutes(tx, ws);
   const rates = await loadRates(tx);
   const ownPlates = new Set(versions.filter((v) => v.kind === 'frame' && v.lineage?.projectId === projectId && v.status === 'accepted' && v.lineage?.plateAssetId).map((v) => v.scene_id));
   const wantsPlate = (s: SceneRow) => s.production_mode === 'STRICT_COMPOSITE' && s.purpose !== 'cta' && !!imagery.cutout?.keyed && !!routes.plate && !ownPlates.has(s.id);
   const voChars = scenes.reduce((n, s) => n + ((s.spoken_line as string | null)?.trim().length ?? 0), 0);
-  const plan = planProduction(scenes, voChars, routes, rates, {
-    reuse: new Set(reusableRenders(scenes, versions).keys()),
-    plates: scenes.filter(wantsPlate).length,
-    ceilingMicros: CEILING_PURPOSES.includes(purpose) ? COST_LIMITS.CREATIVE_TEST_CEILING : null,
-  });
-  return { routes, rates, plan };
+  // The class ceiling, or a staff-approved override of it for this project (§44 commercial policy; cost-governor.ts).
+  const [ov] = await tx`select ceiling_override_micros from projects where id = ${projectId} and workspace_id = ${ws}`;
+  const ceilingMicros = CEILING_PURPOSES.includes(purpose) ? Math.max(COST_LIMITS.CREATIVE_TEST_CEILING, Number(ov?.ceiling_override_micros ?? 0)) : null;
+  const reuse = new Set(reusableRenders(scenes, versions).keys());
+  const planFor = (rows: SceneRow[]) => planProduction(rows, voChars, routes, rates, { reuse, plates: rows.filter(wantsPlate).length, ceilingMicros });
+  let plan = planFor(scenes);
+  // §44 "Model price doubles": a paid promise whose plan no longer fits its class ceiling at today's rates (the
+  // rates rose after the storyboard was approved) is re-planned within it first — the lowest-priority generated
+  // shots become the exact product on a generated setting (hybrid) — rather than stopping the ad. Renders already
+  // accepted are kept. The merchant sees why on the scene (planner_reason).
+  const replanned: string[] = [];
+  if (ceilingMicros != null && estimate(rates, plan.lines).totalMicros > ceilingMicros) {
+    const facts = { transparency: null, referenceViews: 0, keyedCutout: !!imagery.cutout?.keyed, videoAvailable: true, remixFootage: false };
+    const planned = scenes.map((sc) => ({ mode: (reuse.has(sc.id) ? 'STRICT_COMPOSITE' : sc.production_mode) as ProductionMode, reason: '' }));
+    const withModes = (modes: readonly ProductionMode[]) => scenes.map((sc, i) => (reuse.has(sc.id) ? sc : { ...sc, production_mode: modes[i]! }));
+    const fitted = fitCeiling(
+      scenes.map((sc) => ({ purpose: sc.purpose, durationMs: sc.duration_ms, productionMode: sc.production_mode })),
+      planned,
+      (modes) => estimate(rates, planFor(withModes(modes)).lines).totalMicros,
+      ceilingMicros,
+      facts,
+    );
+    fitted.forEach((f, i) => {
+      const sc = scenes[i]!;
+      if (reuse.has(sc.id) || f.mode === sc.production_mode) return;
+      replanned.push(sc.id);
+      if (opts.apply) {
+        sc.production_mode = f.mode;
+        (sc as SceneRow & { planner_reason?: string }).planner_reason = f.reason;
+      }
+    });
+    if (replanned.length) plan = planFor(opts.apply ? scenes : withModes(fitted.map((f) => f.mode)));
+    if (opts.apply) {
+      for (const id of replanned) {
+        const sc = scenes.find((x) => x.id === id)!;
+        await tx`update scenes set production_mode = ${sc.production_mode}, planner_reason = ${(sc as SceneRow & { planner_reason?: string }).planner_reason ?? null} where id = ${id} and workspace_id = ${ws}`;
+      }
+    }
+  }
+  return { routes, rates, plan, replanned };
 }
 
 /** Load what planRun needs for a project's current storyboard (null when there is none yet). */
@@ -590,7 +625,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   let plan: ProductionPlan;
   try {
     ({ auth, routes, plan } = await withTenant(ws, async (tx) => {
-      const { routes, plan } = await planRun(tx, ws, projectId, purpose, scenes, versions, imagery);
+      const { routes, plan, replanned } = await planRun(tx, ws, projectId, purpose, scenes, versions, imagery, { apply: true });
       const [cur] = p.authorization_id ? await tx`select id, status from cost_authorizations where id = ${p.authorization_id} for update` : [];
       let a: { authorizationId: string; token: string } | null = null;
       if (cur?.status === 'active') {
@@ -623,7 +658,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       } else {
         await tx`update projects set authorization_id = ${a.authorizationId} where id = ${projectId}`;
       }
-      await step(tx, ws, projectId, 'prepare', 'done', `${scenes.length} scenes planned`);
+      await step(tx, ws, projectId, 'prepare', 'done', replanned.length ? `${scenes.length} scenes planned · ${replanned.length} shot${replanned.length === 1 ? '' : 's'} now use your exact product on a generated setting to stay within this ad’s cost limit` : `${scenes.length} scenes planned`);
       await beat(tx, ws, projectId, a.authorizationId);
       return { auth: a, routes, plan };
     }));
@@ -632,7 +667,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     if (e instanceof DomainError && (e.code === 'PAYMENT_REQUIRED' || e.code === 'GATE_BLOCKED')) {
       // A Cost Governor refusal is written for the customer (what to do next); the code says which kind it is.
-      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: e.message, code: e.code === 'PAYMENT_REQUIRED' ? 'entitlement' : 'gate_blocked' }));
+      // A paid ad stopped at its class ceiling (provider rates rose after purchase, even after re-planning): our team
+      // decides (a staff-approved override, §44 commercial policy); the customer is told plainly, never charged again.
+      const atCeiling = e.code === 'GATE_BLOCKED' && CEILING_PURPOSES.includes(purpose) && (e.details as { ceilingMicros?: number } | undefined)?.ceilingMicros != null;
+      const reason = atCeiling ? 'Producing this ad now costs more than we planned. Our team is on it and will get it made — you won’t be charged again. Try again later, or contact support.' : e.message;
+      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason, code: e.code === 'PAYMENT_REQUIRED' ? 'entitlement' : 'gate_blocked' }));
       return 'failed';
     }
     // Anomaly hold / open circuit / unpriceable route before anything was reserved: pause and try again later.

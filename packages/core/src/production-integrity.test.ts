@@ -165,6 +165,50 @@ describe('provider moderation (§44 "model moderation false positive": edge-44-0
   }, 300_000);
 });
 
+describe('rates rose after the customer paid (§44 "model price doubles": edge-44-07)', () => {
+  it('re-plans within the ceiling instead of stopping the paid ad, and says why on the scene', async () => {
+    const r = await storyboardReady();
+    await ownerPool()`update scenes set production_mode = 'GENERATIVE_INTERACTION' where storyboard_id = ${r.storyboardId} and purpose not in ('cta', 'product_reveal')`;
+    await approve(r);
+    try {
+      // Video now costs four times as much: the approved plan no longer fits the Creative Test ceiling.
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        select provider, model, 2, unit, jsonb_build_object('per_second_720p', (rates->>'per_second_720p')::bigint * 4, 'per_second_1080p', (rates->>'per_second_1080p')::bigint * 4),
+                               now() - interval '1 minute', 'published'
+                        from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 1`;
+      expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+      const scenes = await ownerPool()`select production_mode, planner_reason from scenes where storyboard_id = ${r.storyboardId} and purpose not in ('cta', 'product_reveal')`;
+      const hybrid = scenes.filter((s) => s.production_mode === 'HYBRID');
+      expect(hybrid.length).toBeGreaterThan(0);
+      expect(hybrid.every((s) => /cost limit/.test(s.planner_reason as string))).toBe(true);
+      const [a] = await produceAuth(r.projectId);
+      expect(a!.estimate.totalMicros).toBeLessThanOrEqual(COST_LIMITS.CREATIVE_TEST_CEILING);
+      const [p] = await ownerPool()`select state from projects where id = ${r.projectId}`;
+      expect(p!.state).toBe('COMPLETE');
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 2`;
+    }
+  }, 300_000);
+
+  it('when even the re-plan is over the ceiling, the paid ad waits for staff (plainly worded, nothing charged again)', async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    const [cur] = await ownerPool()`select provider, model, unit, rates from provider_rate_tables where provider = 'anthropic' and status = 'published' order by version desc limit 1`;
+    try {
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        values (${cur!.provider as string}, ${cur!.model as string}, 900, ${cur!.unit as string},
+                                ${ownerPool().json(Object.fromEntries(Object.entries(cur!.rates as Record<string, number>).map(([k, v]) => [k, v * 1000])))}, now() - interval '1 minute', 'published')`;
+      expect(await produceProject(r.ctx, r.projectId)).toBe('failed');
+      const [p] = await ownerPool()`select state, failure_code, failure_reason from projects where id = ${r.projectId}`;
+      expect(p).toMatchObject({ state: 'NEEDS_USER_ACTION', failure_code: 'gate_blocked' });
+      expect(p!.failure_reason).toMatch(/won’t be charged again/);
+      expect(await withTenant(r.t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1); // the purchase is intact
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where version = 900`;
+    }
+  }, 300_000);
+});
+
 describe('renders kill switch (§44 "preserve reservation": prod-10)', () => {
   it('reserves the place, pauses without dispatching, and resumes once the switch is off', async () => {
     const r = await storyboardReady();

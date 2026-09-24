@@ -84,6 +84,20 @@ export async function loadRates(tx: Tx): Promise<Map<string, RateTable>> {
   return new Map(rows.map((r) => [`${r.provider}/${r.model}`, r as unknown as RateTable]));
 }
 
+/**
+ * Today's rates, with the given provider/model keys held at the versions an authorization was priced on (any
+ * status: a superseded table still prices the promise it was part of). Keys not pinned use today's version.
+ */
+export async function loadRatesPinned(tx: Tx, pinned: Record<string, number>): Promise<Map<string, RateTable>> {
+  const rates = await loadRates(tx);
+  const keys = Object.entries(pinned).filter(([k, v]) => k.includes('/') && Number.isInteger(v));
+  if (!keys.length) return rates;
+  const rows = await tx`select t.provider, t.model, t.version, t.unit, t.rates from provider_rate_tables t
+                        join unnest(${keys.map(([k]) => k)}::text[], ${keys.map(([, v]) => v)}::int[]) as p(k, v) on t.provider || '/' || t.model = p.k and t.version = p.v`;
+  for (const r of rows) rates.set(`${r.provider}/${r.model}`, r as unknown as RateTable);
+  return rates;
+}
+
 function rate(rates: Map<string, RateTable>, provider: string, model: string): RateTable {
   const r = rates.get(`${provider}/${model}`);
   if (!r) throw new DomainError('UNAVAILABLE', `No published rate table for ${provider}/${model}`);

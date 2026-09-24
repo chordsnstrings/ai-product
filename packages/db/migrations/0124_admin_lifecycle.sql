@@ -86,5 +86,8 @@ alter table provider_jobs add column moderation_status text check (moderation_st
 alter table provider_jobs add column usage jsonb;
 -- Final acceptance: the job's output went into the delivered creative (set when the creative is composed).
 alter table provider_jobs add column final_accepted_at timestamptz;
+-- §44 "Model price doubles … active customer promises handled by commercial policy": a paid production that no
+-- longer fits its class ceiling at today's rates may run at a loss up to this amount, once FINANCE approves it.
+alter table projects add column ceiling_override_micros bigint check (ceiling_override_micros > 0);
 -- Which provider job produced a scene version (render or frame), and what it cost.
 alter table scene_versions add column provider_job_id uuid;

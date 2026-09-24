@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
-import { makeTenant, truncateAll } from '@arkiv/db/testing';
+import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { MockImage, MockLlm, MockTts, MockVideo, providers, setProviders, type LlmJsonRequest, type LlmJsonResult } from '@arkiv/providers';
 import { newId } from '@arkiv/shared';
 import { armComparison } from './canary';
@@ -127,6 +127,41 @@ describe('provider job records (standard §41: arch-34)', () => {
     const [j] = await ownerPool()`select input_refs, usage from provider_jobs where id = ${r.jobId}`;
     expect(j!.input_refs).toMatchObject({ sceneId: 'scene-2', imageSha256: [expect.stringMatching(/^[0-9a-f]{64}$/)] });
     expect(j!.usage).toMatchObject({ kind: 'llm', inputTokens: expect.any(Number), outputTokens: expect.any(Number) });
+  });
+});
+
+describe('a rate rise after the promise (standard §44 "model price doubles": edge-44-07)', () => {
+  it('prices an authorized call at the rates it was authorized on, and books the real (higher) cost', async () => {
+    const t = await makeTenant();
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId, 'video.scene', 'video');
+    try {
+      // Rates double after the reservation.
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        select provider, model, 2, unit, jsonb_build_object('per_second_720p', (rates->>'per_second_720p')::bigint * 2, 'per_second_1080p', (rates->>'per_second_1080p')::bigint * 2),
+                               now() - interval '1 minute', 'published'
+                        from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 1`;
+      // Two 5-second renders fit the authorization at the promised rates (not at today's, which would refuse the second).
+      await generateVideo({ ctx, token, task: 'video.scene', subject: null, prompt: 'hands', references: [], seconds: 5, resolution: '720p', ratio: '9:16' });
+      await generateVideo({ ctx, token, task: 'video.scene', subject: null, prompt: 'hands two', references: [], seconds: 5, resolution: '720p', ratio: '9:16' });
+      const jobs = await ownerPool()`select estimate_micros, actual_micros from provider_jobs where workspace_id = ${t.workspaceId} order by created_at`;
+      expect(jobs.map((j) => Number(j.estimate_micros))).toEqual([5 * 231333, 5 * 231333]);
+      expect(jobs.map((j) => Number(j.actual_micros))).toEqual([5 * 231333 * 2, 5 * 231333 * 2]); // the loss is recorded
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 2`;
+    }
+  });
+
+  it('a staff-approved ceiling override lets a paid production past its class ceiling (and waives the markup floor)', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const p = newId();
+    const sku = await makeSku(t.workspaceId);
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by) values (${p}, ${t.workspaceId}, ${sku}, 'taste', 'STORYBOARD_APPROVED', 'test')`;
+    const lines = await withTenant(t.workspaceId, (tx) => routedLines(tx, t.workspaceId, [{ task: 'video.scene', kind: 'video', seconds: 40, resolution: '720p' }]));
+    const ask = () => withTenant(t.workspaceId, (tx) => authorize(tx, ctx, { purpose: 'taste', projectId: p, lines, idempotencyKey: `ov:${newId()}` }));
+    await expect(ask()).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+    await ownerPool()`update projects set ceiling_override_micros = 20000000 where id = ${p}`;
+    await expect(ask()).resolves.toMatchObject({ authorizationId: expect.any(String) });
   });
 });
 

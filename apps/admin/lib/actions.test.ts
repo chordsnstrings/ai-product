@@ -589,6 +589,26 @@ describe('ad spend import (plan 05 §4 CAC)', () => {
   });
 });
 
+describe('project.ceiling_override (standard §44 commercial policy)', () => {
+  it('needs FINANCE approval, only for a paid production stopped at its ceiling, then queues it again', async () => {
+    const ops = await staff(['OPS']);
+    const fin = await staff(['FINANCE']);
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const sku = await makeSku(t.workspaceId);
+    const p = newId();
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by, failure_code, failure_reason) values (${p}, ${t.workspaceId}, ${sku}, 'taste', 'NEEDS_USER_ACTION', 'test', 'entitlement', 'x')`;
+    await expect(act(ops, 'project.ceiling_override', { workspaceId: t.workspaceId, projectId: p, maxUsd: 12, reason: 'rates doubled' })).rejects.toThrow(/isn’t waiting on its cost ceiling/);
+    await ownerPool()`update projects set failure_code = 'gate_blocked' where id = ${p}`;
+    await expect(act(ops, 'project.ceiling_override', { workspaceId: t.workspaceId, projectId: p, maxUsd: 5, reason: 'rates doubled' })).rejects.toThrow(/above the standard ceiling/);
+    const r = await act(ops, 'project.ceiling_override', { workspaceId: t.workspaceId, projectId: p, maxUsd: 12, reason: 'rates doubled after purchase' });
+    expect(r.status).toBe('pending');
+    await decideApproval(fin, r.approvalId as string, true);
+    const [row] = await ownerPool()`select state, ceiling_override_micros from projects where id = ${p}`;
+    expect(row).toMatchObject({ state: 'STORYBOARD_APPROVED', ceiling_override_micros: 12_000_000 });
+    expect(await ownerPool()`select 1 from outbox where workspace_id = ${t.workspaceId} and queue = ${Queues.produceProject}`).toHaveLength(1);
+  });
+});
+
 describe('plan.price_schedule (plan 04 §3)', () => {
   it('needs a second FINANCE approver, at least 30 days of notice, and notifies subscribers once approved', async () => {
     const f1 = await staff(['FINANCE'], 'Fin A');

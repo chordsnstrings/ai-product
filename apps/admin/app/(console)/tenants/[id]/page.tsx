@@ -294,7 +294,7 @@ const RETRYABLE = ['PROVIDER_FAILED', 'NEEDS_USER_ACTION'];
 
 async function Projects({ id, canManage, focus }: { id: string; canManage: boolean; focus: string | null }) {
   const d0 = await withAdmin(async (tx) => ({
-    projects: await tx`select p.id, p.kind, p.state, p.failure_reason, p.updated_at, p.created_at, p.experiment_id, s.catalogue_no,
+    projects: await tx`select p.id, p.kind, p.state, p.failure_reason, p.failure_code, p.ceiling_override_micros, p.updated_at, p.created_at, p.experiment_id, s.catalogue_no,
                               (select count(*) from provider_jobs j where j.workspace_id = p.workspace_id and j.project_id = p.id)::int as jobs,
                               (select coalesce(sum(actual_micros), 0) from provider_jobs j where j.workspace_id = p.workspace_id and j.project_id = p.id)::bigint as cost,
                               (select status from cost_authorizations a where a.workspace_id = p.workspace_id and a.project_id = p.id order by a.created_at desc limit 1) as reservation
@@ -334,6 +334,13 @@ async function Projects({ id, canManage, focus }: { id: string; canManage: boole
                 <ActButton small action="tenant.project_retry" payload={{ workspaceId: id, projectId: p.id }} confirm="Resume this stalled production? It continues from where it stopped under the reservation it already holds; nothing is reserved or charged again." reason="Resume reason (ticket / incident)">
                   Resume
                 </ActButton>
+              ) : null}
+              {p.state === 'NEEDS_USER_ACTION' && p.failure_code === 'gate_blocked' ? (
+                // §44: a paid ad stopped at its cost ceiling (rates rose after purchase) runs at a loss once FINANCE approves.
+                <ActForm inline action="project.ceiling_override" extra={{ workspaceId: id, projectId: p.id }} submit="🔐 Request ceiling override" fields={[
+                  { name: 'maxUsd', label: 'Allow up to (USD)', required: true },
+                  { name: 'reason', label: 'Reason', required: true },
+                ]} />
               ) : null}
               {(CANCELLABLE_BEFORE_DISPATCH as readonly string[]).includes(p.state as string) ? (
                 <ActButton small danger action="tenant.project_cancel" payload={{ workspaceId: id, projectId: p.id }} confirm="Cancel before dispatch? The project ends cancelled and any reservation returns to the customer’s balance." reason="Cancel reason">

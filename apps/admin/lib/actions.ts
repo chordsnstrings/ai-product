@@ -62,6 +62,7 @@ import {
   requestOpsCommand,
   requestOrExecute,
   retryProjectProduction,
+  retryProduction,
   scheduleTenantPurge,
   SETTING_DEFAULTS,
   setTenantFlags,
@@ -88,7 +89,7 @@ import {
 } from '@arkiv/core';
 import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
 import { canResendTemplate, isTemplateName, sendEmail, templateSamples, type TemplateName } from '@arkiv/email';
-import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, PlanCode, RefundReason, StaffRole } from '@arkiv/shared';
+import { COST_LIMITS, DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, PlanCode, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
 
@@ -146,6 +147,23 @@ registerExecutor('plan.price_schedule', async (p, { approver }) =>
     return { ...r, notices: notices.length };
   }),
 );
+
+// §44 "Model price doubles": a paid production the Cost Governor refused at its class ceiling (rates rose after the
+// customer paid, and re-planning within the ceiling wasn't enough) is honoured at a loss up to an approved amount.
+registerExecutor('project.ceiling_override', async (p, { approver }) => {
+  const ws = p.workspaceId as string;
+  const projectId = p.projectId as string;
+  await withAdmin(async (tx) => {
+    const [pr] = await tx`select state, failure_code, ceiling_override_micros from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+    if (!pr) throw new DomainError('NOT_FOUND', 'Project not found');
+    if (pr.state !== 'NEEDS_USER_ACTION' || pr.failure_code !== 'gate_blocked') throw new DomainError('CONFLICT', 'This production isn’t waiting on its cost ceiling.');
+    await tx`update projects set ceiling_override_micros = ${Number(p.maxMicros)} where id = ${projectId} and workspace_id = ${ws}`;
+    await audit(tx, approver, 'project.ceiling_override', { type: 'project', id: projectId }, { workspaceId: ws, reason: p.reason as string, before: { ceiling_override_micros: pr.ceiling_override_micros ?? null }, after: { ceiling_override_micros: Number(p.maxMicros) } });
+    // The approved production runs again: it re-reserves through the Cost Governor, now under the override.
+    await retryProduction(tx, await staffTenantCtx(tx, approver, ws), projectId);
+  });
+  return { message: 'Override applied; the production is queued again.' };
+});
 
 /** "support, ops" → ['SUPPORT','OPS']; unknown names are rejected rather than silently dropped. */
 function parseRoles(raw: string): StaffRole[] {
@@ -769,6 +787,20 @@ export const ACTIONS = {
       if (!jobIds.length) throw new DomainError('NOT_FOUND', 'No failed jobs of that class on this queue.');
       await requestOpsCommand(s, 'job.bulk_retry', { queue: i.queue, errorClass: i.errorClass, jobIds }, i.reason);
       return { message: `Retry of ${jobIds.length} job${jobIds.length === 1 ? '' : 's'} queued (held workspaces are skipped).` };
+    },
+  }),
+  // §44: request the ceiling override for a paid production stopped at its class ceiling (FINANCE approves).
+  'project.ceiling_override': a({
+    perm: 'jobs.manage',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, projectId: uuid, maxUsd: z.coerce.number().positive().max((COST_LIMITS.CREATIVE_TEST_CEILING / 1_000_000) * 3), reason }),
+    run: async (s, i) => {
+      const maxMicros = Math.round(i.maxUsd * 1_000_000);
+      if (maxMicros <= COST_LIMITS.CREATIVE_TEST_CEILING) throw new DomainError('INVALID', `An override is above the standard ceiling (${(COST_LIMITS.CREATIVE_TEST_CEILING / 1_000_000).toFixed(2)} USD).`);
+      const [pr] = await withAdmin((tx) => tx`select state, failure_code from projects where id = ${i.projectId} and workspace_id = ${i.workspaceId}`);
+      if (!pr || pr.state !== 'NEEDS_USER_ACTION' || pr.failure_code !== 'gate_blocked') throw new DomainError('CONFLICT', 'This production isn’t waiting on its cost ceiling.');
+      const r = await requestOrExecute(s, 'project.ceiling_override', { workspaceId: i.workspaceId, projectId: i.projectId, maxMicros }, i.reason);
+      return { ...r, message: r.status === 'pending' ? 'Override requested; production retries once FINANCE approves.' : 'Override applied; production retries.' };
     },
   }),
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),

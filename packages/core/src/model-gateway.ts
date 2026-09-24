@@ -25,12 +25,12 @@ import type { z } from 'zod';
 import { raiseAlert } from './alerts';
 import { saveAsset } from './assets';
 import type { TenantContext } from './context';
-import { consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
+import { authorizationRateVersions, consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
 import { findPrompt } from './prompts';
-import { actualCost, loadRates, priceLine, promoSplit, type CostLine } from './rates';
+import { actualCost, loadRates, loadRatesPinned, priceLine, promoSplit, type CostLine } from './rates';
 
 /**
  * Model Gateway (§33): provider-agnostic, and the ONLY path to a billable provider. Every call must present a
@@ -289,7 +289,8 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
       throw new DomainError('UNAVAILABLE', 'Production is paused for maintenance. Your place is held.', { killSwitch: 'renders' });
     }
     const costLine = line(r);
-    const rates = await loadRates(tx);
+    // Debited at the rates the authorization was priced on: a rate rise after the promise never strands the job.
+    const rates = await loadRatesPinned(tx, await authorizationRateVersions(tx, meta.token));
     const expected = priceLine(rates, costLine).micros;
     const auth = await consumeAuthorization(tx, meta.token, expected);
     const [job] = await tx`
