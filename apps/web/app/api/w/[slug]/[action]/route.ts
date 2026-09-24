@@ -51,7 +51,7 @@ import {
 } from '@arkiv/core';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { CSV_PLATFORMS, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
+import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
@@ -85,9 +85,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const platform = z.enum(CSV_PLATFORMS, { error: 'Choose whether this export is from Meta or TikTok.' }).parse(form.get('platform'));
                 // The day column is in the ad account's reporting timezone (§47); the uploader can name it.
         const tz = z.string().trim().max(64).regex(/^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+)*$/).optional().parse((form.get('timezone') as string | null) || undefined) ?? null;
-        const rows = parsePerformanceCsv(await file.text(), platform, { timezone: tz });
+        // §48: organic or affiliate delivery is kept in its own measurement context, never mixed with paid.
+        const source = z.enum(CSV_SOURCES).default('paid').parse((form.get('source') as string | null) || undefined);
+        const rows = parsePerformanceCsv(await file.text(), platform, { timezone: tz, source });
         if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
-        const r = await t((tx) => once(tx, { platform, tz, file: fileIdentity(file), rows: rows.length }, () => ingestObservations(tx, ctx, null, rows)));
+        const r = await t((tx) => once(tx, { platform, tz, source, file: fileIdentity(file), rows: rows.length }, () => ingestObservations(tx, ctx, null, rows)));
         return json({ ok: true, ...r });
       }
       case 'evidence': {

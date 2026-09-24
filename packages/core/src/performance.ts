@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { globalTx, withSystem, withTenant, type Tx } from '@arkiv/db';
-import { csvContext, DomainError, env, FREE_EXPLORATION, newId, type CsvPlatform } from '@arkiv/shared';
+import { csvContext, DomainError, env, FREE_EXPLORATION, newId, type CsvPlatform, type CsvSource } from '@arkiv/shared';
 import { logger } from '@arkiv/shared/log';
 import {
   ConnectorError,
@@ -861,7 +861,7 @@ export function csvAttributionWindow(v: string): string | null {
  * Currency column) or the uploader, never assumed (§47). Purchases are read only from a purchases column: Ads
  * Manager's "Results" counts whatever the campaign optimises for.
  */
-export function parsePerformanceCsv(csv: string, platform: CsvPlatform, opts: { timezone?: string | null; currency?: string | null } = {}): NormalizedObservation[] {
+export function parsePerformanceCsv(csv: string, platform: CsvPlatform, opts: { timezone?: string | null; currency?: string | null; source?: CsvSource } = {}): NormalizedObservation[] {
   const table = parseCsv(csv.trim());
   const head = (table.shift() ?? []).map((h) => h.trim().toLowerCase().replace(/\s+/g, ' '));
   const other: CsvPlatform = platform === 'meta' ? 'tiktok' : 'meta';
@@ -932,7 +932,8 @@ export function parsePerformanceCsv(csv: string, platform: CsvPlatform, opts: { 
       attributionWindow: window ?? 'merchant_import',
       optimizationEvent: get(r, 'result type', 'optimization event') || null,
       campaignType: null,
-      measurementContext: csvContext(platform),
+      // Paid, organic or affiliate delivery each keep their own context (§48).
+      measurementContext: csvContext(platform, opts.source ?? 'paid'),
       // The day column is in the ad account's reporting timezone (§47); the uploader names it.
       sourceTimezone: get(r, 'timezone', 'time zone') || opts.timezone || null,
       adapterVersion: 'merchant-csv@2',

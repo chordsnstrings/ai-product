@@ -1,6 +1,6 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { assertAssetUsable, creativeSourceAssets } from './asset-rights';
-import { DomainError, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
+import { DomainError, isPaidContext, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
@@ -566,7 +566,9 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
     }
   }
 
-  const primary = summary.filter((s) => s.metric === e.primary_metric);
+  // The test's state and its learnings come from paid delivery only: organic and affiliate results are stored and
+  // shown as their own panels, never read as a paid comparison (§48).
+  const primary = summary.filter((s) => s.metric === e.primary_metric && isPaidContext(s.context));
   const best = primary.find((s) => s.state === 'ACTIONABLE') ?? primary.find((s) => s.state === 'DIRECTIONAL') ?? primary.find((s) => s.state === 'INCONCLUSIVE');
   let resultState: ExperimentState = agg.length ? 'GATHERING_SIGNAL' : (e.state as ExperimentState);
   if (best) resultState = best.state as ExperimentState;

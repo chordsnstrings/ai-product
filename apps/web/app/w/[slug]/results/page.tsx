@@ -43,6 +43,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
             <SheetButton label="Upload CSV" title="Upload performance CSV" description="No ad account connection? Export a daily ad report (Ad name, Day, Spend, Impressions, Clicks, Purchases) and upload it here — one file per platform, so Meta and TikTok results stay separate.">
               <ActionForm slug={slug} action="performance-csv" multipart submit="Upload" fields={[
                 { name: 'platform', label: 'Exported from', type: 'select', required: true, options: [{ value: '', label: 'Choose…' }, { value: 'meta', label: 'Meta Ads Manager' }, { value: 'tiktok', label: 'TikTok Ads Manager' }] },
+                { name: 'source', label: 'What it reports', type: 'select', options: [{ value: 'paid', label: 'Paid ads' }, { value: 'organic', label: 'Organic posts' }, { value: 'affiliate', label: 'Affiliate / creator posts' }], hint: 'Organic and affiliate results are shown separately and never compared with paid ads.' },
                 { name: 'file', label: 'CSV file', type: 'file', accept: '.csv,text/csv', required: true },
                 { name: 'timezone', label: 'Ad account timezone', defaultValue: d.tz ?? '', placeholder: 'e.g. America/New_York', max: 64, hint: 'The timezone your ad account reports days in, so each day lines up with stock-outs and price changes.' },
               ]} />
