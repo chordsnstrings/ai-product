@@ -82,10 +82,13 @@ import {
   RATE_PROVIDERS,
   RATE_UNITS,
   validateRateTable,
+  notifyPriceChanges,
+  PRICE_NOTICE_DAYS,
+  schedulePlanPrice,
 } from '@arkiv/core';
 import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
 import { canResendTemplate, isTemplateName, sendEmail, templateSamples, type TemplateName } from '@arkiv/email';
-import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, RefundReason, StaffRole } from '@arkiv/shared';
+import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, PlanCode, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
 
@@ -133,6 +136,16 @@ registerExecutor('stripe.assign', async (p, { approver }) => {
   });
   return { outcome: await processStripeEvent(e.id as string) };
 });
+
+// Plan 04 §3 price change (four-eyes, FINANCE approves): the version is stored and every live subscriber of the plan
+// is sent notice in the same transaction; the worker applies it at each subscriber's first renewal on/after the date.
+registerExecutor('plan.price_schedule', async (p, { approver }) =>
+  withAdmin(async (tx) => {
+    const r = await schedulePlanPrice(tx, approver, { plan: p.plan as PlanCode, priceMicros: Number(p.priceMicros), stripePriceId: (p.stripePriceId as string | null) ?? null, effectiveFrom: new Date(p.effectiveFrom as string), reason: p.reason as string });
+    const notices = await notifyPriceChanges(tx);
+    return { ...r, notices: notices.length };
+  }),
+);
 
 /** "support, ops" → ['SUPPORT','OPS']; unknown names are rejected rather than silently dropped. */
 function parseRoles(raw: string): StaffRole[] {
@@ -526,6 +539,26 @@ export const ACTIONS = {
         await audit(tx, s, 'fx.set', { type: 'fx_rate', id: r!.id as string }, { reason: i.reason, before: prev ? { usdPerUnit: Number(prev.usd_per_unit), version: prev.version } : null, after: { currency: i.currency, usdPerUnit: i.usdPerUnit, version } });
         return { message: `${i.currency} v${version}: 1 ${i.currency} = ${i.usdPerUnit} USD from today.` };
       }),
+  }),
+
+  /* ── Plan prices (plan 04 §3) ── */
+  'plan.price_schedule': a({
+    perm: 'billing.manage',
+    reauth: true,
+    schema: z.object({
+      plan: z.enum(PlanCode),
+      price: z.coerce.number().positive().max(10_000),
+      stripePriceId: z.string().trim().regex(/^price_[A-Za-z0-9]+$/, 'Stripe price ids look like price_1Nx…').optional().or(z.literal('')),
+      effectiveOn: z.string().date('Use a date like 2026-11-01'),
+      reason,
+    }),
+    run: async (s, i) => {
+      const effectiveFrom = new Date(`${i.effectiveOn}T00:00:00Z`);
+      if (effectiveFrom.getTime() < Date.now() + PRICE_NOTICE_DAYS * 86400_000) throw new DomainError('INVALID', `Choose a date at least ${PRICE_NOTICE_DAYS} days from today, so every subscriber gets notice first.`);
+      if (billingGateway().live && !i.stripePriceId) throw new DomainError('INVALID', 'Create the new price in Stripe first and paste its price id.');
+      const r = await requestOrExecute(s, 'plan.price_schedule', { plan: i.plan, priceMicros: Math.round(i.price * 1_000_000), stripePriceId: i.stripePriceId || null, effectiveFrom: effectiveFrom.toISOString() }, i.reason);
+      return { ...r, message: r.status === 'pending' ? 'Price change requested; it is scheduled (and subscribers are notified) once FINANCE approves.' : 'Price change scheduled; subscribers are notified.' };
+    },
   }),
 
   /* ── Providers & routes ── */

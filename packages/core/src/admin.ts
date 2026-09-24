@@ -219,7 +219,8 @@ export type ApprovalAction =
   | 'staff.roles'
   | 'claim.unblock'
   | 'claim.approve_override'
-  | 'stripe.assign';
+  | 'stripe.assign'
+  | 'plan.price_schedule';
 
 type Executor = (payload: Record<string, unknown>, ctx: { requester: Staff; approver: Staff }) => Promise<unknown>;
 const executors = new Map<ApprovalAction, Executor>();
@@ -252,6 +253,7 @@ const APPROVER_ROLE: Record<ApprovalAction, StaffRole> = {
   'claim.unblock': 'COMPLIANCE',
   'claim.approve_override': 'COMPLIANCE',
   'stripe.assign': 'FINANCE',
+  'plan.price_schedule': 'FINANCE',
 };
 
 /** Run now if under threshold, otherwise file an approval request. */

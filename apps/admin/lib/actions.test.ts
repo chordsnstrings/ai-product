@@ -589,6 +589,26 @@ describe('ad spend import (plan 05 §4 CAC)', () => {
   });
 });
 
+describe('plan.price_schedule (plan 04 §3)', () => {
+  it('needs a second FINANCE approver, at least 30 days of notice, and notifies subscribers once approved', async () => {
+    const f1 = await staff(['FINANCE'], 'Fin A');
+    const f2 = await staff(['FINANCE'], 'Fin B');
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id) values (${t.workspaceId}, 'sub_ps', 'SCALE', 'active', gen_random_uuid())`;
+    const on = (d: number) => new Date(Date.now() + d * 86400_000).toISOString().slice(0, 10);
+    await expect(act(f1, 'plan.price_schedule', { plan: 'SCALE', price: 229, effectiveOn: on(20), reason: 'new pricing' })).rejects.toThrow(/at least 30 days/);
+    const r = await act(f1, 'plan.price_schedule', { plan: 'SCALE', price: 229, effectiveOn: on(35), stripePriceId: 'price_scale229', reason: 'new pricing' });
+    expect(r.status).toBe('pending');
+    expect(await ownerPool()`select 1 from plan_prices`).toHaveLength(0);
+    await expect(decideApproval(f1, r.approvalId as string, true)).rejects.toThrow(/own request/);
+    await decideApproval(f2, r.approvalId as string, true);
+    const [v] = await ownerPool()`select plan_code, price_micros, stripe_price_id from plan_prices`;
+    expect(v).toMatchObject({ plan_code: 'SCALE', price_micros: 229_000_000, stripe_price_id: 'price_scale229' });
+    const [n] = await ownerPool()`select old_price_micros, new_price_micros from price_change_notices where workspace_id = ${t.workspaceId}`;
+    expect(n).toMatchObject({ old_price_micros: 199_000_000, new_price_micros: 229_000_000 });
+  });
+});
+
 describe('growth and finance consoles (plan 05 §5–§10)', () => {
   it('landing pages: status → live is a publish (checked), rollback keeps variants, and only GROWTH edits', async () => {
     const g = await staff(['GROWTH']);

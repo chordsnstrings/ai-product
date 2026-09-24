@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
 import { env, formatTime, formatUsd, PLANS, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { isTemplateName, quietHoursDelay, sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import { assetUrl, enqueue, Queues, quoteAfterOffer, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
+import { assetUrl, enqueue, Queues, quoteAfterOffer, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, subscriptionPrice, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -71,8 +71,21 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
     }
     case 'subscription_started': {
       const plan = PLANS[(data.plan as PlanCode) ?? 'GROWTH'];
-      const [s] = await withTenant(ws, (tx) => tx`select current_period_end from subscriptions order by created_at desc limit 1`);
-      await send('subscription_started', { planName: plan.name, tests: plan.creativeTestsPerMonth, price: formatUsd(plan.priceMicros, 0), renewsOn: s ? new Date(s.current_period_end as string).toDateString() : 'in one month', url: `${base}/this-week` }, await recipients(ws, ['OWNER']));
+      const [s] = await withTenant(ws, (tx) => tx`select id, plan_code, created_at, current_period_end from subscriptions order by created_at desc limit 1`);
+      // The price this subscriber agreed to (a scheduled plan price version counts from its effective date).
+      const price = s ? (await withTenant(ws, (tx) => subscriptionPrice(tx, { id: s.id as string, workspaceId: ws, planCode: s.plan_code as PlanCode, createdAt: s.created_at as string }))).priceMicros : plan.priceMicros;
+      await send('subscription_started', { planName: plan.name, tests: plan.creativeTestsPerMonth, price: formatUsd(price, 0), renewsOn: s ? new Date(s.current_period_end as string).toDateString() : 'in one month', url: `${base}/this-week` }, await recipients(ws, ['OWNER']));
+      return;
+    }
+    // Plan 04 §3: notice of a subscriber's price change, at least 30 days before it applies.
+    case 'price_change_notice': {
+      const [n] = await withTenant(ws, (tx) => tx`select plan_code, old_price_micros, new_price_micros, effective_from, applied_at from price_change_notices where id = ${String(data.noticeId)}`);
+      if (!n || n.applied_at) return;
+      await send(
+        'price_change_notice',
+        { planName: PLANS[n.plan_code as PlanCode].name, oldPrice: formatUsd(Number(n.old_price_micros), 0), newPrice: formatUsd(Number(n.new_price_micros), 0), effectiveOn: new Date(n.effective_from as string).toDateString(), url: `${base}/settings/billing` },
+        await recipients(ws, ['OWNER']),
+      );
       return;
     }
     case 'payment_failed':

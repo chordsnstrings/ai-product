@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, classifySubscriptionEvents, mrrReport, mrrTotals, reconciliationExceptions, subscriptionEvents } from '@arkiv/core';
+import { auditView, currentPlanPrices, PRICE_NOTICE_DAYS, classifySubscriptionEvents, mrrReport, mrrTotals, reconciliationExceptions, subscriptionEvents } from '@arkiv/core';
 import { assembleDisputeEvidence, DISPUTE_OPEN } from '@arkiv/billing';
 import { PLANS, type PlanCode } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
@@ -44,6 +44,12 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
                         from workspaces w join subscriptions s on s.workspace_id = w.id and s.status = 'past_due' where (${prefs.includeTest} or not w.is_test) order by s.next_payment_attempt nulls first`,
       disputes: await tx`select d.id, d.workspace_id, d.status, d.reason, d.amount_cents, d.evidence_due_by, d.evidence_submitted_at, d.stripe_created_at, w.name
                          from stripe_disputes d join workspaces w on w.id = d.workspace_id where true ${t('d.workspace_id')} order by d.stripe_created_at desc nulls last limit 100`,
+      // Plan 04 §3 price versions and the subscriber notices each one produced.
+      prices: tab === 'prices' ? await tx`select v.*, st.name as by_name,
+                                                 (select count(*) from price_change_notices n where n.plan_price_id = v.id)::int as notices,
+                                                 (select count(*) from price_change_notices n where n.plan_price_id = v.id and n.applied_at is not null)::int as applied
+                                          from plan_prices v left join staff_users st on st.id = v.created_by order by v.effective_from desc` : [],
+      current: tab === 'prices' ? await currentPlanPrices(tx) : null,
       pack: packWs ? await tx.savepoint((sp2) => assembleDisputeEvidence(sp2, packWs, sp.dispute!)).catch(() => null) : null,
     };
   });
@@ -59,7 +65,33 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
         <Kpi label="Unmatched Stripe events" value={d0.unmatched.length} alert={d0.unmatched.length > 0} />
         <Kpi label="Reconciliation exceptions" value={openRecon} alert={openRecon > 0} sub={d0.lastRun ? `Stripe check ${d0.lastRun.status} ${dt(d0.lastRun.finished_at ?? d0.lastRun.started_at)}` : 'Stripe check not run yet'} />
       </Grid>
-      <Tabs label="Billing sections" base="/billing" current={tab} tabs={[['revenue', 'Revenue'], ['unmatched', 'Unmatched events'], ['recon', 'Reconciliation'], ['dunning', 'Dunning'], ['disputes', 'Disputes']]} />
+      <Tabs label="Billing sections" base="/billing" current={tab} tabs={[['revenue', 'Revenue'], ['unmatched', 'Unmatched events'], ['recon', 'Reconciliation'], ['dunning', 'Dunning'], ['disputes', 'Disputes'], ['prices', 'Plan prices']]} />
+      {tab === 'prices' && d0.current ? (
+        <>
+          <Section title="Current prices">
+            <Table head={['Plan', 'Price today', 'Built-in price']} rows={(Object.keys(PLANS) as PlanCode[]).map((p) => [PLANS[p].name, `${money(d0.current![p], 0)}/mo`, `${money(PLANS[p].priceMicros, 0)}/mo`])} />
+          </Section>
+          <Section title="Price versions and subscriber notices">
+            <Table
+              head={['Plan', 'Price', 'Effective from', 'Stripe price', 'Notices sent', 'Applied', 'By', 'Reason']}
+              rows={d0.prices.map((v) => [v.plan_code as string, `${money(v.price_micros, 0)}/mo`, dt(v.effective_from), <Mono key="p">{(v.stripe_price_id as string) ?? '—'}</Mono>, v.notices as number, v.applied as number, (v.by_name as string) ?? '—', v.reason as string])}
+              empty="No price changes yet: plans sell at their built-in prices."
+            />
+          </Section>
+          <Section title="Schedule a price change">
+            <div className="ak-panel" style={{ maxWidth: 560 }}>
+              <p className="ak-small ak-muted" style={{ marginTop: 0 }}>At least {PRICE_NOTICE_DAYS} days out. Once another FINANCE member approves, every live subscriber of the plan is emailed notice; each moves to the new price at their first renewal on or after the date (no proration). New subscribers pay it from the date. Create the price in Stripe first.</p>
+              <ActForm action="plan.price_schedule" submit="🔐 Request price change" fields={[
+                { name: 'plan', label: 'Plan', type: 'select', options: Object.keys(PLANS) },
+                { name: 'price', label: 'New monthly price (USD)', required: true },
+                { name: 'effectiveOn', label: 'Effective on (YYYY-MM-DD)', required: true },
+                { name: 'stripePriceId', label: 'Stripe price id', placeholder: 'price_…' },
+                { name: 'reason', label: 'Reason', type: 'textarea', required: true },
+              ]} />
+            </div>
+          </Section>
+        </>
+      ) : null}
       {tab === 'revenue' && d0.report ? (
         <>
           <p className="ak-small ak-muted">MRR movements from subscription events, priced at each plan’s price. Scheduled downgrades and cancellations move no MRR until they take effect (shown separately); logo churn counts customers, revenue churn counts money.</p>

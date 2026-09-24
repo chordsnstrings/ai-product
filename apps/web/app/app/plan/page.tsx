@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
+import { currentPlanPrices } from '@arkiv/core';
 import { autoRenewText } from '@arkiv/billing';
 import { PLANS, formatUsd, type PlanCode } from '@arkiv/shared';
 import { requireUser } from '@/lib/session';
@@ -20,8 +21,9 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ p
   if (!w) redirect('/app');
   const [sub] = await withTenant(w.workspace_id as string, (tx) => tx`select plan_code from subscriptions where status in ('active','trialing','past_due') limit 1`);
   if (sub) redirect(`/w/${w.slug}/settings/billing`);
+  const prices = await withTenant(w.workspace_id as string, (tx) => currentPlanPrices(tx));
   const initial = (['LAUNCH', 'GROWTH', 'SCALE'].includes(sp.plan ?? '') ? sp.plan : 'GROWTH') as PlanCode;
-  const plans = (['LAUNCH', 'GROWTH', 'SCALE'] as const).map((c) => ({ code: c, name: PLANS[c].name, price: formatUsd(PLANS[c].priceMicros, 0), tests: PLANS[c].creativeTestsPerMonth, perTest: formatUsd(PLANS[c].priceMicros / PLANS[c].creativeTestsPerMonth, 0), consent: autoRenewText(c) }));
+  const plans = (['LAUNCH', 'GROWTH', 'SCALE'] as const).map((c) => ({ code: c, name: PLANS[c].name, price: formatUsd(prices[c], 0), tests: PLANS[c].creativeTestsPerMonth, perTest: formatUsd(prices[c] / PLANS[c].creativeTestsPerMonth, 0), consent: autoRenewText(c, new Date(), prices[c]) }));
   return (
     <ThemeScope theme="light">
       <div className="ak-wrap ak-section" style={{ maxWidth: 720 }}>

@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { DomainError, newId } from '@arkiv/shared';
 import {
-  cacByCampaign, deviceClass, funnelBySlice, importAdSpend, monthTwoPlus, parseAdSpendCsv, planMix, recordFunnel, recordFunnelOnce, stageLatency, tasteCohorts,
+  adSpendByAd, cacByCampaign, deviceClass, funnelBySlice, importAdSpend, monthTwoPlus, parseAdSpendCsv, planMix, recordFunnel, recordFunnelOnce, stageLatency, tasteCohorts,
   uploadDropoff, uploadFailureCategory,
 } from './funnel';
 import { saveIntegration } from './performance';
@@ -129,6 +129,22 @@ describe('cohorts and CAC (plan 05 §4, Appendix C)', () => {
     // Contribution: $19 − 2.9% − $0.30 fee − $3.00 render cost after payment.
     expect(texture).toMatchObject({ spendMicros: 100_000_000, tasteBuyers: 1, subscribers: 1, previewCogsMicros: 500_000, tasteContributionMicros: 15_149_000, mediaCacPerTaste: 100_000_000, effectiveSubscriberCac: 85_351_000 });
     expect(total.spendMicros).toBe(100_000_000); // spend outside the window is left out
+    // Payback: effective CAC ÷ (Launch $49 − 2.9% − $0.30 − $3.50 provider cost in the last 30 days).
+    expect(texture).toMatchObject({ subscriberMonthlyContributionMicros: 43_779_000, paybackMonths: 1.9, landingViews: 1 });
+    // No impressions/clicks in the export: no CPM, CTR or CPC rather than zeros.
+    expect(texture).toMatchObject({ impressions: 0, clicks: 0, cpmMicros: null, ctr: null, cpcMicros: null, lpvPerClick: null });
+
+    // Standard §7 acquisition metrics once the export carries impressions and clicks (re-import replaces the day).
+    const today = new Date().toISOString().slice(0, 10);
+    const withReach = parseAdSpendCsv(`date,campaign,ad_id,spend,impressions,clicks\n${today},Texture-Launch,ad-77,80,"20,000",400\n${today},Texture-Launch,ad-77,20,5000,100`, 'meta');
+    expect(withReach[0]).toMatchObject({ impressions: 20_000, clicks: 400 });
+    await withAdmin((tx) => importAdSpend(tx, withReach, { staffId: staff, batchId: newId() }));
+    const reach = (await withAdmin((tx) => cacByCampaign(tx, { days: 7 }))).rows.find((r) => r.campaign === 'texture-launch')!;
+    expect(reach).toMatchObject({ spendMicros: 100_000_000, impressions: 25_000, clicks: 500, cpmMicros: 4_000_000, ctr: 0.02, cpcMicros: 200_000, lpvPerClick: 0.002 });
+    const [ad] = await withAdmin((tx) => adSpendByAd(tx, { days: 7 }));
+    expect(ad).toMatchObject({ adId: 'ad-77', spendMicros: 100_000_000, impressions: 25_000, clicks: 500, cpmMicros: 4_000_000, cpcMicros: 200_000 });
+    expect(() => parseAdSpendCsv(`date,campaign,spend,impressions,source\n${today},a,10,1.5,meta`)).toThrow(/whole number/);
+
     // A test workspace doesn't count as a buyer.
     await ownerPool()`update workspaces set is_test = true where id = ${b.workspaceId}`;
     const noTest = await withAdmin((tx) => cacByCampaign(tx, { days: 7 }));

@@ -1,5 +1,5 @@
 import { withSystem, withTenant } from '@arkiv/db';
-import { reconcileStripe } from '@arkiv/billing';
+import { applyDuePriceChanges, reconcileStripe } from '@arkiv/billing';
 import { sendEmail, sequence } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import {
@@ -34,6 +34,7 @@ import {
   sweepSignInRecords,
   sweepHeartbeats,
   sweepStaffAccessReview,
+  notifyPriceChanges,
   sweepExpiringTokens,
   sweepStaleIntegrations,
   sweepRetention,
@@ -86,6 +87,13 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   // Plan 05 §23 quarterly access review: roles not re-confirmed within 14 days of the review falling due are removed
   // (sessions end; each removal is audited as a system action).
   'staff-access-review': { cron: '35 6 * * *', run: () => withSystem((tx) => sweepStaffAccessReview(tx)).then((r) => r.length) },
+  // Plan 04 §3 subscriber price changes: notice to anyone on a plan with a future price who hasn't had one (e.g.
+  // subscribed after it was scheduled), then each notified change whose date has come moves that subscription's
+  // Stripe price without proration, so their next renewal is the first at the new price.
+  'price-changes': {
+    cron: '50 5 * * *',
+    run: async () => ({ notified: (await withSystem((tx) => notifyPriceChanges(tx))).length, applied: await applyDuePriceChanges() }),
+  },
   // Plan 05 §22: service instances not heard from in a day are dropped.
   'sweep-heartbeats': { cron: '5 4 * * *', run: () => withSystem((tx) => sweepHeartbeats(tx)) },
   // Plan 05 §15: free-preview COGS outliers become abuse signals (once a day per workspace).

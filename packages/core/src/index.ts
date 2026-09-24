@@ -81,3 +81,4 @@ export * from './statements';
 export * from './creator-packs';
 export * from './not-right';
 export * from './access-review';
+export * from './plan-prices';
