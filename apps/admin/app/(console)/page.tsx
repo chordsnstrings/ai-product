@@ -17,6 +17,7 @@ const ALERT_HREF: Record<string, (id: string) => string> = {
   stripe_price: () => '/offers',
   landing_page: (id) => `/landing-pages/${id}`,
   route: () => '/providers',
+  project: () => '/jobs?stuck=1',
 };
 
 const STAGES = [

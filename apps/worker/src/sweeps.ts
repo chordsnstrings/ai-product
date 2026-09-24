@@ -26,6 +26,7 @@ import {
   sweepExpiredAuthorizations,
   sweepExpiringEvidence,
   sweepExpiredRights,
+  sweepDelayedProductions,
   sweepLandingGalleryRights,
   sweepOfferGuardrails,
   sweepProvisional,
@@ -174,6 +175,8 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return rows.length;
     },
   },
+  // Plan 03 P9 edge: a production past 20 minutes gets one proactive email to the owners and a Pulse alert.
+  'production-delays': { cron: '*/5 * * * *', run: () => withSystem(async (tx) => (await sweepDelayedProductions(tx)).length) },
   // Plan 03 P3: an analysis with no progress for 10 minutes (worker lost, job expired) is failed honestly: the
   // SKU waits for the merchant with what was found, instead of "analyzing" forever. System role: every
   // predicate is tied to the SKU's own workspace.

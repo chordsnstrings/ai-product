@@ -6,6 +6,7 @@ import { assertAssetUsable, replaceAsset, sweepExpiredRights, unusableAssets } f
 import { authorize } from './cost-governor';
 import { createExperiment } from './experiments';
 import { mockConcepts } from './mock-intel';
+import { sweepDelayedProductions } from './production-delays';
 import { importHistoricalCreative } from './genome';
 import { routedLines } from './model-gateway';
 import { qaScene } from './qa';
@@ -118,5 +119,37 @@ describe('creator usage rights expire (§48)', () => {
     expect(n).toMatchObject({ kind: 'creator_footage', lineage: { replaces: footageId }, rights_expires_at: null });
     expect(await ownerPool()`select 1 from assets where id = ${footageId} and deleted_at is null`).toHaveLength(1);
     expect(await withTenant(t.workspaceId, (tx) => usableAssetIds(tx, [r.assetId]))).toEqual([r.assetId]);
+  });
+});
+
+describe('production running past 20 minutes (plan 03 P9 edge)', () => {
+  async function producing(minutesAgo: number, state = 'RENDERING', wsState = 'ACTIVE_PAID') {
+    const r = await tenant();
+    const id = newId();
+    // A reserved render started `minutesAgo` (updated_at is maintained by a trigger, so the reservation dates it).
+    const [a] = await ownerPool()`insert into cost_authorizations (workspace_id, purpose, token_hash, idempotency_key, rate_table_versions, estimate, max_cost_micros, expires_at, created_at)
+                                  values (${r.t.workspaceId}, 'creative_test', ${`h:${id}`}, ${`t:${id}`}, '{}', '{}', 1, now() + interval '3 hours', now() - make_interval(mins => ${minutesAgo})) returning id`;
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by, entitlement_unit, authorization_id)
+                      values (${id}, ${r.t.workspaceId}, ${r.skuId}, 'taste', ${state}, 'test', 'taste', ${a!.id})`;
+    if (wsState !== 'ACTIVE_PAID') await ownerPool()`update workspaces set state = ${wsState} where id = ${r.t.workspaceId}`;
+    return { ...r, projectId: id };
+  }
+
+  it('emails the owners once and raises one staff alert; on-time, finished and held productions are left alone', async () => {
+    const late = await producing(25);
+    const onTime = await producing(5);
+    const done = await producing(60, 'COMPLETE');
+    const held = await producing(60, 'RENDERING', 'SUSPENDED');
+    const first = await withSystem((tx) => sweepDelayedProductions(tx));
+    expect(first).toEqual([{ projectId: late.projectId, workspaceId: late.t.workspaceId, minutes: 25 }]);
+    expect(await withSystem((tx) => sweepDelayedProductions(tx))).toEqual([]);
+    // Even after the email job was dispatched, a later sweep does not send it again.
+    await ownerPool()`update outbox set dispatched_at = now() where workspace_id = ${late.t.workspaceId}`;
+    expect(await withSystem((tx) => sweepDelayedProductions(tx))).toEqual([]);
+    const mail = await ownerPool()`select payload from outbox where queue = 'send-email' and payload->>'template' = 'production_delayed'`;
+    expect(mail.map((m) => m.payload)).toEqual([expect.objectContaining({ projectId: late.projectId, workspaceId: late.t.workspaceId })]);
+    const alerts = await ownerPool()`select subject_id, severity from platform_alerts where kind = 'production_delayed' and resolved_at is null`;
+    expect(alerts).toEqual([{ subject_id: late.projectId, severity: 'risk' }]);
+    for (const other of [onTime, done, held]) expect(await ownerPool()`select 1 from outbox where workspace_id = ${other.t.workspaceId} and queue = 'send-email'`).toHaveLength(0);
   });
 });

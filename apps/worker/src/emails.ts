@@ -151,6 +151,14 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       await send('day30_review', { productName: b.sku.name, tested: b.summary.tested, actionable: b.summary.actionable, url: `${base}/products/${r.sku_id}/review` }, await recipients(ws, ['OWNER', 'ADMIN']));
       return;
     }
+    case 'production_delayed': {
+      // Still producing (the sweep may have raced the delivery): a finished or failed production gets no delay email.
+      const [p] = await withTenant(ws, (tx) => tx`select p.id, p.state, s.name from projects p join skus s on s.id = p.sku_id where p.id = ${data.projectId as string}`);
+      if (p && ['RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA'].includes(p.state as string)) {
+        await send('production_delayed', { productName: p.name as string, minutes: Number(data.minutes ?? 20), url: `${app}/produce/${p.id}` }, await recipients(ws, ['OWNER', 'ADMIN']));
+      }
+      return;
+    }
     case 'rights_expired': {
       const ids = Array.isArray(data.assetIds) ? (data.assetIds as string[]) : [];
       const [s] = data.skuId ? await withTenant(ws, (tx) => tx`select id, name from skus where id = ${data.skuId as string}`) : [];
