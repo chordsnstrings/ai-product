@@ -76,9 +76,24 @@ export async function captionOverlay(
   return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
-/** End card: product name + CTA in arkiv style. */
-export async function endCard(opts: { productName: string; cta: string; index?: string; aspect: Aspect }): Promise<Buffer> {
+/** A brand colour usable on the end card: a 6-digit hex, else null (never interpolated unchecked into the SVG). */
+export function brandAccent(colors: readonly string[] | null | undefined): string | null {
+  return (colors ?? []).map((c) => c.trim()).find((c) => /^#[0-9a-f]{6}$/i.test(c)) ?? null;
+}
+
+/**
+ * End card: product name + CTA in arkiv style. The brand's colour fills the CTA bar and its mandatory disclosure
+ * (Brand Brain, §16) is set under it in small type.
+ */
+export async function endCard(opts: { productName: string; cta: string; index?: string; aspect: Aspect; accent?: string | null; note?: string | null }): Promise<Buffer> {
   const { w, h } = ASPECT_SIZE[opts.aspect];
+  const bar = brandAccent(opts.accent ? [opts.accent] : []) ?? INK;
+  const note = (opts.note ?? '').trim()
+    ? wrap(opts.note!.trim(), w * 0.026, w * 0.84)
+        .slice(0, 3)
+        .map((l, i) => `<text x="${w * 0.08}" y="${h * 0.66 + w * 0.19 + i * w * 0.036}" font-family="Inter Tight, Inter, Arial, sans-serif" font-size="${w * 0.026}" fill="${STONE}">${esc(l)}</text>`)
+        .join('')
+    : '';
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
     <rect width="${w}" height="${h}" fill="${PAPER}"/>
     <text x="${w * 0.08}" y="${h * 0.36}" font-family="IBM Plex Mono, monospace" font-size="${w * 0.028}" fill="${STONE}" letter-spacing="3">${esc(opts.index ?? 'NO. 001')}</text>
@@ -87,8 +102,9 @@ export async function endCard(opts: { productName: string; cta: string; index?: 
       .slice(0, 3)
       .map((l, i) => `<text x="${w * 0.08}" y="${h * 0.46 + i * w * 0.09}" font-family="Instrument Serif, Georgia, serif" font-size="${w * 0.075}" fill="${INK}">${esc(l)}</text>`)
       .join('')}
-    <rect x="${w * 0.08}" y="${h * 0.66}" width="${w * 0.84}" height="${w * 0.13}" fill="${INK}"/>
+    <rect x="${w * 0.08}" y="${h * 0.66}" width="${w * 0.84}" height="${w * 0.13}" fill="${bar}"/>
     <text x="${w * 0.5}" y="${h * 0.66 + w * 0.083}" text-anchor="middle" font-family="Inter Tight, Inter, Arial, sans-serif" font-size="${w * 0.045}" fill="${PAPER}">${esc(opts.cta)}</text>
+    ${note}
   </svg>`;
   return sharp(Buffer.from(svg)).png().toBuffer();
 }

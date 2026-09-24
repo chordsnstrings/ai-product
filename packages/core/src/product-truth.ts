@@ -4,6 +4,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
+import { onMaterialProductChange } from './experiment-state';
 
 /**
  * ProductTruthService (§15–16, §33): atomic, versioned facts with provenance. Raw observations are never
@@ -169,7 +170,8 @@ export async function recordFacts(tx: Tx, ctx: TenantContext, skuId: string, fac
     await emit(tx, ctx, 'PRODUCT_FACT_OBSERVED', { type: 'sku', id: skuId }, { key: f.key, source: f.sourceType, state: f.state, factId, value: factValue(f) }, { factId });
     if (replaced.length) {
       await tx`update product_facts set status = 'SUPERSEDED', valid_to = now() where id in ${tx(replaced.map((r) => r.id as string))}`;
-      await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: skuId }, { key: f.key, factId, source: f.sourceType, value: factValue(f), supersedes: replaced.map((r) => r.id) }, { factId });
+      await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: skuId }, { key: f.key, factId, source: f.sourceType, value: factValue(f), supersedes: replaced.map((r) => r.id) }, { factId });      // A new price is a context change for tests and learnings on this SKU (§21, §45).
+      await onMaterialProductChange(tx, ctx, skuId, f.key);
     }
     if (!MATERIAL_KEYS.has(f.key) || f.state !== 'OBSERVED') continue;
     const rest = existing.filter((e) => !replaced.includes(e));
@@ -198,7 +200,7 @@ export async function recordFacts(tx: Tx, ctx: TenantContext, skuId: string, fac
 export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key: string, value: { text?: string | null; number?: number | null; json?: unknown }) {
   if (ctx.actor.kind === 'user' || ctx.actor.kind === 'provisional') assertCan(ctx, 'sku.edit');
   await lockKey(tx, skuId, key);
-  const prior = await tx`select id, source_type, state from product_facts where sku_id = ${skuId} and normalized_key = ${key} and status <> 'SUPERSEDED' order by observed_at desc`;
+  const prior = await tx`select id, source_type, state, value_text, value_number from product_facts where sku_id = ${skuId} and normalized_key = ${key} and status <> 'SUPERSEDED' order by observed_at desc`;
   const [row] = await tx`
     insert into product_facts (workspace_id, sku_id, fact_type, normalized_key, value_text, value_number, value_json,
       source_type, state, merchant_confirmed, created_by, supersedes_fact_id)
@@ -219,6 +221,8 @@ export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key:
     supersedes: nonShopify,
     disputes: shopify,
   }, { factId: row!.id as string });
+  const current = prior.find((p) => p.state === 'DECIDED') ?? prior[0];
+  if (current && String(current.value_number != null ? Number(current.value_number) : (current.value_text ?? '')) !== String(value.number ?? value.text ?? '')) await onMaterialProductChange(tx, ctx, skuId, key);
   return row!.id as string;
 }
 
@@ -245,6 +249,7 @@ export async function acceptSourceFact(tx: Tx, ctx: TenantContext, skuId: string
     value: factValue({ valueText: cur!.value_text as string | null, valueNumber: cur!.value_number == null ? null : Number(cur!.value_number), valueJson: cur!.value_json }),
     supersedes: decided.map((d) => d.id),
   }, { factId });
+  if (decided.length) await onMaterialProductChange(tx, ctx, skuId, key);
 }
 
 /** Confirm an observed fact without changing it (becomes merchant-confirmed, still OBSERVED). */

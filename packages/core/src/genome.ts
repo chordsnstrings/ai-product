@@ -8,6 +8,7 @@ import { Genome } from './intel-schemas';
 import { mockGenome } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, Queues } from './outbox';
+import { evidenceFloor } from './statistics';
 
 /**
  * CreativeGenomeService (§19): every historical or new ad gets a versioned structured genome using the
@@ -86,4 +87,42 @@ export async function creativeMap(tx: Tx, skuId: string) {
     treatments: Taxonomy.treatment,
     cells: rows.map((r) => ({ angle: r.angle as string, treatment: r.treatment as string, count: r.n as number, state: state(Number(r.best)) })),
   };
+}
+
+/** Delivery an ad needs before its territory counts as tested (the small-account CTR evidence floor, §21). */
+export const COVERAGE_MIN_IMPRESSIONS = evidenceFloor('ctr', 0).minTrials;
+
+export interface Coverage {
+  /** Meaningful tests per angle. */
+  angles: Map<string, number>;
+  /** Tested cells: `angle|hookMechanism` and `angle|t:treatment`. */
+  cells: Set<string>;
+}
+
+/**
+ * Territory that has genuinely been tested for a SKU (§20 coverage gap; Appendix C "one trivial/under-delivered
+ * ad should not mark territory complete"): experiments that reached a readable result (directional, actionable
+ * or inconclusive) or delivered past the evidence floor, plus imported historical ads whose linked delivery passed
+ * it. Archived, never-launched and still-gathering tests below the floor don't count.
+ */
+export async function meaningfulCoverage(tx: Tx, skuId: string): Promise<Coverage> {
+  const rows = await tx`
+    select e.genes->>'angle' as angle, e.genes->>'hookMechanism' as hook, e.genes->>'treatment' as treatment from experiments e
+    where e.sku_id = ${skuId}
+      and (e.state in ('DIRECTIONAL','ACTIONABLE','INCONCLUSIVE')
+           or exists (select 1 from experiment_results r where r.experiment_id = e.id and r.metric = 'ctr' and r.trials >= ${COVERAGE_MIN_IMPRESSIONS}))
+    union all
+    select c.genome->>'angle', c.genome->>'hookMechanism', c.genome->>'treatment' from creatives c
+    where c.sku_id = ${skuId} and c.origin = 'imported' and c.genome is not null
+      and (select coalesce(sum(o.impressions), 0) from performance_observations o where o.creative_id = c.id and o.superseded_at is null) >= ${COVERAGE_MIN_IMPRESSIONS}`;
+  const angles = new Map<string, number>();
+  const cells = new Set<string>();
+  for (const r of rows) {
+    if (!r.angle) continue;
+    const a = r.angle as string;
+    angles.set(a, (angles.get(a) ?? 0) + 1);
+    if (r.hook) cells.add(`${a}|${r.hook as string}`);
+    if (r.treatment) cells.add(`${a}|t:${r.treatment as string}`);
+  }
+  return { angles, cells };
 }

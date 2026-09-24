@@ -85,6 +85,7 @@ export interface TemplateMap {
   security_alert: { event: string; when: string; url: string };
   weekly_brief: { workspaceName: string; week: string; recommendations: { hypothesis: string; slot: string }[]; url: string };
   friday_summary: { workspaceName: string; lines: string[]; url: string };
+  signal_update: { workspaceName: string; changes: { test: string; from: string; to: string }[]; url: string };
   day30_review: { productName: string; tested: number; actionable: number; url: string };
   staff_break_glass: { staffName: string; reason: string; when: string; url: string };
   ownership_transfer_confirm: { workspaceName: string; newOwner: string; reason: string; url: string; expiresIn: string };
@@ -353,6 +354,29 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: 
     case 'friday_summary': {
       const m = d as TemplateMap['friday_summary'];
       return { subject: `${m.workspaceName} · This week’s learning`, stream: 'transactional', element: (<L preview={m.lines[0] ?? 'Weekly summary'} label="Friday summary"><H>What we learned</H>{m.lines.map((l, i) => <P key={i}>{l}</P>)}<Cta href={m.url}>Open results</Cta></L>) };
+    }
+    case 'signal_update': {
+      const m = d as TemplateMap['signal_update'];
+      const label = (st: string) => st.toLowerCase().replace(/_/g, ' ');
+      return {
+        subject: `${m.workspaceName} · ${m.changes.length === 1 ? 'A test crossed a threshold' : `${m.changes.length} tests crossed a threshold`}`,
+        stream: 'transactional',
+        element: (
+          <L preview={m.changes[0] ? `${m.changes[0].test}: now ${label(m.changes[0].to)}` : 'Signal update'} label="Midweek signal update">
+            <H>Where your tests stand</H>
+            <P>Only tests whose confidence crossed a threshold since last week are listed.</P>
+            {m.changes.map((c, i) => (
+              <Text key={i} style={{ fontSize: 15, lineHeight: '22px', borderBottom: `1px solid ${C.rule}`, padding: '8px 0', margin: 0 }}>
+                <span style={{ fontFamily: mono, fontSize: 11, color: C.stone }}>{label(c.from)} → {label(c.to)}</span>
+                <br />
+                {c.test}
+              </Text>
+            ))}
+            <P>{' '}</P>
+            <Cta href={m.url}>Open results</Cta>
+          </L>
+        ),
+      };
     }
     case 'day30_review': {
       const m = d as TemplateMap['day30_review'];

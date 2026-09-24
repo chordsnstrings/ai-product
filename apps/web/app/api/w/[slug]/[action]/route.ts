@@ -3,7 +3,7 @@ import { withTenant } from '@arkiv/db';
 import {
   acceptSourceFact,
   approveClaim,
-  approveForProduction,
+  approveExperiment,
   assertCan,
   attachEvidence,
   cancelDeletion,
@@ -129,13 +129,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'experiment-approve': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
       assertCan(ctx, 'spend.creative_test');
-      await t(async (tx) => {
-        const [v] = await tx`select v.project_id from experiments e join variants v on v.experiment_id = e.id and v.project_id is not null where e.id = ${experimentId} limit 1`;
-        if (!v) throw new DomainError('NOT_FOUND', 'Experiment not found');
-        await approveForProduction(tx, ctx, v.project_id as string, 'creative_test');
-        await tx`update experiments set approved_by = ${`user:${ctx.actor.id}`} where id = ${experimentId}`;
-        await setExperimentState(tx, ctx, experimentId, 'PRODUCING');
-      });
+      await t((tx) => approveExperiment(tx, ctx, experimentId));
       return json({ ok: true });
     }
     case 'experiment-archive': {

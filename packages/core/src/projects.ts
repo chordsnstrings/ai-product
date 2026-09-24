@@ -2,6 +2,7 @@ import type { Tx } from '@arkiv/db';
 import { DomainError, type ProjectState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { emit } from './events';
+import { syncExperimentWithProject } from './experiment-state';
 
 /**
  * Why a project stopped, as a code (plan 03 P9, standard §8). The customer sees copy mapped from the code
@@ -143,6 +144,8 @@ export async function transition(
   }
   // `reason` is customer-facing (shown in the funnel); `detail` is the internal cause, kept on the event only.
   await emit(tx, ctx, 'PROJECT_STATE_CHANGED', { type: 'project', id: projectId }, { from, to, reason: opts.reason ?? null, detail: opts.detail ?? null });
+  // A creative test's experiment follows its master production (failed → retryable, cancelled → archived).
+  await syncExperimentWithProject(tx, ctx, projectId, to);
   return { changed: true, from };
 }
 

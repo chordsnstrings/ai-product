@@ -214,7 +214,7 @@ export interface ComposeSpec {
    * SRT). Without them the SRT carries the on-screen text.
    */
   captions?: Cue[];
-  endCard?: { productName: string; cta: string; index?: string; durationMs: number } | null;
+  endCard?: { productName: string; cta: string; index?: string; durationMs: number; accent?: string | null; note?: string | null } | null;
   aspects: Aspect[];
   /** Container metadata written into every export (e.g. the AI-content disclosure, standard §40). */
   metadata?: Record<string, string>;

@@ -36,6 +36,8 @@ async function runningExperiment() {
   const skuId = await makeSku(t.workspaceId);
   const proposal = mockConcepts({ name: 'Glow Serum', category: 'serum', approvedClaims: [], themes: [], testedAngles: [] }).concepts[0]!;
   const { experimentId } = await withTenant(t.workspaceId, (tx) => createExperiment(tx, ctx, { skuId, proposal, slot: 'EXPAND' }));
+  // Produced and ready (production itself is covered by the learning-loop test): only a live test receives results.
+  await ownerPool()`update experiments set state = 'READY_TO_RUN' where id = ${experimentId}`;
   const variants = await ownerPool()`select id, code from variants where experiment_id = ${experimentId} order by code`;
   /** Six days of data; `hold` gives each variant's hold rate (share of starts reaching 75%). */
   const ingest = (hold: [number, number, number]) => {

@@ -348,6 +348,7 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   LEARNING_CREATED: ['learningId', 'experimentId', 'skuId'],
   CONFIDENCE_CHANGED: ['experimentId', 'skuId'],
   EXPERIMENT_CREATED: ['experimentId', 'skuId'],
+  EXPERIMENT_APPROVED: ['experimentId', 'skuId', 'projectId'],
   RECOMMENDATION_CREATED: ['recommendationId', 'skuId'],
   RECOMMENDATION_ACCEPTED: ['recommendationId', 'experimentId', 'skuId'],
   GENOME_EXTRACTED: ['creativeId'],

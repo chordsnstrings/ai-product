@@ -122,6 +122,29 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       if (recs.length) await send('weekly_brief', { workspaceName: w!.name, week: String(data.week), recommendations: recs.map((r) => ({ hypothesis: r.h as string, slot: r.slot as string })), url: `${base}/this-week` });
       return;
     }
+    case 'signal_update': {
+      // §11 midweek: only tests whose confidence crossed a threshold since the previous window; one email per
+      // workspace per window, however many jobs a busy week queues (the send is keyed on the window).
+      const window = String(data.window ?? '');
+      const since = window ? new Date(Date.parse(`${window}T15:00:00Z`) - 7 * 86400_000) : new Date(Date.now() - 7 * 86400_000);
+      const rows = await withTenant(ws, (tx) => tx`
+        select distinct on (e.subject_id) e.subject_id, e.payload->>'to' as "to", x.hypothesis, s.name
+        from events e join experiments x on x.id = e.subject_id join skus s on s.id = x.sku_id
+        where e.type = 'CONFIDENCE_CHANGED' and e.at > ${since}
+        order by e.subject_id, e.seq desc`);
+      const first = await withTenant(ws, (tx) => tx`
+        select distinct on (e.subject_id) e.subject_id, e.payload->>'from' as "from"
+        from events e where e.type = 'CONFIDENCE_CHANGED' and e.at > ${since} order by e.subject_id, e.seq`);
+      const from = new Map(first.map((r) => [r.subject_id as string, r.from as string]));
+      const changes = rows
+        .filter((r) => ['DIRECTIONAL', 'ACTIONABLE', 'INCONCLUSIVE', 'OPERATIONALLY_CONFOUNDED'].includes(r.to as string) && from.get(r.subject_id as string) !== r.to)
+        .map((r) => ({ test: `${r.name as string}: ${String(r.hypothesis).slice(0, 120)}`, from: from.get(r.subject_id as string) ?? 'GATHERING_SIGNAL', to: r.to as string }));
+      if (!changes.length) return;
+      for (const email of await recipients(ws)) {
+        await sendEmail('signal_update', email, { workspaceName: w!.name as string, changes, url: `${base}/results` }, { idempotencyKey: `signal:${window || jobId}:${email}`, workspaceId: ws });
+      }
+      return;
+    }
     case 'friday_summary': {
       const lines = await withTenant(ws, (tx) => tx`select statement, state from learnings where last_revalidated_at > now() - interval '7 days' order by confidence desc limit 4`);
       const out = lines.map((l) => `${l.state === 'ACTIONABLE' ? 'Actionable' : l.state === 'DIRECTIONAL' ? 'Directional' : 'Weakening'}: ${l.statement}`);

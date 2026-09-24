@@ -40,7 +40,7 @@ export interface CompositionManifest {
   scenes: ManifestScene[];
   voiceover: { voice: string; segments: VoiceSegment[] } | null;
   captions: Cue[];
-  endCard: { productName: string; cta: string; index: string; durationMs: number; sceneId: string | null; spokenText: string | null };
+  endCard: { productName: string; cta: string; index: string; durationMs: number; sceneId: string | null; spokenText: string | null; accent?: string | null; note?: string | null };
   durationMs: number;
   aspects: Aspect[];
   genes: Record<string, unknown>;
@@ -94,7 +94,7 @@ export function diffCompositions(base: CompositionManifest, next: CompositionMan
   if (!same(segKey(seg(base, h0?.sceneId)), segKey(seg(next, h1?.sceneId)))) changed.add('hook');
   const rest = (m: CompositionManifest, hookId: string | undefined) => (m.voiceover?.segments ?? []).filter((s) => s.sceneId !== hookId).map(segKey);
   if ((base.voiceover?.voice ?? null) !== (next.voiceover?.voice ?? null) || !same(rest(base, h0?.sceneId), rest(next, h1?.sceneId))) changed.add('voiceover');
-  if (base.endCard.cta !== next.endCard.cta || base.endCard.spokenText !== next.endCard.spokenText || base.endCard.index !== next.endCard.index) changed.add('cta');
+  if (base.endCard.cta !== next.endCard.cta || base.endCard.spokenText !== next.endCard.spokenText || base.endCard.index !== next.endCard.index || (base.endCard.note ?? null) !== (next.endCard.note ?? null) || (base.endCard.accent ?? null) !== (next.endCard.accent ?? null)) changed.add('cta');
   if (base.skuId !== next.skuId || base.cutoutAssetId !== next.cutoutAssetId || base.endCard.productName !== next.endCard.productName) changed.add('product');
   if (base.durationMs !== next.durationMs || base.endCard.durationMs !== next.endCard.durationMs) changed.add('duration');
   const genes: [string, string][] = [['angle', 'angle'], ['hookMechanism', 'hook_mechanism'], ['proofMechanism', 'proof'], ['treatment', 'treatment']];

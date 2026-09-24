@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, probBest } from './statistics';
+import { baselineFrom, BASELINE_MIN_TRIALS, compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, probAbove, probBest } from './statistics';
 
 describe('statistics (§21, §45)', () => {
   it('shrinks a tiny sample toward the baseline (no false winner)', () => {
@@ -46,5 +46,34 @@ describe('statistics (§21, §45)', () => {
     expect(nextLearningState('WEAKENING', 0.2, false)).toBe('INVALIDATED');
     expect(nextLearningState('ACTIONABLE', 0.01, true)).toBe('INVALIDATED');
     expect(nextLearningState('DIRECTIONAL', 0.97, true)).toBe('ACTIONABLE');
+  });
+
+  it('shrinks toward the SKU baseline, else the account, else the default assumption (§21)', () => {
+    const def = DEFAULT_BASELINES.hold_rate;
+    // No pool past the floor: the default.
+    expect(baselineFrom('hold_rate', [{ level: 'sku', successes: 10, trials: 100 }])).toMatchObject({ rate: def.rate, strength: def.strength, level: 'default' });
+    // The account has volume, the SKU too little: the account's rate, strength proportional to its volume.
+    const acct = baselineFrom('hold_rate', [{ level: 'sku', successes: 10, trials: 100 }, { level: 'account', successes: 2_000, trials: 6_000 }]);
+    expect(acct.level).toBe('account');
+    expect(acct.rate).toBeCloseTo(1 / 3);
+    expect(acct.strength).toBe(def.strength); // capped: never more weight than the default assumption
+    // Strength grows with the pool's volume below the cap.
+    expect(baselineFrom('cvr', [{ level: 'account', successes: 30, trials: 1_000 }])).toMatchObject({ level: 'account', rate: 0.03, strength: 100 });
+    // The SKU has enough of its own: it wins, and a huge pool never outweighs the default strength.
+    const sku = baselineFrom('hold_rate', [{ level: 'sku', successes: 30_000, trials: 100_000 }, { level: 'account', successes: 2_000, trials: 6_000 }]);
+    expect(sku).toMatchObject({ level: 'sku', rate: 0.3, strength: def.strength });
+    expect(BASELINE_MIN_TRIALS.ctr).toBeGreaterThan(BASELINE_MIN_TRIALS.cvr);
+    // The same small sample lands nearer a high account baseline than the default one.
+    const obs = { successes: 20, trials: 200 };
+    expect(posterior(obs, acct).mean).toBeGreaterThan(posterior(obs, def).mean);
+  });
+
+  it('P(winner genes beat loser genes) is high when the winner carries the lead and low when it flips', () => {
+    const strong = posterior({ successes: 900, trials: 3_000 }, DEFAULT_BASELINES.hold_rate);
+    const weak = posterior({ successes: 500, trials: 3_000 }, DEFAULT_BASELINES.hold_rate);
+    expect(probAbove([strong], [weak])).toBeGreaterThan(0.99);
+    expect(probAbove([weak], [strong])).toBeLessThan(0.01);
+    expect(probAbove([weak, strong], [weak])).toBeGreaterThan(0.99); // best of the winners
+    expect(probAbove([], [weak])).toBe(0.5); // nothing to compare
   });
 });
