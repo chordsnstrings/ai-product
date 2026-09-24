@@ -13,7 +13,11 @@ import { generateVideo } from './model-gateway';
 import { approveForProduction, blockedLines, cancelProduction, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
 import { clearSettingsCache } from './settings';
 import { customerReason } from './projects';
-import { repeatedFidelityFailures } from './qa-metrics';
+import { firstRenderAcceptance, repeatedFidelityFailures } from './qa-metrics';
+import { recordAssetExport } from './exports';
+import { decideFact } from './product-truth';
+import { priceUpdate, recomposeProject } from './recompose';
+import { emit } from './events';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
@@ -415,6 +419,56 @@ describe('cancelling a running production (standard §38, §46: arch-11)', () =>
   }, 240_000);
 });
 
+describe('whole-creative QA (standard §43 implied claims, §44/§48 continuity: edge-43-04, edge-44-04)', () => {
+  it('a finished ad whose pictures imply a medical result is blocked like a blocked line, and nothing is charged', async () => {
+    const r = await storyboardReady();
+    // The claim is carried by what the scene shows, not by any line (the mock reviewer reads the marker).
+    await ownerPool()`update scenes set visual_plan = visual_plan || ' [[qa:implied]]' where storyboard_id = ${r.storyboardId} and purpose = 'routine'`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('failed');
+    await withTenant(r.t.workspaceId, async (tx) => {
+      const [p] = await tx`select state, failure_code, qa_report from projects where id = ${r.projectId}`;
+      expect(p).toMatchObject({ state: 'BLOCKED_COMPLIANCE', failure_code: 'claims_blocked' });
+      const report = p!.qa_report as { impliedClaims: { impliedClaims: { basis: string; severity: string }[] }; checks: { check: string; pass: boolean; detail: string }[] };
+      expect(report.impliedClaims.impliedClaims).toEqual([expect.objectContaining({ basis: 'combined', severity: 'block' })]);
+      expect(report.checks.find((c) => c.check === 'claims' && !c.pass)!.detail).toMatch(/^Implied claim: Scene \d+: The pictures imply/);
+      expect(await available(tx, 'taste')).toBe(1); // released: the customer is not charged for a blocked ad
+      const [job] = await tx`select task, status from provider_jobs where task = 'qa.implied_claims'`;
+      expect(job).toMatchObject({ status: 'succeeded' });
+    });
+    // The blocked implication is listed for the merchant to change, like a blocked line.
+    const [p] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect(blockedLines(p!.qa_report).map((l) => l.reason)).toContain('Implied claim carried by the pictures or the whole ad');
+  }, 240_000);
+
+  it('a clean ad passes the implied-claim scan', async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const [p] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect((p!.qa_report as { checks: { check: string; pass: boolean; detail: string }[] }).checks).toContainEqual(expect.objectContaining({ check: 'claims', pass: true, detail: expect.stringMatching(/implied claims \(words and pictures\)/) }));
+  }, 240_000);
+
+  it('a generated person who changes between scenes switches that scene to the exact product, without retries', async () => {
+    const r = await storyboardReady();
+    const [first, second] = await ownerPool()`select id from scenes where storyboard_id = ${r.storyboardId} and purpose not in ('cta', 'product_reveal') order by position limit 2`;
+    await ownerPool()`update scenes set production_mode = 'GENERATIVE_INTERACTION', shows_human_skin = true where id in ${ownerPool()([first!.id, second!.id])}`;
+    await ownerPool()`update scenes set visual_plan = visual_plan || ' [[qa:continuity]]' where id = ${second!.id}`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const m = await manifestOf(r.projectId);
+    expect(m.scenes.find((s) => s.sceneId === first!.id)).toMatchObject({ kind: 'video', technique: 'generative' });
+    expect(m.scenes.find((s) => s.sceneId === second!.id)).toMatchObject({ kind: 'still', technique: 'exact_product_composite' });
+    const [p] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    const cont = (p!.qa_report as { checks: { check: string; detail: string; data?: { inconsistentSceneIds?: string[] } }[] }).checks.find((c) => /^Continuity/.test(c.detail));
+    expect(cont).toMatchObject({ check: 'visual', data: { inconsistentSceneIds: [second!.id] } });
+    // No extra render was paid for: one render per generated scene.
+    const renders = await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`;
+    expect(renders[0]!.n).toBe(2);
+    expect((await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'qa.continuity'`)[0]!.n).toBe(1);
+  }, 240_000);
+});
+
 describe('repeated product-fidelity failure KPI (standard §10: biz-21)', () => {
   it('counts paid projects with a scene that failed product fidelity hard twice', async () => {
     const r = await storyboardReady();
@@ -427,5 +481,76 @@ describe('repeated product-fidelity failure KPI (standard §10: biz-21)', () => 
     expect(await withAdmin((tx) => repeatedFidelityFailures(tx, 7))).toEqual({ paid: 1, repeated: 1, rate: 1 });
     await ownerPool()`update workspaces set is_test = true where id = ${r.t.workspaceId}`;
     expect((await withAdmin((tx) => repeatedFidelityFailures(tx, 7))).paid).toBe(0);
+  }, 240_000);
+});
+
+describe('first-render acceptance (Appendix C; exp-38)', () => {
+  it('counts paid ads exported without a customer-requested regeneration', async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    // Delivered, not exported yet: not accepted.
+    expect(await withAdmin((tx) => firstRenderAcceptance(tx, 7))).toEqual({ delivered: 1, accepted: 0, rate: 0 });
+    const [a] = await ownerPool()`select id from assets where workspace_id = ${r.t.workspaceId} and kind = 'final_export' and lineage->>'projectId' = ${r.projectId} limit 1`;
+    await withTenant(r.t.workspaceId, (tx) => recordAssetExport(tx, r.ctx, a!.id as string, r.projectId));
+    expect(await withAdmin((tx) => firstRenderAcceptance(tx, 7))).toEqual({ delivered: 1, accepted: 1, rate: 1 });
+    const regen = (by: 'user' | 'staff') =>
+      withTenant(r.t.workspaceId, (tx) => emit(tx, r.ctx, 'CREATIVE_REGENERATION_REQUESTED', { type: 'project', id: r.projectId }, { by, from: 'PROVIDER_FAILED', reason: null }, { projectId: r.projectId, skuId: r.skuId }));
+    // A staff (or system) retry is not the customer's: still accepted first time.
+    await regen('staff');
+    expect((await withAdmin((tx) => firstRenderAcceptance(tx, 7))).accepted).toBe(1);
+    await regen('user');
+    expect(await withAdmin((tx) => firstRenderAcceptance(tx, 7))).toEqual({ delivered: 1, accepted: 0, rate: 0 });
+    await ownerPool()`update workspaces set is_test = true where id = ${r.t.workspaceId}`;
+    expect((await withAdmin((tx) => firstRenderAcceptance(tx, 7))).delivered).toBe(0);
+  }, 240_000);
+
+  it("a customer's retry of a failed paid production is recorded as their regeneration request", async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    await withTenant(r.t.workspaceId, (tx) => failProduction(tx, r.ctx, r.projectId, 'test: render failed QA'));
+    await withTenant(r.t.workspaceId, (tx) => retryProduction(tx, r.ctx, r.projectId));
+    const events = await ownerPool()`select payload, refs from events where workspace_id = ${r.t.workspaceId} and type = 'CREATIVE_REGENERATION_REQUESTED'`;
+    expect(events).toEqual([expect.objectContaining({ payload: { by: 'user', from: 'PROVIDER_FAILED', reason: 'quality_failed' }, refs: expect.objectContaining({ projectId: r.projectId, skuId: r.skuId }) })]);
+  }, 120_000);
+});
+
+describe('price changes after production (standard §42; edge-42-08)', () => {
+  it('shows the current price through tokens, and recomposes a delivered ad on a price change with no new footage', async () => {
+    const r = await storyboardReady();
+    await withTenant(r.t.workspaceId, (tx) => decideFact(tx, r.ctx, r.skuId, 'price', { number: 24, json: { currency: 'USD' } }));
+    await ownerPool()`update scenes set overlay_text = 'Only {price}' where storyboard_id = ${r.storyboardId} and purpose = 'routine'`;
+    await ownerPool()`update storyboards set cta_text = 'Shop now {price}' where id = ${r.storyboardId}`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const first = await manifestOf(r.projectId);
+    expect(first.tokens?.price).toMatchObject({ text: '$24' });
+    const routine = first.scenes.find((s) => s.overlayTemplate === 'Only {price}');
+    expect(routine).toMatchObject({ overlayText: 'Only $24' });
+    expect(first.endCard).toMatchObject({ cta: 'Shop now', price: '$24', ctaTemplate: 'Shop now {price}' });
+    // The price is a traced fact (Launch Gate 2).
+    const [rep1] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect((rep1!.qa_report as { statementMap: { text: string; status: string }[] }).statementMap.find((m) => m.text === 'Only $24')).toMatchObject({ status: 'sourced' });
+
+    const jobsBefore = (await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId}`)[0]!.n;
+    const [before] = await ownerPool()`select final_creative_id from projects where id = ${r.projectId}`;
+    // The price changes: the delivered ad is queued for recomposition and shows as stale until then.
+    await withTenant(r.t.workspaceId, (tx) => decideFact(tx, r.ctx, r.skuId, 'price', { number: 19, json: { currency: 'USD' } }));
+    expect(await ownerPool()`select payload->>'projectId' as project from outbox where queue = 'recompose-project'`).toEqual([{ project: r.projectId }]);
+    expect(await withTenant(r.t.workspaceId, (tx) => priceUpdate(tx, r.t.workspaceId, r.projectId))).toEqual({ stale: true, shown: '$24', current: '$19' });
+
+    expect(await recomposeProject(r.ctx, r.projectId)).toBe('recomposed');
+    const next = await manifestOf(r.projectId);
+    expect(next.scenes.find((s) => s.sceneId === routine!.sceneId)).toMatchObject({ overlayText: 'Only $19', assetId: routine!.assetId });
+    expect(next.endCard).toMatchObject({ price: '$19', cta: 'Shop now' });
+    // Same footage and voice, no provider call, a new version of the creative.
+    expect(next.scenes.map((s) => s.assetId)).toEqual(first.scenes.map((s) => s.assetId));
+    expect(next.voiceover?.segments.map((s) => s.clipAssetId)).toEqual(first.voiceover?.segments.map((s) => s.clipAssetId));
+    expect((await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId}`)[0]!.n).toBe(jobsBefore);
+    const [after] = await ownerPool()`select p.final_creative_id, c.parent_creative_id, cardinality(c.final_asset_ids) as n from projects p join creatives c on c.id = p.final_creative_id where p.id = ${r.projectId}`;
+    expect(after).toMatchObject({ parent_creative_id: before!.final_creative_id, n: 3 });
+    expect(await withTenant(r.t.workspaceId, (tx) => priceUpdate(tx, r.t.workspaceId, r.projectId))).toMatchObject({ stale: false });
+    // Idempotent: nothing more to do.
+    expect(await recomposeProject(r.ctx, r.projectId)).toBe('unchanged');
   }, 240_000);
 });

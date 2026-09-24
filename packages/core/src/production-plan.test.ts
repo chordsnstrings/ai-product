@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { closeAll, globalTx } from '@arkiv/db';
 import { COST_LIMITS } from '@arkiv/shared';
-import { diffCompositions, type CompositionManifest } from './composition';
+import { diffCompositions, formatPrice, hasFactTokens, resolveFactTokens, type CompositionManifest } from './composition';
 import { MAX_GENERATIVE_SCENES, normalizePlan } from './creative-director';
 import type { StoryboardPlan } from './intel-schemas';
 import { planProduction, productionRoutes, voiceLine } from './production';
@@ -173,5 +173,21 @@ describe('customer QA summary (plan 03 P10: prod-38)', () => {
     expect(rows.every((r) => r.ok)).toBe(true);
     expect(customerQaSummary(null)).toEqual([]);
     expect(customerQaSummary({ checks: [{ check: 'product_fidelity', pass: false, hard: false, detail: 'drift' }] })).toEqual([{ label: 'Product accuracy', ok: false }]);
+  });
+});
+
+describe('fact tokens in on-screen text (standard §42)', () => {
+  const tokens = { price: { factId: 'p', text: '$24' }, size: { factId: 's', text: '30 ml' } };
+  it('resolve {price} and {size} from the current facts, dropping a token with no fact rather than inventing one', () => {
+    expect(hasFactTokens('Only {price}')).toBe(true);
+    expect(hasFactTokens('Only today')).toBe(false);
+    expect(resolveFactTokens('Only {price} · {size}', tokens)).toBe('Only $24 · 30 ml');
+    expect(resolveFactTokens('Shop now {price}', { price: null, size: null })).toBe('Shop now');
+    expect(resolveFactTokens('{size} · {price}', { ...tokens, price: null })).toBe('30 ml');
+  });
+  it('formats prices the way ads show them', () => {
+    expect(formatPrice(24)).toBe('$24');
+    expect(formatPrice(19.5, 'EUR')).toBe('€19.50');
+    expect(formatPrice(1200, 'JPY')).toBe('1200 JPY');
   });
 });

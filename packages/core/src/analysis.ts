@@ -20,6 +20,7 @@ import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
 import { recordVariants } from './sku-variants';
 import { isTerminal, transition } from './projects';
+import { DEFAULT_FIDELITY_THRESHOLDS } from './fidelity';
 import { cutout, dominantColors, holdForReview, nameReviewFlags, toJpegBase64, usableAssetIds, type MediaReviewFlags } from './vision';
 import { ingestBytes } from './uploads';
 import { nextCatalogueNo } from './workspaces';
@@ -348,7 +349,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
                  package_type, closure, dominant_colors, transparency, thresholds)
                values (${ws}, ${skuId}, ${v!.v}, ${[...usable, ...(await usableAssetIds(tx, photoIds.slice(3)))]}, ${c.id}, ${x.labelText}, ${x.brand}, ${x.packaging.type}, ${x.packaging.closure},
                  ${tx.json(colors)}, ${x.packaging.transparent ? 'transparent' : 'opaque'},
-                 ${tx.json({ paletteDistanceMax: 70, labelMustMatch: !!x.labelText } as never)})`;
+                 ${tx.json({ ...DEFAULT_FIDELITY_THRESHOLDS, labelMustMatch: !!x.labelText } as never)})`;
       await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed, technique: cut.technique });
       await step(tx, ws, skuId, 'fingerprint', 'done', `${x.packaging.type.replace('_', ' ')}${x.packaging.closure ? ` · ${x.packaging.closure}` : ''}`);
       await tx`update skus set status = 'active' where id = ${skuId}`;

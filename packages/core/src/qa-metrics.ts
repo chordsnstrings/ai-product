@@ -43,6 +43,33 @@ export async function repeatedFidelityFailures(tx: Tx, days: number, opts: { inc
   return { paid, repeated, rate: paid ? repeated / paid : NaN };
 }
 
+/**
+ * Appendix C "First-render acceptance": paid projects (Taste, Standalone, Creative Test) delivered in the last
+ * `days` that the customer exported without asking for their creative to be generated again (automatic QA repairs
+ * and system or staff retries don't count against it), over all paid projects delivered then. Admin/system scope.
+ */
+export async function firstRenderAcceptance(tx: Tx, days: number, opts: { includeTest?: boolean } = {}): Promise<{ delivered: number; accepted: number; rate: number }> {
+  const [r] = await tx`
+    with delivered as (
+      select distinct p.id, p.workspace_id from events e
+      join projects p on p.id = e.subject_id and p.workspace_id = e.workspace_id
+      where e.type = 'COMPOSITION_COMPLETED' and e.at > now() - make_interval(days => ${days})
+        and p.kind in ('taste','standalone','creative_test') and p.state = 'COMPLETE'
+        and (${!!opts.includeTest} or p.workspace_id not in (select id from workspaces where is_test))
+    ),
+    accepted as (
+      select d.id, d.workspace_id from delivered d
+      where exists (select 1 from events x join assets a on a.id = x.subject_id and a.workspace_id = x.workspace_id and a.kind = 'final_export'
+                    where x.type = 'ASSET_EXPORTED' and x.workspace_id = d.workspace_id and a.lineage->>'projectId' = d.id::text)
+        and not exists (select 1 from events g where g.type = 'CREATIVE_REGENERATION_REQUESTED' and g.workspace_id = d.workspace_id
+                        and g.subject_id = d.id and g.payload->>'by' = 'user')
+    )
+    select (select count(*) from delivered)::int as delivered, (select count(*) from accepted)::int as accepted`;
+  const delivered = Number(r?.delivered ?? 0);
+  const accepted = Number(r?.accepted ?? 0);
+  return { delivered, accepted, rate: delivered ? accepted / delivered : NaN };
+}
+
 // ───────────── QA calibration against human verdicts (plan 05 §13) ─────────────
 
 /** One reviewed automated check: what QA decided, what the reviewer said, and a numeric score if it had one. */

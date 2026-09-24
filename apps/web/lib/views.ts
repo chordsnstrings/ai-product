@@ -15,6 +15,7 @@ import {
   listVariants,
   liveness,
   outageStatus,
+  priceUpdate,
   resumableAfterEdit,
   SLOW_STEP_MS,
   stepEta,
@@ -73,6 +74,8 @@ export async function projectView(workspaceId: string, projectId: string) {
     // Why production stopped, in customer words (plan 03 P9, standard §8): a paused production's queue status
     // (partner + ETA), otherwise the copy mapped from the stored reason code — never an internal error.
     const queue = p.outage ? await outageStatus(tx, workspaceId, projectId) : null;
+    // A delivered ad showing a price or size that has since changed (§42): offered as a free update.
+    const factUpdate = p.state === 'COMPLETE' ? await priceUpdate(tx, workspaceId, projectId) : null;
     const resumable = p.state === 'STORYBOARD_READY' && (await resumableAfterEdit(tx, workspaceId, projectId));
     // What cancelling would do right now (dispatch/spend state), shown before the customer confirms (§38, §46).
     const cancel = p.state !== 'COMPLETE' && p.entitlement_unit ? await cancelDecision(tx, workspaceId, projectId) : null;
@@ -124,6 +127,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         resumable,
         /** Cancel is offered while this is set; `message` says what happens to the credit or payment. */
         cancel: cancel?.allowed ? { message: cancel.message, refund: cancel.refund, outcome: cancel.outcome } : null,
+        /** The ad shows a price or size that changed since: `shown` → `current` (recomposed free, same footage). */
+        factUpdate: factUpdate?.stale ? { shown: factUpdate.shown, current: factUpdate.current } : null,
         cancelling: !!p.cancel_requested_at && !['CANCELLED', 'REFUNDED', 'COMPLETE'].includes(p.state as string),
         /** Is the production run alive? From its heartbeat, never from elapsed time alone (§39). */
         liveness: liveness(IN_PRODUCTION.includes(p.state as ProjectState), (p.heartbeat_at as string | null) ?? null),
@@ -222,6 +227,8 @@ async function storyboardBlock(tx: Tx, storyboardId: string) {
         spokenLine: (s.spoken_line as string) ?? null,
         overlayText: (s.overlay_text as string) ?? null,
         productionMode: s.production_mode as string,
+        /** Why the Production Planner chose this scene's medium (§23), shown before approval. */
+        plannerReason: (s.planner_reason as string | null) ?? null,
         locked: s.locked as boolean,
         frameUrl: s.frame_asset_id ? await assetUrl(tx, s.frame_asset_id as string) : null,
         freeRegenerationsUsed: Number(s.free_regenerations_used),

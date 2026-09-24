@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 import { ProviderError } from '../types';
-import { SeedreamCutout } from './byteplus';
+import { SeedanceVideo, SeedreamCutout } from './byteplus';
 
 const STRIPES = ['#D94F30', '#2E7D32', '#1565C0', '#F9A825', '#6A1B9A', '#00838F'];
 
@@ -54,5 +54,23 @@ describe('Seedream background removal (plan 06 Phase 1 #6)', () => {
     const e = await new SeedreamCutout('key', 'https://ark.example/api/v3').removeBackground({ model: 'm', image: await bottle('busy') }).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(ProviderError);
     expect(e).toMatchObject({ kind: 'rate_limit', retryable: true });
+  });
+});
+
+describe('Seedance references (standard §24: many multimodal references)', () => {
+  it('sends the scene frame and the product views up to the configured cap, in order', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ id: 'task-1' }), { status: 200 });
+    });
+    const refs = Array.from({ length: 12 }, (_, i) => `data:image/png;base64,ref${i}`);
+    const req = { model: 'm', prompt: 'p', references: refs, seconds: 5, resolution: '720p' as const, ratio: '9:16' as const };
+    await new SeedanceVideo('key', 'https://ark.example/api/v3').submit(req);
+    await new SeedanceVideo('key', 'https://ark.example/api/v3', 3).submit(req);
+    const images = (b: Record<string, unknown>) => (b.content as { type: string; image_url?: { url: string }; role?: string }[]).filter((c) => c.type === 'image_url');
+    expect(images(bodies[0]!).map((c) => c.image_url!.url)).toEqual(refs.slice(0, 9));
+    expect(images(bodies[0]!).every((c) => c.role === 'reference_image')).toBe(true);
+    expect(images(bodies[1]!).map((c) => c.image_url!.url)).toEqual(refs.slice(0, 3));
   });
 });

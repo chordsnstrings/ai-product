@@ -34,10 +34,12 @@ function injected(prompt: string): string | null {
 }
 
 export class MockLlm implements LlmProvider {
-  readonly name = 'anthropic';
+  constructor(readonly name = 'anthropic') {}
   async json<T>(req: LlmJsonRequest<T>): Promise<LlmJsonResult<T>> {
     const text = req.content.map((c) => (c.type === 'image' ? '' : c.text)).join('\n');
     const fail = injected(text);
+    // A partial failure: the model generated (and the provider billed) tokens, then the answer was unusable.
+    if (fail === 'partial') throw new ProviderError(this.name, 'injected partial failure (billed)', false, 'server', { tokens: { input: approxTokens(req.system + text), output: 400 } });
     if (fail) throw new ProviderError(this.name, `injected ${fail}`, fail !== 'invalid', fail as never);
     const data = req.schema.parse(req.mock());
     return {
@@ -80,9 +82,10 @@ export class MockSegmentation implements SegmentationProvider {
 const aspectFor = (w: number, h: number): Aspect => (w === h ? '1x1' : w / h > 0.7 ? '4x5' : '9x16');
 
 export class MockImage implements ImageProvider {
-  readonly name = 'byteplus';
+  constructor(readonly name = 'byteplus') {}
   async generate(req: ImageRequest): Promise<ImageResult> {
     const fail = injected(req.prompt);
+    if (fail === 'partial') throw new ProviderError(this.name, 'injected partial failure (billed)', false, 'server', { images: 1 });
     if (fail) throw new ProviderError(this.name, `injected ${fail}`, fail !== 'invalid', fail as never);
     const seed = parseInt(createHash('sha1').update(req.prompt).digest('hex').slice(0, 4), 16);
     const bytes = await placeholderFrame(req.mockLabel ?? req.prompt.slice(0, 80), aspectFor(req.width, req.height), seed);
@@ -99,12 +102,18 @@ interface MockTask {
 }
 
 export class MockVideo implements VideoProvider {
-  readonly name = 'byteplus';
   private tasks = new Map<string, MockTask>();
+  /** The latest requests submitted, in order (tests inspect what a render was asked for). */
+  readonly requests: VideoRequest[] = [];
   /** Simulated latency before a task completes. */
-  constructor(private readonly latencyMs = 50) {}
+  constructor(
+    private readonly latencyMs = 50,
+    readonly name = 'byteplus',
+  ) {}
 
   async submit(req: VideoRequest): Promise<{ providerRequestId: string }> {
+    this.requests.push(req);
+    if (this.requests.length > 50) this.requests.shift();
     const fail = injected(req.prompt);
     if (fail === 'submit') throw new ProviderError(this.name, 'injected submit failure', true, 'server');
     const id = `mock-vid-${randomUUID()}`;
@@ -116,7 +125,7 @@ export class MockVideo implements VideoProvider {
     const t = this.tasks.get(id);
     if (!t) return { status: 'failed', error: 'unknown task (worker restarted?)' };
     if (t.status === 'cancelled' || t.status === 'failed' || t.status === 'succeeded') {
-      return { status: t.status, bytes: t.bytes, error: t.error, modelVersion: `${t.req.model}-mock`, outputSeconds: t.req.seconds };
+      return { status: t.status, bytes: t.bytes, error: t.error, modelVersion: `${t.req.model}-mock`, outputSeconds: t.status === 'succeeded' || injected(t.req.prompt) === 'partial' ? t.req.seconds : undefined };
     }
     if (Date.now() - t.createdAt < this.latencyMs) return { status: 'running' };
     const fail = injected(t.req.prompt);
@@ -124,6 +133,12 @@ export class MockVideo implements VideoProvider {
       t.status = 'failed';
       t.error = fail === 'moderation' ? 'content moderation rejected the request' : 'provider render failure';
       return { status: 'failed', error: t.error };
+    }
+    // Generated, billed, then rejected: the provider charges the seconds it rendered.
+    if (fail === 'partial') {
+      t.status = 'failed';
+      t.error = 'output rejected after generation';
+      return { status: 'failed', error: t.error, outputSeconds: t.req.seconds, rawMeta: { mock: true, status: 'failed', seconds: t.req.seconds } };
     }
     const aspect: Aspect = t.req.ratio === '1:1' ? '1x1' : t.req.ratio === '4:5' ? '4x5' : '9x16';
     t.bytes = await withTempDir(async (dir) => {
@@ -148,6 +163,7 @@ export class MockTts implements TtsProvider {
   constructor(readonly name = 'minimax') {}
   async synthesize(req: TtsRequest): Promise<TtsResult> {
     const fail = injected(req.text);
+    if (fail === 'partial') throw new ProviderError(this.name, 'injected partial failure (billed)', false, 'server', { chars: req.text.length });
     if (fail) throw new ProviderError(this.name, `injected ${fail}`, true, 'server');
     // ~2.6 words per second of natural voice-over.
     const words = req.text.split(/\s+/).filter(Boolean).length;

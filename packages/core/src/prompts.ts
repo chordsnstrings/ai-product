@@ -130,6 +130,22 @@ const IMPLIED_CLAIMS_1_0 = `You review a complete skincare ad (script, on-screen
 Flag anything that implies treating a condition, changing skin structure, guaranteed results, or
 before/after outcomes, even if no single sentence says it outright.`;
 
+const IMPLIED_CLAIMS_1_1 = `You review a complete skincare ad for implied claims: the script (spoken lines), on-screen text, hook and
+call to action, the scene descriptions and sampled frames of the finished video, together. Flag anything that implies
+treating or curing a condition, changing skin structure or biology, guaranteed or time-bound results, or a
+before/after outcome — including when no single sentence says it and the implication comes from the pictures or
+from words and pictures together (a blemish that disappears, skin that visibly transforms between shots, a
+clinical setting that suggests a medical treatment). Cosmetic, sensory and appearance wording ("feels softer",
+"looks dewy") is not an implied claim. For each implication give the claim in plain words, whether text, visuals or
+both carry it, the scene it comes from if one, and severity "block" for medical, structure/function or before/after
+outcomes and "review" for borderline cases.`;
+
+const CONTINUITY_1_0 = `You compare frames from different scenes of one skincare ad that show the same AI-generated person (hands,
+skin, face). Report whether it is recognisably the same person across the frames (face, hands, apparent age), and
+whether the skin tone and complexion stay consistent — material lightening or darkening, or skin that looks
+smoother, clearer or more even in later frames, is a failure because it can imply a treatment result. List the
+1-based frames that break continuity with the first frame.`;
+
 const CONTEXT_PACKET = 'JSON context packet: product facts (with ids), approved/blocked claims, customer themes, learnings, coverage gaps';
 
 export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
@@ -314,6 +330,26 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     author: AUTHOR,
     date: '2026-09-23',
   },
+  {
+    name: 'implied-claims',
+    version: '1.1.0',
+    text: IMPLIED_CLAIMS_1_1,
+    variables: { creative: 'script, on-screen text, hook, CTA and scene descriptions', frames: 'frames sampled from the finished 9:16 export' },
+    outputSchema: 'ImpliedClaimsCheck',
+    changelog: 'Evaluates the whole creative — words and pictures together — and returns each implication with its basis and severity (§43).',
+    author: AUTHOR,
+    date: '2026-09-24',
+  },
+  {
+    name: 'continuity',
+    version: '1.0.0',
+    text: CONTINUITY_1_0,
+    variables: { frames: 'one frame per accepted generated scene showing a person' },
+    outputSchema: 'ContinuityCheck',
+    changelog: 'Initial cross-scene talent and skin-tone continuity check (§44, §48).',
+    author: AUTHOR,
+    date: '2026-09-24',
+  },
 ];
 
 /** `<name>@<semver>`, as model_routes.prompt_version stores it. */
@@ -350,3 +386,4 @@ export const THEMES_SYSTEM = latestPrompt('themes').text;
 export const GENOME_SYSTEM = latestPrompt('genome').text;
 export const FIDELITY_SYSTEM = latestPrompt('fidelity').text;
 export const IMPLIED_CLAIMS_SYSTEM = latestPrompt('implied-claims').text;
+export const CONTINUITY_SYSTEM = latestPrompt('continuity').text;

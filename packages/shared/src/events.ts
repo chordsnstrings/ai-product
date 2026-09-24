@@ -34,6 +34,8 @@ export const EventType = [
   // Platform event: a hook variant was not shipped (claims, integrity or fit) — never shipped confounded.
   'VARIANT_SKIPPED',
   'VARIANT_EXPORTED',
+  // Standard §26 / §49 usage: a Creator Pack (a structured brief for a human creator) was made for an experiment.
+  'CREATOR_PACK_CREATED',
   'EXPERIMENT_CONFOUNDED',
   // Performance
   'PERFORMANCE_INGESTED',
@@ -54,6 +56,9 @@ export const EventType = [
   'QA_FAILED',
   'QA_PASSED',
   'COMPOSITION_COMPLETED',
+  // Platform event: a paid production was asked to generate its creative again (Appendix C first-render acceptance:
+  // `by: user` is a customer-requested regeneration; system and staff retries are not the customer's).
+  'CREATIVE_REGENERATION_REQUESTED',
   // Billing / ledger
   'CREDIT_RESERVED',
   'CREDIT_CONSUMED',
@@ -154,6 +159,7 @@ export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
   PROVIDER_JOB_FAILED: z
     .object({ task: z.string(), latencyMs: z.number().int().nullable(), actualMicros: z.number().int(), providerRequestId: z.string().nullable(), errorKind: z.string() })
     .strict(),
+  CREATIVE_REGENERATION_REQUESTED: z.object({ by: z.enum(['user', 'staff', 'system']), from: z.string(), reason: z.string().nullable() }).strict(),
   // A creative derived from a delivered one (a hook variant, a recomposition): its parent and what changed.
   CREATIVE_VERSIONED: z
     .object({ parentCreativeId: z.string().uuid(), changedVariables: z.array(z.string()).min(1), variantId: z.string().uuid().nullable(), projectId: z.string().uuid().nullable() })
@@ -281,6 +287,8 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   QA_FAILED: 'scene',
   QA_PASSED: 'scene',
   COMPOSITION_COMPLETED: 'project',
+  CREATOR_PACK_CREATED: 'experiment',
+  CREATIVE_REGENERATION_REQUESTED: 'project',
   CREDIT_RESERVED: 'project',
   CREDIT_CONSUMED: 'project',
   CREDIT_RELEASED: 'project',
@@ -341,6 +349,8 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   VARIANT_GENERATED: ['variantId', 'experimentId', 'creativeId', 'skuId'],
   VARIANT_SKIPPED: ['variantId', 'experimentId', 'skuId'],
   COMPOSITION_COMPLETED: ['projectId', 'skuId', 'creativeId'],
+  CREATOR_PACK_CREATED: ['experimentId', 'skuId'],
+  CREATIVE_REGENERATION_REQUESTED: ['projectId', 'skuId'],
   CREDIT_RESERVED: ['ledgerEntryId', 'authorizationId'],
   CREDIT_CONSUMED: ['ledgerEntryId', 'authorizationId'],
   CREDIT_RELEASED: ['ledgerEntryId', 'authorizationId'],

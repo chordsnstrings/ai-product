@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { ACTIVE_PRODUCTION_STATES, costPerUsableExport, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
+import { ACTIVE_PRODUCTION_STATES, costPerUsableExport, firstRenderAcceptance, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
@@ -67,6 +67,8 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
                           from events where type in ('QA_PASSED','QA_FAILED') and at > now() - make_interval(days => ${days}) ${t()}`;
     // Standard §10: repeated product-fidelity failure on < 3% of paid projects.
     const fidelity = await repeatedFidelityFailures(tx, days, { includeTest: prefs.includeTest });
+    // Appendix C: paid ads exported without a customer-requested regeneration.
+    const firstRender = await firstRenderAcceptance(tx, days, { includeTest: prefs.includeTest });
     const [cogs] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > now() - make_interval(days => ${days}) ${t()}`;
     // "Today" and the forecast baseline use calendar days in the console timezone.
     const [today] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at >= date_trunc('day', now(), ${tz}) ${t()}`;
@@ -86,7 +88,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       union all select 'Platform alerts', count(*)::int, min(created_at), '/#alerts' from platform_alerts where resolved_at is null
       union all select 'Stripe reconciliation', count(*)::int, min(created_at), '/billing?tab=recon' from stripe_recon_exceptions where resolved_at is null`;
     const alerts = await tx`select id, kind, severity, subject_type, subject_id, message, created_at from platform_alerts where resolved_at is null order by created_at desc limit 50`;
-    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, usable, conn, risk, queues, alerts };
+    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, firstRender, cogs, today, prior, usable, conn, risk, queues, alerts };
   });
   const count = (t: string) => Number(m.funnel.find((r) => r.type === t)?.n ?? 0);
   const base = (t: string) => Number(m.funnel.find((r) => r.type === t)?.base ?? 0);
@@ -145,6 +147,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
           <Kpi label="Stuck > 20 min" value={stuck} alert={stuck > 0} alertText="Stuck" href="/jobs?stuck=1" />
           <Kpi label="Oldest queued" value={oldestQueued ? ago(new Date(Date.now() - oldestQueued * 1000)) : '—'} alert={oldestQueued > 600} alertText="Over 10 min" href="/jobs" />
           <Kpi label="QA first-pass" value={pct(firstPass, 0)} alert={Number.isFinite(firstPass) && firstPass < 0.7} alertText="Below 70%" sub={`${qaTotal} checks`} href="/qa" />
+          <Kpi label="First-render acceptance" value={pct(m.firstRender.rate, 0)} sub={`${m.firstRender.accepted} of ${m.firstRender.delivered} paid ads exported without a customer-requested regeneration`} href="/qa" />
           <Kpi label="Hard fidelity fails" value={pct(hardRate)} alert={hardFailAlert(Number(m.qa!.hard), qaTotal)} alertText="Above 3%" sub={`${m.qa!.hard} of ${qaTotal}`} href="/qa" />
           <Kpi label="Repeated fidelity fails" value={pct(m.fidelity.rate)} alert={Number.isFinite(m.fidelity.rate) && m.fidelity.rate > REPEATED_FIDELITY_TARGET} alertText={`Above ${pct(REPEATED_FIDELITY_TARGET, 0)}`} sub={`${m.fidelity.repeated} of ${m.fidelity.paid} paid projects · target < ${pct(REPEATED_FIDELITY_TARGET, 0)}`} href="/qa" />
           <Kpi label="Connector freshness" value={pct(freshPct, 0)} alert={Number.isFinite(freshPct) && freshPct < 0.9} alertText="Below 90%" sub={`${m.conn!.fresh}/${m.conn!.n} fresh`} href="/integrations?stale=1" />

@@ -2,15 +2,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformsFor, type LogicalVoice, type Micros, type Platform, type ProjectState } from '@arkiv/shared';
-import { brandAccent, captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProductionMode, type ProjectState } from '@arkiv/shared';
+import { brandAccent, captionCues, composeAd, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
 import { classifyClaim, showsSyntheticPeople, syntheticTestimonials, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
-import { diffCompositions, disclosureMetadata, type AiDisclosure, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
+import { diffCompositions, disclosureMetadata, hasFactTokens, resolveFactTokens, type AiDisclosure, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
 import { authorize, holdAuthorization, reissueToken, settle, type Purpose } from './cost-governor';
 import { allowedClaimTexts } from './creative-director';
@@ -22,10 +22,15 @@ import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoi
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
+import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
-import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
+import { qaClaims, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
+import { fidelityThresholds } from './fidelity';
+import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
+import { factsForStatements, mapStatements, statementCheck } from './statements';
+import { factTokens } from './recompose';
 
 export const PRODUCTION_STEPS = [
   { key: 'prepare', label: 'Preparing your product' },
@@ -41,6 +46,11 @@ export const ASPECTS: Aspect[] = ['9x16', '4x5', '1x1'];
 const MIN_GEN_SECONDS = 5;
 /** Generated environment plates for strict product composites (§23). */
 export const PLATE_TASK = 'image.environment_plate';
+/** The whole-creative implied-claim scan and the cross-scene continuity check (QA Gateway, §25). */
+export const IMPLIED_TASK = 'qa.implied_claims';
+export const CONTINUITY_TASK = 'qa.continuity';
+/** Frames of the finished 9:16 export the implied-claim scan looks at. */
+const IMPLIED_FRAMES = 3;
 /** A voice-over may run this far past the end of the ad before the export is refused (never cut mid-word). */
 const VO_OVERFLOW_TOLERANCE_MS = 250;
 
@@ -97,6 +107,9 @@ export interface ProductionRoutes {
   tts: RouteModel[];
   qa: RouteModel[];
   plate: RouteModel[] | null;
+  /** Whole-creative implied-claim scan (§43) and cross-scene continuity (§44) — null when the route isn't set up. */
+  implied: RouteModel[] | null;
+  continuity: RouteModel[] | null;
 }
 
 /** A task's route and its approved fallback route (when one is set). */
@@ -106,12 +119,14 @@ async function withFallbackRoute(tx: Tx, task: string, workspaceId: string | nul
 }
 
 export async function productionRoutes(tx: Tx, workspaceId: string | null): Promise<ProductionRoutes> {
-  const [plate] = await tx`select 1 from model_routes where task = ${PLATE_TASK}`;
+  const has = async (task: string) => (await tx`select 1 from model_routes where task = ${task}`).length > 0;
   return {
     video: await withFallbackRoute(tx, 'video.scene', workspaceId),
     tts: await withFallbackRoute(tx, 'tts.voiceover', workspaceId),
     qa: await withFallbackRoute(tx, 'qa.fidelity', workspaceId),
-    plate: plate ? await withFallbackRoute(tx, PLATE_TASK, workspaceId) : null,
+    plate: (await has(PLATE_TASK)) ? await withFallbackRoute(tx, PLATE_TASK, workspaceId) : null,
+    implied: (await has(IMPLIED_TASK)) ? await withFallbackRoute(tx, IMPLIED_TASK, workspaceId) : null,
+    continuity: (await has(CONTINUITY_TASK)) ? await withFallbackRoute(tx, CONTINUITY_TASK, workspaceId) : null,
   };
 }
 
@@ -176,12 +191,19 @@ export function planProduction(
   const shortest = secs.length ? Math.min(...secs) : 0;
   const plates = routes.plate ? (opts.plates ?? 0) : 0;
   const voice = (): CostLine[] => (voiceChars ? [voiceLine(routes, rates, voiceChars)] : []);
+  // One whole-creative implied-claim scan, and one continuity check when two or more generated scenes show people.
+  const people = scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION' && !!s.shows_human_skin).length;
+  const review = (): CostLine[] => [
+    ...(routes.implied ? [dearerLine(routes.implied, rates, { kind: 'llm', inputTokens: 1_500 * IMPLIED_FRAMES + 3_000, outputTokens: 1_200 })] : []),
+    ...(routes.continuity && people >= 2 ? [dearerLine(routes.continuity, rates, { kind: 'llm', inputTokens: 1_500 * Math.min(6, people) + 500, outputTokens: 600 })] : []),
+  ];
   const tail = (reserve: number): CostLine[] => {
     const repairs = generative.length ? Math.min(generative.length, Math.floor((reserve + 1e-6) / shortest)) : 0;
     const inspections = 2 * generative.length + repairs + plates + 1;
     return [
       ...voice(),
       dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
+      ...review(),
       ...(plates && routes.plate ? [dearerLine(routes.plate, rates, { kind: 'image', images: plates })] : []),
       { kind: 'media', outputs: 1 },
     ];
@@ -195,6 +217,50 @@ export function planProduction(
 }
 
 const CEILING_PURPOSES: readonly Purpose[] = ['taste', 'standalone', 'creative_test'];
+
+export interface PlannedStoryboardScene {
+  mode: ProductionMode;
+  reason: string;
+  /** Planned provider cost of producing the scene (a generated render with its repair reserve; 0 for stills). */
+  estimateMicros: number;
+}
+
+/**
+ * Run the Production Planner (production-planner.ts) over a planned storyboard: the facts it decides on are read
+ * here — the Visual Fingerprint's transparency and reference views, whether the cut-out keyed (or will be tried),
+ * the video route's availability, rights-cleared footage — and the plan is priced on today's routes and rates
+ * against the paid-ad ceiling, so the modes the merchant approves are the ones production makes. Explicitly scoped
+ * by workspace.
+ */
+export async function planStoryboardScenes(tx: Tx, workspaceId: string, skuId: string, scenes: readonly PlannerScene[], opts: { cutoutWillBeTried?: boolean } = {}): Promise<PlannedStoryboardScene[]> {
+  const [fp] = await tx`select f.transparency, coalesce(array_length(f.reference_asset_ids, 1), 0)::int as views, a.lineage->>'keyed' as keyed
+                        from visual_fingerprints f left join assets a on a.id = f.cutout_asset_id and a.workspace_id = f.workspace_id
+                        where f.workspace_id = ${workspaceId} and f.sku_id = ${skuId} and f.active`;
+  const [footage] = await tx`select count(*)::int as n from assets where workspace_id = ${workspaceId} and sku_id = ${skuId} and kind = 'creator_footage'
+                             and deleted_at is null and coalesce(review_status, 'approved') = 'approved'`;
+  // Video counts as unavailable only for a lasting outage: an open circuit announced to reopen within a day is
+  // queued at production with its ETA (§44), not designed around, so a brief outage never downgrades the ad.
+  const lastingOutage = async (task: string) =>
+    ((await tx`select 1 from model_routes where task = ${task} and circuit_open and (circuit_until is null or circuit_until > now() + interval '24 hours')`).length) > 0;
+  const video = await route(tx, 'video.scene', workspaceId);
+  const videoAvailable = !(await lastingOutage('video.scene')) || (!!video.fallbackTask && !(await lastingOutage(video.fallbackTask)));
+  const facts: PlannerFacts = {
+    transparency: (fp?.transparency as string | null) ?? null,
+    referenceViews: Number(fp?.views ?? 0),
+    keyedCutout: (!!fp && fp.keyed !== 'false') || !!opts.cutoutWillBeTried,
+    videoAvailable,
+    remixFootage: Number(footage?.n ?? 0) > 0,
+  };
+  const routes = await productionRoutes(tx, workspaceId);
+  const rates = await loadRates(tx);
+  const rows = (modes: readonly ProductionMode[]) => scenes.map((s, i) => ({ id: `planned-${i}`, purpose: s.purpose, duration_ms: s.durationMs, production_mode: modes[i]! })) as SceneRow[];
+  const cost = (modes: readonly ProductionMode[]) => estimate(rates, planProduction(rows(modes), 0, routes, rates).lines).totalMicros;
+  const planned = fitCeiling(scenes, planSceneModes(scenes, facts), cost, COST_LIMITS.CREATIVE_TEST_CEILING, facts);
+  return planned.map((p, i) => ({
+    ...p,
+    estimateMicros: p.mode === 'GENERATIVE_INTERACTION' ? priceLine(rates, dearerLine(routes.video, rates, { kind: 'video', seconds: genSeconds(scenes[i]!.durationMs), resolution: '720p' })).micros : 0,
+  }));
+}
 
 /**
  * Hash of what a scene's render depends on (§24, §35): the frame it is generated from, the visual plan, the
@@ -423,6 +489,20 @@ export async function produceProject(ctx: TenantContext, projectId: string, opts
   }
 }
 
+/** Product reference photos sent with each render (the cut-out follows them). */
+const VIDEO_PRODUCT_VIEWS = 3;
+
+/**
+ * The render prompt: the scene, then how to use the references — the first image is the scene's storyboard frame,
+ * the others are the exact product, which must not change (label text, shape, closure, colours).
+ */
+export function videoPrompt(s: Record<string, unknown>, attempt: number, productRefs: number): string {
+  const product = productRefs
+    ? `The first reference image is the scene's storyboard frame; the other ${productRefs} reference images show the exact product. Keep the product identical to those product images: the same label text, shape, closure and colours.`
+    : 'Keep the product identical to the reference image.';
+  return `${s.visual_plan as string}. ${(s.product_behavior as string | null) ?? ''} ${product} Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`;
+}
+
 function platePrompt(s: SceneRow): string {
   return [
     `Empty product-photography set for a vertical 9:16 skincare ad. Setting: ${s.visual_plan as string}.`,
@@ -451,6 +531,28 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
   });
   const { p, scenes, sb, sku, fp, variant, versions, brand, imagery } = load;
+  // {price} / {size} in on-screen text and the CTA show the product's current facts (§42): resolved now, and kept
+  // as templates in the manifest so a later change recomposes the ad without new footage.
+  const tokens = await withTenant(ws, (tx) => factTokens(tx, p.sku_id as string));
+  const usedTokens = { price: false, size: false };
+  let tokensSpoken = false;
+  const resolve = (text: string) => {
+    if (/\{price\}/.test(text)) usedTokens.price = true;
+    if (/\{size\}/.test(text)) usedTokens.size = true;
+    return resolveFactTokens(text, tokens);
+  };
+  for (const s of scenes) {
+    if (hasFactTokens(s.overlay_text as string | null)) {
+      s.overlay_template = s.overlay_text;
+      s.overlay_text = resolve(s.overlay_text as string) || null;
+    }
+    if (hasFactTokens(s.spoken_line as string | null)) {
+      tokensSpoken = true;
+      s.spoken_line = resolve(s.spoken_line as string) || null;
+    }
+  }
+  const ctaTemplate = hasFactTokens(sb?.cta_text as string | null) ? (sb!.cta_text as string) : null;
+  if (ctaTemplate) sb!.cta_text = resolve(ctaTemplate);
   // Cancelled while queued or while a previous run was stopping: this run holds the lease, so it settles the cancel.
   if (p.cancel_requested_at && RUNNABLE.includes(p.state as ProjectState)) return withTenant(ws, async (tx) => ((await finalizeCancel(tx, ctx, projectId)) ? 'cancelled' : 'skipped'));
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
@@ -562,7 +664,18 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     });
     // Fidelity QA compares against the advertised variant's own image first (§42), then the fingerprint's photos.
     const refs = await withTenant(ws, async (tx) => Promise.all((await referenceAssetIds(tx, sku.id as string, projectId)).map((id) => assetBytes(tx, id))));
-    const fingerprint = { labelText: (fp?.label_text as string) ?? null, closure: (fp?.closure as string) ?? null, paletteDistanceMax: 70 };
+    // The Visual Fingerprint's own constraints (§16): its similarity thresholds, dominant colours and — when the
+    // cut-out keyed cleanly — the exact product the deterministic checks locate in each frame.
+    const fingerprint = {
+      labelText: (fp?.label_text as string) ?? null,
+      closure: (fp?.closure as string) ?? null,
+      dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
+      thresholds: fidelityThresholds(fp?.thresholds),
+      cutout: imagery.cutout?.keyed ? imagery.cutout.bytes : null,
+    };
+    // The product's own views for the video model (§23 "preserves product truth", §24 multimodal references): the
+    // fingerprint's reference photos and, when it keyed cleanly, the exact cut-out — never only a generated frame.
+    const productRefs = [...(await Promise.all(refs.slice(0, VIDEO_PRODUCT_VIEWS).map((b) => toDataUrl(b)))), ...(imagery.cutout?.keyed ? [`data:image/png;base64,${imagery.cutout.bytes.toString('base64')}`] : [])];
     if (imagery.cutout && !imagery.cutout.keyed) checks.push({ check: 'product_fidelity', pass: true, hard: false, detail: `Your product photo couldn’t be cut out cleanly, so product shots use the photo itself. ${CLEAN_PHOTO_TIP}` });
 
     await withTempDir(async (dir) => {
@@ -606,6 +719,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         versionId,
         technique,
         overlayText: (s.overlay_text as string | null) ?? null,
+        ...(s.overlay_template ? { overlayTemplate: s.overlay_template as string } : {}),
         spokenText: ((s.spoken_line as string | null) ?? '').trim() || null,
         durationMs: s.duration_ms,
         claimIds: [],
@@ -684,8 +798,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                 task: 'video.scene',
                 subject: { type: 'scene', id: s.id },
                 inputRefs: { skuId: sku.id, sceneId: s.id, inputHash: hashes.get(s.id), frameVersionId: s.current_version_id ?? null, attempt },
-                prompt: `${s.visual_plan as string}. ${s.product_behavior ?? ''} Keep the product identical to the reference image. Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`,
-                references: [`data:image/png;base64,${frame.bytes.toString('base64')}`],
+                prompt: videoPrompt(s, attempt, productRefs.length),
+                references: [`data:image/png;base64,${frame.bytes.toString('base64')}`, ...productRefs],
                 seconds,
                 resolution: '720p',
                 ratio: '9:16',
@@ -790,6 +904,30 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         else if (s.production_mode === 'STRICT_COMPOSITE') slots.push(await strict(s, n));
         else slots.push(await still(s, n, await frameOf(s, n)));
       }
+
+      // Continuity of generated people across scenes (§44, §48): scenes that break it with the first become the
+      // exact-product composite — no extra renders ("continuity is not worth endless retries").
+      const people = slots.map((sl, i) => ({ sl, s: body[i]! })).filter(({ sl, s }) => sl.entry.kind === 'video' && sl.entry.technique === 'generative' && !!s.shows_human_skin);
+      if (people.length >= 2 && routes.continuity) {
+        await heartbeat();
+        const frames = await Promise.all(
+          people.map(async ({ sl, s }) => ({ sceneId: s.id, planText: (s.visual_plan as string) ?? '', bytes: await withTempDir(async (sub) => readFile((await extractFrames(sl.input.file, 1, sub))[0]!)) })),
+        );
+        let cont: Awaited<ReturnType<typeof qaContinuity>>;
+        try {
+          cont = await qaContinuity(ctx, auth.token, projectId, frames);
+        } catch (e) {
+          if (isProviderOutage(e)) throw new ProviderOutage(CONTINUITY_TASK, e);
+          throw e;
+        }
+        if (cont) {
+          checks.push(cont.check);
+          for (const sceneId of cont.inconsistentSceneIds) {
+            const i = body.findIndex((s) => s.id === sceneId);
+            if (i >= 0) slots[i] = await exactFallback(body[i]!, i + 1, 'AI talent inconsistent across scenes');
+          }
+        }
+      }
       await heartbeat();
       await withTenant(ws, async (tx) => {
         await step(tx, ws, projectId, 'scenes', 'done', `${scenes.length} scenes`);
@@ -814,12 +952,16 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         for (const s of scenes) await tx`update scenes set claim_ids = ${claimIds.get(s.id)!}::uuid[] where id = ${s.id}`;
       });
       for (const slot of slots) slot.entry.claimIds = claimIds.get(slot.entry.sceneId) ?? [];
-      if (!claimCheck.pass || testimonials) {
+      // Launch Gate 2: every factual statement traces to a ProductFact, an approved claim or a merchant decision.
+      const statementMap = mapStatements(lines, mapping, await withTenant(ws, (tx) => factsForStatements(tx, sku.id as string)));
+      const statements = statementCheck(statementMap);
+      checks.push(statements);
+      if (!claimCheck.pass || testimonials || !statements.pass) {
         await withTenant(ws, async (tx) => {
           await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
           // The lines and why are in the QA report (shown with a compliant alternative); the reason is customer copy.
-          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: [claimCheck.pass ? null : claimCheck.detail, testimonials?.detail].filter(Boolean).join(' | '), code: 'claims_blocked' });
-          await tx`update projects set qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
+          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: [claimCheck.pass ? null : claimCheck.detail, testimonials?.detail, statements.pass ? null : statements.detail].filter(Boolean).join(' | ').slice(0, 1000), code: 'claims_blocked' });
+          await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), statementMap } as never)} where id = ${projectId}`;
           await settle(tx, ctx, auth.authorizationId, 'released');
         });
         return;
@@ -894,7 +1036,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // disclosure on the end card of every export.
       const endCard = {
         productName: sku.name as string,
-        cta: ((sb.cta_text as string | null) ?? '').trim() || brand?.brain.cta?.trim() || 'Shop now',
+        // A CTA template with {price} shows the price on its own line above the CTA bar.
+        cta: ctaTemplate && /\{price\}/.test(ctaTemplate) ? resolveFactTokens(ctaTemplate.replace(/\{price\}/g, ''), tokens) || 'Shop now' : ((sb.cta_text as string | null) ?? '').trim() || brand?.brain.cta?.trim() || 'Shop now',
+        price: ctaTemplate && /\{price\}/.test(ctaTemplate) ? (tokens.price?.text ?? null) : null,
         index: `NO. ${String(sku.catalogue_no).padStart(3, '0')}`,
         durationMs: endCardMs,
         accent: brandAccent(brand?.brain.colors),
@@ -910,6 +1054,37 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         generatedScenes,
       };
       const outs = await composeAd({ scenes: slots.map((s) => s.input), voiceover: voPath, captions, endCard, aspects: ASPECTS, metadata: disclosureMetadata(disclosure) }, dir);
+
+      // The whole creative — script, on-screen text, hook, CTA and the finished pictures together — is scanned
+      // for implied claims (§25 check 3, §43 "Visual implies a medical result"). An implied medical,
+      // structure/function or before/after result blocks the ad like a blocked line.
+      if (routes.implied) {
+        await heartbeat();
+        const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
+        const frames = await withTempDir(async (sub) => Promise.all((await extractFrames(vertical.file, IMPLIED_FRAMES, sub)).map((f) => readFile(f))));
+        let implied: CheckResult;
+        try {
+          implied = await qaImpliedClaims(ctx, auth.token, projectId, {
+            scenes: scenes.map((s) => ({ visualPlan: (s.visual_plan as string | null) ?? null, spokenLine: (s.spoken_line as string | null) ?? null, overlayText: (s.overlay_text as string | null) ?? null })),
+            hook: (sb.hook_text as string | null) ?? null,
+            cta: endCard.cta,
+            frames,
+          });
+        } catch (e) {
+          if (isProviderOutage(e)) throw new ProviderOutage(IMPLIED_TASK, e);
+          throw e;
+        }
+        checks.push(implied);
+        if (!implied.pass) {
+          await withTenant(ws, async (tx) => {
+            await step(tx, ws, projectId, 'claims', 'failed', 'Something in the ad needs changing before we can finish');
+            await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: implied.detail.slice(0, 500), code: 'claims_blocked' });
+            await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), impliedClaims: implied.data } as never)} where id = ${projectId}`;
+            await settle(tx, ctx, auth.authorizationId, 'released');
+          });
+          return;
+        }
+      }
       const [concept] = await withTenant(ws, (tx) => tx`select proposal from concepts where id = ${p.selected_concept_id}`);
       const proposal = (concept?.proposal ?? {}) as Record<string, unknown>;
       const manifest: CompositionManifest = {
@@ -919,7 +1094,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         scenes: slots.map((s) => s.entry),
         voiceover: segments.length ? { voice, segments } : null,
         captions,
-        endCard: { ...endCard, sceneId: ctaScene?.id ?? null, spokenText: ((ctaScene?.spoken_line as string | null) ?? '').trim() || null },
+        endCard: { ...endCard, sceneId: ctaScene?.id ?? null, spokenText: ((ctaScene?.spoken_line as string | null) ?? '').trim() || null, ctaTemplate },
+        tokens: usedTokens.price || usedTokens.size ? { price: usedTokens.price ? tokens.price : null, size: usedTokens.size ? tokens.size : null } : null,
+        ...(tokensSpoken ? { tokensSpoken } : {}),
         durationMs: totalMs,
         aspects: ASPECTS,
         genes: { angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment },
@@ -952,11 +1129,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const [cr] = await tx`
           insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
-            ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0 } as never)},
+            ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
             1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
-        if (p.variant_id) await tx`update variants set creative_id = ${cr!.id} where id = ${p.variant_id}`;
-        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
+        if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
+        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');
         await settle(tx, ctx, auth.authorizationId, 'consumed');
@@ -1178,8 +1355,10 @@ export async function finishAfterEdit(tx: Tx, ctx: TenantContext, projectId: str
   const [sku] = await tx`select name from skus where id = ${p.sku_id}`;
   const check = await claimsQaForExports(tx, p.sku_id as string, await adLines(tx, p.storyboard_id as string), ASPECTS, { names: [sku?.name as string, (await brandBrainFor(tx, p.sku_id as string))?.name ?? null] });
   const testimonials = testimonialCheck(await tx`select production_mode, shows_human_skin, spoken_line, overlay_text from scenes where storyboard_id = ${p.storyboard_id}`);
-  if (!check.pass || testimonials) {
-    const lines = blockedLines({ checks: [check, ...(testimonials ? [testimonials] : [])] });
+  // Launch Gate 2 on the edited lines too: a fact nothing backs would only stop production again.
+  const statements = statementCheck(mapStatements(await adLines(tx, p.storyboard_id as string), (check.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? [], await factsForStatements(tx, p.sku_id as string)));
+  if (!check.pass || testimonials || !statements.pass) {
+    const lines = blockedLines({ checks: [check, ...(testimonials ? [testimonials] : []), ...(statements.pass ? [] : [statements])] });
     throw new DomainError('GATE_BLOCKED', `“${lines[0]?.line ?? 'A line'}” still can’t be used: ${lines[0]?.reason ?? check.detail}`, { lines });
   }
   await approveForProduction(tx, ctx, projectId, unit);
@@ -1336,6 +1515,11 @@ export async function retryProduction(tx: Tx, ctx: TenantContext, projectId: str
            where workspace_id = ${ctx.workspaceId} and project_id = ${projectId} and idempotency_key = ${'produce:' + projectId} and status <> 'active'`;
   await transition(tx, ctx, projectId, 'STORYBOARD_APPROVED');
   await tx`update projects set outage = null where id = ${projectId}`;
+  // A failed paid production generated again (Appendix C first-render acceptance): whose request it was.
+  if (p.state === 'PROVIDER_FAILED' && ['taste', 'standalone', 'creative_test'].includes(p.kind as string)) {
+    const by = ctx.actor.kind === 'staff' ? 'staff' : ctx.actor.kind === 'system' ? 'system' : 'user';
+    await emit(tx, ctx, 'CREATIVE_REGENERATION_REQUESTED', { type: 'project', id: projectId }, { by, from: p.state as string, reason: (p.failure_code as string | null) ?? null }, { projectId, skuId: p.sku_id as string });
+  }
   await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor, retry: true }, { singletonKey: `produce:${projectId}:${Date.now()}`, priority: priorityFor(ctx, 'production') });
   return { resumed: false };
 }

@@ -11,7 +11,13 @@ import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, listClaims, proposeClaim } from './claims';
 import { recordAssetWatched } from './funnel';
 import { append, available } from './ledger';
-import { approveForProduction, blockedLines, produceProject } from './production';
+import { approveForProduction, blockedLines, finishAfterEdit, hardFidelityFail, planStoryboardScenes, produceProject, reopenForEdit } from './production';
+import sharp from 'sharp';
+import { authorize } from './cost-governor';
+import { exactProductFrame, productImagery } from './composite';
+import { fidelityThresholds } from './fidelity';
+import { qaScene } from './qa';
+import { providers, type MockVideo } from '@arkiv/providers';
 import { editScene, generateStoryboard, selectConcept, storyboardView } from './storyboard';
 import { currentQuote } from './offers';
 import { ingestBytes } from './uploads';
@@ -62,6 +68,13 @@ describe('free preview → storyboard (Launch Gate 1, first half)', () => {
       expect(v.storyboard.status).toBe('ready');
       expect(v.scenes.reduce((s, x) => s + Number(x.duration_ms), 0)).toBe(15000);
       expect(v.scenes.every((s) => s.frame_asset_id)).toBe(true);
+      // The Production Planner decided every scene's medium and recorded why and what it is planned to cost (§23).
+      expect(v.scenes.every((s) => typeof s.planner_reason === 'string' && (s.planner_reason as string).length > 10)).toBe(true);
+      expect(v.scenes.find((s) => s.purpose === 'cta')).toMatchObject({ production_mode: 'STRICT_COMPOSITE' });
+      const gen = v.scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION');
+      expect(gen.length).toBeGreaterThan(0);
+      expect(gen.every((s) => Number(s.estimate_micros) > 0)).toBe(true);
+      expect(v.scenes.filter((s) => s.production_mode !== 'GENERATIVE_INTERACTION').every((s) => Number(s.estimate_micros) === 0)).toBe(true);
       const [p] = await tx`select state from projects where id = ${projectId}`;
       expect(p!.state).toBe('STORYBOARD_READY');
       const q = await currentQuote(tx);
@@ -71,6 +84,23 @@ describe('free preview → storyboard (Launch Gate 1, first half)', () => {
       const [c] = await tx`select coalesce(sum(spent_micros),0)::bigint as n from cost_authorizations where purpose = 'free_preview'`;
       expect(Number(c!.n)).toBeLessThanOrEqual(200_000);
     });
+  }, 60_000);
+
+  it('the planner designs around a lasting video outage, never a brief one that production queues through (§23, §44)', async () => {
+    const { t, skuId, storyboardId } = await previewToStoryboard();
+    const scenes = (await ownerPool()`select purpose, duration_ms, production_mode from scenes where storyboard_id = ${storyboardId} order by position`).map((s) => ({ purpose: s.purpose as string, durationMs: Number(s.duration_ms), productionMode: s.production_mode as string }));
+    const modes = () => withTenant(t.workspaceId, async (tx) => (await planStoryboardScenes(tx, t.workspaceId, skuId, scenes)).map((p) => p.mode));
+    try {
+      expect(await modes()).toContain('GENERATIVE_INTERACTION');
+      // Open for 40 minutes: the ad keeps its video scenes (production waits with the ETA).
+      await ownerPool()`update model_routes set circuit_open = true, circuit_until = now() + interval '40 minutes' where task = 'video.scene'`;
+      expect(await modes()).toContain('GENERATIVE_INTERACTION');
+      // Open with no announced reopening: no video scene is planned.
+      await ownerPool()`update model_routes set circuit_until = null where task = 'video.scene'`;
+      expect(await modes()).not.toContain('GENERATIVE_INTERACTION');
+    } finally {
+      await ownerPool()`update model_routes set circuit_open = false, circuit_until = null where task = 'video.scene'`;
+    }
   }, 60_000);
 
   it('refuses blocked claim edits in the storyboard with a compliant alternative', async () => {
@@ -99,9 +129,21 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       // Double-approve (webhook replay) is a no-op.
       expect((await approveForProduction(tx, ctx, projectId, 'taste')).replayed).toBe(true);
     });
+    const video = (await providers()).video as MockVideo;
+    const before = video.requests.length;
     expect(await produceProject(ctx, projectId)).toBe('complete');
     // Duplicate job delivery does not produce or charge twice.
     expect(await produceProject(ctx, projectId)).toBe('skipped');
+    // Each render is given the product's own views, not just its (generated) storyboard frame (§23, §24): the frame,
+    // the fingerprint's reference photo and the exact cut-out, with a prompt that points at them.
+    const renders = video.requests.slice(before);
+    expect(renders.length).toBeGreaterThan(0);
+    for (const r of renders) {
+      expect(r.references).toHaveLength(3);
+      expect(r.references[1]).toMatch(/^data:image\/jpeg;base64,/);
+      expect(r.references[2]).toMatch(/^data:image\/png;base64,/);
+      expect(r.prompt).toMatch(/the other 2 reference images show the exact product/);
+    }
     await withTenant(t.workspaceId, async (tx) => {
       const [p] = await tx`select state, qa_report, final_creative_id from projects where id = ${projectId}`;
       expect(p!.state).toBe('COMPLETE');
@@ -168,6 +210,31 @@ describe('Taste production (Launch Gate 1, second half)', () => {
     expect(blockedLines(p!.qa_report)).toEqual([expect.objectContaining({ line: 'I’ve used it for two weeks.', reason: expect.stringMatching(/AI-generated person/) })]);
   }, 120_000);
 
+  it('a materially wrong shade is a hard product-fidelity failure, whatever the inspector says (§16)', async () => {
+    const { t, ctx, skuId } = await previewToStoryboard();
+    const paid = { ...ctx, workspaceState: 'ACTIVE_PAID' as const };
+    const [route] = await ownerPool()`select provider, model from model_routes where task = 'qa.fidelity'`;
+    const { imagery, fp, auth } = await withTenant(t.workspaceId, async (tx) => ({
+      imagery: await productImagery(tx, skuId),
+      fp: (await tx`select label_text, closure, dominant_colors, thresholds from visual_fingerprints where sku_id = ${skuId} and active`)[0]!,
+      auth: await authorize(tx, paid, { purpose: 'storyboard', skuId, lines: [{ kind: 'llm', provider: route!.provider as string, model: route!.model as string, inputTokens: 20_000, outputTokens: 2_000 }], idempotencyKey: 'qa-shade' }),
+    }));
+    // Thresholds come from the fingerprint (defaults written at analysis).
+    expect(fp.thresholds).toMatchObject({ paletteDistanceMax: 70, regionColorMax: 60 });
+    const fingerprint = { labelText: fp.label_text as string | null, closure: fp.closure as string | null, dominantColors: fp.dominant_colors as string[], thresholds: fidelityThresholds(fp.thresholds), cutout: imagery.cutout!.bytes };
+    const exact = (await exactProductFrame(imagery, { purpose: 'hero' }))!.bytes;
+    const recoloured = (await exactProductFrame({ ...imagery, cutout: { ...imagery.cutout!, bytes: await sharp(imagery.cutout!.bytes).modulate({ hue: 180, saturation: 2.5 }).png().toBuffer() } }, { purpose: 'hero' }))!.bytes;
+    const qa = (frameBytes: Buffer) => qaScene({ ctx, token: auth.token, sceneId: newId(), sceneText: 'hero shot', frameBytes, referenceBytes: [imagery.reference!.bytes], fingerprint, planText: 'hero shot', attempt: 1 });
+    const ok = await qa(exact);
+    expect(ok.find((c) => c.check === 'product_fidelity')).toMatchObject({ pass: true, data: { deterministic: { located: true, productCount: 1 } } });
+    const bad = (await qa(recoloured)).find((c) => c.check === 'product_fidelity')!;
+    // The (mock) inspector saw nothing wrong; the fingerprint's colour thresholds still fail the frame hard.
+    expect(bad.data).toMatchObject({ colorMatches: true, sameProduct: true });
+    expect(bad).toMatchObject({ pass: false, hard: true });
+    expect(bad.detail).toMatch(/Materially wrong shade/);
+    expect(hardFidelityFail([bad])).toBe(true);
+  }, 60_000);
+
   it('repairs once for free, then switches technique after repeated fidelity failure', async () => {
     const { t, ctx, projectId } = await previewToStoryboard({ visualPlanMarker: '[[qa:fidelity_always]]' });
     await withTenant(t.workspaceId, async (tx) => {
@@ -225,4 +292,33 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       expect((await listClaims(tx, skuId)).length).toBeGreaterThan(0);
     });
   }, 120_000);
+
+  it('traces every factual statement to a product fact or claim, and stops on one nothing backs (Launch Gate 2)', async () => {
+    const { t, ctx, projectId, storyboardId } = await previewToStoryboard();
+    // A concentration no fact or claim backs, put in an overlay directly (bypassing the editor).
+    await ownerPool()`update scenes set overlay_text = 'With 10% niacinamide' where storyboard_id = ${storyboardId} and purpose = 'routine'`;
+    await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'taste', amount: 1, idempotencyKey: 'pay:gate2' });
+      await approveForProduction(tx, ctx, projectId, 'taste');
+    });
+    expect(await produceProject(ctx, projectId)).toBe('failed');
+    const [p] = await ownerPool()`select state, qa_report from projects where id = ${projectId}`;
+    expect(p!.state).toBe('BLOCKED_COMPLIANCE');
+    const report = p!.qa_report as { statementMap: { text: string; status: string; unsourced: string[] }[] };
+    expect(report.statementMap.find((m) => m.text === 'With 10% niacinamide')).toMatchObject({ status: 'unsourced', unsourced: ['10%', 'niacinamide'] });
+    expect(blockedLines(p!.qa_report).map((l) => l.line)).toContain('With 10% niacinamide');
+    expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
+    // Fixing the line is checked before production goes again: the unsourced fact is refused up front.
+    await ownerPool()`insert into purchases (workspace_id, project_id, kind, amount_micros, status, created_by, paid_at) values (${t.workspaceId}, ${projectId}, 'taste', 19000000, 'paid', 'test', now())`;
+    await withTenant(t.workspaceId, (tx) => reopenForEdit(tx, ctx, projectId));
+    await expect(withTenant(t.workspaceId, (tx) => finishAfterEdit(tx, ctx, projectId))).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+    await ownerPool()`update scenes set overlay_text = 'AM + PM, after cleansing' where storyboard_id = ${storyboardId} and purpose = 'routine'`;
+    await withTenant(t.workspaceId, (tx) => finishAfterEdit(tx, ctx, projectId));
+    expect(await produceProject(ctx, projectId)).toBe('complete');
+    const [done] = await ownerPool()`select p.qa_report, c.genome from projects p join creatives c on c.id = p.final_creative_id where p.id = ${projectId}`;
+    const map = (done!.qa_report as { statementMap: { status: string }[] }).statementMap;
+    expect(map.length).toBeGreaterThan(3);
+    expect(map.every((m) => m.status !== 'unsourced')).toBe(true);
+    expect((done!.genome as { lineage: { statementMap: unknown[] } }).lineage.statementMap).toEqual(map);
+  }, 240_000);
 });

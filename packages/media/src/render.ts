@@ -85,7 +85,7 @@ export function brandAccent(colors: readonly string[] | null | undefined): strin
  * End card: product name + CTA in arkiv style. The brand's colour fills the CTA bar and its mandatory disclosure
  * (Brand Brain, §16) is set under it in small type.
  */
-export async function endCard(opts: { productName: string; cta: string; index?: string; aspect: Aspect; accent?: string | null; note?: string | null }): Promise<Buffer> {
+export async function endCard(opts: { productName: string; cta: string; index?: string; aspect: Aspect; accent?: string | null; note?: string | null; price?: string | null }): Promise<Buffer> {
   const { w, h } = ASPECT_SIZE[opts.aspect];
   const bar = brandAccent(opts.accent ? [opts.accent] : []) ?? INK;
   const note = (opts.note ?? '').trim()
@@ -102,6 +102,7 @@ export async function endCard(opts: { productName: string; cta: string; index?: 
       .slice(0, 3)
       .map((l, i) => `<text x="${w * 0.08}" y="${h * 0.46 + i * w * 0.09}" font-family="Instrument Serif, Georgia, serif" font-size="${w * 0.075}" fill="${INK}">${esc(l)}</text>`)
       .join('')}
+    ${(opts.price ?? '').trim() ? `<text x="${w * 0.08}" y="${h * 0.66 - w * 0.03}" font-family="Inter Tight, Inter, Arial, sans-serif" font-size="${w * 0.05}" fill="${INK}">${esc(opts.price!.trim())}</text>` : ''}
     <rect x="${w * 0.08}" y="${h * 0.66}" width="${w * 0.84}" height="${w * 0.13}" fill="${bar}"/>
     <text x="${w * 0.5}" y="${h * 0.66 + w * 0.083}" text-anchor="middle" font-family="Inter Tight, Inter, Arial, sans-serif" font-size="${w * 0.045}" fill="${PAPER}">${esc(opts.cta)}</text>
     ${note}

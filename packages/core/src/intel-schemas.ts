@@ -128,3 +128,35 @@ export const FidelityCheck = z.object({
   labelTextRead: z.string().max(400).nullable().optional(),
 });
 export type FidelityCheck = z.infer<typeof FidelityCheck>;
+
+/** Whole-creative implied-claim scan (implied-claims@1.1.0; standard §43 "Visual implies a medical result"). */
+export const ImpliedClaimsCheck = z.object({
+  impliedClaims: z
+    .array(
+      z.object({
+        /** The implication in plain words ("the serum clears acne"). */
+        claim: z.string().max(200),
+        /** What carries it: the words alone, the pictures alone, or the two together. */
+        basis: z.enum(['text', 'visual', 'combined']),
+        /** 'block': a medical, structure/function or before/after outcome; 'review': borderline. */
+        severity: z.enum(['block', 'review']),
+        /** 1-based scene the implication comes from, when it is one scene. */
+        scene: z.number().int().min(1).max(20).nullable(),
+      }),
+    )
+    .max(10),
+  notes: z.string().max(300),
+});
+export type ImpliedClaimsCheck = z.infer<typeof ImpliedClaimsCheck>;
+
+/** Cross-scene continuity of AI-generated people (continuity@1.0.0; standard §44, §48 skin tone). */
+export const ContinuityCheck = z.object({
+  /** The same person (face, hands, age presentation) across the frames. */
+  talentConsistent: z.boolean(),
+  /** No material lightening, darkening or complexion drift between the frames. */
+  skinToneConsistent: z.boolean(),
+  /** 1-based indexes of the frames that break continuity with the first. */
+  inconsistentFrames: z.array(z.number().int().min(1).max(20)).max(20),
+  notes: z.string().max(300),
+});
+export type ContinuityCheck = z.infer<typeof ContinuityCheck>;

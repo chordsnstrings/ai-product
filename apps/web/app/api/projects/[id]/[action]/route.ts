@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -15,6 +15,7 @@ import { projectAccess } from '@/lib/tenant';
  *   reopen    – back to the storyboard to fix a line the claims check blocked (purchase kept)
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
+ *   recompose – "Update my ad" after the product's price or size changed: new on-screen text, same footage (§42)
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   photos    – add photos to this product (multipart `photos`): resumes an analysis waiting for them (the URL
  *               failed, §13), or adds side/back reference views to an analysed one (P4)
@@ -90,6 +91,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const { reason } = await body(req, z.object({ reason: z.string().trim().max(300).optional() }));
       const r = await withTenant(a.ctx.workspaceId, (tx) => cancelProduction(tx, a.ctx, id, { reason }));
       return json({ ok: true, status: r.status, message: r.decision.message });
+    }
+    case 'recompose': {
+      if (a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const r = await withTenant(a.ctx.workspaceId, (tx) => requestRecompose(tx, a.ctx, id));
+      return json({ ok: true, ...r }, r.queued ? 202 : 200);
     }
     case 'finish': {
       await withTenant(a.ctx.workspaceId, (tx) => finishAfterEdit(tx, a.ctx, id));

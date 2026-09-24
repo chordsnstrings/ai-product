@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { platformsFor } from '@arkiv/shared';
+import { platformAssets, platformsFor } from '@arkiv/shared';
 import { captionCues, composeAd, layoutVoice, probe, withTempDir, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { brandBrainFor } from './brand';
@@ -167,9 +167,11 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
         const [cur] = await tx`select creative_id from variants where id = ${v.id} for update`;
         if (!cur || cur.creative_id) return false;
         const ids: string[] = [];
+        const exported: { aspect: string; assetId: string }[] = [];
         for (const o of outs) {
           const a = await saveAsset(tx, ws, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId, variantId: v.id, aspect: o.aspect, srt: o.srt, changed } });
           ids.push(a.id);
+          exported.push({ aspect: o.aspect, assetId: a.id });
         }
         const creativeId = await versionCreative(tx, ctx, {
           skuId: p.sku_id as string,
@@ -183,7 +185,7 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
           variantId: v.id as string,
           storyboardId: (p.storyboard_id as string | null) ?? null,
         });
-        const [claimed] = await tx`update variants set creative_id = ${creativeId} where id = ${v.id} and creative_id is null returning id`;
+        const [claimed] = await tx`update variants set creative_id = ${creativeId}, platform_assets = ${tx.json(platformAssets(exported) as never)} where id = ${v.id} and creative_id is null returning id`;
         if (!claimed) throw new Error(`variant ${v.id as string} was claimed concurrently`); // rolls back the creative and its assets
         await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed, creativeId, integrity: integrity.detail }, { ...variantRefs(p), creativeId });
         return true;

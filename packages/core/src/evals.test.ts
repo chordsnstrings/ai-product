@@ -35,6 +35,8 @@ describe('seed datasets', () => {
     expect(evalDatasetFor('extract.product_facts')).toBe('extract.packaging');
     expect(evalDatasetFor('creative_director.storyboard')).toBe('compliance.scan');
     expect(evalDatasetFor('video.scene')).toBeNull();
+    // The whole-creative implied-claim scan is gated by its own golden set (§43).
+    expect(evalDatasetFor('qa.implied_claims')).toBe('implied.creative');
   });
 
   it('only lets a route move to a registered version of its own template', () => {

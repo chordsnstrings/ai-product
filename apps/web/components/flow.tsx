@@ -568,6 +568,8 @@ export function SaveGate({ open, onOpenChange, next, productName }: { open: bool
 /* ───────────── P7 · Storyboard + offer ───────────── */
 
 const PURPOSE: Record<string, string> = { hook: 'Hook', problem: 'Problem', product_reveal: 'Reveal', demonstration: 'Demo', proof: 'Proof', benefit: 'Benefit', routine: 'Routine', cta: 'Call to action' };
+/** The Production Planner's medium, in customer words (§23). */
+const MODE_LABEL: Record<string, string> = { STRICT_COMPOSITE: 'Exact product', GENERATIVE_INTERACTION: 'Generated motion', HYBRID: 'Generated setting + exact product', REAL_ASSET_REMIX: 'Your footage', CREATOR_PACK: 'Creator shot' };
 
 export function StoryboardFlow({ projectId }: { projectId: string }) {
   const active = useCallback(
@@ -627,6 +629,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
                 <div className="ak-between"><span className="ak-index">{String(s.position + 1).padStart(2, '0')} · {PURPOSE[s.purpose] ?? s.purpose}</span><span className="ak-index">{(s.durationMs / 1000).toFixed(1)}s</span></div>
                 {s.overlayText ? <p style={{ fontWeight: 600 }}>{s.overlayText}</p> : null}
                 {s.spokenLine ? <p className="ak-muted">“{s.spokenLine}”</p> : null}
+                {s.plannerReason ? <p className="ak-small ak-muted">{MODE_LABEL[s.productionMode] ?? 'Scene'} · {s.plannerReason}</p> : null}
                 {s.regeneration?.status === 'pending' || s.regeneration?.status === 'active' ? <p className="ak-small ak-muted" role="status">Redrawing this frame…</p> : null}
                 {s.regeneration?.status === 'failed' ? <p className="ak-small ak-error" role="status">{s.regeneration.detail ?? 'We couldn’t redraw this frame.'}</p> : null}
                 <div className="ak-row">
@@ -972,6 +975,35 @@ function WatchedVideo({ projectId, assetId, src }: { projectId: string; assetId:
 
 const ASPECT: Record<string, string> = { '9x16': 'TikTok · Reels · Stories (9:16)', '4x5': 'Feed (4:5)', '1x1': 'Square (1:1)' };
 
+/**
+ * Standard §42: the product's price or size changed after the ad was made. Updating it is free — new on-screen text
+ * over the same footage and voice — and the new files replace the downloads when ready.
+ */
+function FactUpdate({ projectId, update }: { projectId: string; update: { shown: string | null; current: string | null } | null }) {
+  const [state, setState] = useState<'idle' | 'busy' | 'queued' | 'error'>('idle');
+  if (!update) return null;
+  return (
+    <Banner tone="warn">
+      Price changed — update your ad.{update.shown && update.current ? ` It shows ${update.shown}; your product is now ${update.current}.` : ''}{' '}
+      {state === 'queued' ? (
+        <span role="status">Updating — the new files replace these in a minute. No charge.</span>
+      ) : (
+        <button
+          className="ak-textbtn"
+          disabled={state === 'busy'}
+          onClick={async () => {
+            setState('busy');
+            const r = await fetch(`/api/projects/${projectId}/recompose`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+            setState(r.ok ? 'queued' : 'error');
+          }}
+        >
+          {state === 'error' ? 'Try again' : 'Update my ad (free)'}
+        </button>
+      )}
+    </Banner>
+  );
+}
+
 export function DeliverFlow({ projectId }: { projectId: string }) {
   const { data: v, error } = useProject(projectId, useCallback(() => false, []));
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
@@ -987,6 +1019,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
         <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} /> : null}</div>
         <div className="ak-stack">
+          <FactUpdate projectId={projectId} update={v.project.factUpdate} />
           <h2 className="ak-label">Download</h2>
           {v.exports.map((e) => (
             <a key={e.assetId} className="ak-index-row" href={e.download} download>

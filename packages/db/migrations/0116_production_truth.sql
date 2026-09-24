@@ -1,0 +1,43 @@
+-- 0116 · Production truth: variant platform assets, the Production Planner's per-scene record, whole-creative
+-- implied-claim and continuity QA routes, and Creator Packs.
+
+-- ───────────── Variant.platform_assets[] (standard §20) ─────────────
+-- Each finished variant lists its export per platform placement: [{platform, aspect, assetId}] — TikTok and Reels
+-- use the 9:16 export, the Facebook/Instagram feed the 4:5 and the 1:1.
+alter table variants add column platform_assets jsonb not null default '[]';
+
+-- ───────────── Production Planner record per scene (standard §23, §24) ─────────────
+-- The planner decides each scene's medium from the product and the plan; why, and what the scene is planned to
+-- cost, are kept with the scene so the merchant sees them before approving and nothing is downgraded silently.
+alter table scenes add column planner_reason text;
+alter table scenes add column estimate_micros bigint;
+
+-- ───────────── Whole-creative QA routes (standard §25 check 2–3, §43, §44, §48) ─────────────
+-- The implied-claim scan now runs on every finished ad (words and pictures together), and generated people are
+-- checked for continuity across scenes. Both are billable model calls, so they have routes (and circuits).
+-- They use the same provider and model as the fidelity check.
+-- (0108 dropped the unused qa.implied_claims route; it is called again now.)
+insert into model_routes (task, provider, model, prompt_version)
+  select v.task, r.provider, r.model, v.prompt_version from model_routes r,
+    (values ('qa.implied_claims', 'implied-claims@1.1.0'), ('qa.continuity', 'continuity@1.0.0')) as v(task, prompt_version)
+  where r.task = 'qa.fidelity'
+  on conflict (task) do update set prompt_version = excluded.prompt_version;
+
+-- ───────────── Creator Packs (standard §26; plan 06 Phase 4 D6) ─────────────
+-- The public pack page and its footage upload find a live pack by its link token's hash only, counting views; the
+-- app role may call this, and nothing else about creator_packs is reachable without a tenant context.
+create or replace function open_creator_pack(p_token_hash text, p_count_view boolean default true)
+returns table (id uuid, workspace_id uuid, experiment_id uuid, content jsonb, expires_at timestamptz)
+language plpgsql volatile security definer set search_path = public as $$
+begin
+  if p_count_view then
+    return query update creator_packs c set views = c.views + 1
+      where c.share_token_hash = p_token_hash and c.revoked_at is null and c.expires_at > now()
+      returning c.id, c.workspace_id, c.experiment_id, c.content, c.expires_at;
+  else
+    return query select c.id, c.workspace_id, c.experiment_id, c.content, c.expires_at from creator_packs c
+      where c.share_token_hash = p_token_hash and c.revoked_at is null and c.expires_at > now();
+  end if;
+end $$;
+revoke all on function open_creator_pack(text, boolean) from public;
+grant execute on function open_creator_pack(text, boolean) to app_rw;

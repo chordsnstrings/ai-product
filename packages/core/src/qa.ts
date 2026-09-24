@@ -4,9 +4,10 @@ import sharp from 'sharp';
 import { probe, withTempDir, extractFrames, ASPECT_SIZE, type Aspect } from '@arkiv/media';
 import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
-import { FidelityCheck } from './intel-schemas';
+import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, labelTextSimilarity, type FidelityThresholds } from './fidelity';
+import { ContinuityCheck, FidelityCheck, ImpliedClaimsCheck } from './intel-schemas';
 import { llmJson } from './model-gateway';
-import { paletteDistance, toJpegBase64 } from './vision';
+import { toJpegBase64 } from './vision';
 
 /**
  * QA Gateway (§25). Provider success is not customer success: every output passes product, visual, claims,
@@ -30,7 +31,11 @@ export interface SceneQaInput {
   videoBytes?: Buffer;
   frameBytes?: Buffer;
   referenceBytes: Buffer[];
-  fingerprint: { labelText: string | null; closure: string | null; paletteDistanceMax: number };
+  /**
+   * The active Visual Fingerprint (§16): OCR label text, closure, dominant colours and its similarity thresholds
+   * (`visual_fingerprints.thresholds`), and the product cut-out the deterministic checks locate in the frame.
+   */
+  fingerprint: { labelText: string | null; closure: string | null; dominantColors?: string[]; thresholds?: FidelityThresholds; cutout?: Buffer | null };
   /** Test hook: markers in the visual plan make the mock inspector fail deterministically. */
   planText: string;
   attempt: number;
@@ -44,7 +49,10 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     const [mid] = await extractFrames(f, 1, dir);
     return sharp(mid!).toBuffer();
   }));
-  const dist = i.referenceBytes[0] ? await paletteDistance(frame, i.referenceBytes[0]) : 0;
+  const th = i.fingerprint.thresholds ?? DEFAULT_FIDELITY_THRESHOLDS;
+  // Deterministic signals first (independent of the inspector): shade and package count where the exact product
+  // can be located in the frame.
+  const det = i.fingerprint.cutout ? await fidelitySignals(frame, i.fingerprint.cutout, th) : null;
   const failMock = /\[\[qa:fidelity_always\]\]/.test(i.planText) || (/\[\[qa:fidelity\]\]/.test(i.planText) && i.attempt === 1);
   const insp = await llmJson({
     ctx: i.ctx,
@@ -55,7 +63,10 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     content: [
       ...(await Promise.all(i.referenceBytes.slice(0, 2).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 768) })))),
       { type: 'image', mediaType: 'image/jpeg', base64: await toJpegBase64(frame, 768) },
-      { type: 'text', text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}` },
+      {
+        type: 'text',
+        text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. Reference product colours: ${i.fingerprint.dominantColors?.length ? i.fingerprint.dominantColors.join(', ') : 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}`,
+      },
     ],
     schema: FidelityCheck,
     mock: () => ({
@@ -75,14 +86,34 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     maxTokens: 800,
   });
   const f = insp.data;
-  const identityFail = !f.sameProduct || (!!i.fingerprint.labelText && !f.labelTextMatches) || !f.closureMatches || f.productCount > 1;
+  // Label OCR diff: the text the inspector read against the fingerprint's OCR text, whatever its own verdict.
+  const labelSimilarity = i.fingerprint.labelText && f.labelTextRead ? labelTextSimilarity(i.fingerprint.labelText, f.labelTextRead) : null;
+  const reasons: string[] = [];
+  if (!f.sameProduct) reasons.push('not the same product');
+  if (i.fingerprint.labelText && !f.labelTextMatches) reasons.push('label text differs');
+  if (labelSimilarity != null && labelSimilarity < th.labelSimilarityMin && f.labelTextMatches) reasons.push(`label reads “${f.labelTextRead}”`);
+  if (!f.closureMatches) reasons.push('different closure');
+  if (f.productCount > 1) reasons.push(`${f.productCount} products in frame`);
+  for (const d of det?.failures.filter((x) => x.kind === 'count') ?? []) reasons.push(d.detail);
+  const identityFail = reasons.length > 0;
+  // §16: a materially wrong shade is a hard failure regardless of the overall visual score — whether the
+  // inspector saw it or the located product's colours moved beyond the fingerprint's thresholds.
+  const shade = det?.failures.find((x) => x.kind === 'shade') ?? null;
+  const colorFail = !f.colorMatches || !!shade;
+  const colorDetail = shade?.detail ?? 'Materially wrong shade: the product’s colour differs from the reference';
   return [
     {
       check: 'product_fidelity',
-      pass: !identityFail && f.colorMatches,
-      hard: identityFail,
-      detail: identityFail ? `Product identity mismatch: ${f.notes}` : f.colorMatches ? 'Product matches reference' : 'Product colour drift',
-      data: { ...f, paletteDistance: Math.round(dist) },
+      pass: !identityFail && !colorFail,
+      hard: identityFail || colorFail,
+      detail: identityFail ? `Product identity mismatch: ${reasons.join('; ')}${f.notes ? ` (${f.notes})` : ''}` : colorFail ? colorDetail : 'Product matches reference',
+      data: {
+        ...f,
+        labelSimilarity: labelSimilarity == null ? null : Math.round(labelSimilarity * 1000) / 1000,
+        deterministic: det,
+        paletteDistance: det?.paletteDistance ?? null,
+        thresholds: th,
+      },
     },
     {
       check: 'visual',
@@ -91,6 +122,126 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
       detail: f.handsOrFacesDeformed ? 'Deformed hands or face' : f.skinAlteredUnnaturally ? 'Skin altered unnaturally (possible implied before/after)' : f.impliesMedicalResult ? 'Implies a medical result' : 'No visual defects found',
     },
   ];
+}
+
+// ───────────── Whole-creative implied claims (standard §25 check 3, §43 "Visual implies a medical result") ─────────────
+
+/**
+ * Deterministic implied-claim signals across a whole creative's words and scene descriptions: before/after framing,
+ * time-bound outcomes, conditions that disappear, and clinical staging. They complement the model's read of the
+ * finished frames and are what the golden set scores (evals.ts `implied.creative`).
+ */
+const IMPLIED_PATTERNS: { re: RegExp; claim: string }[] = [
+  { re: /\bbefore\s*(?:&|and|\/|vs\.?|-)\s*after\b|\bsplit[- ]screen\b[^.]{0,60}\b(?:skin|face)\b/i, claim: 'a before/after outcome' },
+  { re: /\b(?:acne|pimples?|blemish(?:es)?|breakouts?|eczema|rosacea|psoriasis|scars?|dark spots?|hyperpigmentation|wrinkles?|redness)\b[^.]{0,40}\b(?:disappears?|vanish(?:es)?|gone|fades? away|clears? up|erased?|melts? away)\b/i, claim: 'a skin condition that disappears' },
+  { re: /\b(?:disappears?|vanish(?:es)?|erases?|clears? up)\b[^.]{0,30}\b(?:acne|pimples?|blemish(?:es)?|breakouts?|eczema|rosacea|scars?|dark spots?|wrinkles?|redness)\b/i, claim: 'a skin condition that disappears' },
+  { re: /\b(?:in|within|after)\s+(?:just\s+)?(?:\d+|one|two|three|seven|a)\s+(?:days?|nights?|weeks?|hours?)\b[^.]{0,40}\b(?:clear|flawless|transformed|new skin|results?|gone|healed)\b|\bovernight\b[^.]{0,30}\b(?:clear|flawless|transformed|results?|gone|healed)\b/i, claim: 'a guaranteed, time-bound result' },
+  { re: /\b(?:clinic|clinical setting|doctor'?s office|lab coat|dermatologist'?s office|hospital|syringe|prescription)\b/i, claim: 'a medical treatment setting' },
+  { re: /\b(?:clear|flawless|perfect|transformed|brand[- ]new)\s+skin\b[^.]{0,30}\b(?:in|within)\s+(?:just\s+)?(?:\d+|one|two|three|seven|a)\s+(?:days?|nights?|weeks?|hours?)\b/i, claim: 'a guaranteed, time-bound result' },
+  { re: /\bskin\b[^.]{0,30}\b(?:transforms?|visibly changes?|becomes flawless|is completely clear)\b/i, claim: 'a visible skin transformation' },
+];
+
+export function impliedClaimSignals(texts: readonly (string | null | undefined)[]): { text: string; claim: string }[] {
+  const out: { text: string; claim: string }[] = [];
+  for (const t of texts) {
+    if (!t) continue;
+    for (const p of IMPLIED_PATTERNS) if (p.re.test(t)) out.push({ text: t, claim: p.claim });
+  }
+  return out;
+}
+
+export interface CreativeForReview {
+  /** Per scene, in order: what it shows and what it says. */
+  scenes: { visualPlan: string | null; spokenLine: string | null; overlayText: string | null }[];
+  hook: string | null;
+  cta: string | null;
+  /** Frames sampled from the finished 9:16 export. */
+  frames: Buffer[];
+}
+
+/**
+ * The implied-claim scan on the whole creative (§43): the script, on-screen text, hook, CTA and scene descriptions
+ * together with frames of the finished video, so an implication carried by pictures — or by words and pictures
+ * together — is caught, not just a single sentence. A 'block' implication (medical, structure/function or
+ * before/after) or a deterministic signal fails hard; 'review' implications are recorded, not blocking.
+ */
+export async function qaImpliedClaims(ctx: TenantContext, token: string, projectId: string, c: CreativeForReview): Promise<CheckResult> {
+  const deterministic = impliedClaimSignals([...c.scenes.flatMap((s) => [s.visualPlan, s.spokenLine, s.overlayText]), c.hook, c.cta]);
+  const script = c.scenes.map((s, i) => `Scene ${i + 1}. Shows: ${s.visualPlan ?? '—'} Says: ${s.spokenLine ?? '—'} On screen: ${s.overlayText ?? '—'}`).join('\n');
+  const marker = /\[\[qa:implied\]\]/.test(script);
+  const res = await llmJson({
+    ctx,
+    token,
+    task: 'qa.implied_claims',
+    subject: { type: 'project', id: projectId },
+    template: 'implied-claims',
+    content: [
+      ...(await Promise.all(c.frames.slice(0, 4).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 640) })))),
+      { type: 'untrusted', sourceId: 'creative', text: `Hook: ${c.hook ?? '—'}\nCall to action: ${c.cta ?? '—'}\n${script}` },
+    ],
+    schema: ImpliedClaimsCheck,
+    // Test hook: a scene marked [[qa:implied]] makes the mock reviewer find an implied medical result in it.
+    mock: () => ({
+      impliedClaims: marker ? [{ claim: 'The pictures imply the product clears a skin condition', basis: 'combined' as const, severity: 'block' as const, scene: c.scenes.findIndex((s) => /\[\[qa:implied\]\]/.test(`${s.visualPlan} ${s.spokenLine} ${s.overlayText}`)) + 1 || null }] : [],
+      notes: marker ? 'Implied treatment result' : 'No implied claims',
+    }),
+    effort: 'medium',
+    maxTokens: 1200,
+  });
+  const blocking = res.data.impliedClaims.filter((x) => x.severity === 'block');
+  const problems = [...deterministic.map((d) => `“${d.text}”: implies ${d.claim}`), ...blocking.map((b) => `${b.scene ? `Scene ${b.scene}: ` : ''}${b.claim} (${b.basis === 'visual' ? 'shown in the pictures' : b.basis === 'combined' ? 'words and pictures together' : 'in the words'})`)];
+  const pass = problems.length === 0;
+  return {
+    check: 'claims',
+    pass,
+    hard: !pass,
+    detail: pass ? `Whole creative checked for implied claims (words and pictures)${res.data.impliedClaims.length ? `; ${res.data.impliedClaims.length} borderline noted` : ''}` : `Implied claim: ${problems.join('; ')}`,
+    data: { impliedClaims: res.data.impliedClaims, deterministic, notes: res.data.notes, violations: [...deterministic.map((d) => ({ text: d.text, reason: `Implies ${d.claim}` })), ...blocking.map((b) => ({ text: b.claim, reason: 'Implied claim carried by the pictures or the whole ad' }))], unmapped: [] },
+  };
+}
+
+// ───────────── Cross-scene continuity of generated people (standard §44, §48) ─────────────
+
+/**
+ * Continuity of AI-generated people across scenes: one frame per accepted generated scene that shows a person,
+ * compared together. Talent that changes between scenes, or skin that lightens, darkens or clears up, fails —
+ * the caller replaces the scenes that break continuity with the exact-product composite rather than retrying
+ * (§44 "continuity is not worth endless retries"). Fewer than two such frames need no check.
+ */
+export async function qaContinuity(ctx: TenantContext, token: string, projectId: string, frames: { sceneId: string; bytes: Buffer; planText: string }[]): Promise<{ check: CheckResult; inconsistentSceneIds: string[] } | null> {
+  if (frames.length < 2) return null;
+  const marker = frames.findIndex((f, i) => i > 0 && /\[\[qa:continuity\]\]/.test(f.planText));
+  const res = await llmJson({
+    ctx,
+    token,
+    task: 'qa.continuity',
+    subject: { type: 'project', id: projectId },
+    template: 'continuity',
+    content: [
+      ...(await Promise.all(frames.slice(0, 6).map(async (f) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(f.bytes, 640) })))),
+      { type: 'text', text: `${frames.length} frames, in scene order. Frame 1 is the reference for the person's appearance.` },
+    ],
+    schema: ContinuityCheck,
+    // Test hook: a later scene marked [[qa:continuity]] shows a different person to the mock reviewer.
+    mock: () => ({ talentConsistent: marker < 0, skinToneConsistent: marker < 0, inconsistentFrames: marker < 0 ? [] : [marker + 1], notes: marker < 0 ? 'Same person throughout' : 'Different person and lighter skin' }),
+    effort: 'medium',
+    maxTokens: 600,
+  });
+  const d = res.data;
+  const ok = d.talentConsistent && d.skinToneConsistent;
+  // Only later frames can break continuity with the first; indexes outside the frames are ignored.
+  const bad = ok ? [] : [...new Set(d.inconsistentFrames.filter((n) => n >= 2 && n <= frames.length))].map((n) => frames[n - 1]!.sceneId);
+  const what = [!d.talentConsistent ? 'the person changes between scenes' : null, !d.skinToneConsistent ? 'skin tone or complexion drifts between scenes' : null].filter(Boolean).join('; ');
+  return {
+    check: {
+      check: 'visual',
+      pass: ok,
+      hard: false,
+      detail: ok ? `Same person and skin tone across ${frames.length} scenes` : `Continuity: ${what}${bad.length ? ` — ${bad.length} scene${bad.length === 1 ? '' : 's'} switched to your exact product` : ''}`,
+      data: { continuity: d, inconsistentSceneIds: bad },
+    },
+    inconsistentSceneIds: bad,
+  };
 }
 
 /**

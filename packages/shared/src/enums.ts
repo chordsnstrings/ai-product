@@ -174,6 +174,25 @@ export const EXPORT_PLATFORMS: Record<ExportFormat, readonly Platform[]> = {
 };
 export const platformsFor = (formats: readonly ExportFormat[]): Platform[] => [...new Set(formats.flatMap((f) => EXPORT_PLATFORMS[f]))];
 
+/** One placement of a finished variant (standard §20 Variant.platform_assets[]): the export a platform uses. */
+export interface PlatformAsset {
+  platform: Platform;
+  aspect: ExportFormat;
+  assetId: string;
+}
+
+/** A variant's exports by platform placement, in Platform order, then aspect order (9:16, 4:5, 1:1). */
+export function platformAssets(exports: readonly { aspect: string; assetId: string }[]): PlatformAsset[] {
+  const out: PlatformAsset[] = [];
+  for (const platform of Platform) {
+    for (const aspect of ExportFormat) {
+      if (!EXPORT_PLATFORMS[aspect].includes(platform)) continue;
+      for (const e of exports) if (e.aspect === aspect) out.push({ platform, aspect, assetId: e.assetId });
+    }
+  }
+  return out;
+}
+
 /**
  * Claim scope (§17, §43): the platforms a claim may be used on. Stored upper-case; the export platforms plus
  * YouTube and organic posts. Merchant-facing shorthands expand: META = Reels + Feed.
