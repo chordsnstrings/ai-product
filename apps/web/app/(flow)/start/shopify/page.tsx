@@ -5,7 +5,7 @@ import { Banner, LinkButton } from '@arkiv/ui';
 import { previewContext } from '@/lib/preview-context';
 import { ShopifyPicker } from '@/components/shopify-picker';
 
-export const metadata: Metadata = { title: 'Pick a product · Arkiv', robots: { index: false } };
+export const metadata: Metadata = { title: 'Pick a product', robots: { index: false } };
 
 /**
  * After "Connect Shopify" on the upload step (plan 03 P2): the store's products, to pick the one to preview. Only
