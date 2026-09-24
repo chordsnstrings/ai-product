@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { globalTx, type Tx } from '@arkiv/db';
+import { globalTx, sideTx, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
 import { allowKey, isAllowlisted } from './allowlist';
 
@@ -34,7 +34,7 @@ export async function recordAbuseSignal(tx: Tx, s: AbuseSignal): Promise<void> {
 
 /** Best-effort variant for request paths: a failure to log never fails the customer's request. */
 export async function recordAbuseSignalSafe(s: AbuseSignal): Promise<void> {
-  await globalTx((tx) => recordAbuseSignal(tx, s)).catch(() => {});
+  await sideTx((tx) => recordAbuseSignal(tx, s)).catch(() => {});
 }
 
 /** Fixed-window counter (the rate_limits table) that only counts: returns the count in the current window. */

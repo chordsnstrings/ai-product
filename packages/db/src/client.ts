@@ -9,8 +9,10 @@ export type Db = Sql | Tx;
 type RoleName = 'owner' | 'app' | 'admin' | 'system';
 
 // Shared across bundle layers and dev hot-reloads in one process, so connections are never duplicated.
-const g = globalThis as { __arkivPools?: Map<RoleName, Sql> };
-const pools = (g.__arkivPools ??= new Map<RoleName, Sql>());
+// The 'app:side' pool is the app role's second, small pool for sideTx() (see below).
+type PoolKey = RoleName | 'app:side';
+const g = globalThis as { __arkivPools?: Map<PoolKey, Sql> };
+const pools = (g.__arkivPools ??= new Map<PoolKey, Sql>());
 
 function urlFor(role: RoleName): string {
   const e = env();
@@ -42,13 +44,14 @@ export function assertRoleAllowed(role: RoleName): void {
   if (env().NODE_ENV === 'production' && !process.env[URL_ENV[role]]) throw new Error(`${URL_ENV[role]} is not configured for this process`);
 }
 
-function pool(role: RoleName): Sql {
+function pool(role: RoleName, side = false): Sql {
   assertRoleAllowed(role);
-  let p = pools.get(role);
+  const key: PoolKey = side ? 'app:side' : role;
+  let p = pools.get(key);
   if (!p) {
     const url = role === 'system' ? (env().SYSTEM_DATABASE_URL ?? urlFor(role)) : urlFor(role);
     p = postgres(url, {
-      max: role === 'owner' ? 3 : 10,
+      max: side ? 4 : role === 'owner' ? 3 : 10,
       idle_timeout: 20,
       // PgBouncer transaction pooling can't keep named prepared statements; tenant context uses set_config(..., true)
       // (transaction-local), which is pooling-safe. The owner and system roles connect directly.
@@ -61,7 +64,7 @@ function pool(role: RoleName): Sql {
       },
       transform: { undefined: null },
     });
-    pools.set(role, p);
+    pools.set(key, p);
   }
   return p;
 }
@@ -90,6 +93,17 @@ export async function withTenant<T>(workspaceId: string, fn: (tx: Tx) => Promise
 /** Transaction on the app pool without tenant context: only global tables are reachable (RLS fails closed). */
 export async function globalTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   return appPool().begin(fn) as Promise<T>;
+}
+
+/**
+ * A short, independent transaction on the app role without tenant context, committed on its own whatever the
+ * caller's transaction does (rate-limit counters, best-effort abuse signals). It runs on a separate small pool so
+ * that code already holding an app connection (inside withTenant/globalTx) never waits on the pool it is itself
+ * exhausting: with the main pool full of such callers, a nested globalTx() would wait forever.
+ * `fn` must not open further transactions.
+ */
+export async function sideTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+  return pool('app', true).begin(fn) as Promise<T>;
 }
 
 export async function withSystem<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {

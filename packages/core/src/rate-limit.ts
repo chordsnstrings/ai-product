@@ -1,4 +1,4 @@
-import { globalTx, type Tx } from '@arkiv/db';
+import { sideTx, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
 import { isAllowlisted } from './allowlist';
 
@@ -28,7 +28,7 @@ export async function hit(key: string, limit: number, windowSeconds: number, tx?
     }
     return limit - count;
   };
-  return tx ? run(tx) : globalTx(run);
+  return tx ? run(tx) : sideTx(run);
 }
 
 export async function sweepRateLimits(tx: Tx): Promise<number> {

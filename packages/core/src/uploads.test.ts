@@ -88,3 +88,19 @@ describe('upload rate limit (plan 02 §4: 100 per workspace per hour)', () => {
     await expect(withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, junk, 'product_photo', null))).rejects.toMatchObject({ code: 'RATE_LIMITED' });
   });
 });
+
+describe('uploads under load (nightly load test: 200 concurrent previews)', () => {
+  it('more concurrent uploads than app connections all finish: the upload counter never waits on the pool its caller holds', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const junk = Buffer.from('not an image at all');
+    // 25 tenant transactions take every connection of the app pool (10); each then counts its upload in its own
+    // committed transaction. That count must not need a second connection from the same, exhausted pool.
+    const results = await Promise.race([
+      Promise.allSettled(Array.from({ length: 25 }, () => withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, junk, 'product_photo', null)))),
+      new Promise<'stuck'>((res) => setTimeout(() => res('stuck'), 20_000)),
+    ]);
+    expect(results).not.toBe('stuck');
+    expect((results as PromiseSettledResult<unknown>[]).every((r) => r.status === 'rejected' && (r.reason as DomainError).code === 'INVALID')).toBe(true);
+  });
+});
