@@ -108,7 +108,7 @@ async function Overview({ id, w, canFlag }: { id: string; w: Record<string, unkn
           })} />
         </Section>
         <Section title="State timeline">
-          <Table head={['When', 'Change', 'By']} rows={d0.timeline.map((t) => [dt(t.at), `${(t.payload as { from: string }).from} → ${(t.payload as { to: string }).to} · ${(t.payload as { reason?: string }).reason ?? ''}`, <Mono key="a">{String(t.actor).split(':')[0]}</Mono>])} empty="No state changes." />
+          <Table head={['When', 'Change', 'By']} rows={d0.timeline.map((t) => [dt(t.at), stateChange(t.payload as StateChange), <Mono key="a">{String(t.actor).split(':')[0]}</Mono>])} empty="No state changes." />
         </Section>
       </div>
       <div className="ak-stack">
@@ -357,6 +357,11 @@ async function Projects({ id, canManage, focus }: { id: string; canManage: boole
     </>
   );
 }
+
+type StateChange = { from: string; to: string; reason?: string; underlying?: { from: string; to: string } };
+/** A lifecycle change; under a hold or scheduled deletion, billing moves the state it returns to (plan 02 §2). */
+const stateChange = (p: StateChange) =>
+  p.underlying ? `${p.from} (returns to ${p.underlying.from} → ${p.underlying.to}) · ${p.reason ?? ''}` : `${p.from} → ${p.to} · ${p.reason ?? ''}`;
 
 /** Job timeline for one project: state changes and QA events, provider calls, and ledger rows, in order. */
 async function Timeline({ id, projectId }: { id: string; projectId: string }) {
