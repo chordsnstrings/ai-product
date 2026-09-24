@@ -6,7 +6,7 @@ import { ExampleAsset, Testimonial } from '@arkiv/ui';
 import { StickyCta } from '@arkiv/ui/client';
 import { LandingBeacon } from '@/components/landing-beacon';
 import { MarketingShell } from '@/components/marketing';
-import { UploadModule } from '@/components/upload-module';
+import { HeroCta } from '@/components/hero-cta';
 import { FIRST_VIEW_COOKIE } from '@/lib/landing-routing';
 import { recordLandingView } from '@/lib/lp-view';
 import { currentUser, hasVisitorCookie, visitorId } from '@/lib/session';
@@ -133,7 +133,7 @@ function LandingBody({ page, blocks, variant, loggedIn, extras, preview, beacon 
                 </div>
               ) : null}
             </div>
-            <UploadModule page={page?.slug as string} variant={variant} turnstileSiteKey={env().TURNSTILE_SITE_KEY ?? null} assurance={blocks.cta.assurance} />
+            <HeroCta page={page?.slug as string} variant={variant} turnstileSiteKey={env().TURNSTILE_SITE_KEY ?? null} assurance={blocks.cta.assurance} />
           </div>
         </section>
 
