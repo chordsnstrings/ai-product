@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { connection } from 'next/server';
 import { globalTx } from '@arkiv/db';
 import { publicExampleUrls } from '@arkiv/core';
 import { landingBlocksFrom } from '@arkiv/shared';
@@ -7,8 +8,6 @@ import { MarketingShell } from '@/components/marketing';
 import { BUILT_IN_EXAMPLES, EXAMPLE_LABEL } from '@/lib/examples';
 
 export const metadata: Metadata = { title: 'Examples', description: 'Skincare ad examples by format: texture demo, serum launch, creator-style, founder story and creative refresh.' };
-// The published pages' example galleries change when staff publish; re-read at most every 10 minutes.
-export const revalidate = 600;
 
 /**
  * `/examples` (plan 03 route map; P1 §7): skincare examples only (standard §13), each 9:16 with a mono caption and
@@ -16,6 +15,7 @@ export const revalidate = 600;
  * rechecked for rights at render) come first, then the built-in demo-product examples of every ad format.
  */
 export default async function Examples() {
+  await connection(); // the examples' signed URLs and the live pages are read per request, never at build time
   const chosen = await globalTx(async (tx) => {
     const pages = await tx`select live_content from landing_pages where status = 'live' order by slug = 'default' desc, slug`;
     const items = pages.flatMap((p) => landingBlocksFrom(p.live_content).gallery.items);

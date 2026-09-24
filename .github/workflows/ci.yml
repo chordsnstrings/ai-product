@@ -62,6 +62,8 @@ jobs:
       - run: pnpm --filter @arkiv/admin build
       - name: Font budget — at most 2 preloaded font files per route (design §5)
         run: pnpm exec tsx scripts/check-fonts.ts apps/web apps/admin
+      - name: Bundle budget — first-load JS of the marketing and funnel routes (plan 06 Phase 0 D2)
+        run: pnpm exec tsx scripts/bundle-budget.ts apps/web
 
   e2e:
     name: E2E (browser + HTTP smoke)
