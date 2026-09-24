@@ -231,6 +231,8 @@ export const RISK_PLAYBOOKS: Record<RiskIndicator, RiskPlaybook> = {
 /** A member hides an in-app notice for the whole workspace (the app may only mark notices dismissed). */
 export async function dismissNotice(tx: Tx, ctx: TenantContext, noticeId: string) {
   if (ctx.actor.kind !== 'user') throw new DomainError('FORBIDDEN', 'Only a signed-in member can dismiss notices.');
+  // Any member may acknowledge a notice, including while the workspace is held (that is when notices matter).
+  assertCan(ctx, 'workspace.view');
   const r = await tx`update workspace_notices set dismissed_at = now(), dismissed_by = ${ctx.actor.id}
                      where id = ${noticeId} and workspace_id = ${ctx.workspaceId} and dismissed_at is null returning id`;
   return r.length > 0;

@@ -179,7 +179,11 @@ describe('intervention playbooks (plan 05 §2.2 Risk, §17)', () => {
     const [notice] = await ownerPool()`select id from workspace_notices where workspace_id = ${t.workspaceId}`;
     expect(await withTenant(other.workspaceId, (tx) => dismissNotice(tx, ctxFor(other.workspaceId, other.userId), notice!.id as string))).toBe(false);
     expect(await withTenant(t.workspaceId, (tx) => tx`select id from workspace_notices where dismissed_at is null`)).toHaveLength(1);
-    expect(await withTenant(t.workspaceId, (tx) => dismissNotice(tx, ctxFor(t.workspaceId, t.userId), notice!.id as string))).toBe(true);
+    const staffCtx = { ...ctxFor(t.workspaceId, t.userId), actor: { kind: 'staff' as const, id: sup.staffId } };
+    await expect(withTenant(t.workspaceId, (tx) => dismissNotice(tx, staffCtx, notice!.id as string))).rejects.toThrow(/signed-in member/);
+    // Any role may acknowledge it, even while the workspace is held.
+    expect(await withTenant(t.workspaceId, (tx) => dismissNotice(tx, ctxFor(t.workspaceId, t.userId, 'VIEWER', 'LOCKED'), notice!.id as string))).toBe(true);
+    expect(await withTenant(t.workspaceId, (tx) => dismissNotice(tx, ctxFor(t.workspaceId, t.userId), notice!.id as string))).toBe(false);
     // The app can only mark notices dismissed, never write them.
     await expect(withTenant(t.workspaceId, (tx) => tx`update workspace_notices set title = 'x'`)).rejects.toThrow(/permission denied/);
     await expect(withTenant(t.workspaceId, (tx) => tx`insert into workspace_notices (workspace_id, title, body, created_by) values (${t.workspaceId}, 'x', 'y', 'user')`)).rejects.toThrow(/permission denied/);
