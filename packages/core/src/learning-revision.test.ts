@@ -99,7 +99,8 @@ describe('learnings revise with corrected data', () => {
     await withTenant(x.t.workspaceId, (tx) => markConfounder(tx, x.ctx, { skuId: x.skuId, kind: 'offer_change', startsAt: day(0) }));
     await x.compute();
     const [after] = await x.learnings();
-    expect(after).toMatchObject({ id: l!.id, state: 'ACTIONABLE', confounded: true });
+    // The offer change is also a change of context (§21): the learning weakens and is scheduled for revalidation.
+    expect(after).toMatchObject({ id: l!.id, state: 'WEAKENING', confounded: true });
     expect(await x.learnings()).toHaveLength(1);
   });
 });

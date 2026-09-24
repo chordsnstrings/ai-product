@@ -5,7 +5,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
-import { confoundRunning, LIVE_STATES, recordExperimentApproval, setExperimentState } from './experiment-state';
+import { confoundRunning, CONTEXT_CHANGE_KINDS, LIVE_STATES, recordExperimentApproval, setExperimentState, weakenLearnings } from './experiment-state';
 import { authorizeFromQuote, renderQuote } from './render-quotes';
 import { available, lockEntitlement } from './ledger';
 import type { Proposal } from './intel-schemas';
@@ -31,7 +31,7 @@ import {
   type VariantEvidence,
 } from './statistics';
 
-export { setExperimentState, EXPERIMENT_NEXT, canExperimentTransition, onMaterialProductChange } from './experiment-state';
+export { setExperimentState, EXPERIMENT_NEXT, canExperimentTransition, onMaterialProductChange, weakenLearnings, sweepStaleLearnings, CONTEXT_CHANGE_KINDS, LEARNING_REVALIDATION_DAYS } from './experiment-state';
 
 /**
  * Experiment Engine (§20) + learning (§21). CONTROLLED experiments change a limited set of variables and keep
@@ -751,6 +751,8 @@ export async function markConfounder(
            values (${ctx.workspaceId}, ${input.skuId ?? null}, ${input.kind}, ${input.startsAt}, ${input.endsAt ?? null}, ${input.note ?? null},
                    'merchant', ${actorString(ctx)})`;
   await confoundRunning(tx, ctx, input.skuId ?? null, input.kind);
+  // §21: a price or offer change is a change of context — the learnings it touches weaken and get revalidated.
+  if (CONTEXT_CHANGE_KINDS.has(input.kind)) await weakenLearnings(tx, ctx, input.skuId ?? null, `${input.kind.replace('_', ' ')} marked by the merchant`);
 }
 
 /**
@@ -768,6 +770,7 @@ export async function decideConfounder(tx: Tx, ctx: TenantContext, confounderId:
   await tx`update confounders set status = ${to}, decided_at = now(), decided_by = ${actorString(ctx)} where id = ${confounderId}`;
   if (to === 'active') {
     await confoundRunning(tx, ctx, (c.sku_id as string | null) ?? null, c.kind as string);
+    if (CONTEXT_CHANGE_KINDS.has(c.kind as string)) await weakenLearnings(tx, ctx, (c.sku_id as string | null) ?? null, `${String(c.kind).replace('_', ' ')} confirmed`);
   } else {
     // Dismissed: the tests it touched are read again without it.
     const exps = await tx`select id from experiments where (${(c.sku_id as string | null) ?? null}::uuid is null or sku_id = ${(c.sku_id as string | null) ?? null}::uuid)

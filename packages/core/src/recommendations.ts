@@ -128,6 +128,9 @@ export function learningMatch(l: LearningSignal, p: Proposal): number {
 
 const STATE_WEIGHT: Record<string, number> = { ACTIONABLE: 1, DIRECTIONAL: 0.5, WEAKENING: 0.25 };
 
+/** The proposal re-tests what a WEAKENING learning found (its winning value), i.e. it would revalidate it (§21). */
+export const revalidates = (p: Proposal, s: Pick<ScoringContext, 'learnings'>) => s.learnings.some((l) => l.state === 'WEAKENING' && learningMatch(l, p) > 0);
+
 /**
  * Adjacent historical signal (§20 "evidence from related genes after shrinkage, not raw winner cloning"): around a
  * neutral 0.4, Σ state weight × confidence × shrunk effect × signed gene similarity, clamped to [0, 1].
@@ -200,7 +203,9 @@ export function scoreProposal(p: Proposal, s: ScoringContext): Scored {
     adjacentSignal: adjacentSignal(s.learnings, p),
     coverageGap: coverageGap(p, s),
     fatigueNeed: s.fatiguingAngles.has(p.angle) ? 0.9 : s.fatiguingAngles.size ? 0.5 : 0.2,
-    learnability: p.primaryVariable === 'hook' ? 1 : p.riskProfile === 'exploratory' ? 0.45 : 0.75,
+    // §21 WEAKENING "schedule validation": a proposal that re-tests a weakening learning's winning value is a
+    // revalidation, and as learnable as a hook test.
+    learnability: p.primaryVariable === 'hook' || revalidates(p, s) ? 1 : p.riskProfile === 'exploratory' ? 0.45 : 0.75,
     feasibility: Math.min(1, s.fidelityConfidence * (p.estimatedGenerationClass === 'generative_short' ? 0.85 : 1) + 0.1),
     platformFit: NATIVE_ANGLES.has(p.angle) ? 1 : 0.55,
     cogsEfficiency: COGS_SCORE[p.estimatedGenerationClass],

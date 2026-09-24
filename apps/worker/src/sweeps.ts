@@ -26,6 +26,7 @@ import {
   sweepExpiredAuthorizations,
   sweepExpiringEvidence,
   sweepExpiredRights,
+  sweepStaleLearnings,
   sweepDelayedProductions,
   sweepLandingGalleryRights,
   sweepOfferGuardrails,
@@ -175,6 +176,8 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return rows.length;
     },
   },
+  // Standard §21: actionable learnings not revalidated in 60 days weaken (weekly) and are proposed for revalidation.
+  'learning-revalidation': { cron: '45 5 * * 1', run: () => withSystem((tx) => sweepStaleLearnings(tx)) },
   // Plan 03 P9 edge: a production past 20 minutes gets one proactive email to the owners and a Pulse alert.
   'production-delays': { cron: '*/5 * * * *', run: () => withSystem(async (tx) => (await sweepDelayedProductions(tx)).length) },
   // Plan 03 P3: an analysis with no progress for 10 minutes (worker lost, job expired) is failed honestly: the
