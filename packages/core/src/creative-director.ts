@@ -30,6 +30,14 @@ export function verifiedIngredients(facts: Awaited<ReturnType<typeof currentFact
     return ok ? factText(facts, key) : null;
   };
   const split = (t: string, max: number) => t.split(/[,;\n]/).map((s) => s.trim()).filter((s) => s && s.length <= 60).slice(0, max);
+  // A merchant's correction wins (§15/§16), whichever row they corrected: the P4 "Key ingredients" row and the
+  // full INCI list are separate facts, so a decision on either beats an observed list on the other. When both were
+  // decided, the most recent decision stands.
+  const decided = (['key_ingredients', 'ingredients'] as const)
+    .map((k) => ({ k, f: facts[k] }))
+    .filter((x) => x.f && !x.f.disputed && x.f.value.state === 'DECIDED' && usable(x.k))
+    .sort((a, b) => b.f!.value.observedAt.localeCompare(a.f!.value.observedAt))[0];
+  if (decided) return { list: split(usable(decided.k)!, decided.k === 'key_ingredients' ? 8 : 6), verified: true };
   const key = usable('key_ingredients');
   if (key) return { list: split(key, 8), verified: true };
   const full = usable('ingredients');

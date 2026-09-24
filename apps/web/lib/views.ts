@@ -27,7 +27,7 @@ import {
   type QaReport,
 } from '@arkiv/core';
 import type { ProjectState } from '@arkiv/shared';
-import type { WorkspaceState } from '@arkiv/shared';
+import { PLANS, type WorkspaceState } from '@arkiv/shared';
 
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
 export async function projectView(workspaceId: string, projectId: string) {
@@ -201,6 +201,8 @@ export async function projectView(workspaceId: string, projectId: string) {
       // An offer bonus is shown only when the offer carries it (what is shown is what is delivered, §8).
       bonus: { offered: quote.kind === 'taste' && bonusHooks(quote.bonus) > 0, exports: bonusExports, pending: bonusPending, failed: !!p.bonus_hook_failed_at },
       disclosure,
+      /** The plan the delivery continuation points to (plan 04 L17). */
+      upsell: { growthName: PLANS.GROWTH.name, growthTestsPerMonth: PLANS.GROWTH.creativeTestsPerMonth },
     };
   });
 }

@@ -180,6 +180,9 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
             onChange={(e) => setUrl(e.target.value)}
             aria-describedby="upload-help"
           />
+          {/* Plan 03 P2: validated as the user types — a valid link shape gets a subtle ✓. */}
+          {validUrl ? <span className="ak-url-ok" aria-hidden>✓</span> : null}
+          <span className="ak-sr" aria-live="polite">{validUrl ? 'Link looks good' : ''}</span>
           <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={pasteFromClipboard} aria-label="Paste link from clipboard">Paste</button>
         </div>
       </div>

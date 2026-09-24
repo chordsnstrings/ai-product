@@ -58,7 +58,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     }
     case 'fact': {
       // Confirmation screen (P4): the merchant's correction becomes a DECIDED fact and wins over page/photo values.
-      const f = await body(req, z.object({ key: z.enum(['name', 'brand', 'size', 'price', 'category', 'texture', 'packaging', 'ingredients']), value: z.string().trim().min(1).max(400) }));
+      const f = await body(req, z.object({ key: z.enum(['name', 'brand', 'size', 'price', 'category', 'texture', 'packaging', 'key_ingredients', 'ingredients']), value: z.string().trim().min(1).max(400) }));
       const [p] = await withTenant(a.ctx.workspaceId, (tx) => tx`select sku_id from projects where id = ${id}`);
       const num = f.key === 'price' ? Number(f.value.replace(/[^0-9.]/g, '')) : null;
       if (f.key === 'price' && !(num! > 0)) throw new DomainError('INVALID', 'Enter a price like 38.00');

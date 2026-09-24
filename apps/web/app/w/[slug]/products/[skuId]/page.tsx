@@ -8,10 +8,11 @@ import { ProvenanceChip } from '@arkiv/ui/client';
 import { formatDate } from '@arkiv/shared/format';
 import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
+import { disputeChoices } from '@/lib/flow-helpers';
 
 export const metadata: Metadata = { title: 'Product · Arkiv' };
 
-const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', texture: 'Texture', ingredients: 'Ingredients', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
+const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', key_ingredients: 'Key ingredients', ingredients: 'Ingredients (INCI)', texture: 'Texture', format: 'Format', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
 /** Where a value that disagrees with the merchant's correction came from. */
 const SOURCE_WORDS: Record<string, string> = { shopify: 'Shopify', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label', import: 'Your import' };
 /** Files the customer uploaded (deleteAsset refuses generated work). */
@@ -93,7 +94,20 @@ export default async function Product({ params, searchParams }: { params: Promis
               value: (
                 <span>
                   {f.value.valueText ? (f.value.valueText.length > 240 ? `${f.value.valueText.slice(0, 240)}…` : f.value.valueText) : f.value.valueNumber != null ? String(f.value.valueNumber) : JSON.stringify(f.value.valueJson)}
-                  {f.disputed ? <span className="ak-small ak-muted" style={{ display: 'block' }}>Disputed: {f.candidates.map((c) => `${c.valueText ?? c.valueNumber} (${c.sourceType})`).join(' vs ')}</span> : null}
+                  {f.disputed ? (
+                    <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                      Your sources disagree. Which is right?
+                      {canEdit ? (
+                        <span className="ak-row" style={{ gap: 8, marginTop: 4, flexWrap: 'wrap' }}>
+                          {disputeChoices(k, f.candidates.map((c) => ({ value: c.valueText ?? String(c.valueNumber ?? ''), source: c.sourceType }))).map((c) => (
+                            <ActionButton key={c.value} slug={slug} action="fact" size="sm" variant="secondary" body={{ skuId, key: k, value: c.value }}>{c.label}</ActionButton>
+                          ))}
+                        </span>
+                      ) : (
+                        <> {f.candidates.map((c) => `${c.valueText ?? c.valueNumber} (${c.sourceType})`).join(' vs ')}</>
+                      )}
+                    </span>
+                  ) : null}
                   {f.sourceConflict ? (
                     <span className="ak-small ak-muted" style={{ display: 'block' }}>
                       {SOURCE_WORDS[f.sourceConflict.fact.sourceType] ?? f.sourceConflict.fact.sourceType} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.fact.valueText ?? f.sourceConflict.fact.valueNumber}”

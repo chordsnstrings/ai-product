@@ -130,6 +130,25 @@ describe('missing ingredient list (§42)', () => {
     expect(after.packet.product.keyIngredients).toEqual(['Niacinamide', 'Zinc PCA']);
     expect(verifiedIngredients(after.facts)).toEqual({ list: ['Niacinamide', 'Zinc PCA'], verified: true });
   }, 60_000);
+
+  it('a merchant correction of either ingredient row reaches the concepts over an observed list (x-contracts-03)', async () => {
+    const { t, ctx, skuId } = await preview();
+    // The page's INCI matched the vision list, so key_ingredients is OBSERVED from the page.
+    await withTenant(t.workspaceId, (tx) =>
+      recordFacts(tx, ctx, skuId, [
+        { key: 'key_ingredients', valueText: 'Niacinamide, Retinol', sourceType: 'product_page', state: 'OBSERVED', confidence: 0.8 },
+        { key: 'ingredients', valueText: 'Aqua, Niacinamide, Retinol', sourceType: 'product_page', state: 'OBSERVED', confidence: 0.8 },
+      ]),
+    );
+    expect((await withTenant(t.workspaceId, (tx) => buildContext(tx, skuId))).packet.product.keyIngredients).toEqual(['Niacinamide', 'Retinol']);
+    // Correcting the full list wins over the observed key list…
+    await withTenant(t.workspaceId, (tx) => decideFact(tx, ctx, skuId, 'ingredients', { text: 'Niacinamide, Zinc PCA' }));
+    expect((await withTenant(t.workspaceId, (tx) => buildContext(tx, skuId))).packet.product.keyIngredients).toEqual(['Niacinamide', 'Zinc PCA']);
+    // …and a later correction of the key list itself wins over that.
+    await new Promise((r) => setTimeout(r, 5));
+    await withTenant(t.workspaceId, (tx) => decideFact(tx, ctx, skuId, 'key_ingredients', { text: 'Bakuchiol' }));
+    expect((await withTenant(t.workspaceId, (tx) => buildContext(tx, skuId))).packet.product.keyIngredients).toEqual(['Bakuchiol']);
+  }, 60_000);
 });
 
 describe('free-preview SKU cap under concurrency (plan 02 §4, standard §48)', () => {
