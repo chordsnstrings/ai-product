@@ -9,6 +9,8 @@ import {
   type LlmJsonResult,
   type ProviderSet,
   type RawMeta,
+  type SegmentationProvider,
+  type SegmentationResult,
   type TtsProvider,
   type TtsResult,
   type VideoPoll,
@@ -380,6 +382,48 @@ async function imageOnce(call: ImageCall, p: ProviderSet): Promise<ImageResult &
   try {
     const r = await withTransientRetry(() => p.image.generate({ model: wire, prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }));
     await finish(call, started, { ok: true, actualLine: started.line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, rawMeta: r.rawMeta, wireModel: wire, latencyMs: Date.now() - t0 });
+    return { ...r, jobId: started.jobId, promptVersion: started.route.promptVersion, task: call.task };
+  } catch (e) {
+    await finish(call, started, { ok: false, error: (e as Error).message, errorKind: errorKind(e), latencyMs: Date.now() - t0, wireModel: wire });
+    throw e;
+  }
+}
+
+export interface CutoutCall extends CallMeta {
+  /** The product photo to cut out. */
+  image: Buffer;
+}
+
+/** The background-removal task (plan 06 Phase 1 #6): priced as one image on its route. */
+export const CUTOUT_TASK = 'vision.cutout';
+
+/**
+ * Background removal for the product cut-out, through the gateway like any billable call: its own route, Cost
+ * Governor debit, provider job and usage events. Without a configured adapter nothing is dispatched or charged
+ * (UNAVAILABLE), and the caller keeps its keyed or framed cut-out.
+ */
+export async function removeBackground(call: CutoutCall): Promise<SegmentationResult & { jobId: string; promptVersion: string; task: string }> {
+  const p = await providers();
+  const adapter = p.segmentation;
+  if (!adapter) throw new DomainError('UNAVAILABLE', 'Background removal isn’t available right now.', { notConfigured: 'segmentation' });
+  return withRouteFallback(call, adapter, (m) => cutoutOnce({ ...call, task: m.task }, p, adapter));
+}
+
+async function cutoutOnce(call: CutoutCall, p: ProviderSet, adapter: SegmentationProvider): Promise<SegmentationResult & { jobId: string; promptVersion: string; task: string }> {
+  const started = await begin(call, (rt) => lineFor(rt, { kind: 'image', images: 1 }), { image: createHash('sha256').update(call.image).digest('hex') });
+  const wire = wireModelFor(started.route, p);
+  const t0 = Date.now();
+  try {
+    const r = await withTransientRetry(() => adapter.removeBackground({ model: wire, image: call.image }));
+    await finish(call, started, {
+      ok: true,
+      actualLine: started.line,
+      modelVersion: r.modelVersion,
+      providerRequestId: r.providerRequestId,
+      rawMeta: { ...(r.rawMeta ?? {}), aligned: r.aligned, coverage: Math.round(r.coverage * 1000) / 1000, technique: r.technique },
+      wireModel: wire,
+      latencyMs: Date.now() - t0,
+    });
     return { ...r, jobId: started.jobId, promptVersion: started.route.promptVersion, task: call.task };
   } catch (e) {
     await finish(call, started, { ok: false, error: (e as Error).message, errorKind: errorKind(e), latencyMs: Date.now() - t0, wireModel: wire });

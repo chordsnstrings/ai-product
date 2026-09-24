@@ -260,12 +260,20 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       await step(tx, ws, skuId, 'claims', 'done', cc!.n ? `${cc!.n} claim${cc!.n > 1 ? 's' : ''} found${cc!.risky ? ` · ${cc!.risky} we won’t use` : ''}` : 'No claims found on the page');
     });
 
-    // 6. Visual Fingerprint + cut-out (deterministic).
+    // 6. Visual Fingerprint + cut-out (deterministic keying; a photo keying can't separate gets one background-removal
+    //    try when the storyboard first needs the cut-out — see cutout.ts).
     await withTenant(ws, (tx) => step(tx, ws, skuId, 'fingerprint', 'active'));
     const cut = await cutout(photos[0]!);
     const colors = await dominantColors(cut.png);
     await withTenant(ws, async (tx) => {
-      const c = await saveAsset(tx, ws, { bytes: cut.png, mime: 'image/png', kind: 'cutout', skuId, source: 'generated', lineage: { from: photoIds[0], keyed: cut.keyed } });
+      const c = await saveAsset(tx, ws, {
+        bytes: cut.png,
+        mime: 'image/png',
+        kind: 'cutout',
+        skuId,
+        source: 'generated',
+        lineage: { from: photoIds[0], keyed: cut.keyed, technique: cut.technique, coverage: Math.round(cut.coverage * 1000) / 1000, spread: Math.round(cut.spread * 1000) / 1000 },
+      });
       const [v] = await tx`select coalesce(max(version), 0) + 1 as v from visual_fingerprints where sku_id = ${skuId}`;
       await tx`update visual_fingerprints set active = false where sku_id = ${skuId}`;
       await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text, brand_text,
@@ -273,7 +281,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
                values (${ws}, ${skuId}, ${v!.v}, ${photoIds}, ${c.id}, ${x.labelText}, ${x.brand}, ${x.packaging.type}, ${x.packaging.closure},
                  ${tx.json(colors)}, ${x.packaging.transparent ? 'transparent' : 'opaque'},
                  ${tx.json({ paletteDistanceMax: 70, labelMustMatch: !!x.labelText } as never)})`;
-      await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed });
+      await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed, technique: cut.technique });
       await step(tx, ws, skuId, 'fingerprint', 'done', `${x.packaging.type.replace('_', ' ')}${x.packaging.closure ? ` · ${x.packaging.closure}` : ''}`);
       await tx`update skus set status = 'active' where id = ${skuId}`;
       await transition(tx, ctx, projectId, 'PRODUCT_ANALYZED');

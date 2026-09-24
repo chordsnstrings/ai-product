@@ -39,6 +39,13 @@ alter table creatives add column synthetic_people boolean not null default false
 -- The storyboard prompt now tells the Creative Director that generated people never speak as customers.
 update model_routes set prompt_version = 'storyboard@1.1.0' where task = 'creative_director.storyboard' and prompt_version = 'storyboard@1.0.0';
 
+-- ───────────── Background removal for the product cut-out (plan 06 Phase 1 #6, design M3) ─────────────
+-- Decision: a Seedream image edit puts the product on a flat backdrop; the worker keys the backdrop and applies
+-- the mask to the merchant's own photo, so the cut-out never carries generated pixels. Priced as one image; staff
+-- route, pin or trip it like any other task. Used only when border keying can't separate the product.
+insert into model_routes (task, provider, model, prompt_version) values ('vision.cutout', 'byteplus', 'seedream-5-0-pro', 'cutout@1.0.0')
+  on conflict (task) do nothing;
+
 -- ───────────── Funnel: one upload start per visitor attempt (standard §7, plan 04 §1 S2) ─────────────
 -- Upload intent is recorded when the visitor first adds a photo or link (a beacon), and again when the form is
 -- submitted — whichever comes first counts, once per visitor per window. app_rw may only insert funnel events,

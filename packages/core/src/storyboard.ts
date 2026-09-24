@@ -7,12 +7,13 @@ import { brandBrainFor } from './brand';
 import { classifyClaim, isFirstPersonTestimonial, scanCreativeText, showsSyntheticPeople, SYNTHETIC_TESTIMONIAL_REASON, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
 import type { TenantContext } from './context';
+import { cutoutState, segmentCutout, wantsSegmentation } from './cutout';
 import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
 import { allowedClaimTexts, planStoryboard } from './creative-director';
 import { emit } from './events';
 import { projectVisitor, recordFunnel } from './funnel';
 import type { StoryboardPlan } from './intel-schemas';
-import { generateImage, routedLines } from './model-gateway';
+import { CUTOUT_TASK, generateImage, routedLines } from './model-gateway';
 import { issueTasteOffer } from './offers';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
@@ -84,18 +85,23 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
   });
   if (status !== 'generating') return; // superseded or already done
 
-  const auth = await withTenant(ws, async (tx) =>
-    authorize(tx, ctx, {
+  // The frames are where the product cut-out is first used: a photo keying couldn't cut out cleanly gets one
+  // background-removal try here, priced into this storyboard's authorization (plan 06 Phase 1 #6).
+  const { auth, segment } = await withTenant(ws, async (tx) => {
+    const segment = wantsSegmentation(await cutoutState(tx, skuId));
+    const auth = await authorize(tx, ctx, {
       purpose: 'storyboard',
       projectId,
       skuId,
       lines: await routedLines(tx, ws, [
         { task: 'creative_director.storyboard', kind: 'llm', inputTokens: 5_000, outputTokens: 2_500 },
         { task: 'image.storyboard_frame', kind: 'image', images: MAX_GENERATED_FRAMES },
+        ...(segment ? [{ task: CUTOUT_TASK, kind: 'image' as const, images: 1 }] : []),
       ]),
       idempotencyKey: `storyboard:${storyboardId}`,
-    }),
-  );
+    });
+    return { auth, segment };
+  });
   try {
     await withTenant(ws, (tx) => step(tx, ws, storyboardId, 'plan', 'active'));
     const { plan, promptVersion, model, brandBrainVersionId } = await planStoryboard({ ctx, token: auth.token, skuId, projectId, conceptId });
@@ -129,6 +135,7 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     const scenes = await withTenant(ws, (tx) => tx`select * from scenes where storyboard_id = ${storyboardId} order by position`);
     const [pv] = await withTenant(ws, (tx) => tx`select sku_variant_id from projects where id = ${projectId}`);
     if (pv?.sku_variant_id) await ensureVariantImage(ctx, pv.sku_variant_id as string);
+    if (segment) await segmentCutout({ ctx, token: auth.token, skuId });
     const { imagery, refs } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId), refs: await referenceDataUrls(tx, skuId, projectId) }));
     const cut = imagery.cutout?.keyed ? imagery.cutout : null;
     let generated = 0;

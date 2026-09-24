@@ -1,7 +1,11 @@
+import { backdropFor, cutoutFromFlatBackdrop } from '@arkiv/media';
 import type {
   ImageProvider,
   ImageRequest,
   ImageResult,
+  SegmentationProvider,
+  SegmentationRequest,
+  SegmentationResult,
   TtsProvider,
   TtsRequest,
   TtsResult,
@@ -84,6 +88,61 @@ export class SeedreamImage implements ImageProvider {
       providerRequestId: r.id ?? url.split('?')[0]!.split('/').pop()!,
       // The signed download URL is not kept (it grants access); the output is already in our storage.
       rawMeta: { id: r.id ?? null, model: r.model ?? null, created: r.created ?? null, usage: r.usage ?? null, images: r.data.length },
+    };
+  }
+}
+
+/**
+ * The background-removal edit (task `vision.cutout`, prompt cutout@1.0.0). The product must stay exactly where
+ * and as it is; only the background changes, to one flat colour chosen to be unlike the product.
+ */
+export const cutoutPrompt = (backdrop: { name: string; hex: string }) =>
+  `Replace the entire background of this product photo with one perfectly flat, uniform ${backdrop.name} colour (${backdrop.hex}) ` +
+  'from edge to edge: no gradient, shadow, reflection, surface, props, hands or text. Keep the product itself exactly as it is — ' +
+  'same position, size, angle, shape, colours, label text and lighting. Do not add, remove, move or redraw anything on the product.';
+
+/**
+ * Background removal on Seedream (plan 06 Phase 1 #6): an image edit that puts the product on a flat backdrop,
+ * sized like the photo; the backdrop is keyed here and the mask is applied to the photo's own pixels. An edit that
+ * moved or redrew the product is reported as not aligned rather than used.
+ */
+export class SeedreamCutout implements SegmentationProvider {
+  readonly name = 'byteplus';
+  private readonly ark: ArkClient;
+  constructor(apiKey: string, baseUrl: string) {
+    this.ark = new ArkClient(apiKey, baseUrl);
+  }
+  async removeBackground(req: SegmentationRequest): Promise<SegmentationResult> {
+    const sharp = (await import('sharp')).default;
+    const meta = await sharp(req.image).metadata();
+    const [w0, h0] = (meta.orientation ?? 1) >= 5 ? [meta.height ?? 1024, meta.width ?? 1024] : [meta.width ?? 1024, meta.height ?? 1024];
+    // The photo's aspect ratio at 1–4 megapixels in multiples of 8 (a planning assumption for Seedream's size
+    // limits); the edit is resized back onto the photo for keying anyway.
+    const scale = Math.min(2048 / Math.max(w0, h0), Math.max(1, Math.sqrt(1_048_576 / (w0 * h0))));
+    const size = (v: number) => Math.max(512, Math.round((v * scale) / 8) * 8);
+    const backdrop = await backdropFor(req.image);
+    const jpeg = await sharp(req.image).rotate().flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toBuffer();
+    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string; usage?: unknown; created?: number }>('images/generations', 'POST', {
+      model: req.model,
+      prompt: cutoutPrompt(backdrop),
+      image: [`data:image/jpeg;base64,${jpeg.toString('base64')}`],
+      size: `${size(w0)}x${size(h0)}`,
+      response_format: 'url',
+      watermark: false,
+    });
+    const url = r.data[0]?.url;
+    if (!url) throw new ProviderError('byteplus', 'no image returned', true, 'server');
+    const cut = await cutoutFromFlatBackdrop(req.image, await download(url));
+    return {
+      png: cut.png,
+      mask: cut.mask,
+      coverage: cut.coverage,
+      aligned: cut.aligned,
+      technique: 'seedream_edit+key',
+      model: req.model,
+      modelVersion: r.model ?? req.model,
+      providerRequestId: r.id ?? url.split('?')[0]!.split('/').pop()!,
+      rawMeta: { id: r.id ?? null, model: r.model ?? null, created: r.created ?? null, usage: r.usage ?? null, backdrop: backdrop.hex, drift: Math.round(cut.drift) },
     };
   }
 }
