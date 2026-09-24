@@ -3,19 +3,22 @@ import { decryptToken, encryptToken, signState, verifyState } from './crypto';
 import { hmacHex } from './crypto';
 import { normalizeMetaInsight, normalizeTikTokRow, verifyShopifyQuery } from './connectors';
 
+/** Replaces the character at `i` with a different one, so the string always changes. */
+const flipChar = (s: string, i: number) => s.slice(0, i) + (s[i] === 'A' ? 'B' : 'A') + s.slice(i + 1);
+
 /** Contract tests with recorded-shape fixtures (§51). */
 describe('token encryption', () => {
   it('round-trips and detects tampering', () => {
     const e = encryptToken('shpat_secret');
     expect(e).not.toContain('shpat');
     expect(decryptToken(e)).toBe('shpat_secret');
-    const tampered = e.slice(0, -2) + (e.endsWith('A') ? 'B' : 'A') + e.slice(-1);
-    expect(() => decryptToken(tampered)).toThrow();
+    // The ciphertext is 12 bytes (16 base64url characters, no padding bits), so every character is significant.
+    expect(() => decryptToken(flipChar(e, e.length - 2))).toThrow();
   });
   it('signs and expires OAuth state', () => {
     const s = signState({ workspaceId: 'w', userId: 'u' });
     expect(verifyState(s)?.workspaceId).toBe('w');
-    expect(verifyState(s.replace(/.$/, 'x'))).toBeNull();
+    expect(verifyState(flipChar(s, s.length - 1))).toBeNull();
   });
 });
 
