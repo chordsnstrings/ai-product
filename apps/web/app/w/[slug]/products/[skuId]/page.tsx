@@ -4,12 +4,16 @@ import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import { assetUrl, currentFacts, verifiedIngredients } from '@arkiv/core';
 import { MetadataTable, ProvenanceChip } from '@arkiv/ui';
-import { ActionForm } from '@/components/actions';
+import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Product · Arkiv' };
 
 const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', texture: 'Texture', ingredients: 'Ingredients', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
+/** Where a value that disagrees with the merchant's correction came from. */
+const SOURCE_WORDS: Record<string, string> = { shopify: 'Shopify', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label', import: 'Your import' };
+/** Files the customer uploaded (deleteAsset refuses generated work). */
+const DELETABLE_KINDS = new Set(['product_photo', 'reference_view', 'creator_footage', 'evidence_doc', 'brand_logo', 'historical_creative']);
 const TABS = ['facts', 'look', 'language', 'assets', 'history'] as const;
 
 /** A4 Product Brain: facts with provenance, visual fingerprint, customer language, assets, imported history. */
@@ -24,7 +28,7 @@ export default async function Product({ params, searchParams }: { params: Promis
     const facts = await currentFacts(tx, skuId);
     const [fp] = await tx`select * from visual_fingerprints where sku_id = ${skuId} and active`;
     const fps = await tx`select version, created_at from visual_fingerprints where sku_id = ${skuId} order by version desc`;
-    const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence desc limit 20`;
+    const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
     const assets = await tx`select id, kind, mime, created_at, source from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
     const imported = await tx`select id, genome, platform_refs, created_at from creatives where sku_id = ${skuId} and origin = 'imported' order by created_at desc limit 20`;
@@ -49,6 +53,7 @@ export default async function Product({ params, searchParams }: { params: Promis
         <h1 className="ak-h1" style={{ margin: 0 }}>{d.sku.name as string}</h1>
         <div className="ak-row">
           <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/products/${skuId}/claims`}>Claims</Link>
+          <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/products/${skuId}/review`}>Review</Link>
           <Link className="ak-btn ak-btn--secondary" href={`/w/${slug}/map?sku=${skuId}`}>Map</Link>
         </div>
       </div>
@@ -70,6 +75,20 @@ export default async function Product({ params, searchParams }: { params: Promis
                 <span>
                   {f.value.valueText ? (f.value.valueText.length > 240 ? `${f.value.valueText.slice(0, 240)}…` : f.value.valueText) : f.value.valueNumber != null ? String(f.value.valueNumber) : JSON.stringify(f.value.valueJson)}
                   {f.disputed ? <span className="ak-small ak-muted" style={{ display: 'block' }}>Disputed: {f.candidates.map((c) => `${c.valueText ?? c.valueNumber} (${c.sourceType})`).join(' vs ')}</span> : null}
+                  {f.sourceConflict ? (
+                    <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                      {SOURCE_WORDS[f.sourceConflict.fact.sourceType] ?? f.sourceConflict.fact.sourceType} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.fact.valueText ?? f.sourceConflict.fact.valueNumber}”
+                      {' '}({new Date(f.sourceConflict.fact.observedAt).toLocaleDateString()}).
+                      {canEdit ? (
+                        <span className="ak-row" style={{ gap: 8, marginTop: 4 }}>
+                          {f.sourceConflict.newer ? (
+                            <ActionButton slug={slug} action="fact" variant="text" body={{ skuId, key: k, value: f.value.valueText ?? String(f.value.valueNumber ?? '') }}>Keep yours</ActionButton>
+                          ) : null}
+                          <ActionButton slug={slug} action="fact-accept-source" variant="text" body={{ skuId, factId: f.sourceConflict.fact.id }}>Use store value</ActionButton>
+                        </span>
+                      ) : null}
+                    </span>
+                  ) : null}
                 </span>
               ),
               chip: <ProvenanceChip state={f.value.state as 'OBSERVED'} source={f.value.sourceType} />,
@@ -92,7 +111,7 @@ export default async function Product({ params, searchParams }: { params: Promis
             ) : null}
             <div className="ak-panel">
               <h2 className="ak-label">Correct a fact</h2>
-              <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. Shopify values that disagree are kept and marked disputed.</p>
+              <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. If your store says something different, we keep showing it next to your value so you can switch back.</p>
               <ActionForm slug={slug} action="fact" extra={{ skuId }} submit="Save" fields={[{ name: 'key', label: 'Field', type: 'select', options: Object.entries(LABEL).map(([value, label]) => ({ value, label })) }, { name: 'value', label: 'Value', type: 'textarea', required: true, max: 2000 }]} />
             </div>
             </div>
@@ -121,15 +140,19 @@ export default async function Product({ params, searchParams }: { params: Promis
             <p className="ak-small ak-muted">{d.signalCount} customer comments imported. Themes guide hooks and angles; customer words are never turned into product claims.</p>
             {d.themes.length === 0 ? <p className="ak-muted">No themes yet.</p> : d.themes.map((t) => (
               <div key={t.id as string} className="ak-index-row">
-                <span>{t.label as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>{t.signal_type as string} · {t.trend as string}</span></span>
-                <span className="ak-index">{Math.round(Number(t.prevalence) * 100)}% · n={t.sample_size as number}</span>
+                <span>{t.label as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>
+                  {t.signal_type as string} · {t.trend as string}
+                  {t.sentiment != null ? ` · ${Number(t.sentiment) > 0.2 ? 'positive' : Number(t.sentiment) < -0.2 ? 'negative' : 'mixed'}` : ''}
+                  {Number(t.relevance) < 0.5 ? ' · mostly not about the product' : ''}
+                </span></span>
+                <span className="ak-index" title="Recency-weighted share of comments · comments in this theme">{Math.round(Number(t.prevalence) * 100)}% · n={t.sample_size as number}</span>
               </div>
             ))}
           </div>
           {canEdit ? (
             <div className="ak-panel">
               <h2 className="ak-label">Import reviews</h2>
-              <ActionForm slug={slug} action="reviews" extra={{ skuId }} submit="Import" fields={[{ name: 'text', label: 'Paste reviews (one per line or a CSV export)', type: 'textarea', required: true, hint: 'Names and emails are removed automatically.' }]} />
+              <ActionForm slug={slug} action="reviews" extra={{ skuId }} submit="Import" fields={[{ name: 'text', label: 'Paste reviews (one per line or a CSV export)', type: 'textarea', required: true, hint: 'We keep only the review text, rating and date. Reviewer names are hashed, other columns are dropped, and emails, phone numbers and addresses in the text are removed.' }]} />
             </div>
           ) : null}
         </div>
@@ -141,6 +164,9 @@ export default async function Product({ params, searchParams }: { params: Promis
             <figure key={a.id as string} className="ak-frame">
               <div className="ak-well" style={{ aspectRatio: '1' }}>{a.url ? <img src={a.url} alt={String(a.kind)} style={{ objectFit: 'contain', width: '100%', height: '100%' }} /> : <span className="ak-index">{String(a.mime)}</span>}</div>
               <figcaption className="ak-index">{String(a.kind).replace(/_/g, ' ')} · {new Date(a.created_at as string).toLocaleDateString()}</figcaption>
+              {canEdit && DELETABLE_KINDS.has(a.kind) ? (
+                <ActionButton slug={slug} action="asset-delete" variant="text" body={{ assetId: a.id }} confirm="Delete this file? It disappears from Arkiv. Evidence behind an approved claim and delivered ads are kept for our records.">Delete</ActionButton>
+              ) : null}
             </figure>
           ))}
         </div>

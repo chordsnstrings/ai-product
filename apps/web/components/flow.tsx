@@ -42,6 +42,8 @@ function Loading() {
 
 const FACT_LABELS: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at', category: 'Category', texture: 'Texture', ingredients: 'Key ingredients', sku_code: 'SKU', gtin: 'GTIN' };
 const EDITABLE = new Set(['name', 'brand', 'size', 'price', 'category', 'texture', 'ingredients']);
+/** Where a disagreeing value came from, in customer words. */
+const SOURCE_WORDS: Record<string, string> = { shopify: 'Your Shopify store', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label in your photos', import: 'Your import' };
 
 /** Inline inputs for facts we could not find (plan 03 P3 "ask for the missing field"; §42 ingredient source). */
 function MissingFacts({ projectId, fields, onSaved }: { projectId: string; fields: { key: string; label: string; hint?: string }[]; onSaved: () => void }) {
@@ -127,7 +129,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
   if (v.sku.status === 'rejected') {
     return (
       <Shell step={1} title="We can’t make an ad for this product" sub={v.sku.rejectReason ?? 'This product is outside what Arkiv supports.'}>
-        <p className="ak-muted">Arkiv is built for cosmetic skincare only — cleansers, serums, moisturisers, SPF and similar. You haven’t been charged anything.</p>
+        <p className="ak-muted">Arkiv is built for cosmetic skincare only — cleansers, serums, moisturisers and similar, not sunscreen/SPF or acne and other OTC treatments. You haven’t been charged anything.</p>
         <LinkButton href="/#upload" variant="secondary">Try a different product</LinkButton>
       </Shell>
     );
@@ -158,6 +160,17 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
     }
   }
   const disputed = v.facts.filter((f) => f.disputed);
+  // Keep the merchant's correction (a fresh decision acknowledges the newer source value) or take the source's.
+  async function resolveSource(key: string, keep: { value: string } | { factId: string }) {
+    setErr(null);
+    try {
+      if ('factId' in keep) await api(`/api/projects/${projectId}/fact-accept-source`, { factId: keep.factId });
+      else await api(`/api/projects/${projectId}/fact`, { key, value: keep.value });
+      refresh();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  }
 
   return (
     <Shell
@@ -175,6 +188,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
           {!analyzing ? (
             <>
               {disputed.length ? <Banner tone="warn">Your page and photos disagree on {disputed.map((d) => FACT_LABELS[d.key] ?? d.key).join(', ')}. Tell us which is right.</Banner> : null}
+              {v.facts.some((f) => f.sourceConflict?.newer) ? <Banner tone="warn">Your store changed {v.facts.filter((f) => f.sourceConflict?.newer).map((d) => FACT_LABELS[d.key] ?? d.key).join(', ')} since you corrected it. Keep yours, or use the store’s value.</Banner> : null}
               <MetadataTable
                 animate
                 rows={v.facts
@@ -193,6 +207,18 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                         <span>
                           {f.key === 'ingredients' && f.value.length > 120 ? `${f.value.slice(0, 120)}…` : f.value}
                           {EDITABLE.has(f.key) ? <button className="ak-textbtn" style={{ marginLeft: 8 }} onClick={() => { setEditing(f.key); setDraft(f.value); }}>Fix</button> : null}
+                          {f.sourceConflict ? (
+                            <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                              {SOURCE_WORDS[f.sourceConflict.source] ?? 'Another source'} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.value}”
+                              {f.sourceConflict.newer ? ` (since ${new Date(f.sourceConflict.observedAt).toLocaleDateString()})` : ''}.
+                              {f.sourceConflict.newer && EDITABLE.has(f.key) ? (
+                                <>
+                                  {' '}<button className="ak-textbtn" onClick={() => void resolveSource(f.key, { value: f.value })}>Keep yours</button>
+                                  {' · '}<button className="ak-textbtn" onClick={() => void resolveSource(f.key, { factId: f.sourceConflict!.factId })}>Use store value</button>
+                                </>
+                              ) : null}
+                            </span>
+                          ) : null}
                         </span>
                       ),
                     chip: <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} />,

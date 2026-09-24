@@ -73,11 +73,13 @@ export default async function Claims({ params }: { params: Promise<{ slug: strin
                         ]} />
                       </SheetButton>
                     ) : null}
-                    <SheetButton variant="text" label="Attach evidence" title="Attach evidence" description="A study, lab report or certificate supporting this claim.">
+                    <SheetButton variant="text" label="Attach evidence" title="Attach evidence" description="A study, lab report or certificate supporting this claim. Your say-so alone keeps a claim pending.">
                       <ActionForm slug={slug} action="evidence" multipart extra={{ claimId: c.id }} submit="Attach" fields={[
                         { name: 'type', label: 'Type', type: 'select', options: [['clinical_study', 'Clinical study'], ['consumer_perception', 'Consumer perception study'], ['lab_test', 'Lab test'], ['certificate', 'Certificate'], ['ingredient_spec', 'Ingredient spec'], ['other', 'Other']].map(([value, label]) => ({ value: value!, label: label! })) },
+                        { name: 'applicability', label: 'What it tested', type: 'select', options: [['product_specific', 'This exact product (same formula)'], ['ingredient_level', 'An ingredient, not the finished product'], ['other_formulation', 'A different formula or product']].map(([value, label]) => ({ value: value!, label: label! })), hint: 'Only evidence about this exact product can approve a clinical, quantified or expert claim.' },
                         { name: 'file', label: 'File (PDF or image)', type: 'file', accept: 'application/pdf,image/*' },
-                        { name: 'location', label: 'Page / section (optional)' },
+                        { name: 'location', label: 'Or a link to it (and page / section)', placeholder: 'https://…' },
+                        { name: 'wording', label: 'Claim wording the evidence supports', placeholder: c.preferredWording, hint: 'Required for expert endorsements such as “dermatologist tested”: the exact words the report allows.', max: 200 },
                         { name: 'expiry', label: 'Expires (optional)', type: 'date' },
                       ]} />
                     </SheetButton>

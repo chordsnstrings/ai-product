@@ -82,6 +82,8 @@ export const EventType = [
   'INTEGRATION_DISCONNECTED',
   // Platform event: staff moved a SKU between workspaces with the owner's consent (plan 05 §2.3); one per side.
   'SKU_TRANSFERRED',
+  // Standard §9/§11: the Day-30 / month-end SKU Creative Review was written.
+  'SKU_REVIEW_CREATED',
   // Funnel (plan 04 §1) — server-side source of truth
   'LP_VIEWED',
   'UPLOAD_STARTED',
@@ -101,6 +103,8 @@ export const EventType = [
   'TASTE_DELIVERED',
   'ASSET_WATCHED',
   'ASSET_EXPORTED',
+  // Standard §40: a customer deleted an uploaded file (bytes purged unless retained for evidence/delivery).
+  'ASSET_DELETED',
   // Standard §7 "Ad account connected — Meta/TikTok connection rate".
   'AD_ACCOUNT_CONNECTED',
   'SUBSCRIPTION_STARTED',
@@ -299,6 +303,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   INTEGRATION_DEGRADED: 'integration',
   INTEGRATION_DISCONNECTED: 'integration',
   SKU_TRANSFERRED: 'sku',
+  SKU_REVIEW_CREATED: 'sku',
   LP_VIEWED: null,
   UPLOAD_STARTED: null,
   UPLOAD_COMPLETED: 'sku',
@@ -315,6 +320,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   TASTE_DELIVERED: 'project',
   ASSET_WATCHED: 'asset',
   ASSET_EXPORTED: 'asset',
+  ASSET_DELETED: 'asset',
   AD_ACCOUNT_CONNECTED: 'integration',
   SUBSCRIPTION_STARTED: 'subscription',
 };

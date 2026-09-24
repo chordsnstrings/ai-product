@@ -6,6 +6,8 @@ import {
   DomainError,
   env,
   LandingBlocks,
+  PLANS,
+  PRICES,
   landingAssetIds,
   landingBlocksFrom,
   LandingExperiment,
@@ -16,7 +18,7 @@ import {
 } from '@arkiv/shared';
 import { audit, type Staff } from './admin';
 import { raiseAlert } from './alerts';
-import { scanCreativeText } from './compliance';
+import { fleschKincaidGrade, MAX_LANDING_GRADE, scanCreativeText } from './compliance';
 import { storage } from './storage';
 import { posterior, probBest } from './statistics';
 
@@ -60,7 +62,35 @@ export function lintLandingCopy(content: unknown, variants: readonly { content: 
   const out = MARKETING_BANNED.filter((b) => b.re.test(text)).map((b) => b.why);
   const scan = scanCreativeText(copy.flatMap((c) => c.split(/(?<=[.!?"])\s+/)).slice(0, 400), []);
   if (!scan.ok) out.push(...scan.violations.map((v) => `“${v.text.slice(0, 60)}”: ${v.reason}`));
+  // Plan 04 L14: grade 6–7 readability, per page version (the control and each variant as a visitor reads it).
+  const base = content && typeof content === 'object' ? (content as LandingBlocks) : null;
+  const versions: [string, unknown][] = [['The page', content], ...(base ? variants.map((v): [string, unknown] => [`Variant ${(v as { key?: string }).key ?? ''}`.trim(), applyLandingVariant(base, v.content as LandingVariantContent)]) : [])];
+  for (const [name, c] of versions) {
+    const grade = fleschKincaidGrade(landingCopy(c));
+    if (grade > MAX_LANDING_GRADE) out.push(`${name} reads at grade ${grade}; keep it at ${MAX_LANDING_GRADE} or below (shorter sentences, plainer words).`);
+  }
   return [...new Set(out)];
+}
+
+/** Dollar amounts the copy states ("$19", "$49/mo", "$8.50"). */
+export const statedPrices = (copy: readonly string[]): number[] =>
+  [...copy.join(' ').matchAll(/\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/g)].map((m) => Number(m[1]!.replace(/,/g, '')));
+
+/**
+ * Plan 04 §4 "anchor validity": every price the copy states must be a price a visitor can actually pay today — an
+ * active offer, a plan, or the standard one-off prices. A stale "$19" after the offer changed is refused.
+ */
+export async function landingPriceProblems(tx: Tx, content: unknown, variants: readonly { content: unknown }[] = []): Promise<string[]> {
+  const stated = [...new Set(statedPrices(landingCopy(content, variants)))];
+  if (!stated.length) return [];
+  const offers = await tx`select price_micros from offer_definitions where active`;
+  const valid = new Set([...offers.map((o) => Number(o.price_micros)), ...Object.values(PLANS).map((p) => p.priceMicros), PRICES.TASTE, PRICES.STANDALONE].map((m) => Math.round(Number(m) / 10_000)));
+  return stated.filter((d) => !valid.has(Math.round(d * 100))).map((d) => `“$${d}” isn’t a price anyone can pay right now (no active offer or plan at that price).`);
+}
+
+/** Everything the copy itself must pass (lint, readability, price anchors), on save, rollback and publish. */
+async function copyProblems(tx: Tx, draft: LandingDraft): Promise<string[]> {
+  return [...lintLandingCopy(draft.content, draft.variants), ...(await landingPriceProblems(tx, draft.content, draft.variants))];
 }
 
 // ───────────── Example assets and testimonials ─────────────
@@ -158,7 +188,7 @@ export function parseLandingDraft(content: unknown, variants: unknown = []): Lan
 
 /** Everything that must hold before a draft reaches the public page. Throws GATE_BLOCKED with every problem. */
 export async function assertPublishable(tx: Tx, draft: LandingDraft): Promise<void> {
-  const problems = lintLandingCopy(draft.content, draft.variants).map((p) => `Compliance lint: ${p}`);
+  const problems = (await copyProblems(tx, draft)).map((p) => `Compliance lint: ${p}`);
   for (const v of draft.variants) {
     const merged = applyLandingVariant(draft.content, v.content);
     if (!merged.hero.headline.trim()) problems.push(`Variant ${v.key} has no headline.`);
@@ -213,7 +243,7 @@ export interface LandingSaveInput {
  */
 export async function saveLandingDraft(tx: Tx, s: Staff, i: LandingSaveInput) {
   const draft = parseLandingDraft(i.content, i.variants);
-  const lint = lintLandingCopy(draft.content, draft.variants);
+  const lint = await copyProblems(tx, draft);
   if (lint.length) throw new DomainError('GATE_BLOCKED', `Compliance lint: ${lint.join(' ')}`, { problems: lint });
   const experiment = i.experiment ? LandingExperiment.parse(i.experiment) : undefined;
   const [before] = await tx`select * from landing_pages where slug = ${i.slug} for update`;
@@ -270,7 +300,7 @@ export async function rollbackLanding(tx: Tx, s: Staff, slug: string, version: n
   const live = p.status === 'live';
   if (live) await assertPublishable(tx, draft);
   else {
-    const lint = lintLandingCopy(draft.content, draft.variants);
+    const lint = await copyProblems(tx, draft);
     if (lint.length) throw new DomainError('GATE_BLOCKED', `Compliance lint: ${lint.join(' ')}`, { problems: lint });
   }
   const next = Number(p.version) + 1;

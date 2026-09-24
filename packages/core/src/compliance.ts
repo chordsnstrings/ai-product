@@ -231,3 +231,30 @@ export function syntheticTestimonials(
     .filter((l): l is string => !!l && isFirstPersonTestimonial(l))
     .map((text) => ({ text, reason: SYNTHETIC_TESTIMONIAL_REASON }));
 }
+
+// ───────────── Readability (plan 04 L14: landing copy at grade 6–7) ─────────────
+
+/** Syllables in an English word (vowel groups, silent final e, -le/-ed endings): good enough for a grade estimate. */
+export function syllables(word: string): number {
+  const w = word.toLowerCase().replace(/[^a-z]/g, '');
+  if (!w) return 0;
+  if (w.length <= 3) return 1;
+  const trimmed = w.replace(/(?:[^laeiouy]es|[^laeiouy]ed|[^laeiouy]e)$/, '').replace(/^y/, '');
+  const groups = trimmed.match(/[aeiouy]{1,2}/g)?.length ?? 0;
+  return Math.max(1, groups + (/[^aeiouy]le$/.test(w) ? 1 : 0));
+}
+
+/**
+ * Flesch–Kincaid grade level of a piece of copy. Every separate string (a headline, a button) counts as its own
+ * sentence, as do [.!?] endings inside it. Numbers and prices count as one-syllable words.
+ */
+export function fleschKincaidGrade(copy: string | readonly string[]): number {
+  const parts = (typeof copy === 'string' ? [copy] : copy).flatMap((c) => c.split(/(?<=[.!?])\s+|\n+/)).map((c) => c.trim()).filter((c) => /[a-z0-9]/i.test(c));
+  const words = parts.flatMap((p) => p.split(/\s+/).filter((w) => /[a-z0-9]/i.test(w)));
+  if (!parts.length || !words.length) return 0;
+  const syl = words.reduce((n, w) => n + (/[a-z]/i.test(w) ? syllables(w) : 1), 0);
+  return Math.round((0.39 * (words.length / parts.length) + 11.8 * (syl / words.length) - 15.59) * 10) / 10;
+}
+
+/** Plan 04 L14: the highest reading grade landing copy may have. */
+export const MAX_LANDING_GRADE = 7;

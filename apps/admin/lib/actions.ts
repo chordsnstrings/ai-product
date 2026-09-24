@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
 import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
+  deleteUser,
   actOnBehalf,
   addTenantNote,
   approveClaim,
@@ -705,7 +706,18 @@ export const ACTIONS = {
   /* ── Claims (tenant routed these to our compliance team; views are audited as content access) ── */
   'claim.decide': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock', 'keep_restricted', 'request_evidence']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('TIKTOK,META'), markets: z.string().optional(), reason }),
+    schema: z.object({
+      workspaceId: uuid,
+      claimId: uuid,
+      decision: z.enum(['approve', 'block', 'unblock', 'keep_restricted', 'request_evidence', 'approve_without_evidence']),
+      wording: z.string().max(200).optional(),
+      qualifier: z.string().max(200).optional(),
+      platforms: z.string().default('TIKTOK,META'),
+      markets: z.string().optional(),
+      /** Comma-separated claim_evidence ids the approval rests on (default: every qualifying file). */
+      evidenceIds: z.string().optional(),
+      reason,
+    }),
     run: async (s, i) => {
       if (i.decision === 'unblock') return requestOrExecute(s, 'claim.unblock', { workspaceId: i.workspaceId, claimId: i.claimId }, i.reason);
       if (i.decision === 'keep_restricted' || i.decision === 'request_evidence') {
@@ -718,6 +730,11 @@ export const ACTIONS = {
         }
         return { message: i.decision === 'request_evidence' ? 'Evidence requested; the brand has been emailed. The claim stays restricted meanwhile.' : 'Kept restricted; the brand sees the reason in its Claims Vault.' };
       }
+      const evidenceIds = (i.evidenceIds ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+      if (evidenceIds.some((x) => !uuid.safeParse(x).success)) throw new DomainError('INVALID', 'Evidence ids must be UUIDs.');
+      // A high-risk claim approved without qualifying evidence needs a second compliance reviewer (§43, four-eyes).
+      if (i.decision === 'approve_without_evidence')
+        return requestOrExecute(s, 'claim.approve_override', { workspaceId: i.workspaceId, claimId: i.claimId, wording: i.wording ?? null, qualifier: i.qualifier ?? null, platforms: i.platforms, markets: i.markets ?? null }, i.reason);
       return withAdmin(async (tx) => {
         const [owned] = await tx`select 1 from claims where id = ${i.claimId} and workspace_id = ${i.workspaceId}`;
         if (!owned) throw new DomainError('NOT_FOUND', 'Claim not found');
@@ -728,9 +745,9 @@ export const ACTIONS = {
           const [cl] = await tx`select sku_id from claims where id = ${i.claimId} and workspace_id = ${i.workspaceId}`;
           if (!cl) throw new DomainError('NOT_FOUND', 'Claim not found');
           const markets = i.markets?.trim() ? i.markets.split(',').map((m) => m.trim()).filter(Boolean) : [await claimMarket(tx, cl.sku_id as string)];
-          await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording });
+          await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording, evidenceIds: evidenceIds.length ? evidenceIds : null });
         }
-        await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier } });
+        await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier, evidenceIds } });
         const [c] = await tx`select c.preferred_wording, c.sku_id, w.slug from claims c join workspaces w on w.id = c.workspace_id where c.id = ${i.claimId} and c.workspace_id = ${i.workspaceId}`;
         // "Open Claims Vault" lands on this SKU's claims page.
         const url = c ? appUrl(c.slug as string, `/products/${c.sku_id as string}/claims`) : `${env().APP_URL}/app`;
@@ -1027,6 +1044,26 @@ export const ACTIONS = {
 
   /* ── Privacy ── */
   'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(DataRequestKind), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
+  // Plan 02 §7 "Delete user" for a delete_user request: the requester's account leaves every workspace and is
+  // anonymised; refused (with the workspaces named) while they are the last Owner of a live workspace.
+  'privacy.delete_user': a({
+    perm: 'privacy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, reason }),
+    run: async (s, i) => {
+      const [r] = await withAdmin((tx) => tx`select kind, status, requester_email from data_requests where id = ${i.id}`);
+      if (!r) throw new DomainError('NOT_FOUND', 'Request not found');
+      if (r.kind !== 'delete_user' || !['open', 'in_progress'].includes(r.status as string)) throw new DomainError('CONFLICT', 'Only an open account-deletion request can be carried out.');
+      const [u] = await withAdmin((tx) => tx`select id from users where email = ${r.requester_email as string} and deleted_at is null`);
+      const done = u ? await deleteUser(u.id as string, { by: 'staff' }) : { workspaces: 0 };
+      await withAdmin(async (tx) => {
+        const note = u ? `Account deleted (${done.workspaces} workspace memberships removed).` : 'No account with this email.';
+        await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${note}) where id = ${i.id}`;
+        await audit(tx, s, 'privacy.delete_user', { type: 'data_request', id: i.id }, { reason: i.reason, after: { userId: (u?.id as string) ?? null, ...done } });
+      });
+      return { message: u ? 'Account deleted.' : 'No account with this email — request completed.' };
+    },
+  }),
   'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status, notes, workspace_id from data_requests where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Request not found'); await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, before: { status: b.status, notes: b.notes }, after: { status: i.status, notes: i.notes ?? b.notes } }); }) }),
   'privacy.erase_reviews': a({
     perm: 'privacy.manage',

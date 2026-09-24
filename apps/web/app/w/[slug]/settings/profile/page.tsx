@@ -3,7 +3,7 @@ import { globalTx } from '@arkiv/db';
 import { listSessions } from '@arkiv/auth';
 import { requireUser } from '@/lib/session';
 import { LogoutButton } from '@/components/logout-button';
-import { MeButton, NameForm, PasskeyRegister } from '@/components/profile';
+import { DeleteAccount, MeButton, NameForm, PasskeyRegister } from '@/components/profile';
 
 export const metadata: Metadata = { title: 'Profile · Arkiv' };
 
@@ -43,6 +43,11 @@ export default async function Profile({ params }: { params: Promise<{ slug: stri
           <MeButton action="sessions-revoke-others">Sign out everywhere else</MeButton>
           <LogoutButton />
         </div>
+      </section>
+      <section className="ak-panel">
+        <h2 className="ak-label">Delete your account</h2>
+        <p className="ak-small ak-muted">You leave every workspace and your sign-in methods are removed. Workspaces and their products stay with their other members; if you’re the only Owner of a workspace, transfer it or delete it first. Billing and audit records are kept as the law requires, without your name or email. You’ll need to have signed in within the last 10 minutes.</p>
+        <DeleteAccount email={u.email} />
       </section>
     </div>
   );

@@ -38,6 +38,15 @@ const EXTRACT_PRODUCT_1_1 = `${EXTRACT_PRODUCT_1_0}
   (two states of skin side by side or labelled before/after) or a person who may be under 18. Leave it empty
   when no photo does. These photos go to our compliance team before any ad uses them.`;
 
+// 1.2.0 inserts the packaging-size and drug/sunscreen rules before the closing not-skincare rule.
+const EXTRACT_PRODUCT_1_2 = EXTRACT_PRODUCT_1_1.replace(
+  '- If the product is not cosmetic skincare',
+  `- "sizeText" is the net size printed on the packaging itself, not the page's; null if it is not visible.
+- If the product is sunscreen / has an SPF, or is an OTC drug (a "Drug Facts" panel, benzoyl peroxide, adapalene,
+  hydroquinone, acne or pigment treatment), set category to "drug_or_sunscreen".
+- If the product is not cosmetic skincare`,
+);
+
 const CONCEPTS_1_0 = `You are the senior Creative Director for performance ads of one US skincare product (Meta and TikTok).
 Propose exactly three genuinely different creative TESTS — different hypotheses, not copy variations.
 Rules:
@@ -86,6 +95,11 @@ const THEMES_1_0 = `You cluster raw customer reviews and comments about one skin
 Return concise labels (e.g. "sticky texture", "pills under makeup", "price concern"). Themes describe what
 customers say — they are never evidence that the product works.`;
 
+const THEMES_1_1 = `${THEMES_1_0}
+- "matchIndexes" lists every snippet index that expresses the theme; "snippetIndexes" up to 5 representative ones.
+- "sentiment" is the polarity of what customers say in the theme (-1 negative … 1 positive); "intensity" how
+  strongly they say it.`;
+
 const GENOME_1_0 = `You annotate a short-form skincare ad with a fixed creative taxonomy. Choose the closest controlled values;
 do not invent new ones. Record the exact hook text if present.`;
 
@@ -123,6 +137,16 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     variables: { photos: 'up to 3 product photos (JPEG)', product_page: 'untrusted product page JSON: name, description, ingredients, size, price' },
     outputSchema: 'ProductExtraction',
     changelog: 'Flags before/after photos and photos that may show minors for compliance review (plan 05 §14, standard §48).',
+    author: AUTHOR,
+    date: '2026-09-24',
+  },
+  {
+    name: 'extract-product',
+    version: '1.2.0',
+    text: EXTRACT_PRODUCT_1_2,
+    variables: { photos: 'up to 3 product photos (JPEG)', product_page: 'untrusted product page JSON: name, description, ingredients, size, price' },
+    outputSchema: 'ProductExtraction',
+    changelog: 'Reads the net size printed on the packaging (sizeText) and flags sunscreen/OTC drugs as drug_or_sunscreen for the scope check.',
     author: AUTHOR,
     date: '2026-09-24',
   },
@@ -196,6 +220,16 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     changelog: 'Initial customer-language themes template.',
     author: AUTHOR,
     date: '2026-09-23',
+  },
+  {
+    name: 'themes',
+    version: '1.1.0',
+    text: THEMES_1_1,
+    variables: { signals: 'untrusted customer reviews and comments' },
+    outputSchema: 'ThemeSet',
+    changelog: 'Asks for every matching snippet index, sentiment and intensity per theme (recency-weighted prevalence, trend).',
+    author: AUTHOR,
+    date: '2026-09-24',
   },
   {
     name: 'genome',

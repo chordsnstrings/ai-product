@@ -1,11 +1,15 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withAdmin, withSystem } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { DEFAULT_LANDING_BLOCKS, landingBlocksFrom, newId, type LandingBlocks, type StaffRole } from '@arkiv/shared';
 import type { Staff } from './admin';
+import { fleschKincaidGrade } from './compliance';
 import {
   diffLanding,
   landingAssetProblems,
+  landingPriceProblems,
   landingPreviewToken,
   landingStats,
   landingVerdict,
@@ -15,6 +19,7 @@ import {
   rollbackLanding,
   saveLandingDraft,
   setLandingStatus,
+  statedPrices,
   sweepLandingGalleryRights,
   verifyLandingPreviewToken,
 } from './landing';
@@ -63,6 +68,42 @@ describe('landing blocks (plan 05 §5)', () => {
     expect(lintLandingCopy(DEFAULT_LANDING_BLOCKS, [{ content: { hero: { sub: 'Our serum cures acne.' } } }]).length).toBeGreaterThan(0);
     // Ids are not copy.
     expect(lintLandingCopy(blocks({ proof: { text: 'Built only for skincare brands', testimonialIds: [newId()] } }))).toEqual([]);
+  });
+
+  it('keeps landing copy at reading grade 7 or below (plan 04 L14), including the seeded pages and the static landing', () => {
+    expect(fleschKincaidGrade('The cat sat on the mat.')).toBeLessThan(2);
+    expect(fleschKincaidGrade('Comprehensive dermatological substantiation methodologies necessitate considerable organizational investment.')).toBeGreaterThan(12);
+    for (const seed of [
+      { headline: 'Know what skincare ad to make next. Then make it.', sub: 'Upload your product. Get three test ideas and a storyboard in about a minute. Your first ad is $19.' },
+      { headline: 'Texture-first ads for your serum. Made this week.', sub: 'Show the finish, the absorb, the feel. We plan it, check every claim, and produce it.' },
+      { headline: 'Your best ad is tiring. Here is what to test next.', sub: 'Three new directions for your hero product, grounded in what your customers actually say.' },
+    ]) {
+      expect(lintLandingCopy(landingBlocksFrom({ label: 'Skincare', proof: 'Built only for skincare brands', ...seed }))).toEqual([]);
+    }
+    // The static landing's own copy (JSX text), read from the source as CI would.
+    const src = readFileSync(fileURLToPath(new URL('../../../apps/web/app/(marketing)/landing.tsx', import.meta.url)), 'utf8');
+    const jsxText = [...src.matchAll(/>([^<>{}]{3,})</g)].map((m) => m[1]!.trim()).filter((t) => /[a-z]{3}/i.test(t));
+    expect(jsxText.length).toBeGreaterThan(5);
+    expect(fleschKincaidGrade(jsxText)).toBeLessThanOrEqual(7);
+    // A page written in dense prose fails (grade is a whole-page measure: every string replaced).
+    const dense = 'Comprehensive dermatological substantiation methodologies necessitate considerable organizational investment.';
+    const densePage = JSON.parse(JSON.stringify(DEFAULT_LANDING_BLOCKS), (k, v) => (typeof v === 'string' && !/Id$/.test(k) ? dense : v)) as LandingBlocks;
+    expect(lintLandingCopy(densePage).join(' ')).toMatch(/The page reads at grade/);
+    // A variant is graded as the visitor reads it (the control stays readable).
+    const denseVariant = { key: 'b', weight: 1, content: { hero: densePage.hero, faq: densePage.faq, howItWorks: densePage.howItWorks, cta: densePage.cta, proof: { text: dense } } };
+    const out = lintLandingCopy(DEFAULT_LANDING_BLOCKS, [denseVariant as never]).join(' ');
+    expect(out).toMatch(/Variant b reads at grade/);
+    expect(out).not.toMatch(/The page reads/);
+  });
+
+  it('every stated price is one a visitor can pay today (anchor validity)', async () => {
+    expect(statedPrices(['Your first ad is $19.', 'Plans from $49/month', '$1,299 value'])).toEqual([19, 49, 1299]);
+    await withSystem(async (tx) => {
+      expect(await landingPriceProblems(tx, DEFAULT_LANDING_BLOCKS)).toEqual([]);
+      expect((await landingPriceProblems(tx, blocks({ hero: { ...DEFAULT_LANDING_BLOCKS.hero, sub: 'Your first ad is $15.' } }))).join(' ')).toMatch(/\$15/);
+    });
+    const s = await staff();
+    await expect(withAdmin((tx) => saveLandingDraft(tx, s, { slug: newSlug(), archetype: 'general', content: blocks({ cta: { label: 'Get it for $9', assurance: '' } }), variants: [], utmMatch: [] }))).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
   });
 
   it('accepts structured blocks only: no HTML, no unknown blocks, 3–6 examples or none', () => {

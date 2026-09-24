@@ -318,6 +318,25 @@ describe('danger zone and jobs actions', () => {
     expect(ev).toEqual([{ type: 'CLAIM_UNBLOCKED', actor: `staff:${c2.staffId}`, payload: { from: 'BLOCKED', to: 'MERCHANT_REVIEW_REQUIRED', reason: 'Evidence pack received' } }]);
   });
 
+  it('staff approval of a RESTRICTED claim needs evidence; approving without it goes to a second reviewer (§43)', async () => {
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const [cl] = await ownerPool()`insert into claims (workspace_id, sku_id, canonical_meaning, preferred_wording, claim_category, risk_level, status, origin)
+                                   values (${t.workspaceId}, ${sku}, 'clinical', 'Clinically proven to smooth skin', 'clinical_claim', 'high', 'RESTRICTED', 'merchant') returning id`;
+    const c1 = await staff(['COMPLIANCE']);
+    const c2 = await staff(['COMPLIANCE']);
+    await expect(act(c1, 'claim.decide', { workspaceId: t.workspaceId, claimId: cl!.id, decision: 'approve', reason: 'Looks fine' })).rejects.toThrow(/needs evidence/);
+    const r = await act(c1, 'claim.decide', { workspaceId: t.workspaceId, claimId: cl!.id, decision: 'approve_without_evidence', reason: 'Study reviewed offline by counsel' });
+    expect(r.status).toBe('pending');
+    expect((await ownerPool()`select status from claims where id = ${cl!.id}`)[0]!.status).toBe('RESTRICTED');
+    await expect(decideApproval(c1, r.approvalId as string, true)).rejects.toThrow(/own request/);
+    await decideApproval(c2, r.approvalId as string, true);
+    expect((await ownerPool()`select status from claims where id = ${cl!.id}`)[0]!.status).toBe('VERIFIED');
+    const [ev] = await ownerPool()`select actor, payload from events where subject_id = ${cl!.id} and type = 'CLAIM_APPROVED'`;
+    expect(ev!.actor).toBe(`staff:${c2.staffId}`);
+    expect((ev!.payload as { evidenceOverride: string }).evidenceOverride).toMatch(/Study reviewed offline by counsel/);
+  });
+
   it('allowlist keys are normalised so the heuristics recognise them', async () => {
     const c = await staff(['COMPLIANCE']);
     await act(c, 'abuse.allowlist', { key: '203.0.113.77', reason: 'agency evaluating 12 SKUs', days: 30 });

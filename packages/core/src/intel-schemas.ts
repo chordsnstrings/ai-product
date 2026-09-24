@@ -6,8 +6,8 @@ import { Taxonomy } from '@arkiv/shared';
 export const ProductExtraction = z.object({
   name: z.string().min(1).max(160),
   brand: z.string().max(120).nullable(),
-  category: z.enum(['serum', 'cleanser', 'moisturizer', 'eye', 'mask', 'facial_oil', 'toner', 'exfoliant', 'balm', 'skincare', 'not_skincare']),
-  sizeText: z.string().max(40).nullable(),
+  category: z.enum(['serum', 'cleanser', 'moisturizer', 'eye', 'mask', 'facial_oil', 'toner', 'exfoliant', 'balm', 'skincare', 'drug_or_sunscreen', 'not_skincare']),
+  sizeText: z.string().max(40).nullable().describe('Net size exactly as printed on the packaging in the photos; null if not visible'),
   format: z.string().max(60).nullable().describe('e.g. gel, cream, oil, lotion'),
   texture: z.string().max(120).nullable(),
   keyIngredients: z.array(z.string().max(60)).max(8),
@@ -89,7 +89,9 @@ export const ThemeSet = z.object({
         label: z.string().max(60),
         signalType: z.enum(['objection', 'benefit', 'question', 'usage', 'sentiment']),
         intensity: z.number().min(0).max(1),
-        snippetIndexes: z.array(z.number().int().min(0)).max(5),
+        sentiment: z.number().min(-1).max(1).describe('Polarity of what customers say in this theme: -1 negative … 1 positive'),
+        snippetIndexes: z.array(z.number().int().min(0)).max(5).describe('Up to 5 representative snippets'),
+        matchIndexes: z.array(z.number().int().min(0)).max(400).describe('Every snippet that expresses this theme'),
       }),
     )
     .max(10),

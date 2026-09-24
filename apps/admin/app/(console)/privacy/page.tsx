@@ -21,7 +21,12 @@ export default async function Privacy() {
       <Table head={['Opened', 'Kind', 'Requester', 'Workspace', 'Due', 'Status', '']} rows={d0.requests.map((r) => {
         const overdue = ['open', 'in_progress'].includes(r.status as string) && new Date(r.due_at as string) < new Date(Date.now() + 7 * 86400_000);
         return [dt(r.created_at), r.kind as string, r.requester_email as string, r.workspace_id ? <Link key="w" href={`/tenants/${r.workspace_id}?tab=danger`}>{String(r.workspace_id).slice(0, 8)}</Link> : '—', <span key="d" style={{ color: overdue ? 'var(--risk)' : undefined }}>{dt(r.due_at)}</span>, r.status as string,
-          ['open', 'in_progress'].includes(r.status as string) ? <ActForm key="u" inline action="privacy.update" extra={{ id: r.id }} submit="Update" fields={[{ name: 'status', label: 'Status', type: 'select', options: ['in_progress', 'completed', 'rejected'] }, { name: 'notes', label: 'Notes' }]} /> : ((r.notes as string) ?? '')];
+          ['open', 'in_progress'].includes(r.status as string) ? (
+            <div key="u" className="ak-stack">
+              <ActForm inline action="privacy.update" extra={{ id: r.id }} submit="Update" fields={[{ name: 'status', label: 'Status', type: 'select', options: ['in_progress', 'completed', 'rejected'] }, { name: 'notes', label: 'Notes' }]} />
+              {r.kind === 'delete_user' ? <ActForm inline action="privacy.delete_user" extra={{ id: r.id }} submit="🔐 Delete account" fields={[{ name: 'reason', label: 'Verification reference', required: true }]} /> : null}
+            </div>
+          ) : ((r.notes as string) ?? '')];
       })} empty="No requests." />
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
         <Section title="Log a request">

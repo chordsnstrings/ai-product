@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { ProviderError, type LlmJsonRequest, type LlmProvider } from '@arkiv/providers';
-import { FREE_EXPLORATION } from '@arkiv/shared';
+import { FREE_EXPLORATION, PROVISIONAL } from '@arkiv/shared';
 import { analyzeProduct, ANALYSIS_FAILED_COPY, failAnalysis, generateConceptBatch, requestConcepts, retryAnalysis, startPreview } from './analysis';
 import { authorize, estimateCost } from './cost-governor';
 import { selectConcept } from './storyboard';
@@ -130,6 +130,22 @@ describe('missing ingredient list (§42)', () => {
     expect(after.packet.product.keyIngredients).toEqual(['Niacinamide', 'Zinc PCA']);
     expect(verifiedIngredients(after.facts)).toEqual({ list: ['Niacinamide', 'Zinc PCA'], verified: true });
   }, 60_000);
+});
+
+describe('free-preview SKU cap under concurrency (plan 02 §4, standard §48)', () => {
+  it('six parallel submissions on one provisional workspace create exactly the cap', async () => {
+    const t = await makeTenant({ state: 'PROVISIONAL' });
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'PROVISIONAL');
+    const results = await Promise.allSettled(
+      Array.from({ length: 6 }, () => withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { url: 'https://shop.example/products/glow' }))),
+    );
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(PROVISIONAL.MAX_SKUS);
+    const refused = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(refused).toHaveLength(6 - PROVISIONAL.MAX_SKUS);
+    for (const r of refused) expect(r.reason).toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    const [n] = await ownerPool()`select count(*)::int as n from skus where workspace_id = ${t.workspaceId}`;
+    expect(n!.n).toBe(PROVISIONAL.MAX_SKUS);
+  });
 });
 
 describe('bounded free exploration for signed-in, non-paying workspaces (standard §5)', () => {

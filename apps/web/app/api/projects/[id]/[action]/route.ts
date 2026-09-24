@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { cancelProduction, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, cancelProduction, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -16,6 +16,7 @@ import { projectAccess } from '@/lib/tenant';
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
+ *   fact-accept-source – use the store's newer value instead of the merchant's earlier correction (§28, §42)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
  *   watched   – the finished ad was played (P10 "Watch", standard §7); recorded once per project
  */
@@ -46,6 +47,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const num = f.key === 'price' ? Number(f.value.replace(/[^0-9.]/g, '')) : null;
       if (f.key === 'price' && !(num! > 0)) throw new DomainError('INVALID', 'Enter a price like 38.00');
       await withTenant(a.ctx.workspaceId, (tx) => decideFact(tx, a.ctx, p!.sku_id as string, f.key, f.key === 'price' ? { number: num } : { text: f.value }));
+      return json({ ok: true });
+    }
+    case 'fact-accept-source': {
+      const f = await body(req, z.object({ factId: z.string().uuid() }));
+      const [p] = await withTenant(a.ctx.workspaceId, (tx) => tx`select sku_id from projects where id = ${id}`);
+      await withTenant(a.ctx.workspaceId, (tx) => acceptSourceFact(tx, a.ctx, p!.sku_id as string, f.factId));
       return json({ ok: true });
     }
     case 'retry':

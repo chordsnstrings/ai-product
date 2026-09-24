@@ -322,6 +322,58 @@ export async function removeMember(tx: Tx, ctx: TenantContext, userId: string) {
   await emit(tx, ctx, 'MEMBER_REMOVED', { type: 'user', id: userId }, { role: target.role, self });
 }
 
+/** Workspaces that are ending: their last Owner may leave with their account. */
+const ENDING_STATES: readonly WorkspaceState[] = ['CANCELLED', 'PURGE_SCHEDULED', 'PURGED'];
+
+/** The actor string a deleted user's past actions are attributed to (plan 02 §7). Stable, not reversible. */
+export const deletedUserActor = (userId: string) => `user:deleted:${sha256(`arkiv-deleted-user:${userId}`).slice(0, 16)}`;
+
+/**
+ * Delete a user account (plan 02 §7, standard §40): the user leaves every workspace, their sign-in methods and
+ * sessions are removed, their past actions in event logs are attributed to `user:deleted:<hash>`, and the user row
+ * keeps no email or name. Refused while they are the last Owner of a live workspace (M1) — including a paid one
+ * (M2): ownership is transferred, or the workspace cancelled or deleted, first. Financial and audit records stay.
+ * Re-runnable: a partly finished deletion completes on the next call.
+ */
+export async function deleteUser(userId: string, meta: { by: 'self' | 'staff' } = { by: 'self' }): Promise<{ workspaces: number }> {
+  // System read across workspaces, filtered to this user's own memberships.
+  const memberships = await withSystem(
+    (tx) => tx`select m.workspace_id, m.role, w.state, w.name,
+                      (select count(*) from memberships o where o.workspace_id = m.workspace_id and o.role = 'OWNER')::int as owners
+               from memberships m join workspaces w on w.id = m.workspace_id where m.user_id = ${userId}`,
+  );
+  const [u] = await globalTx((tx) => tx`select id, email, deleted_at from users where id = ${userId}`);
+  if (!u) throw notFound('Account not found');
+  const blocking = memberships.filter((m) => m.role === 'OWNER' && m.owners <= 1 && !ENDING_STATES.includes(m.state as WorkspaceState));
+  if (blocking.length) {
+    const paid = blocking.some((m) => ['ACTIVE_PAID', 'PAST_DUE'].includes(m.state as string));
+    throw conflict(
+      `You’re the only Owner of ${blocking.map((m) => `“${m.name}”`).join(', ')}. Transfer ownership${paid ? ' or cancel the subscription' : ' or delete the workspace'} first.`,
+      { workspaces: blocking.map((m) => m.workspace_id), paid },
+    );
+  }
+  for (const m of memberships) {
+    await withTenant(m.workspace_id as string, async (tx) => {
+      await tx`select 1 from workspaces where id = ${m.workspace_id} for update`;
+      const r = await tx`delete from memberships where user_id = ${userId} returning role`;
+      if (!r.length) return;
+      await tx`update workspaces set membership_version = membership_version + 1 where id = ${m.workspace_id}`;
+      await emit(tx, { workspaceId: m.workspace_id as string, actor: { kind: 'user', id: userId } }, 'MEMBER_REMOVED', { type: 'user', id: userId }, { role: r[0]!.role, self: meta.by === 'self', reason: 'account_deleted' });
+    });
+  }
+  const actor = deletedUserActor(userId);
+  await withSystem((tx) => tx`select arkiv_anonymize_user_events(${userId}::uuid, ${actor})`);
+  await globalTx(async (tx) => {
+    await tx`delete from sessions where user_id = ${userId}`;
+    await tx`delete from passkeys where user_id = ${userId}`;
+    await tx`delete from user_identities where user_id = ${userId}`;
+    if (!u.deleted_at) await tx`delete from magic_links where email = ${u.email as string}`;
+    await tx`update users set email = ${`deleted+${userId}@deleted.invalid`}, name = null, email_verified_at = null,
+               deleted_at = coalesce(deleted_at, now()) where id = ${userId}`;
+  });
+  return { workspaces: memberships.length };
+}
+
 export async function transferOwnership(tx: Tx, ctx: TenantContext, toUserId: string) {
   assertCan(ctx, 'workspace.transfer');
   await lockMembership(tx, ctx);

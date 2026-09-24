@@ -91,6 +91,16 @@ export async function projectView(workspaceId: string, projectId: string) {
         source: f.value.sourceType,
         disputed: f.disputed,
         candidates: f.disputed ? f.candidates.map((c) => ({ value: c.valueText ?? String(c.valueNumber ?? ''), source: c.sourceType })) : [],
+        /** A source still disagrees with the merchant's correction (§28): shown, never hidden behind the decision. */
+        sourceConflict: f.sourceConflict
+          ? {
+              factId: f.sourceConflict.fact.id,
+              value: f.sourceConflict.fact.valueText ?? (f.sourceConflict.fact.valueNumber != null ? (key.includes('price') ? `$${f.sourceConflict.fact.valueNumber.toFixed(2)}` : String(f.sourceConflict.fact.valueNumber)) : ''),
+              source: f.sourceConflict.fact.sourceType,
+              observedAt: f.sourceConflict.fact.observedAt,
+              newer: f.sourceConflict.newer,
+            }
+          : null,
       }));
     return {
       serverNow: new Date().toISOString(),

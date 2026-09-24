@@ -37,7 +37,9 @@ const ALLOWED: Record<string, 'image' | 'video' | 'pdf'> = {
 
 export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, declaredMime: string, bytes: number) {
   assertCan(ctx, 'sku.edit');
-  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
+  // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
+  // still spends the budget, and the counter row is not locked across decoding and storage I/O.
+  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600);
   const family = ALLOWED[declaredMime];
   if (!family) throw new DomainError('INVALID', 'That file type isn’t supported. Use JPG, PNG, WebP, MP4 or PDF.');
   if (bytes > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.', { maxBytes: UPLOAD_LIMITS[family].maxBytes });
@@ -168,7 +170,9 @@ export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind:
   // Provisional visitors carry an OWNER context on their own PROVISIONAL workspace, so they pass; Viewers and
   // held workspaces do not.
   assertCan(ctx, 'sku.edit');
-  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
+  // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
+  // still spends the budget, and the counter row is not locked across decoding and storage I/O.
+  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600);
   const v = await validateMedia(raw);
   const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });
   // Merchant media named as a before/after or showing children waits for compliance review (plan 05 §14).

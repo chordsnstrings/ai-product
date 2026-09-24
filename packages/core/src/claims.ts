@@ -76,11 +76,52 @@ export async function proposeClaim(
  * Approve a claim for use. Rules can't be overridden by the merchant: BLOCKED stays blocked (§43 "merchant
  * insists"), RESTRICTED needs the staff compliance path, and evidence-level claims need attached evidence.
  */
+/** How evidence relates to the claimed product (§43: ingredient evidence does not transfer to the product). */
+export const EVIDENCE_APPLICABILITY = ['product_specific', 'ingredient_level', 'other_formulation'] as const;
+export type EvidenceApplicability = (typeof EVIDENCE_APPLICABILITY)[number];
+
+/** Claim categories whose endorsement must be substantiated in its exact wording (§43 "Dermatologist tested"). */
+const EXACT_WORDING = new Set(['expert_endorsement']);
+
+const normWording = (s: string) => s.toLowerCase().replace(/[“”"'’.!]/g, '').replace(/\s+/g, ' ').trim();
+
+/**
+ * Evidence on file that can substantiate this wording of a claim (§43, FTC [R13]): a document or a link to one
+ * (a merchant's say-so alone is not evidence), not expired, about this product (not an ingredient study or another
+ * formulation), not a mere ingredient spec, and — where it states the substantiated wording — the same wording.
+ * Expert endorsements need that wording stated.
+ */
+export async function qualifyingEvidence(tx: Tx, claimId: string, wording: string, category: string, only?: string[] | null) {
+  const rows = await tx`select id, evidence_type, source_asset_id, source_location, applicability, expiry_date, substantiated_wording
+                        from claim_evidence where claim_id = ${claimId}`;
+  const reasons = new Set<string>();
+  const ok = rows.filter((e) => {
+    if (only?.length && !only.includes(e.id as string)) return false;
+    const onFile = e.source_asset_id != null || /^https?:\/\/\S+$/i.test(String(e.source_location ?? '').trim());
+    if (!onFile) return reasons.add('attach the document (or a link to it)'), false;
+    if (e.expiry_date && new Date(e.expiry_date as string).getTime() < new Date(new Date().toISOString().slice(0, 10)).getTime()) return reasons.add('the evidence has expired'), false;
+    if (e.evidence_type === 'ingredient_spec' || e.applicability !== 'product_specific') return reasons.add('the evidence must be about this product, not an ingredient or another formula'), false;
+    const said = (e.substantiated_wording as string | null)?.trim();
+    if (said ? normWording(said) !== normWording(wording) : EXACT_WORDING.has(category)) return reasons.add('the evidence must state this exact wording'), false;
+    return true;
+  });
+  return { ids: ok.map((e) => e.id as string), reasons: [...reasons] };
+}
+
 export async function approveClaim(
   tx: Tx,
   ctx: TenantContext,
   claimId: string,
-  scope: { markets: string[]; platforms: string[]; qualifier?: string | null; wording?: string },
+  scope: {
+    markets: string[];
+    platforms: string[];
+    qualifier?: string | null;
+    wording?: string;
+    /** The evidence this approval rests on (default: every qualifying file). */
+    evidenceIds?: string[] | null;
+    /** Staff only, after a second reviewer's approval: approve without qualifying evidence, with the reason. */
+    overrideReason?: string | null;
+  },
 ): Promise<ClaimRow> {
   const isStaff = ctx.actor.kind === 'staff';
   if (!isStaff) assertCan(ctx, 'claim.approve');
@@ -97,9 +138,21 @@ export async function approveClaim(
   if ((c.status === 'RESTRICTED' || cls.status === 'RESTRICTED') && !isStaff)
     throw new DomainError('GATE_BLOCKED', 'This claim needs our compliance team’s review before it can be used.', { restricted: true });
   if (c.status === 'INFERRED_ONLY') throw new DomainError('GATE_BLOCKED', 'Customer language can guide ideas but can’t be advertised as a product claim.');
-  if (cls.risk === 'high' && !isStaff) {
-    const [e] = await tx`select count(*)::int as n from claim_evidence where claim_id = ${claimId}`;
-    if (!e!.n) throw new DomainError('GATE_BLOCKED', 'Attach evidence (a study, test report or certificate) before approving this claim.', { needsEvidence: true });
+  // High-risk and RESTRICTED claims need qualifying evidence — for staff approvals too (§43 "Clinically tested").
+  let evidenceIds: string[] = [];
+  let override: string | null = null;
+  if (cls.risk === 'high' || c.status === 'RESTRICTED' || cls.status === 'RESTRICTED') {
+    const ev = await qualifyingEvidence(tx, claimId, wording, cls.category, scope.evidenceIds);
+    evidenceIds = ev.ids;
+    if (!evidenceIds.length) {
+      if (!isStaff || !scope.overrideReason?.trim())
+        throw new DomainError(
+          'GATE_BLOCKED',
+          `This claim needs evidence before it can be approved${ev.reasons.length ? `: ${ev.reasons.join('; ')}` : ' (a study, test report or certificate about this product)'}.`,
+          { needsEvidence: true, reasons: ev.reasons },
+        );
+      override = scope.overrideReason.trim();
+    }
   }
   const qualifier = scope.qualifier?.trim() || (c.mandatory_qualifier as string | null);
   const status: ClaimStatus = qualifier ? 'VERIFIED_WITH_QUALIFIER' : 'VERIFIED';
@@ -108,7 +161,7 @@ export async function approveClaim(
       allowed_markets = ${markets}, allowed_platforms = ${platforms}, merchant_approved = ${!isStaff},
       approved_by = ${actorString(ctx)}, reviewed_at = now()
     where id = ${claimId} returning *`;
-  await emit(tx, ctx, 'CLAIM_APPROVED', { type: 'claim', id: claimId }, { status, scope: { markets, platforms, qualifier: qualifier ?? null } });
+  await emit(tx, ctx, 'CLAIM_APPROVED', { type: 'claim', id: claimId }, { status, scope: { markets, platforms, qualifier: qualifier ?? null }, evidenceIds, ...(override ? { evidenceOverride: override } : {}) });
   return toClaim(r!);
 }
 
@@ -127,13 +180,23 @@ export async function attachEvidence(
   tx: Tx,
   ctx: TenantContext,
   claimId: string,
-  e: { type: string; assetId?: string | null; location?: string | null; applicability?: string | null; strength?: 'weak' | 'moderate' | 'strong'; expiry?: string | null },
+  e: {
+    type: string;
+    assetId?: string | null;
+    location?: string | null;
+    applicability?: EvidenceApplicability | null;
+    strength?: 'weak' | 'moderate' | 'strong';
+    expiry?: string | null;
+    /** The claim wording the evidence substantiates, as it states it. */
+    wording?: string | null;
+  },
 ) {
   if (ctx.actor.kind !== 'staff') assertCan(ctx, 'sku.edit');
+  if (e.applicability && !(EVIDENCE_APPLICABILITY as readonly string[]).includes(e.applicability)) throw new DomainError('INVALID', 'Say whether the evidence is about this product.');
   await tx`insert into claim_evidence (workspace_id, claim_id, evidence_type, source_asset_id, source_location, supplied_by,
-             applicability, evidence_strength, expiry_date)
+             applicability, evidence_strength, expiry_date, substantiated_wording)
            values (${ctx.workspaceId}, ${claimId}, ${e.type}, ${e.assetId ?? null}, ${e.location ?? null}, ${actorString(ctx)},
-             ${e.applicability ?? null}, ${e.strength ?? 'moderate'}, ${e.expiry ?? null})`;
+             ${e.applicability ?? null}, ${e.strength ?? 'moderate'}, ${e.expiry ?? null}, ${e.wording?.trim() || null})`;
   await emit(tx, ctx, 'CLAIM_EVIDENCE_ATTACHED', { type: 'claim', id: claimId }, { type: e.type });
 }
 

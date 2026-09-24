@@ -72,3 +72,34 @@ export function PasskeyRegister() {
     </div>
   );
 }
+
+/** Standard §40: delete your own account (type your email; needs a recent sign-in). */
+export function DeleteAccount({ email }: { email: string }) {
+  const [confirm, setConfirm] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  return (
+    <form
+      className="ak-stack"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setErr(null);
+        setBusy(true);
+        try {
+          const r = await api<{ next?: string | null }>('/api/me/delete-account', { confirm });
+          window.location.assign(r.next ?? '/');
+        } catch (x) {
+          setErr((x as Error).message);
+        }
+        setBusy(false);
+      }}
+    >
+      <label className="ak-field">
+        <span className="ak-label">Type {email} to confirm</span>
+        <input className="ak-input" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="off" />
+      </label>
+      {err ? <p className="ak-error ak-small" role="alert">{err}</p> : null}
+      <div><Button type="submit" variant="secondary" size="sm" disabled={busy || confirm.trim().toLowerCase() !== email.toLowerCase()}>Delete my account</Button></div>
+    </form>
+  );
+}

@@ -7,7 +7,7 @@ import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Claims & compliance' };
 
-type Evidence = { type: string; strength: string | null; location: string | null; supplied_by: string; expiry: string | null };
+type Evidence = { id: string; type: string; strength: string | null; location: string | null; supplied_by: string; expiry: string | null };
 
 /**
  * Plan 05 §14. Tenants route RESTRICTED claims to us for review, so the compliance team sees claim text and
@@ -29,7 +29,7 @@ export default async function Claims() {
     return {
       restricted: await tx`select c.id, c.workspace_id, c.preferred_wording, c.claim_category, c.block_reason, c.created_at, c.allowed_markets, c.allowed_platforms,
                                   c.compliance_note, c.evidence_requested_at, w.name, s.catalogue_no, s.name as sku_name,
-                                  coalesce((select jsonb_agg(jsonb_build_object('type', e.evidence_type, 'strength', e.evidence_strength, 'location', e.source_location,
+                                  coalesce((select jsonb_agg(jsonb_build_object('id', e.id, 'type', e.evidence_type, 'strength', e.evidence_strength, 'location', e.source_location,
                                                                                 'supplied_by', e.supplied_by, 'expiry', e.expiry_date) order by e.created_at)
                                             from claim_evidence e where e.claim_id = c.id and e.workspace_id = c.workspace_id), '[]'::jsonb) as evidence
                            from claims c join workspaces w on w.id = c.workspace_id join skus s on s.id = c.sku_id and s.workspace_id = c.workspace_id
@@ -58,7 +58,7 @@ export default async function Claims() {
             ago(c.created_at), <Link key="w" href={`/tenants/${c.workspace_id}`}>{c.name as string}</Link>,
             <span key="k">{String(c.catalogue_no).padStart(3, '0')} <span className="ak-small ak-muted">{(c.sku_name as string) ?? ''}</span></span>,
             <span key="c">“{c.preferred_wording as string}”<br /><span className="ak-small ak-muted">{c.claim_category as string}{c.compliance_note ? ` · note: ${c.compliance_note as string}` : ''}{c.evidence_requested_at ? ` · evidence requested ${d(c.evidence_requested_at)}` : ''}</span></span>,
-            ev.length ? <ul key="e" className="ak-small" style={{ margin: 0, paddingLeft: 16 }}>{ev.map((e, n) => <li key={n}>{e.type}{e.strength ? ` (${e.strength})` : ''}{e.location ? ` · ${e.location}` : ''}{e.expiry ? ` · expires ${d(e.expiry)}` : ''} · by {e.supplied_by}</li>)}</ul> : <span key="e" className="ak-muted">none</span>,
+            ev.length ? <ul key="e" className="ak-small" style={{ margin: 0, paddingLeft: 16 }}>{ev.map((e, n) => <li key={n}><Mono>{e.id}</Mono> {e.type}{e.strength ? ` (${e.strength})` : ''}{e.location ? ` · ${e.location}` : ''}{e.expiry ? ` · expires ${d(e.expiry)}` : ''} · by {e.supplied_by}</li>)}</ul> : <span key="e" className="ak-muted">none</span>,
             <span key="m" className="ak-small">{((c.allowed_markets as string[]) ?? []).join(', ') || '—'} · {((c.allowed_platforms as string[]) ?? []).join(', ') || '—'}</span>,
             <ActForm key="f" inline action="claim.decide" extra={{ workspaceId: c.workspace_id, claimId: c.id }} submit="Decide" fields={[
               { name: 'decision', label: 'Decision', type: 'select', options: [
@@ -66,12 +66,14 @@ export default async function Claims() {
                 { value: 'keep_restricted', label: 'Keep restricted' },
                 { value: 'request_evidence', label: 'Request more evidence (emails the brand)' },
                 { value: 'block', label: 'Block' },
+                { value: 'approve_without_evidence', label: 'Approve without qualifying evidence (second reviewer)' },
               ] },
               { name: 'wording', label: 'Exact wording', defaultValue: c.preferred_wording as string },
               { name: 'qualifier', label: 'Qualifier' },
               { name: 'platforms', label: 'Platforms (TIKTOK, META = Reels + Feed, YOUTUBE, ORGANIC)', defaultValue: ((c.allowed_platforms as string[]) ?? []).join(',') || 'TIKTOK,META' },
               { name: 'markets', label: 'Markets (blank = brand market)', defaultValue: ((c.allowed_markets as string[]) ?? []).join(',') },
-              { name: 'reason', label: 'Reason / what evidence we need', required: true },
+              { name: 'evidenceIds', label: 'Evidence ids relied on (blank = every product-specific file on record)' },
+              { name: 'reason', label: 'Reason / what evidence we need (approving without evidence goes to a second compliance reviewer)', required: true },
             ]} />,
           ];
         })} empty="Nothing waiting for compliance review." />
