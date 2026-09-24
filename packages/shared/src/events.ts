@@ -59,6 +59,9 @@ export const EventType = [
   'PROVIDER_JOB_CREATED',
   'PROVIDER_JOB_SUCCEEDED',
   'PROVIDER_JOB_FAILED',
+  // §44 "model moderation false positive": a provider's safety filter declined a scene; surfaced to staff (QA queue),
+  // never resubmitted — the scene becomes a compliant alternative shot.
+  'PROVIDER_MODERATION_REJECTED',
   'QA_FAILED',
   'QA_PASSED',
   'COMPOSITION_COMPLETED',
@@ -296,6 +299,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   PROVIDER_JOB_CREATED: 'provider_job',
   PROVIDER_JOB_SUCCEEDED: 'provider_job',
   PROVIDER_JOB_FAILED: 'provider_job',
+  PROVIDER_MODERATION_REJECTED: 'scene',
   QA_FAILED: 'scene',
   QA_PASSED: 'scene',
   COMPOSITION_COMPLETED: 'project',
@@ -384,6 +388,7 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   PROVIDER_JOB_CREATED: ['providerJobId', 'authorizationId'],
   PROVIDER_JOB_SUCCEEDED: ['providerJobId', 'authorizationId'],
   PROVIDER_JOB_FAILED: ['providerJobId', 'authorizationId'],
+  PROVIDER_MODERATION_REJECTED: ['sceneId', 'projectId', 'providerJobId'],
 };
 
 /** Merge the subject into the refs and drop empty values. */

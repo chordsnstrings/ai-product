@@ -230,6 +230,19 @@ export default async function Product({ params, searchParams }: { params: Promis
                 { name: 'file', label: 'Video (optional)', type: 'file', accept: 'video/mp4,video/quicktime' },
                 { name: 'platform', label: 'Platform', type: 'select', options: [{ value: '', label: '—' }, { value: 'meta', label: 'Meta' }, { value: 'tiktok', label: 'TikTok' }] },
                 { name: 'adId', label: 'Ad ID (optional)' },
+                {
+                  name: 'beforeAfter',
+                  label: 'Before/after footage',
+                  type: 'checkboxes',
+                  checked: [],
+                  hint: 'Before/after is reviewed by our compliance team before any ad uses it. We never generate before/after results.',
+                  options: [
+                    { value: 'before_after', label: 'This video shows a before/after comparison' },
+                    { value: 'consent', label: 'The person shown gave written permission for ads' },
+                    { value: 'unretouched', label: 'The images are unretouched' },
+                    { value: 'same_conditions', label: 'Before and after were taken under the same lighting, angle and conditions' },
+                  ],
+                },
               ]} />
             </div>
           ) : null}

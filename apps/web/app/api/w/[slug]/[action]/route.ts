@@ -25,6 +25,7 @@ import {
   dismissRecommendation,
   enqueue,
   importHistoricalCreative,
+  beforeAfterAttestation,
   importSignals,
   ingestBytes,
   ingestObservations,
@@ -116,9 +117,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         assertCan(ctx, 'sku.create');
         const platform = (form.get('platform') as 'meta' | 'tiktok') || null;
         const adId = (form.get('adId') as string) || null;
+        // §43: a before/after is declared with its provenance/permission attestation and goes to policy review.
+        const beforeAfter = beforeAfterAttestation(form.getAll('beforeAfter').map(String));
         const id = await t((tx) =>
-          once(tx, { skuId, copy, platform, adId, file: fileIdentity(file) }, async () => {
-            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
+          once(tx, { skuId, copy, platform, adId, beforeAfter: !!beforeAfter, file: fileIdentity(file) }, async () => {
+            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name, ...(beforeAfter ? { beforeAfter } : {}) })).id : null;
             return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId });
           }),
         );

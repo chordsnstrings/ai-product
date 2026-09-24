@@ -856,12 +856,12 @@ export const ACTIONS = {
   }),
   'asset.review': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, assetId: uuid, verdict: z.enum(['approved', 'rejected']), reason }),
+    schema: z.object({ workspaceId: uuid, assetId: uuid, verdict: z.enum(['approved', 'rejected']), permissionRef: z.string().trim().max(200).optional(), reason }),
     run: async (s, i) => {
       const r = await withAdmin(async (tx) => {
         // Looking at the media is looking at tenant content: break-glass first (plan 05 §0.3).
         await assertBreakGlass(tx, s, i.workspaceId, `media review ${i.assetId}`);
-        return reviewAsset(tx, s, i.workspaceId, i.assetId, i.verdict, i.reason);
+        return reviewAsset(tx, s, i.workspaceId, i.assetId, i.verdict, i.reason, { permissionRef: i.permissionRef });
       });
       const url = appUrl(await workspaceSlug(i.workspaceId), r.skuId ? `/products/${r.skuId}` : '/products');
       const note = i.verdict === 'approved' ? 'Our team checked it and it can be used in your ads.' : 'Our team checked it: it shows a before/after comparison or a person who may be under 18, which we can’t use in ads. Your other photos are unaffected.';

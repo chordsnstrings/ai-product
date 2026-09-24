@@ -731,6 +731,23 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
        * (§25, §44): the exact product from the merchant's own photo — itself QA-checked — never a reused
        * generated frame.
        */
+      /** A render the provider's safety filter declined: a failed scene version (moderation) and an event for staff. */
+      const recordModeration = async (s: SceneRow, attempt: number, e: ProviderError) =>
+        withTenant(ws, async (tx) => {
+          const [job] = await tx`select id from provider_jobs where workspace_id = ${ws} and subject_type = 'scene' and subject_id = ${s.id} and task like 'video.%' and status = 'failed'
+                                 order by created_at desc limit 1`;
+          const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
+          const qa = [{ check: 'visual', pass: false, hard: false, detail: `provider moderation: ${e.message.slice(0, 200)}`, data: { moderation: true } }];
+          await tx`insert into scene_versions (workspace_id, scene_id, version, kind, technique, qa, status, input_hash, lineage)
+                   values (${ws}, ${s.id}, ${v!.v}, 'render', 'generative', ${tx.json(qa as never)}, 'failed', ${hashes.get(s.id)!},
+                           ${tx.json({ attempt, moderation: true, provider: e.provider, providerJobId: (job?.id as string) ?? null } as never)})`;
+          if (job) {
+            await emit(tx, ctx, 'PROVIDER_MODERATION_REJECTED', { type: 'scene', id: s.id }, { projectId, provider: e.provider, attempt, error: e.message.slice(0, 200) }, {
+              projectId, skuId: sku.id as string, storyboardId: sb!.id as string, providerJobId: job.id as string, authorizationId: auth.authorizationId,
+            });
+          }
+        });
+
       const exactFallback = async (s: SceneRow, n: number, why: string): Promise<Slot> => {
         await withTenant(ws, (tx) => step(tx, ws, projectId, 'accuracy', 'active', 'Using your exact product photo for this shot'));
         const prior = fallbackFrame(s.id);
@@ -773,6 +790,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         });
         let why = 'repeated QA failure';
         let lastFailure = 'QA';
+        // A provider already declined these exact inputs (§44): a resumed run doesn't ask again.
+        if (versions.some((v) => v.scene_id === s.id && v.kind === 'render' && v.status === 'failed' && v.lineage?.moderation === true && sameInputs(v, s))) return exactFallback(s, n, 'provider moderation');
         while (attempt < 2) {
           attempt++;
           // A pending render was paid for already (its repair, if it is one, drew on the reserve then).
@@ -840,11 +859,14 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             }
             lastFailure = res.find((c) => !c.pass)?.detail ?? 'QA';
           } catch (e) {
-            // Moderation (a policy false positive, §44) is answered like a QA failure: a compliant alternative shot.
+            // §44 moderation false positive: surfaced internally (a failed scene version + an event the QA queue
+            // lists), never resubmitted — not even reworded — and the scene becomes the compliant alternative shot
+            // (the exact product composite). Safety filters are never worked around.
             if (e instanceof ProviderError && e.kind === 'moderation') {
-              checks.push({ check: 'visual', pass: false, hard: false, detail: `Scene ${n}: provider moderation — using a compliant alternative shot` });
-              lastFailure = 'provider moderation';
-              continue;
+              await recordModeration(s, attempt, e);
+              checks.push({ check: 'visual', pass: false, hard: false, detail: `Scene ${n}: the video provider's safety filter declined this shot — using the exact product composite`, data: { moderation: true } });
+              why = 'provider moderation';
+              break;
             }
             // The authorization can't fund the repair (e.g. rates rose since planning): stop spending, switch technique.
             if (attempt === 2 && reserveExhausted(e)) {

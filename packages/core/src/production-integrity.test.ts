@@ -10,6 +10,7 @@ import type { CompositionManifest } from './composition';
 import { authorize } from './cost-governor';
 import { available, append } from './ledger';
 import { generateVideo } from './model-gateway';
+import { qaQueueSql } from './admin';
 import { approveForProduction, blockedLines, cancelProduction, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
 import { clearSettingsCache } from './settings';
 import { customerReason } from './projects';
@@ -122,6 +123,36 @@ describe('QA repair reserve and technique switch (§5, §6, §25, §44: arch-22,
     ]);
     const spent = await ownerPool()`select spent_micros, max_cost_micros from cost_authorizations where id = ${a!.id}`;
     expect(Number(spent[0]!.spent_micros)).toBeLessThanOrEqual(Number(spent[0]!.max_cost_micros));
+  }, 300_000);
+});
+
+describe('provider moderation (§44 "model moderation false positive": edge-44-06)', () => {
+  afterEach(() => setProviders(undefined));
+  it('never resubmits a declined shot: records it for staff and uses the exact product composite', async () => {
+    // Only the video provider's safety filter declines the marked shot (the LLM checks see an ordinary scene).
+    class Moderating extends MockVideo {
+      override async submit(req: Parameters<MockVideo['submit']>[0]) {
+        return super.submit(req.prompt.includes('ZZMODERATED') ? { ...req, prompt: `${req.prompt} [[fail:moderation]]` } : req);
+      }
+    }
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new Moderating(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const r = await storyboardReady();
+    await ownerPool()`update scenes set production_mode = 'GENERATIVE_INTERACTION', visual_plan = visual_plan || ' ZZMODERATED'
+                      where storyboard_id = ${r.storyboardId} and purpose <> 'cta' and position = (select min(position) from scenes where storyboard_id = ${r.storyboardId} and purpose <> 'cta')`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const [sc] = await ownerPool()`select id from scenes where storyboard_id = ${r.storyboardId} and visual_plan like '%ZZMODERATED%'`;
+    const jobs = await ownerPool()`select id, status from provider_jobs where subject_id = ${sc!.id} and task like 'video.%'`;
+    expect(jobs).toHaveLength(1); // asked once, never again with a reworded prompt
+    expect(jobs[0]!.status).toBe('failed');
+    const [v] = await ownerPool()`select status, lineage, qa from scene_versions where scene_id = ${sc!.id} and kind = 'render'`;
+    expect(v).toMatchObject({ status: 'failed', lineage: { moderation: true, providerJobId: jobs[0]!.id } });
+    const [e] = await ownerPool()`select refs from events where workspace_id = ${r.t.workspaceId} and type = 'PROVIDER_MODERATION_REJECTED'`;
+    expect(e!.refs).toMatchObject({ sceneId: sc!.id, projectId: r.projectId, providerJobId: jobs[0]!.id });
+    const m = await manifestOf(r.projectId);
+    expect(m.scenes.find((s) => s.sceneId === sc!.id)).toMatchObject({ kind: 'still', technique: 'exact_product_composite' });
+    const queue = await withAdmin((tx) => tx`${qaQueueSql(tx, { includeTest: true })}`);
+    expect(queue.find((q) => q.id === r.projectId)?.why).toBe('provider moderation (alternative shot used)');
   }, 300_000);
 });
 

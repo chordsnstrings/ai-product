@@ -3,6 +3,7 @@ import { DomainError, newId } from '@arkiv/shared';
 import { assertStaff, audit, type Staff } from './admin';
 import type { TenantContext } from './context';
 import { emit } from './events';
+import { attestationOf } from './vision';
 
 /**
  * Compliance review queues (plan 05 §14): staff decisions on restricted claims, implied-claim flags, repeated
@@ -109,14 +110,21 @@ export async function confirmSkuExclusion(tx: Tx, s: Staff, workspaceId: string,
  * Decide a held before/after or possible-minor asset (§14, standard §48): approved media becomes usable; rejected
  * media is never used in production (and stays out of every reference set).
  */
-export async function reviewAsset(tx: Tx, s: Staff, workspaceId: string, assetId: string, verdict: 'approved' | 'rejected', note: string) {
+export async function reviewAsset(tx: Tx, s: Staff, workspaceId: string, assetId: string, verdict: 'approved' | 'rejected', note: string, opts: { permissionRef?: string | null } = {}) {
   assertStaff(s, 'claims.review');
-  const [a] = await tx`select a.id, a.review_status, a.review_flags, a.sku_id, k.name as sku_name from assets a left join skus k on k.id = a.sku_id and k.workspace_id = a.workspace_id
+  const [a] = await tx`select a.id, a.review_status, a.review_flags, a.origin, a.sku_id, k.name as sku_name from assets a left join skus k on k.id = a.sku_id and k.workspace_id = a.workspace_id
                        where a.id = ${assetId} and a.workspace_id = ${workspaceId} for update of a`;
   if (!a) throw new DomainError('NOT_FOUND', 'Asset not found in this workspace');
   if (a.review_status !== 'pending') throw new DomainError('CONFLICT', 'This media isn’t waiting for review.');
+  // §43: a before/after is used only with provenance and permission on file — the merchant's attestation at
+  // upload, or a reference to the written permission they sent us. The policy review is this decision.
+  const permissionRef = opts.permissionRef?.trim() || null;
+  const attestation = attestationOf(a.origin);
+  if (verdict === 'approved' && (a.review_flags as { beforeAfter?: boolean } | null)?.beforeAfter && !attestation && !permissionRef) {
+    throw new DomainError('CONFLICT', 'A before/after can only be approved with provenance and permission on file: the merchant’s upload attestation, or a reference to the written permission they sent.');
+  }
   await tx`update assets set review_status = ${verdict} where id = ${assetId} and workspace_id = ${workspaceId}`;
-  await record(tx, s, workspaceId, 'asset_review', { type: 'asset', id: assetId }, verdict, note);
-  await audit(tx, s, `asset_review.${verdict}`, { type: 'asset', id: assetId }, { workspaceId, reason: note, before: { review_status: 'pending', flags: a.review_flags }, after: { review_status: verdict } });
+  await record(tx, s, workspaceId, 'asset_review', { type: 'asset', id: assetId }, verdict, permissionRef ? `${note} (permission: ${permissionRef})` : note);
+  await audit(tx, s, `asset_review.${verdict}`, { type: 'asset', id: assetId }, { workspaceId, reason: note, before: { review_status: 'pending', flags: a.review_flags }, after: { review_status: verdict, attestation, permissionRef } });
   return { skuId: (a.sku_id as string | null) ?? null, productName: (a.sku_name as string | null) ?? 'your product' };
 }

@@ -47,6 +47,8 @@ export function verifiedIngredients(facts: Awaited<ReturnType<typeof currentFact
 
 /** Ingredient-led creative (education, explanation) needs a sourced ingredient list (§42). */
 export const isIngredientLed = (p: Pick<Proposal, 'angle' | 'proofMechanism'>) => p.angle === 'INGREDIENT_EDUCATION' || p.proofMechanism === 'INGREDIENT_EXPLANATION';
+/** §43 "Before/after images": require provenance/permission and separate policy review; no generated outcome imagery. */
+export const BEFORE_AFTER_REASON = 'before/after needs your own permissioned images and a separate policy review';
 export const UNVERIFIED_INGREDIENTS_REASON = 'ingredient creative needs your ingredient list (add it to unlock ingredient tests)';
 
 /**
@@ -263,7 +265,10 @@ export function gateProposal(
   if (claimBlocked) reasons.push('strategy relies on a blocked claim');
   const brandBanned = [p.bodyStrategy, p.hypothesis].map((t) => prohibitedIn(t, prohibited)).find(Boolean);
   if (brandBanned) reasons.push(`strategy uses “${brandBanned}”, which the brand never shows or says`);
-  const blockedStrategy = claimBlocked || !!brandBanned;
+  // §43 before/after: needs provenance, permission and a separate policy review — never a generated concept.
+  const beforeAfter = p.proofMechanism === 'BEFORE_AFTER_RESTRICTED';
+  if (beforeAfter) reasons.push(BEFORE_AFTER_REASON);
+  const blockedStrategy = claimBlocked || !!brandBanned || beforeAfter;
   const droppedClaims: string[] = [];
   const cleanClaims = p.claimWordings.filter((w) => {
     const ok = approved.some((a) => a.toLowerCase().includes(w.toLowerCase()) || w.toLowerCase().includes(a.toLowerCase()));

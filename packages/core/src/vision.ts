@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
 import { keyBackground, type KeyedCutout } from '@arkiv/media';
+import { DomainError } from '@arkiv/shared';
 
 function dist(a: number[], b: number[]) {
   return Math.sqrt((a[0]! - b[0]!) ** 2 + (a[1]! - b[1]!) ** 2 + (a[2]! - b[2]!) ** 2);
@@ -52,8 +53,42 @@ export async function toDataUrl(input: Buffer): Promise<string> {
 export interface MediaReviewFlags {
   beforeAfter: boolean;
   possibleMinor: boolean;
-  /** What raised the flag: the product analyst looking at the photo, or the file's name/source. */
-  sources: ('vision' | 'name')[];
+  /** What raised the flag: the product analyst looking at the photo, the file's name/source, or the merchant. */
+  sources: ('vision' | 'name' | 'merchant')[];
+}
+
+/**
+ * Standard §43 "Before/after images: require provenance/permission and separate policy review". A merchant who
+ * uploads a before/after declares it and attests all three; the media is then held for compliance review like any
+ * flagged media. Declaring without every attestation is refused.
+ */
+export const BEFORE_AFTER_ATTESTATIONS = ['consent', 'unretouched', 'same_conditions'] as const;
+export type BeforeAfterAttestation = { consent: true; unretouched: true; sameConditions: true; attestedAt: string };
+
+/** Form values (`before_after` + the attestations) → the attestation to store on the asset, or null when undeclared. */
+export function beforeAfterAttestation(values: readonly string[]): BeforeAfterAttestation | null {
+  if (!values.includes('before_after')) return null;
+  const missing = BEFORE_AFTER_ATTESTATIONS.filter((k) => !values.includes(k));
+  if (missing.length) {
+    throw new DomainError('INVALID', 'A before/after needs the pictured person’s written permission, unretouched images, and both photos taken under the same conditions. Confirm all three, or leave it out.');
+  }
+  return { consent: true, unretouched: true, sameConditions: true, attestedAt: new Date().toISOString() };
+}
+
+/** The attestation recorded on an asset's origin, if complete. */
+export function attestationOf(origin: unknown): BeforeAfterAttestation | null {
+  const a = (origin as { beforeAfter?: Partial<BeforeAfterAttestation> } | null)?.beforeAfter;
+  return a && a.consent === true && a.unretouched === true && a.sameConditions === true ? (a as BeforeAfterAttestation) : null;
+}
+
+/** Review flags for a merchant upload: what its name raises, plus a declared before/after. */
+export function uploadReviewFlags(origin: Record<string, unknown>): MediaReviewFlags {
+  const named = nameReviewFlags(JSON.stringify({ ...origin, beforeAfter: undefined }));
+  const declared = !!attestationOf(origin);
+  const sources: MediaReviewFlags['sources'] = [];
+  if (named.beforeAfter || named.possibleMinor) sources.push('name');
+  if (declared) sources.push('merchant');
+  return { beforeAfter: named.beforeAfter || declared, possibleMinor: named.possibleMinor, sources: sources.length ? sources : ['name'] };
 }
 
 const BEFORE_AFTER = /\bbefore\s*(?:and|&|\+|\/|-|_|vs\.?)?\s*after\b|\bb4\s*(?:&|and|-|_)?\s*after\b/i;

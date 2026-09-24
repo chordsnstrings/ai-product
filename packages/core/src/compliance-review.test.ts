@@ -11,7 +11,9 @@ import { referenceAssetIds } from './sku-variants';
 import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
 import { ingestBytes } from './uploads';
-import { holdForReview, nameReviewFlags, usableAssetIds } from './vision';
+import { beforeAfterAttestation, holdForReview, nameReviewFlags, usableAssetIds } from './vision';
+import { BEFORE_AFTER_REASON, gateProposal } from './creative-director';
+import { mockConcepts } from './mock-intel';
 import { ctxFor, eventContractProblems, productPhoto } from './testing';
 
 /** Plan 05 §14 compliance queues. */
@@ -131,6 +133,38 @@ describe('before/after and possible minors (standard §48)', () => {
     await ownerPool()`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, active) values (${t.workspaceId}, ${skuId}, 1, ${[flagged.id, plain.id]}, true)`;
     expect(await withTenant(t.workspaceId, (tx) => referenceAssetIds(tx, skuId, null))).toEqual([plain.id]);
     expect((await withTenant(t.workspaceId, (tx) => productImagery(tx, skuId))).reference?.assetId).toBe(plain.id);
+  });
+
+  it('before/after needs provenance and permission, a separate policy review, and is never a generated concept (§43)', async () => {
+    // The merchant declares it with all three attestations, or not at all.
+    expect(beforeAfterAttestation(['consent'])).toBeNull();
+    expect(() => beforeAfterAttestation(['before_after', 'consent', 'unretouched'])).toThrow(/same conditions/);
+    const att = beforeAfterAttestation(['before_after', 'consent', 'unretouched', 'same_conditions'])!;
+    expect(att).toMatchObject({ consent: true, unretouched: true, sameConditions: true });
+
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const photo = await productPhoto();
+    const declared = await withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, photo, 'creator_footage', null, { filename: 'week4.jpg', beforeAfter: att }));
+    const named = await withTenant(t.workspaceId, (tx) => ingestBytes(tx, ctx, photo, 'product_photo', null, { filename: 'serum-before-after.jpg' }));
+    const [d] = await ownerPool()`select review_status, review_flags from assets where id = ${declared.id}`;
+    expect(d).toMatchObject({ review_status: 'pending', review_flags: { beforeAfter: true, sources: ['merchant'] } });
+    expect(await withTenant(t.workspaceId, (tx) => usableAssetIds(tx, [declared.id, named.id]))).toEqual([]);
+
+    // Approval needs provenance/permission on file; rejection never does.
+    const s = await staff();
+    await expect(withAdmin((tx) => reviewAsset(tx, s, t.workspaceId, named.id, 'approved', 'looks fine'))).rejects.toThrow(/provenance and permission/);
+    await withAdmin((tx) => reviewAsset(tx, s, t.workspaceId, named.id, 'approved', 'permission checked', { permissionRef: 'ticket 4411' }));
+    await withAdmin((tx) => reviewAsset(tx, s, t.workspaceId, declared.id, 'approved', 'attested; same lighting'));
+    expect(await withTenant(t.workspaceId, (tx) => usableAssetIds(tx, [declared.id, named.id]))).toEqual([declared.id, named.id]);
+    const [a] = await ownerPool()`select after from admin_audit_log where action = 'asset_review.approved' and target_id = ${named.id}`;
+    expect(a!.after).toMatchObject({ permissionRef: 'ticket 4411' });
+
+    // The Creative Director never proposes a before/after concept (free preview / concept path).
+    const [c] = mockConcepts({ name: 'Glow Serum', category: 'serum', approvedClaims: [], themes: [], testedAngles: [] }).concepts;
+    const g = gateProposal({ ...c!, proofMechanism: 'BEFORE_AFTER_RESTRICTED' }, []);
+    expect(g.ok).toBe(false);
+    expect(g.reasons).toContain(BEFORE_AFTER_REASON);
   });
 
   it('the analysis holds photos the analyst flags and builds the fingerprint from the rest', async () => {
