@@ -1,16 +1,16 @@
 import { cookies, headers } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
-import { getStaffSession, STAFF_COOKIE, type StaffSession } from '@arkiv/auth';
+import { getStaffSession, normalizeIp, STAFF_COOKIE, type StaffSession } from '@arkiv/auth';
 import { staffCan, type Permission, type Staff } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { consolePrefs } from './prefs';
 
 export type StaffUser = Staff & { sessionId: string; reauthAt: Date };
 
-/** Client IP as the proxy reports it (the first X-Forwarded-For hop), or null when unknown. */
+/** Client IP as the proxy reports it (the first X-Forwarded-For hop), or null when unknown or malformed. */
 export async function requestMeta() {
   const h = await headers();
-  return { ip: h.get('x-forwarded-for')?.split(',')[0]?.trim() || h.get('x-real-ip') || null, userAgent: h.get('user-agent') };
+  return { ip: normalizeIp(h.get('x-forwarded-for')?.split(',')[0] || h.get('x-real-ip')), userAgent: h.get('user-agent') };
 }
 
 const toStaff = (s: StaffSession, m: { ip: string | null; userAgent: string | null }): StaffUser => ({ staffId: s.staffId, email: s.email, name: s.name, roles: s.roles, sessionId: s.sessionId, reauthAt: s.reauthAt, ...m });

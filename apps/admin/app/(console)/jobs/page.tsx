@@ -1,8 +1,9 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, canRetryQueue, NO_SPEND_QUEUES, staffCan } from '@arkiv/core';
+import { auditView, canRetryQueue, NO_SPEND_QUEUES, shouldMaskPii, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { ago, dt, Mono, Page, Section, Table } from '@/components/ui';
+import { piiView } from '@/lib/mask';
 import { consolePrefs } from '@/lib/prefs';
 import { notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
@@ -15,6 +16,8 @@ const EXPECTED_MIN: Record<string, number> = { RENDERING: 20, QA_RUNNING: 10, CO
 export default async function Jobs({ searchParams }: { searchParams: Promise<{ stuck?: string }> }) {
   const s = await requireStaff('jobs.read');
   const stuckOnly = (await searchParams).stuck === '1';
+  // Job errors and payloads can quote customer addresses; SUPPORT sees them masked (plan 05 §0.2).
+  const pii = piiView(shouldMaskPii(s.roles));
   const prefs = await consolePrefs();
   // Redrive and cancel need jobs.manage; SUPPORT may retry only queues whose handlers make no provider spend.
   const canManage = staffCan(s.roles, 'jobs.manage');
@@ -61,11 +64,11 @@ export default async function Jobs({ searchParams }: { searchParams: Promise<{ s
       <Section title="Outbox (committed, not yet dispatched)"><Table head={['Queue', 'Rows', 'Oldest']} rows={d0.outbox.map((o) => [o.queue as string, o.n as number, ago(o.oldest)])} empty="Dispatcher is caught up." /></Section>
       {stuckTable}
       <Section title="Failed jobs">
-        <Table head={['Finished', 'Queue', 'Job', 'Workspace', 'Retries', 'Error', '']} rows={d0.failed.map((j) => [dt(j.completed_on), <Mono key="q">{j.name as string}</Mono>, <Mono key="j">{String(j.id).slice(0, 8)}</Mono>, j.ws ? <Link key="w" href={`/tenants/${j.ws}`}>{String(j.ws).slice(0, 8)}</Link> : '—', j.retry_count as number, <span key="e" className="ak-small">{JSON.stringify(j.output ?? '').slice(0, 140)}</span>,
+        <Table head={['Finished', 'Queue', 'Job', 'Workspace', 'Retries', 'Error', '']} rows={d0.failed.map((j) => [dt(j.completed_on), <Mono key="q">{j.name as string}</Mono>, <Mono key="j">{String(j.id).slice(0, 8)}</Mono>, j.ws ? <Link key="w" href={`/tenants/${j.ws}`}>{String(j.ws).slice(0, 8)}</Link> : '—', j.retry_count as number, <span key="e" className="ak-small">{pii.text(JSON.stringify(j.output ?? '')).slice(0, 140)}</span>,
           canRetryQueue(s.roles, j.name as string) ? <span key="a" className="ak-row"><ActButton small action="job.retry" payload={{ queue: j.name, jobId: j.id, workspaceId: j.ws ?? undefined }} reason>{NO_SPEND_QUEUES.has(j.name as string) ? 'Retry' : 'Retry (may spend)'}</ActButton></span> : null])} empty="No failed jobs retained." />
       </Section>
       <Section title="Staff queue commands">
-        <Table head={['When', 'Command', 'Payload', 'By', 'Reason', 'Status', 'Result']} rows={d0.commands.map((c) => [dt(c.created_at), c.kind as string, <Mono key="p">{JSON.stringify(c.payload).slice(0, 100)}</Mono>, c.name as string, c.reason as string, c.status as string, <Mono key="r">{JSON.stringify(c.result ?? '').slice(0, 100)}</Mono>])} />
+        <Table head={['When', 'Command', 'Payload', 'By', 'Reason', 'Status', 'Result']} rows={d0.commands.map((c) => [dt(c.created_at), c.kind as string, <Mono key="p">{pii.text(JSON.stringify(c.payload)).slice(0, 100)}</Mono>, c.name as string, c.reason as string, c.status as string, <Mono key="r">{pii.text(JSON.stringify(c.result ?? '')).slice(0, 100)}</Mono>])} />
       </Section>
     </Page>
   );

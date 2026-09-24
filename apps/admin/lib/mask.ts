@@ -37,6 +37,13 @@ export function maskName(name: unknown): string {
   return s ? `${s[0]}.` : '';
 }
 
+/** Free text (job errors, payloads): mask any email addresses and IPv4 addresses it contains. */
+export function maskText(text: unknown): string {
+  return String(text ?? '')
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, (m) => maskEmail(m))
+    .replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, (m) => maskIp(m));
+}
+
 /** Pick the masked or the clear rendering of each kind of PII for one viewer. */
 export function piiView(mask: boolean) {
   return {
@@ -45,6 +52,7 @@ export function piiView(mask: boolean) {
     ip: (v: unknown) => (mask ? maskIp(v) : String(v ?? '')),
     ua: (v: unknown) => (mask ? maskUserAgent(v) : String(v ?? '')),
     name: (v: unknown) => (mask ? maskName(v) : String(v ?? '')),
+    text: (v: unknown) => (mask ? maskText(v) : String(v ?? '')),
   };
 }
 export type PiiView = ReturnType<typeof piiView>;

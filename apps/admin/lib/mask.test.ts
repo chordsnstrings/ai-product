@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { shouldMaskPii } from '@arkiv/core';
-import { maskEmail, maskIp, maskName, maskUserAgent, piiView } from './mask';
+import { maskEmail, maskIp, maskName, maskText, maskUserAgent, piiView } from './mask';
 
 describe('PII masking for SUPPORT (plan 05 §0.2)', () => {
   it('masks emails, IPs, devices and names', () => {
@@ -14,6 +14,8 @@ describe('PII masking for SUPPORT (plan 05 §0.2)', () => {
     expect(maskUserAgent('Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36')).toBe('Chrome · Android');
     expect(maskName('Jane Doe')).toBe('J.');
     expect(piiView(false).email('jane@acme.com')).toBe('jane@acme.com');
+    expect(maskText('{"error":"550 mailbox jane.doe@acme.com unavailable from 203.0.113.9"}')).toBe('{"error":"550 mailbox j•••@a•••.com unavailable from 203.0.x.x"}');
+    expect(piiView(true).text('to x@y.io')).toBe('to x•••@y•••.io');
   });
 
   it('applies when the viewer’s only tenant-reading role is SUPPORT and no break-glass is active', () => {

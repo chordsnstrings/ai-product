@@ -52,15 +52,19 @@ for (const width of [320, 640]) {
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Platform Pulse' })).toBeVisible();
     await expect(page.getByRole('navigation', { name: 'Console', exact: true })).toBeHidden();
-    await page.getByRole('button', { name: /^Menu/ }).click();
     const menu = page.getByRole('dialog', { name: 'Console' });
-    await expect(menu).toBeVisible();
+    // The button works once the page has hydrated; retry the click until the sheet opens.
+    const openMenu = () => expect(async () => {
+      await page.getByRole('button', { name: /^Menu/ }).click();
+      await expect(menu).toBeVisible({ timeout: 1000 });
+    }).toPass();
+    await openMenu();
     await menu.getByRole('link', { name: 'Tenants' }).click();
     await expect(page.getByRole('heading', { name: 'Tenants' })).toBeVisible();
     await expect(menu).toBeHidden();
     await expect(page.getByLabel('Search tenants')).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'no horizontal page scroll').toBe(true);
-    await page.getByRole('button', { name: /^Menu/ }).click();
+    await openMenu();
     await menu.getByRole('link', { name: 'Audit log' }).click();
     await expect(page.getByRole('heading', { name: 'Audit log' })).toBeVisible();
   });
