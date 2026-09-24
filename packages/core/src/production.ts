@@ -25,7 +25,8 @@ import { referenceAssetIds } from './sku-variants';
 import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
-import { qaClaims, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
+import { GENOME_VERSION_SQL } from './creatives';
+import { qaClaims, qaClipContract, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -816,7 +817,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                 return a.id;
               });
             }
-            const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, videoBytes: vid.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt });
+            // §48: the deliverable contract (duration, resolution, format) is checked before QA accepts the clip. A
+            // wrong deliverable is a repairable failure — recorded on the scene version and counted as an attempt —
+            // and is not worth a fidelity inspection.
+            const contract = await qaClipContract(vid.bytes, { seconds, resolution: '720p', ratio: '9:16' });
+            const res = contract.pass ? await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, videoBytes: vid.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt }) : [contract];
             const ok = res.every((c) => c.pass);
             const saved = await withTenant(ws, async (tx) => {
               const a = { id: assetId };
@@ -832,7 +837,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
               });
               return { assetId: a.id, versionId: row!.id as string };
             });
-            checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: ${c.detail}` })));
+            // A wrong provider clip is repaired here (retry, then the exact product); in the final report it is a
+            // record of that repair, not a failure of the delivered export's platform contract.
+            checks.push(...res.map((c) => ({ ...c, ...(c === contract ? { hard: false } : {}), detail: `Scene ${n}: ${c.detail}` })));
             if (ok) {
               const file = path.join(dir, `scene-${n}.mp4`);
               await writeFile(file, vid.bytes);
@@ -1131,7 +1138,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
-            1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
+            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;

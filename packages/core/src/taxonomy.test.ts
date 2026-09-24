@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, ownerPool, withAdmin } from '@arkiv/db';
+import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId, Taxonomy, type StaffRole } from '@arkiv/shared';
 import type { Staff } from './admin';
+import { versionCreative } from './creatives';
 import { canonicalGenome } from './genome';
 import { applyTaxonomyChange, applyTaxonomyRemap, canonicalTaxonomy, proposeTaxonomyChange, reviewTaxonomyProposal, taxonomyRemaps } from './taxonomy';
 
@@ -84,5 +85,20 @@ describe('taxonomy changes (plan 05 §19)', () => {
     expect(await ownerPool()`select 1 from ops_commands`).toHaveLength(0);
     const audit = await ownerPool()`select action from admin_audit_log where action like 'taxonomy.%' order by id`;
     expect(audit.map((x) => x.action)).toEqual(['taxonomy.propose', 'taxonomy.reject', 'taxonomy.propose', 'taxonomy.approve']);
+  });
+
+  it('new creatives are recorded against the current canonical version, not a hardcoded one', async () => {
+    const t = await makeTenant();
+    const skuId = await makeSku(t.workspaceId);
+    const [parent] = await ownerPool()`insert into creatives (workspace_id, sku_id, origin, genome, genome_version) values (${t.workspaceId}, ${skuId}, 'generated', '{}', 1) returning id`;
+    const ctx = { workspaceId: t.workspaceId, actor: { kind: 'system' as const, id: 'test' } };
+    const v = (changed: string) => ({ skuId, parentCreativeId: parent!.id as string, projectId: null, genome: { angle: 'ROUTINE' }, finalAssetIds: [], composition: null, changedVariables: [changed] });
+    const first = await withTenant(t.workspaceId, (tx) => versionCreative(tx, ctx, v('hook')));
+    expect((await ownerPool()`select genome_version from creatives where id = ${first}`)[0]!.genome_version).toBe(Taxonomy.version);
+    const [a, b] = [await staff(), await staff()];
+    const add = await withAdmin((tx) => proposeTaxonomyChange(tx, a, { family: 'proof', op: 'add', value: 'PATCH_TEST', reason: 'new proof type' }));
+    await withAdmin((tx) => reviewTaxonomyProposal(tx, b, add, true, 'ok'));
+    const second = await withTenant(t.workspaceId, (tx) => versionCreative(tx, ctx, v('hook')));
+    expect((await ownerPool()`select genome_version from creatives where id = ${second}`)[0]!.genome_version).toBe(2);
   });
 });

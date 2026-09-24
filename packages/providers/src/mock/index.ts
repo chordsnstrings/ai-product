@@ -146,7 +146,9 @@ export class MockVideo implements VideoProvider {
       const { writeFile } = await import('node:fs/promises');
       await writeFile(png, await placeholderFrame(t.req.mockLabel ?? t.req.prompt.slice(0, 80), aspect, 2));
       const out = path.join(dir, 'v.mp4');
-      await stillToClip(png, t.req.seconds * 1000, aspect, out, 'push');
+      // Test hook: `[[mock:short_clip]]` returns a clip half as long as requested (§48 wrong-duration deliverable).
+      const ms = /\[\[mock:short_clip\]\]/.test(t.req.prompt) ? t.req.seconds * 500 : t.req.seconds * 1000;
+      await stillToClip(png, ms, aspect, out, 'push');
       return readFile(out);
     });
     t.status = 'succeeded';

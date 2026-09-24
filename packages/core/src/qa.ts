@@ -266,6 +266,55 @@ export function qaClaims(lines: string[], allowed: { id: string; wording: string
   };
 }
 
+/** What a scene render was requested as (the provider's deliverable contract, §48). */
+export interface ClipContract {
+  seconds: number;
+  resolution: '720p' | '1080p';
+  ratio: '9:16' | '4:5' | '1:1';
+}
+
+/** A clip this much shorter than requested is a wrong deliverable (the composer would freeze or cut the scene). */
+export const CLIP_DURATION_TOLERANCE_MS = 250;
+const RATIO: Record<ClipContract['ratio'], number> = { '9:16': 9 / 16, '4:5': 4 / 5, '1:1': 1 };
+const PLAYABLE_CODECS = new Set(['h264', 'hevc']);
+
+/**
+ * The deliverable contract of one provider clip, checked before QA accepts it (standard §48 "Provider returns wrong
+ * duration/resolution/format: validate the deliverable contract before QA acceptance; repair/retry"): long enough,
+ * at least the requested resolution on its short side, the requested aspect ratio, and a video codec we can compose.
+ * A failure is repairable (a retry within the reserve, then the exact-product fallback), never delivered.
+ */
+export async function qaClipContract(bytes: Buffer, want: ClipContract): Promise<CheckResult> {
+  let p: Awaited<ReturnType<typeof probe>> | null = null;
+  try {
+    p = await withTempDir(async (dir) => {
+      const f = path.join(dir, 'clip.mp4');
+      await writeFile(f, bytes);
+      return probe(f);
+    });
+  } catch {
+    p = null;
+  }
+  const problems: string[] = [];
+  if (!p || !p.width || !p.height || !p.videoCodec) problems.push('not a readable video');
+  else {
+    if (p.durationMs < want.seconds * 1000 - CLIP_DURATION_TOLERANCE_MS) problems.push(`${(p.durationMs / 1000).toFixed(2)}s instead of ${want.seconds}s`);
+    const minSide = want.resolution === '1080p' ? 1080 : 720;
+    if (Math.min(p.width, p.height) < minSide) problems.push(`${p.width}x${p.height} is below ${want.resolution}`);
+    if (Math.abs(p.width / p.height - RATIO[want.ratio]) > 0.02) problems.push(`${p.width}x${p.height} is not ${want.ratio}`);
+    if (!PLAYABLE_CODECS.has(p.videoCodec)) problems.push(`unsupported codec ${p.videoCodec}`);
+  }
+  const pass = problems.length === 0;
+  return {
+    check: 'platform',
+    pass,
+    // Hard: a wrong deliverable is never accepted; the production repairs it (retry, then the exact product).
+    hard: !pass,
+    detail: pass ? 'Clip matches the requested duration, resolution and format' : `Provider clip does not match the request: ${problems.join('; ')}`,
+    data: { requested: want, probe: p },
+  };
+}
+
 /** Platform + audio contract for one export (§25 checks 4–5; §48 wrong duration/format). */
 export async function qaExport(file: string, aspect: Aspect, expectedMs: number): Promise<CheckResult[]> {
   const p = await probe(file);
@@ -277,7 +326,8 @@ export async function qaExport(file: string, aspect: Aspect, expectedMs: number)
     {
       check: 'platform',
       pass: sizeOk && durOk && codecOk,
-      hard: !sizeOk || !codecOk,
+      // §48 "wrong duration": an export of the wrong length is not delivered, like a wrong size or codec.
+      hard: !sizeOk || !durOk || !codecOk,
       detail: `${p.width}x${p.height} · ${(p.durationMs / 1000).toFixed(2)}s · ${p.videoCodec}/${p.audioCodec}`,
       data: { aspect, ...p },
     },
