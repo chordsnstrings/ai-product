@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { withTenant } from '@arkiv/db';
+import { withTenant, type Tx } from '@arkiv/db';
 import { platformsFor } from '@arkiv/shared';
 import { captionCues, composeAd, layoutVoice, probe, withTempDir, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
@@ -79,7 +79,7 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
   const { p, manifest } = data;
   if (!manifest?.scenes.length) {
     // Without the master's composition nothing can be held constant: no variant rather than a confounded one.
-    await withTenant(ws, (tx) => setExperimentState(tx, ctx, p.experiment_id as string, 'READY_TO_RUN', 'hook variants unavailable: master has no composition record'));
+    await withTenant(ws, (tx) => settleExperiment(tx, ctx, p.experiment_id as string, 'hook variants unavailable: master has no composition record'));
     return 0;
   }
   const hookScene = manifest.scenes[0]!;
@@ -153,7 +153,7 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
         await layoutVoice(clips, variantManifest.durationMs, voPath);
       }
       const e = variantManifest.endCard;
-      const endCard = { productName: e.productName, cta: e.cta, index: e.index, durationMs: e.durationMs };
+      const endCard = { productName: e.productName, cta: e.cta, index: e.index, durationMs: e.durationMs, accent: e.accent ?? null, note: e.note ?? null };
       // The variant is the master's footage with a re-voiced hook: it carries the master's AI-content disclosure (§40).
       const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: variantManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(variantManifest.disclosure) }, dir);
       const checks: CheckResult[] = [integrity];
@@ -191,8 +191,21 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
     });
     if (ok) made++;
   }
-  await withTenant(ws, (tx) => setExperimentState(tx, ctx, p.experiment_id as string, 'READY_TO_RUN', 'variants ready'));
+  await withTenant(ws, (tx) => settleExperiment(tx, ctx, p.experiment_id as string, 'variants ready'));
   return made;
+}
+
+/**
+ * Production is over: the test is READY_TO_RUN when at least two of its variants (master, hook variants, control)
+ * have a creative to compare; with fewer — every hook variant refused by experiment integrity (§25 check 6) — it
+ * can't isolate anything and is INVALIDATED (§35) rather than launched as a one-ad "test".
+ */
+async function settleExperiment(tx: Tx, ctx: TenantContext, experimentId: string, reason: string) {
+  // A system transition (the job may carry the approving merchant as its actor): never refused as a user move.
+  const sys = { workspaceId: ctx.workspaceId, actor: { kind: 'system' as const, id: 'hook-variants' } };
+  const [n] = await tx`select count(*)::int as n from variants where experiment_id = ${experimentId} and creative_id is not null`;
+  if (Number(n!.n) >= 2) await setExperimentState(tx, sys, experimentId, 'READY_TO_RUN', reason);
+  else await setExperimentState(tx, sys, experimentId, 'INVALIDATED', `no comparable variant was produced (${reason})`);
 }
 
 /**

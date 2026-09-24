@@ -25,7 +25,9 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     return { ...v, conf, revisedAt: revised[0]?.at as string | null };
   });
   if (!d) notFound();
-  const contexts = [...new Set(d.results.map((r) => r.measurement_context as string))];
+  // One table per measurement context and attribution window: different windows are different measurements (§30).
+  const groups = [...new Map(d.results.map((r) => [`${r.measurement_context}|${r.attribution_window}`, { ctx: r.measurement_context as string, window: String(r.attribution_window ?? 'default') }])).values()];
+  const windowLabel = (w: string) => (w === 'default' ? null : w.replace(/_/g, ' ').replace(/(\d+)d/g, '$1-day'));
   const label = new Map(d.variants.map((v) => [v.id as string, `${v.code} · ${v.label}`]));
   return (
     <>
@@ -35,19 +37,19 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
         <SignalChip state={String(d.experiment.state)} />
       </div>
       {d.revisedAt ? <Banner>Updated: numbers were revised on {new Date(d.revisedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} as late conversions arrived.</Banner> : null}
-      {d.freshness?.degraded ? <Banner tone="warn">A connected ad account needs attention — these numbers may be incomplete.</Banner> : null}
-      {contexts.length === 0 ? (
+      {d.freshness?.stale ? <Banner tone="warn">{d.freshness.degraded ? 'A connected ad account needs attention' : 'Your ad data hasn’t synced for over a week'} — these numbers may be incomplete.</Banner> : null}
+      {groups.length === 0 ? (
         <p className="ak-muted" style={{ marginTop: 24 }}>No performance data yet. Launch the ads with the variant codes in their names, or upload a CSV from Results. Signals appear after roughly 1,000 impressions per variant.</p>
       ) : (
-        contexts.map((ctx) => (
-          <section key={ctx} className="ak-section">
-            <h2 className="ak-label">{measurementContextLabel(ctx)}</h2>
+        groups.map(({ ctx, window }) => (
+          <section key={`${ctx}|${window}`} className="ak-section">
+            <h2 className="ak-label">{measurementContextLabel(ctx)}{windowLabel(window) ? ` · attribution ${windowLabel(window)}` : ''}</h2>
             {MeasurementContextCaveat[ctx as MeasurementContext] ? <Banner tone="warn">{MeasurementContextCaveat[ctx as MeasurementContext]}</Banner> : null}
             <div className="ak-scroll-x">
               <table className="ak-table">
                 <thead><tr><th>Variant</th><th>Metric</th><th>Observed</th><th>Estimated</th><th>Range (90%)</th><th>Chance best</th><th>Signal</th></tr></thead>
                 <tbody>
-                  {d.results.filter((r) => r.measurement_context === ctx).map((r) => (
+                  {d.results.filter((r) => r.measurement_context === ctx && String(r.attribution_window ?? 'default') === window).map((r) => (
                     <tr key={r.id as string}>
                       <td className="ak-mono">{label.get(r.variant_id as string)}</td>
                       <td>{String(r.metric).replace('_', ' ')}</td>

@@ -31,10 +31,18 @@ export default async function Ledger({ searchParams }: { searchParams: Promise<S
                                               count(*) filter (where j.status = 'failed')::int as failed
                                        from provider_jobs j where j.created_at > now() - make_interval(days => ${days}) ${notTest(tx, prefs, 'j.workspace_id')} group by 1, 2, 3 order by spend desc` : [],
       trend: tab === 'cogs' ? await tx`
-        with spend as (select date_trunc('week', created_at, ${tz}) as wk, sum(amount)::bigint as spend,
-                              coalesce(sum(amount) filter (where reason ilike '%retry%' or reason ilike '%repair%'), 0)::bigint as retry_spend
-                       from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > now() - interval '12 weeks' ${notTest(tx, prefs)} group by 1),
-             ex as (select date_trunc('week', at, ${tz}) as wk, count(*)::int as exports from events where type = 'COMPOSITION_COMPLETED' and at > now() - interval '12 weeks' ${notTest(tx, prefs)} group by 1)
+        with spend as (select date_trunc('week', l.created_at, ${tz}) as wk, sum(l.amount)::bigint as spend,
+                              coalesce(sum(l.amount) filter (where l.reason ilike '%retry%' or l.reason ilike '%repair%'), 0)::bigint as retry_spend
+                       from ledger_entries l left join cost_authorizations a on a.id = l.authorization_id and a.workspace_id = l.workspace_id
+                       where l.type = 'PROVIDER_COST_RECORDED' and coalesce(a.purpose, '') <> 'free_preview' and l.created_at > now() - interval '12 weeks'
+                         ${notTest(tx, prefs, 'l.workspace_id')} group by 1),
+             -- Appendix C: distinct paid ads (master or hook variant) the customer exported, not compositions.
+             ex as (select date_trunc('week', e.at, ${tz}) as wk,
+                           count(distinct (a.workspace_id::text || ':' || (a.lineage->>'projectId') || ':' || coalesce(a.lineage->>'variantId', 'master')))::int as exports
+                    from events e join assets a on a.id = e.subject_id and a.workspace_id = e.workspace_id and a.kind = 'final_export'
+                    join projects p on p.id::text = a.lineage->>'projectId' and p.workspace_id = a.workspace_id
+                    where e.type = 'ASSET_EXPORTED' and p.kind in ('taste', 'standalone', 'creative_test') and e.at > now() - interval '12 weeks'
+                      ${notTest(tx, prefs, 'e.workspace_id')} group by 1)
         select to_char(s.wk at time zone ${tz}, 'YYYY-MM-DD') as week, s.spend, coalesce(ex.exports, 0) as exports, s.retry_spend from spend s left join ex on ex.wk = s.wk order by s.wk desc` : [],
       cogs: tab === 'cogs' ? await cogsBreakdown(tx, { days, includeTest: prefs.includeTest }) : null,
       margins: tab === 'margin' ? await workspaceMargins(tx, { includeTest: prefs.includeTest }) : [],
@@ -52,7 +60,7 @@ export default async function Ledger({ searchParams }: { searchParams: Promise<S
       <Tabs label="Ledger sections" base="/ledger" current={tab} params={{ days: sp.days }} tabs={[['cogs', 'COGS'], ['margin', 'Margin'], ['stranded', 'Stranded reservations'], ['explorer', 'Ledger explorer'], ['invoices', 'Provider invoices']]} />
       {tab === 'cogs' && d0.cogs ? (
         <>
-          <Table head={['Week', 'Provider spend', 'Exports', 'Cost / usable export', 'QA retry share']} rows={d0.trend.map((t) => [t.week as string, money(t.spend), t.exports as number, Number(t.exports) ? money(Number(t.spend) / Number(t.exports)) : '—', pct(Number(t.spend) ? Number(t.retry_spend) / Number(t.spend) : NaN)])} empty="No provider spend yet." />
+          <Table head={['Week', 'Provider spend', 'Exported paid ads', 'Cost / usable export', 'QA retry share']} rows={d0.trend.map((t) => [t.week as string, money(t.spend), t.exports as number, Number(t.exports) ? money(Number(t.spend) / Number(t.exports)) : '—', pct(Number(t.spend) ? Number(t.retry_spend) / Number(t.spend) : NaN)])} empty="No provider spend yet." />
           <p className="ak-small">Fallback technique rate ({days}d): {pct(d0.cogs.fallback.scenes ? d0.cogs.fallback.fallback / d0.cogs.fallback.scenes : NaN)} of rendered scenes ended on a fallback (exact-product composite) — {d0.cogs.fallback.fallback} of {d0.cogs.fallback.scenes}.</p>
           <div className="ak-grid-2" style={{ alignItems: 'start' }}>
             <Section title={`By modality (${days}d)`}>

@@ -5,6 +5,7 @@ import { brandBrainFor } from './brand';
 import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
 import { classifyClaim, scanCreativeText, scanPasses, syntheticTestimonials } from './compliance';
 import type { TenantContext } from './context';
+import { redactPii } from './customer-language';
 import { emit } from './events';
 import { ConceptSet, StoryboardPlan, type Proposal } from './intel-schemas';
 import { mockConcepts, mockStoryboard, type ProductContext } from './mock-intel';
@@ -52,9 +53,9 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   // Only claims usable wherever this ad will be published (every export platform, the brand's market) are
   // offered as APPROVED; anything narrower would pass here and then fail claims QA after render spend.
   const usable = new Set((await renderableClaims(tx, skuId, { platforms: AD_PLATFORMS })).map((c) => c.id));
-  const themes = await tx`select id, label, signal_type, prevalence, sample_size from customer_themes where sku_id = ${skuId}
+  const themes = await tx`select id, label, signal_type, prevalence, sample_size, snippet_ids from customer_themes where sku_id = ${skuId}
                           order by prevalence * relevance desc limit 6`;
-  const snippets = await tx`select text from customer_signals where sku_id = ${skuId} order by observed_at desc nulls last limit 8`;
+  const phrases = await customerPhrases(tx, themes.map((t) => ({ label: t.label as string, snippetIds: (t.snippet_ids as string[] | null) ?? [] })));
   const coverage = await tx`select genes->>'angle' as angle, state, count(*)::int as n from experiments where sku_id = ${skuId}
                             group by 1, 2`;
   const learnings = await tx`select id, statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
@@ -117,7 +118,71 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   const names = [sku.name as string, brand?.name ?? null];
   const r = productContext.rationaleIds!;
   const packetIds = new Set([...r.themes, ...r.claims, ...r.facts, ...r.learnings]);
-  return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
+  // Terms the brand never shows or says: an extra blocking list for concepts, hooks and storyboard lines (§16).
+  const prohibited = prohibitedTerms(brand?.brain.prohibited);
+  return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, phrases, prohibited, brandBrainVersionId: brand?.versionId ?? null };
+}
+
+export interface CustomerPhrase {
+  theme: string;
+  text: string;
+  /** The phrase states a benefit or outcome no claim covers: voice only, never repeated as a claim. */
+  doNotClaim: boolean;
+}
+
+/**
+ * Representative customer phrases per top theme (§18 "the context builder should expose representative phrases to
+ * Opus so copy is grounded in real language while enforcing Claims Vault at generation time"): up to three per
+ * theme, PII-redacted again and capped, each tagged when it reads as a blocked or restricted claim.
+ */
+export async function customerPhrases(tx: Tx, themes: { label: string; snippetIds: string[] }[]): Promise<CustomerPhrase[]> {
+  const ids = [...new Set(themes.flatMap((t) => t.snippetIds.slice(0, 3)))];
+  if (!ids.length) return [];
+  const rows = await tx`select id, text from customer_signals where id = any(${ids}::uuid[])`;
+  const text = new Map(rows.map((r) => [r.id as string, r.text as string]));
+  return themes.flatMap((t) =>
+    t.snippetIds
+      .slice(0, 3)
+      .map((id) => text.get(id))
+      .filter((x): x is string => !!x)
+      .map((raw) => {
+        const clean = redactPii(raw).replace(/\s+/g, ' ').trim().slice(0, 200);
+        const status = classifyClaim(clean).status;
+        return { theme: t.label, text: clean, doNotClaim: status === 'BLOCKED' || status === 'RESTRICTED' };
+      }),
+  );
+}
+
+/**
+ * The phrases as their own untrusted content part: customer words are data, never instructions, and they are for
+ * voice and objections — never evidence or claims (prompt rule in concepts/recommendations/storyboard ≥ 1.2.0).
+ */
+export function customerPhrasesPart(phrases: CustomerPhrase[]): ContentPart | null {
+  if (!phrases.length) return null;
+  return { type: 'untrusted', sourceId: 'customer_phrases', text: JSON.stringify(phrases.map((p) => ({ theme: p.theme, phrase: p.text, ...(p.doNotClaim ? { do_not_claim: true } : {}) }))) };
+}
+
+/** The Brand Brain's "never show or say" list as matchable terms ("no before/after, avoid clinical" → terms). */
+export function prohibitedTerms(text: string | null | undefined): string[] {
+  return [
+    ...new Set(
+      (text ?? '')
+        .split(/[,;\n]+/)
+        .map((t) => t.trim().toLowerCase().replace(/^(no|never|avoid|don['’]t (use|say|show)|do not (use|say|show))\s+/, '').replace(/[.!]+$/, '').trim())
+        .filter((t) => t.length >= 3 && t.length <= 40),
+    ),
+  ];
+}
+
+/** The prohibited term a line uses, if any (whole words for terms that start/end with a letter or digit). */
+export function prohibitedIn(line: string, terms: readonly string[]): string | null {
+  const l = line.toLowerCase();
+  for (const t of terms) {
+    const esc = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`${/^\w/.test(t) ? '\\b' : ''}${esc}${/\w$/.test(t) ? '\\b' : ''}`, 'i');
+    if (re.test(l)) return t;
+  }
+  return null;
 }
 
 /**
@@ -128,8 +193,8 @@ export function gateProposal(
   p: Proposal,
   approved: string[],
   names: (string | null | undefined)[] = [],
-  opts: { packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean } = {},
-): { ok: boolean; reasons: string[]; cleaned: Proposal } {
+  opts: { packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean; pad?: boolean; prohibited?: readonly string[] } = {},
+): { ok: boolean; reasons: string[]; cleaned: Proposal; removed: { hooks: number; claims: number } } {
   const reasons: string[] = [];
   const { packetIds } = opts;
   const ingredientBlocked = opts.ingredientsVerified === false && isIngredientLed(p);
@@ -142,21 +207,33 @@ export function gateProposal(
   const vault = approved.map((w, i) => ({ id: String(i), wording: w }));
   // Only customer-facing copy is claims-scanned; hypothesis/body are internal strategy notes. A hook that makes a
   // product claim no approved claim covers would be refused by claims QA after render spend, so it goes now.
+  const prohibited = opts.prohibited ?? [];
   const cleanHooks = p.hookOptions.filter((h) => {
+    const banned = prohibitedIn(h, prohibited);
+    if (banned) {
+      reasons.push(`hook removed: “${h}” uses “${banned}”, which the brand never shows or says`);
+      return false;
+    }
     const scan = scanCreativeText([h], vault, { names });
     if (!scan.ok) reasons.push(`hook removed: ${scan.violations[0]!.reason}`);
     else if (scan.unmapped.length) reasons.push(`hook removed: “${h}” makes a claim that isn’t approved`);
     return scanPasses(scan);
   });
-  const blockedStrategy = [p.bodyStrategy, p.hypothesis].some((t) => classifyClaim(t).status === 'BLOCKED');
-  if (blockedStrategy) reasons.push('strategy relies on a blocked claim');
+  const claimBlocked = [p.bodyStrategy, p.hypothesis].some((t) => classifyClaim(t).status === 'BLOCKED');
+  if (claimBlocked) reasons.push('strategy relies on a blocked claim');
+  const brandBanned = [p.bodyStrategy, p.hypothesis].map((t) => prohibitedIn(t, prohibited)).find(Boolean);
+  if (brandBanned) reasons.push(`strategy uses “${brandBanned}”, which the brand never shows or says`);
+  const blockedStrategy = claimBlocked || !!brandBanned;
   const cleanClaims = p.claimWordings.filter((w) => {
     const ok = approved.some((a) => a.toLowerCase().includes(w.toLowerCase()) || w.toLowerCase().includes(a.toLowerCase()));
     if (!ok) reasons.push(`claim not approved: "${w}"`);
     return ok;
   });
-  while (cleanHooks.length < 3) cleanHooks.push(['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'][cleanHooks.length]!);
-  return { ok: !blockedStrategy && !ingredientBlocked, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds } };
+  const removed = { hooks: p.hookOptions.length - cleanHooks.length, claims: p.claimWordings.length - cleanClaims.length };
+  // Concepts the merchant is choosing between are padded with neutral hooks; a recommendation is not (`pad: false`):
+  // it is refused instead, so a gate can't be hidden behind filler (§20).
+  if (opts.pad !== false) while (cleanHooks.length < 3) cleanHooks.push(['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'][cleanHooks.length]!);
+  return { ok: !blockedStrategy && !ingredientBlocked, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds }, removed };
 }
 
 /** Three concepts must differ in hypothesis (angle or primary variable), not just copy (§13). */
@@ -178,9 +255,11 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
+  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names, phrases, prohibited } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
+  const phrasePart = customerPhrasesPart(phrases);
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
+    ...(phrasePart ? [phrasePart] : []),
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
   ];
   let attempt = 0;
@@ -200,7 +279,7 @@ export async function generateConcepts(run: ConceptRun) {
       effort: 'high',
       maxTokens: CONCEPTS_MAX_TOKENS,
     });
-    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified }));
+    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified, prohibited }));
     const valid = gated.filter((g) => g.ok);
     if (valid.length === 3 && conceptsAreDistinct(valid.map((v) => v.cleaned))) break;
     content.push({ type: 'text', text: `Previous attempt was rejected by compliance/diversity gates: ${gated.flatMap((g) => g.reasons).join('; ') || 'concepts too similar'}. Fix and return three distinct compliant concepts.` });
@@ -243,7 +322,7 @@ const VO_WORDS_PER_SECOND = 2.6;
 const VO_MAX_TEMPO = 1.35;
 
 /** Normalize a plan to exactly 15s and enforce scene-level compliance before frames are generated. */
-export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (string | null | undefined)[] = []): StoryboardPlan {
+export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (string | null | undefined)[] = [], prohibited: readonly string[] = []): StoryboardPlan {
   const total = plan.scenes.reduce((s, x) => s + x.durationMs, 0);
   const scale = 15000 / total;
   let acc = 0;
@@ -262,6 +341,11 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (
     const problems = [...scan.violations.map((v) => `"${v.text}" (${v.reason})`), ...scan.unmapped.map((u) => `"${u}" (makes a product claim that isn't approved)`)];
     throw new DomainError('GATE_BLOCKED', `Storyboard failed claims check: ${problems.join('; ')}`, { violations: scan.violations, unmapped: scan.unmapped });
   }
+  // Brand Brain "never show or say" (§16): refused before any frame is generated.
+  const banned = [...lines, plan.hook, plan.cta, ...scenes.map((s) => s.visualPlan)].filter(Boolean).map((l) => ({ l: l as string, t: prohibitedIn(l as string, prohibited) })).filter((x) => x.t);
+  if (banned.length) {
+    throw new DomainError('GATE_BLOCKED', `Storyboard failed the brand check: ${banned.map((b) => `"${b.l}" (uses “${b.t}”, which the brand never shows or says)`).join('; ')}`);
+  }
   // §40: an AI-generated person never speaks as a customer.
   const testimonials = syntheticTestimonials(scenes);
   if (testimonials.length) {
@@ -276,7 +360,7 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (
 }
 
 export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string; brandBrainVersionId: string | null }> {
-  const { productContext, packet, concept, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, async (tx) => {
+  const { productContext, packet, concept, brandBrainVersionId, names, phrases, prohibited } = await withTenant(run.ctx.workspaceId, async (tx) => {
     const c = await buildContext(tx, run.skuId, { projectId: run.projectId });
     const [row] = await tx`select proposal from concepts where id = ${run.conceptId}`;
     if (!row) throw new DomainError('NOT_FOUND', 'Concept not found');
@@ -292,6 +376,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       template: 'storyboard',
       content: [
         { type: 'text', text: `Context packet:\n${JSON.stringify(packet)}` },
+        ...(customerPhrasesPart(phrases) ? [customerPhrasesPart(phrases)!] : []),
         { type: 'text', text: `Approved concept:\n${JSON.stringify(concept)}` },
         ...(attempt ? [{ type: 'text' as const, text: `The previous storyboard failed the claims check: ${(lastErr as Error).message}. Use only approved or neutral wording.` }] : []),
       ],
@@ -301,7 +386,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       maxTokens: 5000,
     });
     try {
-      return { plan: normalizePlan(res.data, productContext.approvedClaims, names), promptVersion: res.promptVersion, model: res.model, brandBrainVersionId };
+      return { plan: normalizePlan(res.data, productContext.approvedClaims, names, prohibited), promptVersion: res.promptVersion, model: res.model, brandBrainVersionId };
     } catch (e) {
       lastErr = e;
     }

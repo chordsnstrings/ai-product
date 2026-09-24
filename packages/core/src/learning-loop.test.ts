@@ -4,12 +4,13 @@ import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import type { NormalizedObservation } from '@arkiv/integrations';
 import { analyzeProduct, startPreview } from './analysis';
 import { clusterThemes, importSignals, parseReviewPaste } from './customer-language';
-import { computeResults, createExperiment } from './experiments';
+import { updateBrandBrain } from './brand';
+import { approveExperiment, computeResults, createExperiment } from './experiments';
 import { append, available } from './ledger';
 import { purgeWorkspace, scheduleDeletion } from './lifecycle';
 import { mockConcepts } from './mock-intel';
 import { ingestObservations, parsePerformanceCsv } from './performance';
-import { approveForProduction, produceProject } from './production';
+import { produceProject } from './production';
 import { generateRecommendations, recommendationsForSku, refreshMaturity } from './recommendations';
 import { generateStoryboard } from './storyboard';
 import { ctxFor, eventContractProblems, productPhoto } from './testing';
@@ -54,8 +55,14 @@ describe('learning loop (Phases 4–5)', () => {
     const { experimentId, projectId, storyboardId } = await withTenant(t.workspaceId, (tx) => createExperiment(tx, ctx, { skuId, proposal, slot: 'EXPAND' }));
     const [concept] = await ownerPool()`select selected_concept_id from projects where id = ${projectId}`;
     await generateStoryboard(ctx, projectId, storyboardId, concept!.selected_concept_id as string);
-    await withTenant(t.workspaceId, (tx) => approveForProduction(tx, ctx, projectId, 'creative_test'));
+    // The Brand Brain's colour and mandatory disclosure go on every export's end card (§16).
+    await withTenant(t.workspaceId, (tx) => updateBrandBrain(tx, ctx, { name: 'Test Brand', colors: ['#AA3355', 'not-a-colour'], disclosures: 'Results vary. Patch test first.', cta: 'Get yours' }));
+    expect((await ownerPool()`select state from experiments where id = ${experimentId}`)[0]!.state).toBe('DRAFT');
+    await withTenant(t.workspaceId, (tx) => approveExperiment(tx, ctx, experimentId));
+    expect((await ownerPool()`select state from experiments where id = ${experimentId}`)[0]!.state).toBe('PRODUCING');
     expect(await produceProject(ctx, projectId)).toBe('complete');
+    const [masterComp] = await ownerPool()`select c.composition from projects p join creatives c on c.id = p.final_creative_id where p.id = ${projectId}`;
+    expect((masterComp!.composition as CompositionManifest).endCard).toMatchObject({ accent: '#AA3355', note: 'Results vary. Patch test first.' });
     // Two deliveries of the job at once (a pg-boss retry after expiry while the first run is still going, or a
     // staff retry): the variants are made once; a later redelivery makes nothing (x-races-23).
     const runs = await Promise.all([produceHookVariants(ctx, projectId), produceHookVariants(ctx, projectId)]);
@@ -143,9 +150,12 @@ describe('learning loop (Phases 4–5)', () => {
     // Next week's recommendations use the new maturity and learning.
     expect(await withTenant(t.workspaceId, (tx) => refreshMaturity(tx, skuId))).toBe('DEVELOPING');
     expect(await generateRecommendations(ctx, skuId, '2026-09-21')).toBeGreaterThan(0);
-    const recs = await ownerPool()`select slot, basis, score from recommendations where week_of = '2026-09-21'`;
+    const recs = await ownerPool()`select slot, basis, score from recommendations where week_of = '2026-09-21' and status = 'open'`;
     expect(recs.length).toBeGreaterThan(0);
     expect(recs.every((r) => Number(r.score) > 0)).toBe(true);
+    // Candidates a hard gate refused are kept for staff with their reasons, scored 0 and never shown (§20).
+    const gated = await ownerPool()`select score, gates from recommendations where week_of = '2026-09-21' and status = 'gated'`;
+    expect(gated.every((g) => Number(g.score) === 0 && (g.gates as { passed: boolean; reasons: string[] }).reasons.length > 0)).toBe(true);
     // §38: every recommendation carries rationale ids (resolvable to packet items) and a confidence.
     const listed = await withTenant(t.workspaceId, (tx) => recommendationsForSku(tx, skuId, { sinceWeek: '2026-09-21' }));
     expect(listed.length).toBe(recs.length);

@@ -31,7 +31,10 @@ export interface Posterior {
   raw: number | null;
 }
 
-/** Default baselines for US DTC skincare paid social when a SKU has no history (assumptions, recalibrated live). */
+/**
+ * Default baselines for US DTC skincare paid social, used only when neither the SKU nor the account has enough
+ * recent volume in the measurement context (baselineFrom).
+ */
 export const DEFAULT_BASELINES: Record<RateMetric, Baseline> = {
   ctr: { rate: 0.012, strength: 2000 },
   hold_rate: { rate: 0.18, strength: 400 },
@@ -114,6 +117,52 @@ export function probBest(posts: Posterior[], draws = 4000, seed = 42): number[] 
     wins[best]!++;
   }
   return wins.map((w) => w / draws);
+}
+
+/**
+ * P(the best of `a` beats the best of `b`) under the shrunk posteriors — how strongly new evidence supports an
+ * existing learning whose winner genes are carried by `a` and loser genes by `b` (§21 strengthen/weaken).
+ */
+export function probAbove(a: Posterior[], b: Posterior[], draws = 4000, seed = 7): number {
+  if (!a.length || !b.length) return 0.5;
+  const r = rng(seed);
+  let wins = 0;
+  for (let i = 0; i < draws; i++) {
+    const va = Math.max(...a.map((p) => sampleBeta(p.alpha, p.beta, r)));
+    const vb = Math.max(...b.map((p) => sampleBeta(p.alpha, p.beta, r)));
+    if (va > vb) wins++;
+  }
+  return wins / draws;
+}
+
+/**
+ * Observed volume at one level of the baseline hierarchy (§21): this SKU, then the whole ad account — both always
+ * within one measurement context (platform), never pooled across platforms.
+ */
+export interface BaselinePool {
+  level: 'sku' | 'account';
+  successes: number;
+  trials: number;
+}
+
+/** Minimum trials before a pool is trusted as a baseline, per metric (below it the next level is used). */
+export const BASELINE_MIN_TRIALS: Record<RateMetric, number> = { ctr: 20_000, hold_rate: 5_000, cvr: 500 };
+/** Prior strength per observed trial: a baseline never carries more weight than a tenth of its own volume. */
+const BASELINE_K = 0.1;
+
+/**
+ * The shrinkage target for a comparison (§21 "Bayesian shrinkage toward the recent SKU/account/platform
+ * baseline"): the most specific pool with enough volume, its prior strength growing with that volume up to the
+ * default strength. With no pool past the floor, the default assumption is used.
+ */
+export function baselineFrom(metric: RateMetric, pools: BaselinePool[], def: Baseline = DEFAULT_BASELINES[metric]): Baseline & { level: BaselinePool['level'] | 'default' } {
+  for (const level of ['sku', 'account'] as const) {
+    const p = pools.find((x) => x.level === level);
+    if (!p || p.trials < BASELINE_MIN_TRIALS[metric] || p.successes <= 0) continue;
+    const rate = Math.min(0.99, Math.max(0.0001, p.successes / p.trials));
+    return { rate, strength: Math.min(def.strength, BASELINE_K * p.trials), level };
+  }
+  return { ...def, level: 'default' };
 }
 
 export interface EvidenceFloor {

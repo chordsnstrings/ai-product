@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { ACTIVE_PRODUCTION_STATES, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
+import { ACTIVE_PRODUCTION_STATES, costPerUsableExport, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
@@ -72,7 +72,8 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
     const [today] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at >= date_trunc('day', now(), ${tz}) ${t()}`;
     const [prior] = await tx`select coalesce(sum(amount), 0)::bigint / 7 as avg from ledger_entries where type = 'PROVIDER_COST_RECORDED'
                              and created_at >= date_trunc('day', now(), ${tz}) - interval '7 days' and created_at < date_trunc('day', now(), ${tz}) ${t()}`;
-    const [exports] = await tx`select count(*)::int as n from events where type = 'COMPOSITION_COMPLETED' and at > now() - make_interval(days => ${days}) ${t()}`;
+    // Appendix C: all variable cost over the distinct paid ads customers actually exported.
+    const usable = await costPerUsableExport(tx, { days, includeTest: prefs.includeTest });
     const [conn] = await tx`select count(*)::int as n, count(*) filter (where status = 'active' and last_success_at > now() - interval '7 days')::int as fresh from integrations where status <> 'disconnected' ${t()}`;
     const [risk] = await tx`select count(*)::int as n from risk_flags where raised_at >= date_trunc('day', now(), ${tz}) and resolved_at is null ${t()}`;
     const queues = await tx`
@@ -85,7 +86,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       union all select 'Platform alerts', count(*)::int, min(created_at), '/#alerts' from platform_alerts where resolved_at is null
       union all select 'Stripe reconciliation', count(*)::int, min(created_at), '/billing?tab=recon' from stripe_recon_exceptions where resolved_at is null`;
     const alerts = await tx`select id, kind, severity, subject_type, subject_id, message, created_at from platform_alerts where resolved_at is null order by created_at desc limit 50`;
-    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, exports, conn, risk, queues, alerts };
+    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, usable, conn, risk, queues, alerts };
   });
   const count = (t: string) => Number(m.funnel.find((r) => r.type === t)?.n ?? 0);
   const base = (t: string) => Number(m.funnel.find((r) => r.type === t)?.base ?? 0);
@@ -93,7 +94,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
   const qaTotal = Number(m.qa!.passed) + Number(m.qa!.failed);
   const firstPass = qaTotal ? Number(m.qa!.passed) / qaTotal : NaN;
   const hardRate = qaTotal ? Number(m.qa!.hard) / qaTotal : NaN;
-  const costPerExport = Number(m.exports!.n) ? Number(m.cogs!.spend) / Number(m.exports!.n) : NaN;
+  const costPerExport = m.usable.perOutputMicros ?? NaN;
   const freshPct = Number(m.conn!.n) ? Number(m.conn!.fresh) / Number(m.conn!.n) : NaN;
   const oldestQueued = Math.max(Number(m.outbox?.oldest ?? 0), Number(m.queued?.oldest ?? 0));
   const activeJobs = m.jobs.reduce((a, j) => a + Number(j.n), 0);
@@ -134,7 +135,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
           <Kpi label="Taste revenue" value={money(m.rev!.taste, 0)} sub={`all one-time ${money(m.rev!.total, 0)}`} href={`/billing?tab=revenue`} />
           <Kpi label="Subscription MRR" value={money(mrr, 0)} sub={`${m.subs.reduce((a, s) => a + Number(s.n), 0)} subscriptions`} href="/billing?tab=revenue" />
           <Kpi label="Net new MRR" value={signed(m.mrrMove.net)} sub={`new ${money(m.mrrMove.new, 0)} · expansion ${money(m.mrrMove.expansion, 0)} · contraction ${money(m.mrrMove.contraction, 0)} · churned ${money(m.mrrMove.churned, 0)}`} alert={m.mrrMove.net < 0} alertText="Shrinking" href="/billing?tab=revenue" />
-          <Kpi label="Cost per usable export" value={Number.isFinite(costPerExport) ? money(costPerExport) : '—'} alert={costPerExport > 8_500_000} alertText="Above $8.50" sub={`${m.exports!.n} exports · COGS ${money(m.cogs!.spend, 0)}`} href={`/ledger?tab=cogs&days=${days}`} />
+          <Kpi label="Cost per usable export" value={Number.isFinite(costPerExport) ? money(costPerExport) : '—'} alert={costPerExport > 8_500_000} alertText="Above $8.50" sub={`${m.usable.outputs} exported paid ads · COGS ${money(m.usable.costMicros, 0)}`} href={`/ledger?tab=cogs&days=${days}`} />
           <Kpi label="Provider spend today" value={money(m.today!.spend)} alert={spendAlert} alertText="Over 130% of forecast" sub={`forecast (7d daily avg) ${money(m.prior!.avg)}`} href="/ledger?tab=cogs&days=1" />
         </Grid>
       </Section>

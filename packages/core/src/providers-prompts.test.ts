@@ -157,7 +157,7 @@ describe('prompt registry (plan 05 §11)', () => {
     expect(new Set(PROMPT_TEMPLATES.map(promptRef)).size).toBe(PROMPT_TEMPLATES.length);
     const llmRoutes = await ownerPool()`select task, prompt_version from model_routes where provider = 'anthropic' and task <> 'vision.fingerprint' and task <> 'extract.claims'`;
     for (const r of llmRoutes) expect(findPrompt(r.prompt_version as string), `${r.task} → ${r.prompt_version}`).toBeDefined();
-    expect(latestPrompt('concepts').version).toBe('1.1.0');
+    expect(latestPrompt('concepts').version).toBe('1.2.0');
   });
 
   it('sends the text of the route’s prompt version, so a rollback really changes what the model reads', async () => {

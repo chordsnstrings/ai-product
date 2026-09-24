@@ -341,6 +341,28 @@ export async function cogsBreakdown(tx: Tx, opts: { days: number; includeTest?: 
   return { byModality, byVideo, byWorkspace, byPlan, byExperiment, fallback: { scenes: Number(fallback[0]?.scenes ?? 0), fallback: Number(fallback[0]?.fallback ?? 0) } };
 }
 
+/**
+ * Cost per usable export (Appendix C): every variable generation, agent, media and QA cost in the window (all
+ * provider cost except the free preview) divided by the customer-accepted paid outputs — distinct paid ads (a
+ * Taste, Standalone or Creative Test master, and each hook variant) the customer actually exported. A composed
+ * ad nobody downloaded, a free preview, or the same ad exported in three formats is not three usable exports.
+ */
+export async function costPerUsableExport(tx: Tx, opts: { days: number; includeTest?: boolean }): Promise<{ costMicros: number; outputs: number; perOutputMicros: number | null }> {
+  const t = (col: string) => (opts.includeTest ? tx`` : tx`and ${tx(col)} not in (select id from workspaces where is_test)`);
+  const since = tx`now() - make_interval(days => ${opts.days})`;
+  const [c] = await tx`select coalesce(sum(l.amount), 0)::bigint as spend from ledger_entries l
+                       left join cost_authorizations a on a.id = l.authorization_id and a.workspace_id = l.workspace_id
+                       where l.type = 'PROVIDER_COST_RECORDED' and l.created_at > ${since} and coalesce(a.purpose, '') <> 'free_preview' ${t('l.workspace_id')}`;
+  const [o] = await tx`select count(distinct (a.workspace_id::text || ':' || (a.lineage->>'projectId') || ':' || coalesce(a.lineage->>'variantId', 'master')))::int as n
+                       from events e
+                       join assets a on a.id = e.subject_id and a.workspace_id = e.workspace_id and a.kind = 'final_export'
+                       join projects p on p.id::text = a.lineage->>'projectId' and p.workspace_id = a.workspace_id
+                       where e.type = 'ASSET_EXPORTED' and e.at > ${since} and p.kind in ('taste', 'standalone', 'creative_test') ${t('e.workspace_id')}`;
+  const costMicros = Number(c?.spend ?? 0);
+  const outputs = Number(o?.n ?? 0);
+  return { costMicros, outputs, perOutputMicros: outputs ? Math.round(costMicros / outputs) : null };
+}
+
 // ───────────── §8 Margin ─────────────
 
 export interface WorkspaceMargin {

@@ -3,7 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
 import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformsFor, type LogicalVoice, type Micros, type Platform, type ProjectState } from '@arkiv/shared';
-import { captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { brandAccent, captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
@@ -770,7 +770,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // Claims check on everything said or shown, before voice is synthesized (Launch Gate 3), per platform the
       // exports are published to (9:16 → TikTok + Reels, 4:5/1:1 → Feed) in the brand's market (§17, §43). Each
       // scene records the Claim IDs its lines use (§24).
-      const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb.hook_text, sb.cta_text].filter(Boolean) as string[];
+      // The end card falls back to the Brand Brain's CTA, so that line is checked like any other.
+      const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb.hook_text, ((sb.cta_text as string | null) ?? '').trim() || brand?.brain.cta].filter(Boolean) as string[];
       const claimCheck = await withTenant(ws, (tx) => claimsQaForExports(tx, sku.id as string, lines, ASPECTS, { names }));
       checks.push(claimCheck);
       // §40: AI-generated people never speak as customers (checked on the scenes as produced).
@@ -858,7 +859,16 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await advance(tx, ctx, projectId, 'PLATFORM_VARIANTS');
         await step(tx, ws, projectId, 'platforms', 'active');
       });
-      const endCard = { productName: sku.name as string, cta: (sb.cta_text as string) ?? 'Shop now', index: `NO. ${String(sku.catalogue_no).padStart(3, '0')}`, durationMs: endCardMs };
+      // Brand Brain (§16): the brand's CTA when the storyboard has none, its colour on the CTA bar, and its mandatory
+      // disclosure on the end card of every export.
+      const endCard = {
+        productName: sku.name as string,
+        cta: ((sb.cta_text as string | null) ?? '').trim() || brand?.brain.cta?.trim() || 'Shop now',
+        index: `NO. ${String(sku.catalogue_no).padStart(3, '0')}`,
+        durationMs: endCardMs,
+        accent: brandAccent(brand?.brain.colors),
+        note: brand?.brain.disclosures?.trim().slice(0, 200) || null,
+      };
       // §40: what in this ad is AI-generated — written into every export's metadata, the manifest and the creative,
       // and shown with each platform's disclosure steps on delivery.
       const generatedScenes = slots.filter((sl) => sl.entry.technique === 'generative' || sl.entry.technique.startsWith('generated') || platedScenes.has(sl.entry.sceneId)).map((sl) => sl.entry.sceneId);

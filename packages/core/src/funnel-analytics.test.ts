@@ -201,7 +201,7 @@ describe('cohorts and CAC (plan 05 §4, Appendix C)', () => {
     const experiment = async () => {
       const [e] = await ownerPool()`insert into experiments (workspace_id, sku_id, hypothesis, primary_variable, mode, created_by)
                                     values (${kept.workspaceId}, ${sku}, 'Texture beats claim', 'hook', 'CONTROLLED', 'test') returning id`;
-      const [v] = await ownerPool()`insert into variants (workspace_id, experiment_id, label, code, role) values (${kept.workspaceId}, ${e!.id}, 'A', ${'AK-' + newId().slice(0, 6)}, 'control') returning id`;
+      const [v] = await ownerPool()`insert into variants (workspace_id, experiment_id, label, code, role) values (${kept.workspaceId}, ${e!.id}, 'A', ${'AK-' + newId()}, 'control') returning id`;
       return { experimentId: e!.id as string, variantId: v!.id as string };
     };
     const linked = await experiment();

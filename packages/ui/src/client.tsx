@@ -2,17 +2,20 @@
 
 import * as Dialog from '@radix-ui/react-dialog';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { monotonicNow, remainingMs } from './offer-clock';
 
 /**
  * Honest urgency (plan 04 L8, design M9): renders a server-issued expiry. No reset, no acceleration, no flashing.
  * `serverNow` corrects for device clock skew (plan 03 P7 edge case).
  */
 export function OfferExpiry({ expiresAt, serverNow, onExpire }: { expiresAt: string; serverNow: string; onExpire?: () => void }) {
-  const skew = useRef(new Date(serverNow).getTime() - Date.now());
-  const [left, setLeft] = useState(() => new Date(expiresAt).getTime() - (Date.now() + skew.current));
+  // When the server's `now` arrived (monotonic clock): elapsed time is measured from here, never the wall clock.
+  const rendered = useRef({ serverNow, at: monotonicNow() });
+  const [left, setLeft] = useState(() => remainingMs(expiresAt, serverNow));
   useEffect(() => {
+    if (rendered.current.serverNow !== serverNow) rendered.current = { serverNow, at: monotonicNow() };
     const t = setInterval(() => {
-      const l = new Date(expiresAt).getTime() - (Date.now() + skew.current);
+      const l = remainingMs(expiresAt, serverNow, monotonicNow() - rendered.current.at);
       setLeft(l);
       if (l <= 0) {
         clearInterval(t);
@@ -20,7 +23,7 @@ export function OfferExpiry({ expiresAt, serverNow, onExpire }: { expiresAt: str
       }
     }, 1000);
     return () => clearInterval(t);
-  }, [expiresAt, onExpire]);
+  }, [expiresAt, serverNow, onExpire]);
   if (left <= 0) return <span className="ak-timer">Intro price ended</span>;
   const m = Math.floor(left / 60000);
   const s = Math.floor((left % 60000) / 1000);
