@@ -153,6 +153,25 @@ export async function landingExampleUrls(tx: Tx, ids: readonly string[], ttlSeco
   return out;
 }
 
+/**
+ * The same, for the public landing page, which runs as the app role: the example rows come from the narrow
+ * landing_example_assets() database function (the same rules as landingAssetProblems, in SQL), never a
+ * cross-tenant read.
+ */
+export async function publicExampleUrls(tx: Tx, ids: readonly string[], ttlSeconds = 3600): Promise<Map<string, { url: string; mime: string }>> {
+  const out = new Map<string, { url: string; mime: string }>();
+  if (!ids.length) return out;
+  const rows = await tx`select id, storage_key, mime from landing_example_assets(${[...new Set(ids)]}::uuid[])`;
+  for (const r of rows) out.set(r.id as string, { url: await storage().signedGetUrl(r.storage_key as string, ttlSeconds), mime: r.mime as string });
+  return out;
+}
+
+/** Claims checked across the platform in the last 7 days (a count only), for the landing proof line. */
+export async function claimsCheckedLast7Days(tx: Tx): Promise<number> {
+  const [r] = await tx`select landing_claims_checked_7d() as n`;
+  return Number(r?.n ?? 0);
+}
+
 /** Testimonials must link to a stored consent record that hasn't been revoked (FTC 16 CFR 465, plan 04 §4). */
 export async function testimonialProblems(tx: Tx, ids: readonly string[]): Promise<string[]> {
   if (!ids.length) return [];

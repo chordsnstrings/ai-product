@@ -8,15 +8,52 @@ import type { ProjectView } from '@/lib/views';
 type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null } };
 
 const usd = (micros: number) => `$${(micros / 1_000_000).toFixed(micros % 1_000_000 === 0 ? 0 : 2)}`;
+/** Below this photo-quality confidence the P4 screen offers an extra view (plan 03 P4, "only if fidelity confidence is low"). */
+const LOW_FIDELITY = 0.6;
 const PRODUCING = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'QA_RUNNING', 'COMPOSING', 'PLATFORM_VARIANTS', 'FINAL_QA'];
 
+/**
+ * The project view, live while `active` says so: server-sent events from /api/projects/:id/stream (plan 06 Phase 1
+ * #9), falling back to polling GET /api/projects/:id when the stream can't be used (no EventSource, a proxy that
+ * buffers, repeated failures). `refresh` re-reads at once (after the merchant changes something).
+ */
 function useProject(id: string, active: (v: View | null) => boolean) {
   const [live, setLive] = useState(true);
-  const poll = usePoll<View>(`/api/projects/${id}`, 1500, live);
+  const [streaming, setStreaming] = useState(true);
+  const [data, setData] = useState<View | null>(null);
+  // One read on mount and on refresh(); polls on its own only while the stream is off.
+  const poll = usePoll<View>(`/api/projects/${id}`, 1500, live && !streaming);
   useEffect(() => {
-    if (poll.data) setLive(active(poll.data));
-  }, [poll.data, active]);
-  return { ...poll, resume: () => setLive(true) };
+    if (poll.data) setData(poll.data);
+  }, [poll.data]);
+  useEffect(() => {
+    if (!live || !streaming) return;
+    if (typeof EventSource === 'undefined') {
+      setStreaming(false);
+      return;
+    }
+    let failures = 0;
+    const es = new EventSource(`/api/projects/${id}/stream`);
+    es.addEventListener('project', (e) => {
+      failures = 0;
+      setData(JSON.parse((e as MessageEvent<string>).data) as View);
+    });
+    const fallBack = () => {
+      es.close();
+      setStreaming(false);
+    };
+    es.addEventListener('failure', fallBack);
+    es.addEventListener('gone', fallBack);
+    es.onerror = () => {
+      // The browser retries on its own; three failures in a row (or a closed stream) and we poll instead.
+      if (++failures >= 3 || es.readyState === EventSource.CLOSED) fallBack();
+    };
+    return () => es.close();
+  }, [id, live, streaming]);
+  useEffect(() => {
+    if (data) setLive(active(data));
+  }, [data, active]);
+  return { data, error: data ? null : poll.error, refresh: poll.refresh, resume: () => setLive(true) };
 }
 
 function Shell({ step, children, title, sub }: { step: 1 | 2 | 3 | 4; children: React.ReactNode; title: string; sub?: React.ReactNode }) {
@@ -84,6 +121,60 @@ function MissingFacts({ projectId, fields, onSaved }: { projectId: string; field
   );
 }
 
+/** Views the analyst may suggest, in customer words. */
+const VIEW_WORDS: Record<string, string> = { front: 'the front', side: 'a side view', back: 'the back label', swatch: 'a swatch of the product', closure: 'the cap or pump', in_hand: 'the product in hand' };
+
+/**
+ * Add photos to this same product (§13: keep the entered URL, ask for images without a restart; P4 "Add a
+ * side/back photo for sharper product accuracy"). Up to 6 at a time; the server decides whether they resume the
+ * analysis or become extra reference views.
+ */
+function PhotoAdder({ projectId, title, why, cta, onAdded }: { projectId: string; title: string; why: string; cta: string; onAdded: () => void }) {
+  const ref = useRef<HTMLInputElement>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  function pick(list: FileList | null) {
+    if (!list) return;
+    const imgs = [...list].filter((f) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name));
+    if (!imgs.length) return setErr('Choose a photo (JPG or PNG).');
+    setErr(null);
+    setFiles((prev) => [...prev, ...imgs].slice(0, 6));
+  }
+  async function send() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const fd = new FormData();
+      for (const f of files) fd.append('photos', f);
+      await api(`/api/projects/${projectId}/photos`, fd);
+      setFiles([]);
+      setDone(true);
+      onAdded();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+  }
+  if (done) return <p className="ak-small ak-muted" role="status">Thanks — we’ve added your photos.</p>;
+  return (
+    <div className="ak-panel ak-stack">
+      <h2 className="ak-label">{title}</h2>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>{why}</p>
+      <div className="ak-row" style={{ flexWrap: 'wrap' }}>
+        <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => ref.current?.click()}>Choose photos</button>
+        <input ref={ref} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden onChange={(e) => pick(e.target.files)} />
+        {files.map((f, i) => (
+          <span key={i} className="ak-chip">{f.name.slice(0, 18)} <button type="button" className="ak-textbtn" aria-label={`Remove ${f.name}`} onClick={() => setFiles(files.filter((_, j) => j !== i))}>×</button></span>
+        ))}
+      </div>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      <div><Button size="sm" disabled={!files.length || busy} onClick={() => void send()}>{busy ? 'Adding…' : cta}</Button></div>
+    </div>
+  );
+}
+
 /**
  * §42 "Variants / sizes": which size or shade this ad is for, so it never shows the wrong one. Chosen before an
  * idea is picked (the storyboard is drawn for it); until then no size or price that differs between them is used.
@@ -118,6 +209,42 @@ function VariantPicker({ projectId, v, onSaved }: { projectId: string; v: View; 
   );
 }
 
+/** Plan 03 P2: an out-of-scope product gets a waitlist email instead (no generation spend). */
+function WaitlistForm({ projectId }: { projectId: string }) {
+  const [email, setEmail] = useState('');
+  const [consent, setConsent] = useState(false);
+  const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
+  const [err, setErr] = useState<string | null>(null);
+  if (state === 'done') return <p role="status" className="ak-body">Thanks — we’ll email {email} if we start supporting products like this. Nothing else.</p>;
+  return (
+    <form
+      className="ak-panel ak-stack"
+      style={{ maxWidth: 480 }}
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setState('busy');
+        setErr(null);
+        try {
+          await api('/api/waitlist', { projectId, email, consent });
+          setState('done');
+        } catch (x) {
+          setErr((x as Error).message);
+          setState('idle');
+        }
+      }}
+    >
+      <label className="ak-label" htmlFor="waitlist-email">Tell me when you support this</label>
+      <input id="waitlist-email" className="ak-input" type="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+      <label className="ak-small" style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} required />
+        <span>Email me once if Arkiv starts making ads for products like this. You can unsubscribe anytime.</span>
+      </label>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      <div><Button size="sm" type="submit" disabled={state === 'busy' || !email || !consent}>{state === 'busy' ? 'Saving…' : 'Join the waitlist'}</Button></div>
+    </form>
+  );
+}
+
 export function AnalysisFlow({ projectId }: { projectId: string }) {
   const active = useCallback((v: View | null) => !v || v.sku.status === 'analyzing' || (v.sku.status === 'active' && v.concepts.length === 0 && v.project.state !== 'NEEDS_USER_ACTION'), []);
   const { data: v, error, refresh, resume } = useProject(projectId, active);
@@ -130,6 +257,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
     return (
       <Shell step={1} title="We can’t make an ad for this product" sub={v.sku.rejectReason ?? 'This product is outside what Arkiv supports.'}>
         <p className="ak-muted">Arkiv is built for cosmetic skincare only — cleansers, serums, moisturisers and similar, not sunscreen/SPF or acne and other OTC treatments. You haven’t been charged anything.</p>
+        <WaitlistForm projectId={projectId} />
         <LinkButton href="/#upload" variant="secondary">Try a different product</LinkButton>
       </Shell>
     );
@@ -160,6 +288,13 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
     }
   }
   const disputed = v.facts.filter((f) => f.disputed);
+  // "Looks right" confirms what the merchant was shown (§13, §16 merchant_confirmed), then moves on. A failed
+  // confirmation never blocks the ideas: the facts stay as observed.
+  async function confirmAndGo() {
+    const shown = v!.facts.filter((f) => FACT_LABELS[f.key] && !f.disputed && !f.confirmed).map((f) => f.id);
+    if (shown.length) await api(`/api/projects/${projectId}/confirm`, { factIds: shown }).catch(() => {});
+    window.location.assign(`/concepts/${projectId}`);
+  }
   // Keep the merchant's correction (a fresh decision acknowledges the newer source value) or take the source's.
   async function resolveSource(key: string, keep: { value: string } | { factId: string }) {
     setErr(null);
@@ -221,15 +356,32 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                           ) : null}
                         </span>
                       ),
-                    chip: <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} />,
+                    chip: (
+                      <span className="ak-row" style={{ gap: 6 }}>
+                        <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} />
+                        {f.confirmed && f.state !== 'DECIDED' ? <span className="ak-small ak-muted" title="You confirmed this">✓ confirmed</span> : null}
+                      </span>
+                    ),
                   }))}
               />
               {err ? <p className="ak-error" role="alert">{err}</p> : null}
               {failed ? (
                 <div className="ak-stack">
                   <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
-                  <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
-                  <div><Button onClick={() => void retryAnalysis()}>Try again</Button></div>
+                  {v.sku.sourceUrl ? <p className="ak-small ak-muted" style={{ margin: 0, overflowWrap: 'anywhere' }}>Your link is saved: {v.sku.sourceUrl}</p> : null}
+                  <PhotoAdder
+                    projectId={projectId}
+                    title={v.sku.usablePhotos ? 'Add a plain photo of the product' : 'Add 1–3 photos of your product'}
+                    why="We use them to match your packaging exactly in the ad and to read the label (name, size, claims). The front, plus the back label if you have it."
+                    cta="Add photos and continue"
+                    onAdded={() => { resume(); refresh(); }}
+                  />
+                  {v.sku.usablePhotos ? (
+                    <>
+                      <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
+                      <div><Button variant="secondary" onClick={() => void retryAnalysis()}>Try again</Button></div>
+                    </>
+                  ) : null}
                 </div>
               ) : !v.sku.ingredientsVerified ? (
                 <div className="ak-panel ak-stack">
@@ -237,6 +389,15 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <p className="ak-small ak-muted" style={{ margin: 0 }}>We didn’t find an ingredient list on your page or label, so we won’t suggest ingredient-led ads or guess ingredients from the category.</p>
                   <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Key ingredients', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
                 </div>
+              ) : null}
+              {!failed && ready && v.sku.addedViews === 0 && v.sku.suggestedViews.length > 0 && (v.sku.fidelityConfidence ?? 1) < LOW_FIDELITY ? (
+                <PhotoAdder
+                  projectId={projectId}
+                  title="Add a side/back photo for sharper product accuracy"
+                  why={`Optional — ${v.sku.suggestedViews.map((x) => VIEW_WORDS[x] ?? x).join(', ')} would help us keep your packaging exact in every scene.`}
+                  cta="Add photos"
+                  onAdded={refresh}
+                />
               ) : null}
               {!failed && v.sku.variants.length > 1 ? <VariantPicker projectId={projectId} v={v} onSaved={refresh} /> : null}
               {!failed && v.sku.missingEvidence.length ? (
@@ -260,7 +421,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                 </div>
               ) : null}
               {failed ? null : ready ? (
-                <LinkButton href={`/concepts/${projectId}`} block id="cta">Looks right — show me 3 ad ideas</LinkButton>
+                <LinkButton href={`/concepts/${projectId}`} block id="cta" onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
               ) : v.project.state === 'NEEDS_USER_ACTION' ? (
                 <Banner tone="warn">{v.project.failureReason ?? 'We need a clearer photo of the product. Add one to continue.'}</Banner>
               ) : (

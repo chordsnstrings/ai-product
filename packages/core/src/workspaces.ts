@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
-import { globalTx, withSystem, withTenant, type Tx } from '@arkiv/db';
+import { globalTx, withTenant, type Tx } from '@arkiv/db';
 import {
   DomainError,
   FREE_LIMITS,
@@ -159,31 +159,40 @@ export async function createWorkspace(userId: string, name: string): Promise<{ w
  * Composite FKs use ON UPDATE CASCADE, so rewriting skus.workspace_id carries the whole SKU subtree (facts,
  * claims, assets, projects, storyboards, scenes…) atomically. Append-only records of the free preview
  * (ledger, events, provider jobs) stay with the provisional workspace, which is then purged.
+ *
+ * Runs in the customer app, which holds only the RLS-bound app role (plan 02 §3 layer 2): the cross-workspace move
+ * is the narrow move_provisional_skus() database function (it checks the membership and the provisional state
+ * itself); the stored objects are then copied under the target tenant's own context. Should that copy be cut
+ * short, the purge of the provisional workspace re-homes what is still referenced (purgeWorkspace).
  */
 export async function moveProvisionalSkus(fromWorkspaceId: string, toWorkspaceId: string, userId: string): Promise<number> {
-  const [m] = await globalTx((tx) => tx`select * from list_user_workspaces(${userId}) where workspace_id = ${toWorkspaceId}`);
-  if (!m || !['OWNER', 'ADMIN', 'MEMBER'].includes(m.role as string)) throw forbidden();
-  return withSystem(async (tx) => {
-    const [src] = await tx`select state from workspaces where id = ${fromWorkspaceId} for update`;
-    if (!src || src.state !== 'PROVISIONAL') throw conflict('Nothing to move');
-    const skus = await tx`select id from skus where workspace_id = ${fromWorkspaceId} order by catalogue_no`;
-    for (const s of skus) {
-      const [n] = await tx`update workspaces set next_catalogue_no = next_catalogue_no + 1 where id = ${toWorkspaceId}
-                            returning next_catalogue_no - 1 as no`;
-      await tx`update skus set brand_id = null where id = ${s.id}`;
-      await tx`update skus set workspace_id = ${toWorkspaceId}, catalogue_no = ${n!.no} where id = ${s.id}`;
-    }
-    // Storage keys embed the tenant prefix; copy moved objects so purging the old prefix cannot delete them.
-    const moved = await tx`select id, storage_key, mime from assets where workspace_id = ${toWorkspaceId}
-                           and storage_key like ${`t/${fromWorkspaceId}/%`}`;
-    for (const a of moved) {
-      const newKey = (a.storage_key as string).replace(`t/${fromWorkspaceId}/`, `t/${toWorkspaceId}/`);
+  let moved: number;
+  try {
+    const [r] = await globalTx((tx) => tx`select move_provisional_skus(${fromWorkspaceId}::uuid, ${toWorkspaceId}::uuid, ${userId}::uuid) as n`);
+    moved = Number(r!.n);
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (code === '42501') throw forbidden();
+    if (code === 'P0002') throw conflict('Nothing to move');
+    throw e;
+  }
+  await rehomeObjects(toWorkspaceId, fromWorkspaceId);
+  return moved;
+}
+
+/**
+ * Storage keys embed the tenant prefix: copy a workspace's objects still stored under another tenant's prefix to
+ * its own, so purging the old prefix cannot delete them. Runs in the owning tenant's context.
+ */
+export async function rehomeObjects(workspaceId: string, fromWorkspaceId: string): Promise<number> {
+  return withTenant(workspaceId, async (tx) => {
+    const rows = await tx`select id, storage_key, mime from assets where workspace_id = ${workspaceId} and storage_key like ${`t/${fromWorkspaceId}/%`}`;
+    for (const a of rows) {
+      const newKey = (a.storage_key as string).replace(`t/${fromWorkspaceId}/`, `t/${workspaceId}/`);
       await storage().put(newKey, await storage().get(a.storage_key as string), a.mime as string);
       await tx`update assets set storage_key = ${newKey} where id = ${a.id}`;
     }
-    await tx`update workspaces set state = 'PURGE_SCHEDULED', purge_at = now(), provisional_token_hash = null
-             where id = ${fromWorkspaceId}`;
-    return skus.length;
+    return rows.length;
   });
 }
 
@@ -338,11 +347,13 @@ export const deletedUserActor = (userId: string) => `user:deleted:${sha256(`arki
  * Re-runnable: a partly finished deletion completes on the next call.
  */
 export async function deleteUser(userId: string, meta: { by: 'self' | 'staff' } = { by: 'self' }): Promise<{ workspaces: number }> {
-  // System read across workspaces, filtered to this user's own memberships.
-  const memberships = await withSystem(
-    (tx) => tx`select m.workspace_id, m.role, w.state, w.name,
-                      (select count(*) from memberships o where o.workspace_id = m.workspace_id and o.role = 'OWNER')::int as owners
-               from memberships m join workspaces w on w.id = m.workspace_id where m.user_id = ${userId}`,
+  // The user's own memberships (list_user_workspaces), with each workspace's Owner count read in that tenant.
+  const listed = await globalTx((tx) => tx`select workspace_id, role, state, name from list_user_workspaces(${userId}::uuid)`);
+  const memberships = await Promise.all(
+    listed.map(async (m) => {
+      const [o] = await withTenant(m.workspace_id as string, (tx) => tx`select count(*)::int as n from memberships where role = 'OWNER'`);
+      return { workspace_id: m.workspace_id as string, role: m.role as string, state: m.state as string, name: m.name as string, owners: Number(o!.n) };
+    }),
   );
   const [u] = await globalTx((tx) => tx`select id, email, deleted_at from users where id = ${userId}`);
   if (!u) throw notFound('Account not found');
@@ -363,8 +374,6 @@ export async function deleteUser(userId: string, meta: { by: 'self' | 'staff' } 
       await emit(tx, { workspaceId: m.workspace_id as string, actor: { kind: 'user', id: userId } }, 'MEMBER_REMOVED', { type: 'user', id: userId }, { role: r[0]!.role, self: meta.by === 'self', reason: 'account_deleted' });
     });
   }
-  const actor = deletedUserActor(userId);
-  await withSystem((tx) => tx`select arkiv_anonymize_user_events(${userId}::uuid, ${actor})`);
   await globalTx(async (tx) => {
     await tx`delete from sessions where user_id = ${userId}`;
     await tx`delete from passkeys where user_id = ${userId}`;
@@ -373,6 +382,8 @@ export async function deleteUser(userId: string, meta: { by: 'self' | 'staff' } 
     await tx`update users set email = ${`deleted+${userId}@deleted.invalid`}, name = null, email_verified_at = null,
                deleted_at = coalesce(deleted_at, now()) where id = ${userId}`;
   });
+  // Only once the user row is marked deleted: the database function re-attributes that user's events only.
+  await globalTx((tx) => tx`select arkiv_anonymize_user_events(${userId}::uuid, ${deletedUserActor(userId)})`);
   return { workspaces: memberships.length };
 }
 

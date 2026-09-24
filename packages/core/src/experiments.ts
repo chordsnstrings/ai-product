@@ -1,10 +1,11 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
+import { DomainError, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
 import { confoundRunning, LIVE_STATES, recordExperimentApproval, setExperimentState } from './experiment-state';
+import { authorizeFromQuote } from './render-quotes';
 import type { Proposal } from './intel-schemas';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { FRESHNESS_DAYS } from './performance';
@@ -128,7 +129,7 @@ export async function createExperiment(
  * production is approved against a Creative Test and the approval is recorded and evented once — a replay (double
  * click, retried request) changes nothing and emits nothing.
  */
-export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId: string): Promise<{ changed: boolean; projectId: string }> {
+export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId: string, opts: { quoteId?: string } = {}): Promise<{ changed: boolean; projectId: string }> {
   assertCan(ctx, 'spend.creative_test');
   const [e] = await tx`select id, state, sku_id, approved_at from experiments where id = ${experimentId} for update`;
   if (!e) throw new DomainError('NOT_FOUND', 'Experiment not found');
@@ -137,6 +138,9 @@ export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId
   const projectId = v.project_id as string;
   if (e.approved_at) return { changed: false, projectId };
   if (!['DRAFT', 'RECOMMENDED', 'APPROVED'].includes(e.state as string)) throw new DomainError('CONFLICT', 'This test has already moved past approval.');
+  // With a render quote (the customer app always sends one, §38): the Cost Governor authorization is made now, in
+  // this transaction, against the storyboard and rates the merchant was shown; a refusal rolls the approval back.
+  if (opts.quoteId) await authorizeFromQuote(tx, ctx, experimentId, opts.quoteId);
   // The project's transition to STORYBOARD_APPROVED records the approval (syncExperimentWithProject); a project
   // approved earlier (a replay) is recorded here. Either way it happens once.
   await approveForProduction(tx, ctx, projectId, 'creative_test');
@@ -207,10 +211,15 @@ export function withConfounders(state: ExperimentState, confounders: number): Ex
   return confounders > 0 && (state === 'ACTIONABLE' || state === 'DIRECTIONAL') ? 'OPERATIONALLY_CONFOUNDED' : state;
 }
 
+/** A platform-scoped learning never carries to the other platform (§21); a blended one only to other SKUs. */
+export const doNotGeneralizeTo = (platform: 'meta' | 'tiktok' | 'blended'): string[] =>
+  platform === 'meta' ? ['tiktok', 'other_skus'] : platform === 'tiktok' ? ['meta', 'other_skus'] : ['other_skus'];
+
 /** Stands for the merchant's existing ad in a learning; it is never matched across experiments. */
 export const CONTROL_VALUE = 'current control';
 
-const platformOf = (context: string) => (context.startsWith('META') ? 'meta' : context.startsWith('TIKTOK') ? 'tiktok' : 'blended');
+/** From the context the observations were measured in — a CSV import is scoped to the platform it came from. */
+const platformOf = measurementContextPlatform;
 const platformLabel = (p: string) => (p === 'meta' ? 'Meta' : p === 'tiktok' ? 'TikTok' : 'blended data');
 const metricLabel = (m: string) => m.replace('_', ' ');
 const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -463,7 +472,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
             winner_genes, loser_genes, effect, supporting_experiments, confidence, state, do_not_generalize_to, leader_variant_id, history)
           values (${ctx.workspaceId}, ${e.sku_id}, ${d.statement}, ${platform}, ${s.context}, ${s.window}, ${tx.json(d.relevantGenes as never)}, ${d.variable},
             ${tx.json(d.winnerGenes)}, ${tx.json(d.loserGenes)}, ${effect}, ${[experimentId]},
-            ${supports}, ${s.state}, ${platform === 'meta' ? ['tiktok', 'other_skus'] : ['meta', 'other_skus']}, ${s.leader},
+            ${supports}, ${s.state}, ${doNotGeneralizeTo(platform)}, ${s.leader},
             ${tx.json([{ at: now, to: s.state, experimentId, supports, actionable: s.state === 'ACTIONABLE', reason: 'created' }] as never)})
           returning id`;
         revised.add(l!.id as string);

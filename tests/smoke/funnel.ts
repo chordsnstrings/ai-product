@@ -167,7 +167,11 @@ async function main() {
   });
   const studio = await http(`/w/${slug}/studio/${accepted.experimentId}`);
   if (studio.status !== 200) throw new Error(`studio ${studio.status}`);
-  await ok(post(`/api/w/${slug}/experiment-approve`, { experimentId: accepted.experimentId }));
+  // §38: price it first (no reservation), then approve with the quote and an idempotency key.
+  const quote = await ok<{ quoteId: string; estimateMicros: number; blockedReason: string | null }>(post(`/api/w/${slug}/render-estimate`, { experimentId: accepted.experimentId }));
+  if (quote.blockedReason) throw new Error(`render estimate blocked: ${quote.blockedReason}`);
+  console.log(`  render estimate $${(quote.estimateMicros / 1e6).toFixed(2)}`);
+  await ok(post(`/api/w/${slug}/experiment-approve`, { experimentId: accepted.experimentId, quoteId: quote.quoteId, idempotencyKey: `smoke-${quote.quoteId}` }));
   const codes = await until('variants ready', async () => {
     const r = await import('./db').then((m) => m.experimentState(slug, accepted.experimentId));
     return r.state === 'READY_TO_RUN' ? r.codes : null;
@@ -181,6 +185,7 @@ async function main() {
     codes.forEach((c, i) => lines.push(`Spring test — ${c},${day},40,${4000 + i * 10},${i === 0 ? 120 : 60},${i === 0 ? 6 : 3}`));
   }
   const csv = new FormData();
+  csv.append('platform', 'meta');
   csv.append('file', new Blob([lines.join('\n')], { type: 'text/csv' }), 'report.csv');
   const up = await ok<{ inserted?: number }>(http(`/api/w/${slug}/performance-csv`, { method: 'POST', body: csv }));
   console.log(`  CSV ingested ${JSON.stringify(up)}`);

@@ -34,11 +34,8 @@ envs:
   - { key: SPACES_ENDPOINT, value: https://nyc3.digitaloceanspaces.com, scope: RUN_TIME }
   - { key: SPACES_BUCKET, value: arkiv-prod, scope: RUN_TIME }
   - { key: DB_PGBOUNCER, value: "1", scope: RUN_TIME }
-  # Owner/direct connection (migrations, pg-boss, LISTEN) and runtime roles.
-  - { key: DATABASE_URL, value: "${db.DATABASE_URL}", scope: RUN_TIME, type: SECRET }
-  - { key: APP_DATABASE_URL, value: CHANGE_ME_app_pool_url, scope: RUN_TIME, type: SECRET }
-  - { key: ADMIN_DATABASE_URL, value: CHANGE_ME_admin_pool_url, scope: RUN_TIME, type: SECRET }
-  - { key: SYSTEM_DATABASE_URL, value: CHANGE_ME_direct_system_rw_url, scope: RUN_TIME, type: SECRET }
+  # Database connection strings are NOT app-level: each component gets only the roles it uses (plan 02 §3 layer 2),
+  # and DB_ROLES makes any other role fail fast. The customer web app holds app_rw only.
   - { key: APP_SECRET, value: CHANGE_ME_64_random_chars, scope: RUN_TIME, type: SECRET }
   - { key: TOKEN_ENCRYPTION_KEY, value: CHANGE_ME_base64_32_bytes, scope: RUN_TIME, type: SECRET }   # AES-256-GCM for OAuth tokens
   # Structured JSON logs; optional Prometheus endpoint (/api/health/metrics) when METRICS_TOKEN (>= 24 chars) is set.
@@ -84,6 +81,7 @@ jobs:
     run_command: pnpm db:migrate
     instance_size_slug: basic-xs
     envs:
+      - { key: DATABASE_URL, value: "${db.DATABASE_URL}", scope: RUN_TIME, type: SECRET }   # owner: migrations only
       - { key: APP_DB_PASSWORD, value: CHANGE_ME_24plus_chars, scope: RUN_TIME, type: SECRET }
       - { key: ADMIN_DB_PASSWORD, value: CHANGE_ME_24plus_chars, scope: RUN_TIME, type: SECRET }
       - { key: SYSTEM_DB_PASSWORD, value: CHANGE_ME_24plus_chars, scope: RUN_TIME, type: SECRET }
@@ -99,7 +97,10 @@ services:
     routes: [{ path: / }]
     health_check: { http_path: /api/health, initial_delay_seconds: 10, period_seconds: 15 }
     # Build target selected with a build arg understood by App Platform's Dockerfile builds.
-    envs: [{ key: DOCKER_TARGET, value: web, scope: BUILD_TIME }]
+    envs:
+      - { key: DOCKER_TARGET, value: web, scope: BUILD_TIME }
+      - { key: DB_ROLES, value: app, scope: RUN_TIME }
+      - { key: APP_DATABASE_URL, value: CHANGE_ME_app_pool_url, scope: RUN_TIME, type: SECRET }
 
   - name: admin
     dockerfile_path: Dockerfile
@@ -111,7 +112,14 @@ services:
     routes: [{ path: /, preserve_path_prefix: true }]
     # Served on admin.arkiv.app via a DO ingress rule on the Host header (configured in the console);
     # additionally lock down with DO App Platform's IP allowlist / Cloudflare Access in front.
-    envs: [{ key: DOCKER_TARGET, value: admin, scope: BUILD_TIME }]
+    # Staff console: app_rw (global tables), admin_rw (explicit staff policies) and system_rw for the platform-wide
+    # operations staff start (reconciliation, evals workspace).
+    envs:
+      - { key: DOCKER_TARGET, value: admin, scope: BUILD_TIME }
+      - { key: DB_ROLES, value: "app,admin,system", scope: RUN_TIME }
+      - { key: APP_DATABASE_URL, value: CHANGE_ME_app_pool_url, scope: RUN_TIME, type: SECRET }
+      - { key: ADMIN_DATABASE_URL, value: CHANGE_ME_admin_pool_url, scope: RUN_TIME, type: SECRET }
+      - { key: SYSTEM_DATABASE_URL, value: CHANGE_ME_direct_system_rw_url, scope: RUN_TIME, type: SECRET }
 
 workers:
   - name: worker
@@ -120,4 +128,12 @@ workers:
     github: { repo: chordsnstrings/ai-product, branch: main, deploy_on_push: true }
     instance_size_slug: apps-d-2vcpu-4gb   # FFmpeg composition is CPU-bound
     instance_count: 1
-    envs: [{ key: DOCKER_TARGET, value: worker, scope: BUILD_TIME }]
+    # Dispatcher, sweeps and purge (system_rw); pg-boss and ops tooling on the owner connection; admin_rw for the
+    # staff decisions it carries out (automatic holds, refunds of undeliverable one-offs).
+    envs:
+      - { key: DOCKER_TARGET, value: worker, scope: BUILD_TIME }
+      - { key: DB_ROLES, value: "app,admin,system,owner", scope: RUN_TIME }
+      - { key: DATABASE_URL, value: "${db.DATABASE_URL}", scope: RUN_TIME, type: SECRET }
+      - { key: APP_DATABASE_URL, value: CHANGE_ME_app_pool_url, scope: RUN_TIME, type: SECRET }
+      - { key: ADMIN_DATABASE_URL, value: CHANGE_ME_admin_pool_url, scope: RUN_TIME, type: SECRET }
+      - { key: SYSTEM_DATABASE_URL, value: CHANGE_ME_direct_system_rw_url, scope: RUN_TIME, type: SECRET }

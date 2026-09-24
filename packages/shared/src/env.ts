@@ -17,6 +17,12 @@ const EnvSchema = z.object({
   ADMIN_DATABASE_URL: z.string().default('postgres://admin_rw:admin_rw@localhost:5432/arkiv'), // explicit staff policies, audited in app
   // Cross-tenant system role (dispatcher, sweeps, purge). Must be a DIRECT connection: it uses LISTEN.
   SYSTEM_DATABASE_URL: z.string().optional(),
+  /**
+   * Database roles this process may open, comma-separated (owner, app, admin, system). Each deployed component sets
+   * its own (web: app; admin: app,admin,system; worker: app,admin,system,owner) so a compromised customer app has no
+   * RLS-exempt credentials (plan 02 §3 layer 2). Unset (dev, tests): every role.
+   */
+  DB_ROLES: z.string().regex(/^(owner|app|admin|system)(,(owner|app|admin|system))*$/).optional(),
   // Set when APP/ADMIN URLs go through PgBouncer in transaction mode (DO connection pools): disables prepared statements.
   DB_PGBOUNCER: z.enum(['0', '1']).default('0'),
 

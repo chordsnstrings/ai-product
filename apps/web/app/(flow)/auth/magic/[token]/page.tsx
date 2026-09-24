@@ -1,7 +1,8 @@
 import type { Metadata } from 'next';
-import { previewMagicLink } from '@arkiv/auth';
+import { MAGIC_LINK_TTL_MIN, maskEmail, previewMagicLink } from '@arkiv/auth';
 import { LinkButton } from '@arkiv/ui';
 import { ConfirmMagic } from './confirm';
+import { ResendMagic } from './resend';
 
 export const metadata: Metadata = { title: 'Sign in · Arkiv', robots: { index: false } };
 
@@ -13,8 +14,8 @@ export default async function Page({ params }: { params: Promise<{ token: string
     return (
       <div className="ak-wrap ak-section" style={{ maxWidth: 440 }}>
         <h1 className="ak-h1">{p.status === 'used' ? 'This link was already used' : p.status === 'expired' ? 'This link has expired' : 'This link isn’t valid'}</h1>
-        <p className="ak-muted">Links work once and expire after 20 minutes. Your work is saved — request a new link to continue.</p>
-        <LinkButton href="/login">Send a new link</LinkButton>
+        <p className="ak-muted">Links work once and expire after {MAGIC_LINK_TTL_MIN} minutes. Your work is saved — get a new link to continue.</p>
+        {p.email ? <ResendMagic token={token} to={maskEmail(p.email)} ttlMinutes={MAGIC_LINK_TTL_MIN} /> : <LinkButton href="/login">Send a new link</LinkButton>}
       </div>
     );
   }

@@ -29,7 +29,21 @@ function urlFor(role: RoleName): string {
   }
 }
 
+const URL_ENV: Record<RoleName, string> = { owner: 'DATABASE_URL', app: 'APP_DATABASE_URL', admin: 'ADMIN_DATABASE_URL', system: 'SYSTEM_DATABASE_URL' };
+
+/**
+ * Least privilege per process (plan 02 §3 layer 2): a component may only open the roles in DB_ROLES, and in production
+ * only with a connection string it was given explicitly (never a dev default or one derived from another role's).
+ * Checked on every use (a cached pool included), before any query runs.
+ */
+export function assertRoleAllowed(role: RoleName): void {
+  const allowed = env().DB_ROLES?.split(',');
+  if (allowed && !allowed.includes(role)) throw new Error(`This process may not use the ${role} database role (DB_ROLES=${env().DB_ROLES})`);
+  if (env().NODE_ENV === 'production' && !process.env[URL_ENV[role]]) throw new Error(`${URL_ENV[role]} is not configured for this process`);
+}
+
 function pool(role: RoleName): Sql {
+  assertRoleAllowed(role);
   let p = pools.get(role);
   if (!p) {
     const url = role === 'system' ? (env().SYSTEM_DATABASE_URL ?? urlFor(role)) : urlFor(role);

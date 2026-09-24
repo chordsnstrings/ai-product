@@ -1,4 +1,5 @@
 import { env, type MeasurementContext } from '@arkiv/shared';
+import { createHmac } from 'node:crypto';
 import { hmacB64, hmacHex, safeEqual } from './crypto';
 
 /**
@@ -74,6 +75,38 @@ export function verifyShopifyQuery(query: Record<string, string>): boolean {
 export function verifyShopifyWebhook(rawBody: string | Buffer, header: string | null): boolean {
   if (!header) return false;
   return safeEqual(hmacB64(env().SHOPIFY_API_SECRET ?? 'dev', rawBody), header);
+}
+
+// ───────────── Platform deauthorization callbacks (§38 /webhooks/meta, /webhooks/tiktok; §40 revocation) ─────────────
+
+/**
+ * Meta deauthorize / data-deletion callbacks post a `signed_request`: base64url(HMAC-SHA256(payload, app secret))
+ * "." base64url(JSON payload). Returns the app-scoped user id, or null when the signature doesn't verify.
+ */
+export function parseMetaSignedRequest(signed: string | null | undefined): { userId: string; issuedAt: number | null } | null {
+  const secret = env().META_APP_SECRET;
+  if (!secret || !signed) return null;
+  const [sig, body] = signed.split('.');
+  if (!sig || !body) return null;
+  const expected = createHmac('sha256', secret).update(body).digest('base64url');
+  if (!safeEqual(expected, sig.replace(/=+$/, ''))) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as { algorithm?: string; user_id?: string | number; issued_at?: number };
+    if (String(p.algorithm ?? '').toUpperCase() !== 'HMAC-SHA256' || p.user_id == null) return null;
+    return { userId: String(p.user_id), issuedAt: p.issued_at ?? null };
+  } catch {
+    return null;
+  }
+}
+
+/** TikTok webhooks: `TikTok-Signature: t=<unix>,s=<hex HMAC-SHA256 of "t.body">` with the app secret, within 5 minutes. */
+export function verifyTiktokWebhook(rawBody: string, header: string | null, now = Date.now()): boolean {
+  const secret = env().TIKTOK_APP_SECRET;
+  if (!secret || !header) return false;
+  const parts = Object.fromEntries(header.split(',').map((kv) => kv.trim().split('=') as [string, string]));
+  const t = Number(parts.t);
+  if (!parts.s || !Number.isFinite(t) || Math.abs(now / 1000 - t) > 300) return false;
+  return safeEqual(hmacHex(secret, `${parts.t}.${rawBody}`), parts.s);
 }
 
 export async function shopifyExchangeCode(shop: string, code: string): Promise<{ accessToken: string; scopes: string[] }> {
@@ -302,7 +335,7 @@ export interface AdAccount {
 }
 
 /** Meta: code → short-lived → long-lived (~60 day) user token, plus the ad accounts it can read. */
-export async function metaExchangeCode(code: string): Promise<{ accessToken: string; accounts: AdAccount[] }> {
+export async function metaExchangeCode(code: string): Promise<{ accessToken: string; accounts: AdAccount[]; platformUserId: string | null }> {
   const e = env();
   const q = new URLSearchParams({ client_id: e.META_APP_ID ?? '', client_secret: e.META_APP_SECRET ?? '', redirect_uri: `${e.APP_URL}/api/integrations/meta/callback`, code });
   const r1 = await fetch(`${META_API}/oauth/access_token?${q}`);
@@ -314,11 +347,13 @@ export async function metaExchangeCode(code: string): Promise<{ accessToken: str
   const acc = (await (await fetch(`${META_API}/me/adaccounts?${new URLSearchParams({ fields: 'account_id,name,currency,timezone_name', limit: '50', access_token: token })}`)).json()) as {
     data?: { account_id: string; name: string; currency?: string; timezone_name?: string }[];
   };
-  return { accessToken: token, accounts: (acc.data ?? []).map((a) => ({ id: `act_${a.account_id}`, name: a.name, currency: a.currency ?? null, timezone: a.timezone_name ?? null })) };
+  // The app-scoped user id: Meta's deauthorize and data-deletion callbacks name the user, not the ad account.
+  const me = (await (await fetch(`${META_API}/me?${new URLSearchParams({ fields: 'id', access_token: token })}`)).json().catch(() => ({}))) as { id?: string };
+  return { accessToken: token, platformUserId: me.id ?? null, accounts: (acc.data ?? []).map((a) => ({ id: `act_${a.account_id}`, name: a.name, currency: a.currency ?? null, timezone: a.timezone_name ?? null })) };
 }
 
 /** TikTok Business: auth_code → long-lived access token + authorised advertiser ids. */
-export async function tiktokExchangeCode(authCode: string): Promise<{ accessToken: string; accounts: AdAccount[] }> {
+export async function tiktokExchangeCode(authCode: string): Promise<{ accessToken: string; accounts: AdAccount[]; platformUserId: string | null }> {
   const e = env();
   const r = await fetch(`${TIKTOK_API}/oauth2/access_token/`, {
     method: 'POST',
@@ -327,5 +362,5 @@ export async function tiktokExchangeCode(authCode: string): Promise<{ accessToke
   });
   const j = (await r.json()) as { code: number; message: string; data?: { access_token: string; advertiser_ids: string[] } };
   if (j.code !== 0 || !j.data) throw new ConnectorError('tiktok', 'auth_revoked', j.message);
-  return { accessToken: j.data.access_token, accounts: j.data.advertiser_ids.map((id) => ({ id, name: `Advertiser ${id}`, currency: null, timezone: null })) };
+  return { accessToken: j.data.access_token, platformUserId: null, accounts: j.data.advertiser_ids.map((id) => ({ id, name: `Advertiser ${id}`, currency: null, timezone: null })) };
 }

@@ -70,6 +70,9 @@ import {
   validateEligibility,
   type Permission,
   type SettingKey,
+  RATE_PROVIDERS,
+  RATE_UNITS,
+  validateRateTable,
 } from '@arkiv/core';
 import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
 import { canResendTemplate, sendEmail, type TemplateName } from '@arkiv/email';
@@ -443,10 +446,10 @@ export const ACTIONS = {
   'rates.propose': a({
     perm: 'rates.propose',
     schema: z.object({
-      provider: z.string().min(2),
-      model: z.string().min(2),
-      unit: z.string().min(2),
-      rates: z.record(z.string(), z.number().nonnegative()),
+      provider: z.enum(RATE_PROVIDERS),
+      model: z.string().trim().min(2).max(80),
+      unit: z.enum(RATE_UNITS),
+      rates: z.record(z.string(), z.number()),
       sourceUrl: z.string().url().optional(),
       notes: z.string().max(500).optional(),
       // When the new price takes effect (plan 05 §9 "effective at a time"); publishing earlier keeps today's rate until then.
@@ -454,10 +457,12 @@ export const ACTIONS = {
     }),
     run: (s, i) =>
       withAdmin(async (tx) => {
+        // The keys and units the Cost Governor reads, in micros (priceLine): a draft it can't price is refused here.
+        const rates = validateRateTable(i);
         const [v] = await tx`select coalesce(max(version), 0) + 1 as v from provider_rate_tables where provider = ${i.provider} and model = ${i.model}`;
         const effective = i.effectiveFrom ? new Date(i.effectiveFrom) : new Date();
         const [r] = await tx`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, source_url, notes, status, created_by)
-                             values (${i.provider}, ${i.model}, ${v!.v}, ${i.unit}, ${tx.json(i.rates)}, ${effective}, ${i.sourceUrl ?? null}, ${i.notes ?? null}, 'draft', ${s.staffId}) returning id`;
+                             values (${i.provider}, ${i.model}, ${v!.v}, ${i.unit}, ${tx.json(rates)}, ${effective}, ${i.sourceUrl ?? null}, ${i.notes ?? null}, 'draft', ${s.staffId}) returning id`;
         await audit(tx, s, 'rates.proposed', { type: 'rate_table', id: r!.id as string }, { after: i });
         return { id: r!.id, message: `Draft v${v!.v} created (effective ${effective.toUTCString()}). Publishing needs a second approver.` };
       }),

@@ -263,12 +263,20 @@ export function parseProductHtml(html: string, pageUrl: string): ExtractedProduc
   return base;
 }
 
+/** Marketplace listings (not the brand's own store) we don't read; refused at submit time and on import. */
+export const MARKETPLACE_MESSAGE = 'Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.';
+export function isMarketplaceUrl(raw: string): boolean {
+  try {
+    return /(^|\.)(amazon|walmart|ebay)\.[a-z.]+$/i.test(new URL(raw).hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** Full import: try Shopify JSON first (canonical commerce data), then the page. */
 export async function importProductUrl(raw: string, opts: { guard?: NetGuard } = {}): Promise<ExtractedProduct> {
   const url = await assertPublicUrl(raw, opts.guard);
-  if (/amazon\.|walmart\.|ebay\./i.test(url.hostname)) {
-    throw new DomainError('INVALID', 'Marketplace listings aren’t supported yet. Paste your own store’s product page, or upload photos.');
-  }
+  if (isMarketplaceUrl(url.toString())) throw new DomainError('INVALID', MARKETPLACE_MESSAGE);
   const sj = shopifyJsonUrl(url);
   const selectedVariantId = url.searchParams.get('variant') ?? undefined;
   let shopify: Partial<ExtractedProduct> | null = null;

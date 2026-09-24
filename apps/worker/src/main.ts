@@ -2,6 +2,8 @@ import { PgBoss } from 'pg-boss';
 import { closeAll, systemPool, withSystem } from '@arkiv/db';
 import { env } from '@arkiv/shared';
 import { processStripeEvent } from '@arkiv/billing';
+import { processPendingWebhooks } from '@arkiv/core';
+import { handleResendEvent } from '@arkiv/email';
 import { onFinalFailure, processPendingStripeEvents, runJob } from './handlers';
 import { sweepQueue, sweeps } from './sweeps';
 import { grantQueueVisibility, processOpsCommands } from './ops';
@@ -89,6 +91,8 @@ async function main() {
     try {
       while ((await dispatchOnce(boss)) === 100);
       await processPendingStripeEvents(processStripeEvent);
+      // Stored Shopify / Resend / Meta / TikTok deliveries (verified and deduplicated by the web app, §38).
+      await processPendingWebhooks({ resendEvent: handleResendEvent });
       await processOpsCommands(boss);
     } catch (e) {
       log.error('dispatch error', { err: e });

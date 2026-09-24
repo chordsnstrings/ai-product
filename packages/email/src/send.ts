@@ -76,7 +76,8 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
     // Footer support address is a platform setting (plan 05 §20); omitted when unset.
     const [supportRow] = await t`select value from platform_settings where key = 'support.email'`;
     const supportEmail = typeof supportRow?.value === 'string' && supportRow.value.includes('@') ? supportRow.value : null;
-    const element = build(template, data, { supportEmail }).element;
+    const unsubscribeUrl = built.stream === 'marketing' ? unsubscribeLink(email) : null;
+    const element = build(template, data, { supportEmail, unsubscribeUrl }).element;
     const html = await render(element as never);
     const text = await render(element as never, { plainText: true });
     if (!env().RESEND_API_KEY) {
@@ -99,7 +100,7 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
         subject: built.subject,
         html,
         text,
-        headers: built.stream === 'marketing' ? { 'List-Unsubscribe': `<${env().APP_URL}/api/email/unsubscribe?e=${encodeURIComponent(signUnsub(email))}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined,
+        headers: unsubscribeUrl ? { 'List-Unsubscribe': `<${unsubscribeUrl}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined,
       },
       { idempotencyKey: opts.idempotencyKey },
     );
@@ -112,6 +113,14 @@ export async function sendEmail<T extends TemplateName>(template: T, to: string,
   };
   // A send for a workspace runs in that tenant's context (the log row must match it); others need none.
   return tx ? run(tx) : opts.workspaceId ? withTenant(opts.workspaceId, run) : globalTx(run);
+}
+
+/**
+ * The recipient's unsubscribe link (apps/web/app/api/unsubscribe): an RFC 8058 one-click POST from the mail
+ * client unsubscribes directly; a GET (a click, or a link scanner) only opens a confirmation page.
+ */
+export function unsubscribeLink(email: string): string {
+  return `${env().APP_URL}/api/unsubscribe?t=${encodeURIComponent(signUnsub(email))}`;
 }
 
 export function signUnsub(email: string) {

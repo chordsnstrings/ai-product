@@ -20,6 +20,7 @@ import { recordFacts, type FactInput } from './product-truth';
 import { recordVariants } from './sku-variants';
 import { isTerminal, transition } from './projects';
 import { cutout, dominantColors, holdForReview, nameReviewFlags, toJpegBase64, usableAssetIds, type MediaReviewFlags } from './vision';
+import { ingestBytes } from './uploads';
 import { nextCatalogueNo } from './workspaces';
 
 /**
@@ -201,9 +202,13 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
     }
   }
   if (!photoIds.length) {
+    // The entered URL stays on the SKU; the merchant adds photos to this same product (addProductPhotos) and
+    // the analysis resumes — no restart (§13, plan 03 P2 edge cases).
     await withTenant(ws, async (tx) => {
       await step(tx, ws, skuId, 'photos', 'failed', 'Add one clear photo of the front of your product.');
-      await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: 'needs_photo' });
+      await tx`update progress_steps set status = 'skipped' where subject_id = ${skuId} and status = 'pending'`;
+      await tx`update skus set status = 'needs_input' where id = ${skuId}`;
+      await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: NEEDS_PHOTO_COPY, detail: 'needs_photo' });
     });
     return { status: 'needs_input', reason: 'needs_photo' };
   }
@@ -299,7 +304,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
         await tx`update progress_steps set status = 'failed', detail = ${PHOTOS_IN_REVIEW} where subject_id = ${skuId} and status = 'active'`;
         // The merchant can add a plain photo and try again (retryAnalysis) without waiting for our review.
         await tx`update skus set status = 'needs_input' where id = ${skuId}`;
-        await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: 'photos_in_review' });
+        await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: PHOTOS_IN_REVIEW, detail: 'photos_in_review' });
         await settle(tx, ctx, auth.authorizationId, 'consumed');
       });
       return { status: 'needs_input', reason: 'photos_in_review' };
@@ -369,7 +374,9 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
   }
 }
 
-const PHOTOS_IN_REVIEW = 'Your photos need a quick check by our team (before/after or people in shot). Add a plain photo of the product to continue now.';
+export const PHOTOS_IN_REVIEW = 'Your photos need a quick check by our team (before/after or people in shot). Add a plain photo of the product to continue now.';
+/** Customer copy when neither the page nor the upload gave us a product photo (the URL is kept). */
+export const NEEDS_PHOTO_COPY = 'We couldn’t get product photos from that page. Add 1–3 photos of your product and we’ll carry on from here.';
 
 /**
  * Hold the analysed photos the product analyst flagged (by position) or whose source names a before/after or a
@@ -455,6 +462,62 @@ export async function retryAnalysis(tx: Tx, ctx: TenantContext, projectId: strin
   await tx`update progress_steps set status = 'pending', detail = null, started_at = null, completed_at = null, expected_ms = null where subject_id = ${p.sku_id}`;
   await enqueue(tx, ctx.workspaceId, queueFor(Queues.analyzeProduct, ctx), { skuId: p.sku_id, projectId, actor: ctx.actor, retry: true }, { priority: priorityFor(ctx) });
   return { skuId: p.sku_id as string };
+}
+
+/** Photos a merchant can add in one go (the upload module's own limit). */
+export const MAX_ADDED_PHOTOS = 6;
+/** Project states in which extra reference views can still sharpen the fingerprint (before production). */
+const REFERENCE_VIEW_STATES: readonly ProjectState[] = ['PRODUCT_ANALYZED', 'BRIEF_READY', 'CONCEPTS_READY', 'CONCEPT_SELECTED', 'STORYBOARD_READY'];
+
+export interface AddedPhoto {
+  bytes: Buffer;
+  filename?: string | null;
+}
+
+/**
+ * Add photos to an existing product (§13 "request images/details without forcing restart"; plan 03 P4 "Add a
+ * side/back photo for sharper product accuracy"):
+ *  - the analysis is waiting for photos (the URL failed, or every photo went to review): they become product
+ *    photos of the same SKU — its URL and anything already found are kept — and the analysis resumes;
+ *  - the product is already analysed: they become reference views and a new Visual Fingerprint version lists
+ *    them (photos held for compliance review are stored but never referenced).
+ * The state is checked under the project/SKU lock before any file is stored.
+ */
+export async function addProductPhotos(tx: Tx, ctx: TenantContext, projectId: string, files: AddedPhoto[]): Promise<{ skuId: string; mode: 'resumed' | 'reference'; added: number }> {
+  assertCan(ctx, 'sku.edit');
+  if (!files.length) throw new DomainError('INVALID', 'Add at least one photo.');
+  if (files.length > MAX_ADDED_PHOTOS) throw new DomainError('INVALID', `Add up to ${MAX_ADDED_PHOTOS} photos at a time.`);
+  const [p] = await tx`select p.state, p.sku_id, s.status from projects p join skus s on s.id = p.sku_id where p.id = ${projectId} for update of p, s`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  const skuId = p.sku_id as string;
+  if (p.status === 'needs_input' && p.state === 'NEEDS_USER_ACTION') {
+    for (const f of files) await ingestBytes(tx, ctx, f.bytes, 'product_photo', skuId, { filename: f.filename ?? null, addedAfter: 'analysis' });
+    await retryAnalysis(tx, ctx, projectId);
+    await emit(tx, ctx, 'UPLOAD_COMPLETED', { type: 'sku', id: skuId }, { method: 'photos', added: files.length, resumed: true });
+    return { skuId, mode: 'resumed', added: files.length };
+  }
+  if (p.status !== 'active' || !REFERENCE_VIEW_STATES.includes(p.state as ProjectState)) {
+    throw new DomainError('CONFLICT', p.status === 'analyzing' ? 'We’re still reading this product.' : 'Photos can’t be added to this ad any more.');
+  }
+  const ids: string[] = [];
+  for (const f of files) ids.push((await ingestBytes(tx, ctx, f.bytes, 'reference_view', skuId, { filename: f.filename ?? null })).id);
+  const usable = await usableAssetIds(tx, ids);
+  const [fp] = await tx`select * from visual_fingerprints where sku_id = ${skuId} and active order by version desc limit 1 for update`;
+  if (fp && usable.length) {
+    const [v] = await tx`select coalesce(max(version), 0) + 1 as v from visual_fingerprints where sku_id = ${skuId}`;
+    const refs = [...new Set([...((fp.reference_asset_ids as string[]) ?? []), ...usable])];
+    await tx`update visual_fingerprints set active = false where sku_id = ${skuId}`;
+    await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text, brand_text, package_type, closure,
+               dominant_colors, liquid_color, transparency, critical_regions, thresholds)
+             select workspace_id, sku_id, ${v!.v}, ${refs}::uuid[], cutout_asset_id, label_text, brand_text, package_type, closure,
+               dominant_colors, liquid_color, transparency, critical_regions, thresholds
+             from visual_fingerprints where id = ${fp.id}`;
+    await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, addedViews: usable.length });
+  }
+  // The P4 prompt is shown until the merchant has added views.
+  const [views] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind = 'reference_view' and deleted_at is null`;
+  await tx`update skus set analysis = analysis || ${tx.json({ addedViews: views!.n as number } as never)} where id = ${skuId}`;
+  return { skuId, mode: 'reference', added: ids.length };
 }
 
 /** Progress key for one requested concept batch (subject: the project). */

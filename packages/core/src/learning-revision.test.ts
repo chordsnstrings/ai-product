@@ -4,7 +4,7 @@ import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import type { NormalizedObservation } from '@arkiv/integrations';
 import { computeResults, createExperiment, markConfounder } from './experiments';
 import { mockConcepts } from './mock-intel';
-import { ingestObservations } from './performance';
+import { ingestObservations, parsePerformanceCsv } from './performance';
 import { ctxFor } from './testing';
 
 /**
@@ -101,5 +101,30 @@ describe('learnings revise with corrected data', () => {
     const [after] = await x.learnings();
     expect(after).toMatchObject({ id: l!.id, state: 'ACTIONABLE', confounded: true });
     expect(await x.learnings()).toHaveLength(1);
+  });
+});
+
+describe('CSV imports stay per platform (§48 "never average into one universal result")', () => {
+  it('keeps a variant’s Meta and TikTok CSV rows in separate results and scopes each learning to its platform', async () => {
+    const x = await runningExperiment();
+    const csv = (platform: 'meta' | 'tiktok', hold: [number, number, number]) => {
+      const head = platform === 'meta' ? 'Day,Ad name,Ad ID,Impressions,Link clicks,Amount spent (USD),Purchases,3-second video plays,Video plays at 75%' : 'By Day,Ad name,Ad ID,Impressions,Clicks (destination),Cost,Conversions,Video views,Video views at 75%';
+      const lines = [head];
+      for (let d = 1; d <= 6; d++) x.variants.forEach((v, i) => lines.push(`${day(d + 1)},Serum ${v.code},${platform}-${i},4000,48,48.00,1,2400,${Math.round(2400 * hold[i]!)}`));
+      return parsePerformanceCsv(lines.join('\n'), platform);
+    };
+    // B wins on Meta, C wins on TikTok: pooling them would hide both.
+    await withTenant(x.t.workspaceId, (tx) => ingestObservations(tx, x.ctx, null, [...csv('meta', [0.1, 0.32, 0.1]), ...csv('tiktok', [0.1, 0.1, 0.32])]));
+    await x.compute();
+    const results = await ownerPool()`select distinct measurement_context from experiment_results where experiment_id = ${x.experimentId} order by 1`;
+    expect(results.map((r) => r.measurement_context)).toEqual(['MERCHANT_IMPORTED_META', 'MERCHANT_IMPORTED_TIKTOK']);
+    const obsPlatforms = await ownerPool()`select distinct platform, measurement_context from performance_observations order by 1`;
+    expect(obsPlatforms).toEqual([{ platform: 'meta', measurement_context: 'MERCHANT_IMPORTED_META' }, { platform: 'tiktok', measurement_context: 'MERCHANT_IMPORTED_TIKTOK' }]);
+
+    const ls = await ownerPool()`select scope_platform, measurement_context, do_not_generalize_to, leader_variant_id from learnings where sku_id = ${x.skuId} order by scope_platform`;
+    expect(ls).toEqual([
+      { scope_platform: 'meta', measurement_context: 'MERCHANT_IMPORTED_META', do_not_generalize_to: ['tiktok', 'other_skus'], leader_variant_id: x.variants[1]!.id },
+      { scope_platform: 'tiktok', measurement_context: 'MERCHANT_IMPORTED_TIKTOK', do_not_generalize_to: ['meta', 'other_skus'], leader_variant_id: x.variants[2]!.id },
+    ]);
   });
 });

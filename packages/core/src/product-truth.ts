@@ -265,6 +265,20 @@ export async function confirmFact(tx: Tx, ctx: TenantContext, factId: string) {
   }, { factId });
 }
 
+/**
+ * The merchant confirms what we observed (§13 "show what was observed versus what needs confirmation", §16
+ * merchant_confirmed): the P4 "Looks right" confirms the facts shown. Only live facts of this SKU are confirmed
+ * (anything else in the list is ignored); already-confirmed ones are left alone. Returns the facts confirmed now.
+ */
+export async function confirmFacts(tx: Tx, ctx: TenantContext, skuId: string, factIds: readonly string[]): Promise<string[]> {
+  assertCan(ctx, 'sku.edit');
+  if (!factIds.length) return [];
+  const rows = await tx`select id from product_facts where sku_id = ${skuId} and id = any(${[...new Set(factIds)]}::uuid[])
+                        and status <> 'SUPERSEDED' and not merchant_confirmed order by observed_at`;
+  for (const r of rows) await confirmFact(tx, ctx, r.id as string);
+  return rows.map((r) => r.id as string);
+}
+
 /** A source reading that disagrees with the merchant's decision (§28, §42: never hidden behind the decision). */
 export interface SourceConflict {
   fact: Fact;

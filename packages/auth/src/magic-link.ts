@@ -11,7 +11,9 @@ import { createSession, findOrCreateUser } from './sessions';
  * the token, so email security scanners that pre-fetch links cannot burn it (plan 03 Part C).
  */
 const hash = (t: string) => createHash('sha256').update(t).digest('hex');
-const TTL_MIN = 15;
+/** How long an emailed sign-in link works (plan 03 P6: 15 minutes). Shown in the UI copy. */
+export const MAGIC_LINK_TTL_MIN = 15;
+const TTL_MIN = MAGIC_LINK_TTL_MIN;
 
 const TYPO_DOMAINS: Record<string, string> = { 'gmial.com': 'gmail.com', 'gmai.com': 'gmail.com', 'gmail.co': 'gmail.com', 'hotmial.com': 'hotmail.com', 'yaho.com': 'yahoo.com', 'outlok.com': 'outlook.com', 'icloud.co': 'icloud.com' };
 
@@ -63,6 +65,32 @@ export async function previewMagicLink(token: string): Promise<MagicLinkPreview>
   if (m.consumed_at) return { status: 'used', email: m.email };
   if (new Date(m.expires_at as string) < new Date()) return { status: 'expired', email: m.email };
   return { status: 'ok', email: m.email, purpose: m.purpose };
+}
+
+/** "a•••@domain.com": shows whose link it was without printing the whole address on a shareable page. */
+export function maskEmail(email: string): string {
+  const [local = '', domain = ''] = email.split('@');
+  return `${local.slice(0, 1)}•••@${domain}`;
+}
+
+/**
+ * One-tap resend from an expired (or already used) link (plan 03 P6 edge: "Link expired (15 min) → a one-tap
+ * resend"). A fresh link goes to the same address with the same purpose, saved preview and destination, so the
+ * visitor doesn't retype anything; the normal per-address and per-IP limits apply. The address itself is never
+ * returned (only masked): the old token proves nothing about who holds it now.
+ */
+export async function resendMagicLink(token: string, ip: string | null): Promise<{ sent: true; to: string }> {
+  const [m] = await globalTx((tx) => tx`select email, purpose, provisional_workspace_id, redirect_to, expires_at, consumed_at from magic_links where token_hash = ${hash(token)}`);
+  if (!m) throw new DomainError('NOT_FOUND', 'This link isn’t valid. Request a new one from the sign-in page.');
+  if (!m.consumed_at && new Date(m.expires_at as string) > new Date()) throw new DomainError('CONFLICT', 'This link still works — use it to sign in.');
+  await requestMagicLink({
+    email: m.email as string,
+    purpose: m.purpose as 'login' | 'claim' | 'resume' | 'step_up',
+    provisionalWorkspaceId: (m.provisional_workspace_id as string) ?? null,
+    redirectTo: (m.redirect_to as string) ?? null,
+    ip,
+  });
+  return { sent: true, to: maskEmail(m.email as string) };
 }
 
 /** POST handler: consume once, create/verify user, create session. A refused link is recorded as a failed sign-in. */

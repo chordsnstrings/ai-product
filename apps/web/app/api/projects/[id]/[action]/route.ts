@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, cancelProduction, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -16,6 +16,9 @@ import { projectAccess } from '@/lib/tenant';
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
+ *   photos    – add photos to this product (multipart `photos`): resumes an analysis waiting for them (the URL
+ *               failed, §13), or adds side/back reference views to an analysed one (P4)
+ *   confirm   – "Looks right" on the confirmation screen (P4): the shown facts become merchant-confirmed
  *   fact-accept-source – use the store's newer value instead of the merchant's earlier correction (§28, §42)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
  *   watched   – the finished ad was played (P10 "Watch", standard §7); recorded once per project
@@ -61,6 +64,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       await withTenant(a.ctx.workspaceId, (tx) => decideFact(tx, a.ctx, p!.sku_id as string, f.key, f.key === 'price' ? { number: num } : { text: f.value }));
       return json({ ok: true });
     }
+    case 'confirm': {
+      const { factIds } = await body(req, z.object({ factIds: z.array(z.string().uuid()).max(50) }));
+      const confirmed = await withTenant(a.ctx.workspaceId, async (tx) => {
+        const [p] = await tx`select sku_id from projects where id = ${id}`;
+        return confirmFacts(tx, a.ctx, p!.sku_id as string, factIds);
+      });
+      return json({ ok: true, confirmed: confirmed.length });
+    }
     case 'fact-accept-source': {
       const f = await body(req, z.object({ factId: z.string().uuid() }));
       const [p] = await withTenant(a.ctx.workspaceId, (tx) => tx`select sku_id from projects where id = ${id}`);
@@ -93,6 +104,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const { assetId, seconds } = await body(req, z.object({ assetId: z.string().uuid(), seconds: z.number().min(0).max(3600) }));
       const recorded = await withTenant(a.ctx.workspaceId, (tx) => recordAssetWatched(tx, a.ctx, id, assetId, seconds));
       return json({ ok: true, recorded });
+    }
+    case 'photos': {
+      const form = await req.formData().catch(() => null);
+      const files = (form?.getAll('photos') ?? []).filter((f): f is File => f instanceof File && f.size > 0);
+      if (files.length > MAX_ADDED_PHOTOS) throw new DomainError('INVALID', `Add up to ${MAX_ADDED_PHOTOS} photos at a time.`);
+      const photos = await Promise.all(files.map(async (f) => ({ bytes: Buffer.from(await f.arrayBuffer()), filename: f.name })));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => addProductPhotos(tx, a.ctx, id, photos));
+      return json({ ok: true, ...r }, r.mode === 'resumed' ? 202 : 200);
     }
     case 'retry-analysis': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));

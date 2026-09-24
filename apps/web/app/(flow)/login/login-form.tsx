@@ -5,7 +5,7 @@ import { startAuthentication } from '@simplewebauthn/browser';
 import { Banner, Button } from '@arkiv/ui';
 import { api } from '@arkiv/ui/client';
 
-export function LoginForm({ next, error, google, apple }: { next: string | null; error: string | null; google: boolean; apple: boolean }) {
+export function LoginForm({ next, error, google, apple, ttlMinutes }: { next: string | null; error: string | null; google: boolean; apple: boolean; ttlMinutes: number }) {
   const [email, setEmail] = useState('');
   const [sent, setSent] = useState(false);
   const [err, setErr] = useState<string | null>(error);
@@ -42,7 +42,7 @@ export function LoginForm({ next, error, google, apple }: { next: string | null;
   if (sent)
     return (
       <div className="ak-stack" style={{ marginTop: 24 }}>
-        <p>Check <strong>{email}</strong>. The link works once and expires in 20 minutes.</p>
+        <p>Check <strong>{email}</strong>. The link works once and expires in {ttlMinutes} minutes.</p>
         {suggestion ? <p className="ak-small ak-muted">Did you mean {suggestion}?</p> : null}
         <button className="ak-textbtn" onClick={() => setSent(false)}>Use a different email</button>
       </div>

@@ -18,9 +18,11 @@ interface LayoutProps {
   footer?: ReactNode;
   /** Support address (platform setting, plan 05 §20); omitted when unset. */
   support?: string | null;
+  /** Marketing stream only: the visible unsubscribe link (plan 04 L20, plan 05 §18). */
+  unsubscribe?: string | null;
 }
 
-function Layout({ preview, label, children, footer, support }: LayoutProps) {
+function Layout({ preview, label, children, footer, support, unsubscribe }: LayoutProps) {
   return (
     <Html lang="en">
       <Head />
@@ -35,6 +37,11 @@ function Layout({ preview, label, children, footer, support }: LayoutProps) {
             {footer ?? 'Arkiv · Creative testing for skincare brands.'}
             {support ? <> Questions? Write to {support}.</> : null}
           </Text>
+          {unsubscribe ? (
+            <Text style={{ fontSize: 12, color: C.stone, lineHeight: '18px', margin: '8px 0 0' }}>
+              Don’t want these emails? <a href={unsubscribe} style={{ color: C.stone }}>Unsubscribe</a>.
+            </Text>
+          ) : null}
         </Container>
       </Body>
     </Html>
@@ -98,13 +105,25 @@ export type TemplateName = keyof TemplateMap;
 
 type Built = { subject: string; element: ReactNode; stream: 'transactional' | 'marketing' };
 
+/** Templates on the marketing stream (List-Unsubscribe header, visible unsubscribe link, frequency cap). */
+export const MARKETING_TEMPLATES: ReadonlySet<TemplateName> = new Set(['storyboard_saved', 'new_concept']);
+
 export interface BuildOptions {
   /** Footer support address (platform setting `support.email`). */
   supportEmail?: string | null;
+  /** The recipient's signed unsubscribe link; shown on marketing-stream emails only. */
+  unsubscribeUrl?: string | null;
 }
 
 export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: BuildOptions = {}): Built {
-  const L = (p: Omit<LayoutProps, 'support'>) => <Layout {...p} support={opts.supportEmail ?? null} />;
+  const built = buildTemplate(name, d, opts);
+  // The unsubscribe link is decided before the template runs, so the stream list must agree with the template.
+  if ((built.stream === 'marketing') !== MARKETING_TEMPLATES.has(name)) throw new Error(`${name}: stream ${built.stream} disagrees with MARKETING_TEMPLATES`);
+  return built;
+}
+
+function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts: BuildOptions): Built {
+  const L = (p: Omit<LayoutProps, 'support' | 'unsubscribe'>) => <Layout {...p} support={opts.supportEmail ?? null} unsubscribe={MARKETING_TEMPLATES.has(name) ? (opts.unsubscribeUrl ?? null) : null} />;
   const x = d as never as Record<string, unknown> & TemplateMap[TemplateName];
   switch (name) {
     case 'magic_link': {

@@ -77,7 +77,10 @@ export const MeasurementContext = [
   'TIKTOK_PAID_ATTRIBUTED',
   'TIKTOK_GMV_MAX_TOTAL',
   'SHOPIFY_BLENDED_ORDER',
-  'MERCHANT_IMPORTED',
+  // CSV exports the merchant uploads, one context per platform (§48: platform observations are never averaged into
+  // one result). Rows imported before the split carry the legacy 'MERCHANT_IMPORTED'.
+  'MERCHANT_IMPORTED_META',
+  'MERCHANT_IMPORTED_TIKTOK',
 ] as const; // §30
 export type MeasurementContext = (typeof MeasurementContext)[number];
 
@@ -87,8 +90,21 @@ export const MeasurementContextLabel: Record<MeasurementContext, string> = {
   TIKTOK_PAID_ATTRIBUTED: 'TikTok · paid (attributed)',
   TIKTOK_GMV_MAX_TOTAL: 'TikTok GMV Max · total (includes organic + affiliate)',
   SHOPIFY_BLENDED_ORDER: 'Shopify · blended orders',
-  MERCHANT_IMPORTED: 'Imported by you (CSV)',
+  MERCHANT_IMPORTED_META: 'Meta · imported by you (CSV)',
+  MERCHANT_IMPORTED_TIKTOK: 'TikTok · imported by you (CSV)',
 };
+
+/** Ad platforms a merchant can import a CSV export from. */
+export const CSV_PLATFORMS = ['meta', 'tiktok'] as const;
+export type CsvPlatform = (typeof CSV_PLATFORMS)[number];
+export const csvContext = (platform: CsvPlatform): MeasurementContext => (platform === 'tiktok' ? 'MERCHANT_IMPORTED_TIKTOK' : 'MERCHANT_IMPORTED_META');
+
+/** The platform a context's numbers come from; 'blended' spans platforms (Shopify orders, legacy CSV imports). */
+export function measurementContextPlatform(context: string): 'meta' | 'tiktok' | 'blended' {
+  if (context.startsWith('META_') || context === 'MERCHANT_IMPORTED_META') return 'meta';
+  if (context.startsWith('TIKTOK_') || context === 'MERCHANT_IMPORTED_TIKTOK') return 'tiktok';
+  return 'blended';
+}
 
 /** Scope caveats that must travel with a context wherever its numbers are shown (§45). */
 export const MeasurementContextCaveat: Partial<Record<MeasurementContext, string>> = {
@@ -97,6 +113,7 @@ export const MeasurementContextCaveat: Partial<Record<MeasurementContext, string
 };
 
 export function measurementContextLabel(context: string): string {
+  if (context === 'MERCHANT_IMPORTED') return 'Imported by you (CSV, before per-platform imports)';
   return (MeasurementContextLabel as Record<string, string>)[context] ?? context.replace(/_/g, ' ').toLowerCase();
 }
 

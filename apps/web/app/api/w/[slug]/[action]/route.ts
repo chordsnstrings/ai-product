@@ -2,6 +2,9 @@ import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
 import {
   acceptSourceFact,
+  idempotent,
+  renderQuote,
+  confirmFacts,
   approveClaim,
   approveExperiment,
   assertCan,
@@ -39,7 +42,7 @@ import {
 } from '@arkiv/core';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { DomainError, env, PLANS, type PlanCode } from '@arkiv/shared';
+import { CSV_PLATFORMS, DomainError, env, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, json, route } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
@@ -66,7 +69,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         assertCan(ctx, 'integration.manage');
         if (!(file instanceof File)) throw new DomainError('INVALID', 'Choose a CSV file');
         if (file.size > 10 * 1024 * 1024) throw new DomainError('INVALID', 'CSV must be under 10 MB');
-        const rows = parsePerformanceCsv(await file.text());
+        // Which Ads Manager the export is from: each platform's rows are measured (and learned from) separately.
+        const platform = z.enum(CSV_PLATFORMS, { error: 'Choose whether this export is from Meta or TikTok.' }).parse(form.get('platform'));
+        const rows = parsePerformanceCsv(await file.text(), platform);
         if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
         const r = await t((tx) => ingestObservations(tx, ctx, null, rows));
         return json({ ok: true, ...r });
@@ -126,11 +131,20 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       return json({ ok: true });
     }
     /* ── Studio ── */
-    case 'experiment-approve': {
+    case 'render-estimate': {
+      // §38 POST /experiments/:id/render-estimate: cost at today's rates + whether it would be authorised, no reservation.
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
+      return json({ ok: true, ...(await t((tx) => renderQuote(tx, ctx, experimentId))) });
+    }
+    case 'experiment-approve': {
+      // §38 "render endpoint requires cost authorization and idempotency key": a live quote from render-estimate and
+      // an Idempotency-Key; a retried request with the same key returns the first answer.
+      const i = await body(req, z.object({ experimentId: uuid, quoteId: uuid, idempotencyKey: z.string().min(8).max(100).optional() }));
+      const key = req.headers.get('idempotency-key') ?? i.idempotencyKey;
+      if (!key || key.length < 8 || key.length > 100) throw new DomainError('INVALID', 'An Idempotency-Key is required to approve production.');
       assertCan(ctx, 'spend.creative_test');
-      await t((tx) => approveExperiment(tx, ctx, experimentId));
-      return json({ ok: true });
+      const r = await t((tx) => idempotent(tx, ctx.workspaceId, 'experiment-approve', key, { experimentId: i.experimentId, quoteId: i.quoteId }, () => approveExperiment(tx, ctx, i.experimentId, { quoteId: i.quoteId })));
+      return json({ ok: true, replayed: r.replayed, ...r.result });
     }
     case 'experiment-archive': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
@@ -162,6 +176,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const n = i.key.includes('price') ? Number(i.value.replace(/[^0-9.]/g, '')) : null;
       await t((tx) => decideFact(tx, ctx, i.skuId, i.key, n != null && n > 0 ? { number: n } : { text: i.value }));
       return json({ ok: true });
+    }
+    case 'fact-confirm': {
+      const i = await body(req, z.object({ skuId: uuid, factIds: z.array(uuid).min(1).max(50) }));
+      return json({ ok: true, confirmed: (await t((tx) => confirmFacts(tx, ctx, i.skuId, i.factIds))).length });
     }
     case 'asset-delete': {
       const i = await body(req, z.object({ assetId: uuid }));

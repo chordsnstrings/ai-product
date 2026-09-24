@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool } from '@arkiv/db';
 import { truncateAll } from '@arkiv/db/testing';
 import { devOutbox } from '@arkiv/email';
-import { consumeMagicLink, emailSuggestion, previewMagicLink, requestMagicLink } from './magic-link';
+import { consumeMagicLink, emailSuggestion, MAGIC_LINK_TTL_MIN, previewMagicLink, requestMagicLink, resendMagicLink } from './magic-link';
 import { getSession, listSessions, revokeAllSessions } from './sessions';
 import { base32Encode, createStaff, getStaffSession, staffLogin, totp, verifyTotp } from './staff';
 
@@ -48,6 +48,29 @@ describe('magic links (plan 03 Part C)', () => {
     await revokeAllSessions(a.userId, sa!.sessionId);
     expect(await getSession(b.token)).toBeNull();
     expect(await getSession(a.token)).not.toBeNull();
+  });
+
+  it('resends an expired link in one tap with the same purpose, saved preview and destination', async () => {
+    const [ws] = await ownerPool()`insert into workspaces (slug, name, state) values ('prov-resend', 'Your brand', 'PROVISIONAL') returning id`;
+    await requestMagicLink({ email: 'late@glowlab.com', purpose: 'claim', provisionalWorkspaceId: ws!.id as string, redirectTo: '/start/abc' });
+    const old = lastToken();
+    await expect(resendMagicLink(old, null)).rejects.toMatchObject({ code: 'CONFLICT' }); // still valid: use it
+    await ownerPool()`update magic_links set expires_at = now() - interval '1 minute'`;
+    expect((await previewMagicLink(old)).status).toBe('expired');
+
+    expect(await resendMagicLink(old, '1.2.3.4')).toEqual({ sent: true, to: 'l•••@glowlab.com' });
+    const fresh = lastToken();
+    expect(fresh).not.toBe(old);
+    expect(devOutbox.at(-1)!.to).toBe('late@glowlab.com');
+    const r = await consumeMagicLink(fresh, {});
+    expect(r).toMatchObject({ email: 'late@glowlab.com', purpose: 'claim', provisionalWorkspaceId: ws!.id, redirectTo: '/start/abc' });
+    const [ttl] = await ownerPool()`select round(extract(epoch from expires_at - created_at) / 60)::int as m from magic_links order by created_at desc limit 1`;
+    expect(ttl!.m).toBe(MAGIC_LINK_TTL_MIN);
+
+    await expect(resendMagicLink('not-a-real-token-at-all', null)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    // The per-address limit still applies to resends.
+    for (let i = 0; i < 3; i++) await resendMagicLink(old, null);
+    await expect(resendMagicLink(old, null)).rejects.toMatchObject({ code: 'RATE_LIMITED' });
   });
 
   it('locked users cannot sign in', async () => {

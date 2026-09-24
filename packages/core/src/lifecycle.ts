@@ -98,7 +98,7 @@ export async function cancelDeletion(tx: Tx, ctx: TenantContext) {
   return restoreFromScheduledPurge(tx, ctx, 'owner cancelled deletion');
 }
 
-const PURGE_ORDER = ['sku_reviews', 'scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'sku_variants', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes', 'compliance_reviews'];
+const PURGE_ORDER = ['render_quotes', 'sku_reviews', 'scene_versions', 'scenes', 'storyboards', 'concepts', 'progress_steps', 'provider_jobs', 'cost_authorizations', 'variants', 'experiment_results', 'creator_packs', 'recommendations', 'learnings', 'confounders', 'performance_observations', 'creatives', 'projects', 'sku_variants', 'experiments', 'customer_themes', 'customer_signals', 'claim_evidence', 'claims', 'visual_fingerprints', 'product_facts', 'assets', 'uploads', 'skus', 'brand_brain_versions', 'brands', 'integration_rate_limits', 'integrations', 'invites', 'ownership_transfers', 'memberships', 'offers', 'refunds', 'stripe_disputes', 'stripe_invoices', 'purchases', 'subscriptions', 'outbox', 'held_jobs', 'idempotency_keys', 'workspace_leases', 'risk_flags', 'workspace_notices', 'break_glass_sessions', 'tenant_notes', 'compliance_reviews'];
 
 /**
  * Purge (system job): delete tenant rows and every object version; keep financial/audit records (ledger,
@@ -115,6 +115,14 @@ export async function purgeWorkspace(workspaceId: string, opts: { stripeSubscrip
     await tx`delete from shopify_shops where workspace_id = ${workspaceId}`;
     // Golden cases built (with consent) from this tenant's production output go with the tenant.
     await tx`delete from golden_cases where source_workspace_id = ${workspaceId}`;
+    // Objects another workspace still references under this prefix (a saved preview whose copy was cut short) are
+    // copied to their owner's prefix first; the filter is the storage prefix, the write the owner's own row.
+    const strays = await tx`select id, workspace_id, storage_key, mime from assets where workspace_id <> ${workspaceId} and storage_key like ${`t/${workspaceId}/%`}`;
+    for (const a of strays) {
+      const key = (a.storage_key as string).replace(`t/${workspaceId}/`, `t/${a.workspace_id as string}/`);
+      await storage().put(key, await storage().get(a.storage_key as string), a.mime as string);
+      await tx`update assets set storage_key = ${key} where id = ${a.id} and workspace_id = ${a.workspace_id}`;
+    }
     const objects = await storage().deletePrefix(`t/${workspaceId}/`).catch((e) => {
       undeletable.push(`storage: ${(e as Error).message}`);
       return 0;
@@ -296,8 +304,11 @@ export async function computeRisk(tx: Tx, workspaceId: string): Promise<RiskSign
   if (act?.last && Date.now() - new Date(act.last as string).getTime() > 7 * DAY) out.push({ indicator: 'idle_7d', evidence: { lastActivity: act.last } });
 
   const [pne] = await tx`select count(*)::int as n, min(p.updated_at) as since from projects p
-                         where p.workspace_id = ${ws} and p.state = 'COMPLETE' and p.kind in ('taste','standalone')
-                           and not exists (select 1 from events e where e.workspace_id = ${ws} and e.type = 'ASSET_EXPORTED' and e.subject_id = p.id)`;
+                         where p.workspace_id = ${ws} and p.state = 'COMPLETE' and p.kind in ('taste','standalone','creative_test')
+                           and not exists (select 1 from events e left join assets a on a.workspace_id = e.workspace_id and a.id = e.subject_id
+                                           where e.workspace_id = ${ws} and e.type = 'ASSET_EXPORTED'
+                                             -- The export event names its project; events from before it did resolve through the asset.
+                                             and coalesce(e.payload->>'projectId', a.lineage->>'projectId') = p.id::text)`;
   if (pne!.n > 0) out.push({ indicator: 'paid_no_export', evidence: { projects: pne!.n, since: pne!.since } });
 
   const [qa] = await tx`select count(*)::int as n, max(at) as last from events where workspace_id = ${ws} and type = 'QA_FAILED' and at > now() - interval '30 days'`;

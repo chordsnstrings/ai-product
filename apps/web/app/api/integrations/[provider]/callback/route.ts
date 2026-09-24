@@ -35,7 +35,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
     // Connect every readable account (read-only scope); each syncs independently.
     for (const a of r.accounts.slice(0, 10)) {
       await withTenant(ctx.workspaceId, (tx) =>
-        saveIntegration(tx, ctx, { provider: provider as 'meta' | 'tiktok', externalAccountId: a.id, displayName: a.name, token: r.accessToken, scopes: ['ads_read'], currency: a.currency, timezone: a.timezone }),
+        saveIntegration(tx, ctx, { provider: provider as 'meta' | 'tiktok', externalAccountId: a.id, displayName: a.name, token: r.accessToken, scopes: ['ads_read'], currency: a.currency, timezone: a.timezone, platformUserId: r.platformUserId }),
       );
     }
     return back(st.slug!, `${provider === 'meta' ? 'Meta' : 'TikTok'} connected (${r.accounts.length} account${r.accounts.length > 1 ? 's' : ''}). First sync running.`);
