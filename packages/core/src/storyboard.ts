@@ -170,9 +170,11 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
       await transition(tx, ctx, projectId, 'STORYBOARD_READY');
       await settle(tx, ctx, auth.authorizationId, 'consumed');
       // Standard §5: the 60-minute Taste window starts only now.
-      await issueTasteOffer(tx, ctx, projectId);
+      const quote = await issueTasteOffer(tx, ctx, projectId);
       await emit(tx, ctx, 'STORYBOARD_READY', { type: 'project', id: projectId }, { storyboardId });
-      await recordFunnel('STORYBOARD_READY', { workspaceId: ws, visitorId: await projectVisitor(tx, ws, projectId) }, tx);
+      // The offer this storyboard is priced with (definition · experiment variant): the funnel's offer slice (plan 05 §4).
+      const [offer] = quote.offerId ? await tx`select variant from offers where id = ${quote.offerId} and workspace_id = ${ws}` : [];
+      await recordFunnel('STORYBOARD_READY', { workspaceId: ws, visitorId: await projectVisitor(tx, ws, projectId), props: { offer: quote.definitionCode ?? (quote.kind === 'taste' ? 'taste' : 'standalone'), offerVariant: (offer?.variant as string) ?? null } }, tx);
     });
   } catch (e) {
     await withTenant(ws, async (tx) => {

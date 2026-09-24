@@ -9,7 +9,7 @@ import type { TenantContext } from './context';
 import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
 import { CONCEPTS_MAX_TOKENS, generateConcepts } from './creative-director';
 import { emit } from './events';
-import { recordFunnel } from './funnel';
+import { recordFunnel, uploadFailureCategory } from './funnel';
 import { fetchImage, importProductUrl, type ExtractedProduct } from './ingest';
 import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
@@ -116,7 +116,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       // Blocked/JS-only pages fall back to photos without losing the URL (§42, plan 03 P2).
       await withTenant(ws, async (tx) => {
         await step(tx, ws, skuId, 'read_page', 'failed', e instanceof DomainError ? e.message : 'We couldn’t read that page');
-        await recordFunnel('URL_PARSE_FAILED', { workspaceId: ws, props: { reason: (e as Error).message } }, tx);
+        await recordFunnel('URL_PARSE_FAILED', { workspaceId: ws, props: { reason: (e as Error).message, category: uploadFailureCategory(e) } }, tx);
       });
     }
   }

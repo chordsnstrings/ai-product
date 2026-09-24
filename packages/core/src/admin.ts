@@ -66,6 +66,8 @@ const P = {
   'integrations.manage': ['SUPER_ADMIN', 'OPS'],
   'retention.read': ['SUPER_ADMIN', 'OPS', 'SUPPORT'],
   'growth.manage': ['SUPER_ADMIN', 'GROWTH'],
+  // Ad spend import for CAC (plan 05 §4): GROWTH runs acquisition, FINANCE owns the numbers.
+  'adspend.manage': ['SUPER_ADMIN', 'GROWTH', 'FINANCE'],
   'offers.manage': ['SUPER_ADMIN', 'GROWTH', 'FINANCE'],
   'email.read': ['SUPER_ADMIN', 'GROWTH', 'ENGINEERING', 'SUPPORT'],
   'email.manage': ['SUPER_ADMIN', 'GROWTH', 'SUPPORT'],

@@ -82,6 +82,8 @@ export const EventType = [
   'LP_VIEWED',
   'UPLOAD_STARTED',
   'UPLOAD_COMPLETED',
+  // An upload attempt refused before a preview started (plan 05 §4 drop-off drilldown: file too big, unsupported page…).
+  'UPLOAD_FAILED',
   'URL_PARSE_FAILED',
   'SKU_VALIDATED',
   'SKU_REJECTED',

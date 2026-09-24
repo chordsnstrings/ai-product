@@ -41,6 +41,11 @@ export async function clearProvisionalCookie() {
 }
 
 /** First-party random visitor id for server-side funnel events (no fingerprinting). */
+/** Whether this browser already carried our visitor cookie before this request (a returning visitor). */
+export async function hasVisitorCookie(): Promise<boolean> {
+  return !!(await cookies()).get(VISITOR_COOKIE)?.value;
+}
+
 export async function visitorId(): Promise<string> {
   const c = await cookies();
   const v = c.get(VISITOR_COOKIE)?.value;

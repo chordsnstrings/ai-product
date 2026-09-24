@@ -27,6 +27,8 @@ import {
   staffTenantCtx,
   evalDatasetFor,
   GOLDEN,
+  importAdSpend,
+  parseAdSpendCsv,
   normalizeAllowKey,
   QA_VERDICT_KEY,
   Queues,
@@ -606,6 +608,22 @@ export const ACTIONS = {
   }),
   'lp.status': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), status: z.enum(['draft', 'live', 'paused']) }), run: (s, i) => withAdmin(async (tx) => { if (i.slug === 'default' && i.status !== 'live') throw new DomainError('CONFLICT', 'The default page must stay live (paused pages redirect to it).'); const [b] = await tx`select status from landing_pages where slug = ${i.slug} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Page not found'); await tx`update landing_pages set status = ${i.status}, published_at = case when ${i.status} = 'live' then now() else published_at end where slug = ${i.slug}`; await audit(tx, s, 'lp.status', { type: 'landing_page', id: i.slug }, { before: { status: b.status }, after: { status: i.status } }); }) }),
   'lp.rollback': a({ perm: 'growth.manage', schema: z.object({ slug: z.string(), version: z.number().int() }), run: (s, i) => withAdmin(async (tx) => { const [p] = await tx`select history, content, version from landing_pages where slug = ${i.slug} for update`; const h = (p?.history as { version: number; content: unknown; variants: unknown }[]) ?? []; const v = h.find((x) => x.version === i.version); if (!v) throw new DomainError('NOT_FOUND', 'Version not found'); await tx`update landing_pages set content = ${tx.json(v.content as never)}, variants = ${tx.json(v.variants as never)}, version = version + 1, history = history || ${tx.json([{ version: p!.version, content: p!.content, at: new Date().toISOString(), by: s.email }] as never)} where slug = ${i.slug}`; await audit(tx, s, 'lp.rollback', { type: 'landing_page', id: i.slug }, { after: { toVersion: i.version } }); }) }),
+  /* §4 CAC: ad spend imported as CSV in V1 (date, source, campaign, ad id, spend in USD). */
+  'adspend.import': a({
+    perm: 'adspend.manage',
+    schema: z.object({ csv: z.string().min(10).max(2_000_000), source: z.string().trim().max(40).optional(), reason: z.string().max(200).optional() }),
+    run: async (s, i) => {
+      const rows = parseAdSpendCsv(i.csv, i.source || null);
+      const batchId = newId();
+      return withAdmin(async (tx) => {
+        const n = await importAdSpend(tx, rows, { staffId: s.staffId, batchId });
+        const total = rows.reduce((t, r) => t + r.spendMicros, 0);
+        const dates = rows.map((r) => r.date).sort();
+        await audit(tx, s, 'adspend.import', { type: 'ad_spend_batch', id: batchId }, { reason: i.reason ?? null, after: { rows: rows.length, stored: n, totalMicros: total, from: dates[0], to: dates.at(-1) } });
+        return { message: `Imported ${rows.length} rows (${dates[0]} → ${dates.at(-1)}), $${(total / 1e6).toLocaleString('en-US', { maximumFractionDigits: 2 })} in total.` };
+      });
+    },
+  }),
   'offer.create': a({
     perm: 'offers.manage',
     schema: z.object({

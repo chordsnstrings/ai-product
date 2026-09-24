@@ -1,11 +1,11 @@
 import { headers } from 'next/headers';
 import { globalTx, withSystem } from '@arkiv/db';
-import { env } from '@arkiv/shared';
-import { assignVariantOrNull, recordFunnel } from '@arkiv/core';
+import { env, geoFromHeaders } from '@arkiv/shared';
+import { assignVariantOrNull, deviceClass, recordFunnel } from '@arkiv/core';
 import { StickyCta } from '@arkiv/ui/client';
 import { MarketingShell } from '@/components/marketing';
 import { UploadModule } from '@/components/upload-module';
-import { currentUser, visitorId } from '@/lib/session';
+import { currentUser, hasVisitorCookie, visitorId } from '@/lib/session';
 
 interface LandingContent {
   label: string;
@@ -30,13 +30,26 @@ export async function Landing({ slug, searchParams }: { slug: string; searchPara
     const [p] = await tx`select slug, content, variants from landing_pages where slug = ${slug} and status = 'live'`;
     return p ?? (await tx`select slug, content, variants from landing_pages where slug = 'default'`)[0];
   });
+  // A visitor who already carries our first-party cookie has been here before (plan 05 §4 "new vs returning").
+  const returning = await hasVisitorCookie();
   const vid = await visitorId();
   const variants = (page?.variants as { key: string; weight: number; content: Partial<LandingContent> }[]) ?? [];
   const variant = page ? assignVariantOrNull(`lp:${page.slug}`, vid, variants) : null;
   const content: LandingContent = { ...(page?.content as LandingContent), ...(variants.find((v) => v.key === variant)?.content ?? {}) };
   const user = await currentUser();
-  const ua = (await headers()).get('user-agent') ?? '';
-  await recordFunnel('LP_VIEWED', { visitorId: vid, page: page?.slug as string, variant, utm, props: { inApp: /Instagram|FBAN|FBAV|TikTok|musical_ly|BytedanceWebview/i.test(ua) } }).catch(() => {});
+  const h = await headers();
+  const ua = h.get('user-agent') ?? '';
+  const geo = geoFromHeaders(h);
+  // Slices for plan 05 §4: device class, edge country/region, new vs returning, and the ad (creative) id the
+  // campaign passes (ad_id, or the utm_id macro).
+  const adId = String(searchParams.ad_id ?? searchParams.utm_id ?? '').slice(0, 64) || null;
+  await recordFunnel('LP_VIEWED', {
+    visitorId: vid,
+    page: page?.slug as string,
+    variant,
+    utm,
+    props: { inApp: /Instagram|FBAN|FBAV|TikTok|musical_ly|BytedanceWebview/i.test(ua), device: deviceClass(ua), country: geo?.country ?? null, region: geo?.region ?? null, returning, adId },
+  }).catch(() => {});
   // Cross-tenant aggregate (a count only, no tenant data) → system role.
   const stats = await withSystem((tx) => tx`select (select count(*) from events where type = 'CLAIM_CREATED' and at > now() - interval '7 days')::int as claims`).catch(() => [{ claims: 0 }]);
   const claimsChecked = Number(stats[0]?.claims ?? 0);

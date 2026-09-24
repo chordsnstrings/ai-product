@@ -406,3 +406,17 @@ describe('users module actions (plan 05 §3)', () => {
     await expect(act(sup, 'user.send_login_link', { userId: u!.id, reason: 'locked user' })).rejects.toThrow(/locked/);
   });
 });
+
+describe('ad spend import (plan 05 §4 CAC)', () => {
+  it('GROWTH and FINANCE import a CSV; a re-import of the same day replaces it; the import is audited', async () => {
+    expect(() => assertStaff({ roles: ['SUPPORT'] }, ACTIONS['adspend.import'].perm)).toThrow(/role/);
+    const g = await staff(['GROWTH']);
+    const r = await act(g, 'adspend.import', { csv: 'date,campaign,spend\n2026-09-20,texture-launch,84.20\n2026-09-21,texture-launch,10', source: 'meta' });
+    expect(String(r.message)).toMatch(/Imported 2 rows/);
+    await act(await staff(['FINANCE']), 'adspend.import', { csv: 'date,campaign,spend,source\n2026-09-20,texture-launch,90,meta' });
+    const rows = await ownerPool()`select date::text as date, spend_micros from ad_spend order by date`;
+    expect(rows).toEqual([{ date: '2026-09-20', spend_micros: 90_000_000 }, { date: '2026-09-21', spend_micros: 10_000_000 }]);
+    expect(await ownerPool()`select 1 from admin_audit_log where action = 'adspend.import'`).toHaveLength(2);
+    await expect(act(g, 'adspend.import', { csv: 'date,campaign,spend\nnot-a-date,x,1', source: 'meta' })).rejects.toThrow(/Line 2/);
+  });
+});
