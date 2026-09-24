@@ -81,10 +81,15 @@ describe('product variants (§42 "store variant-specific price/media; do not sho
     expect(after[0]).toBe(img.id);
     expect(after[1]).toBe(before[0]);
     // Re-syncing the store keeps the owned image while its source URL is unchanged, and drops it when it changes.
-    await withTenant(t.workspaceId, (tx) => recordVariants(tx, ctx, skuId, 'shopify', SIZES, 'USD'));
-    expect((await withTenant(t.workspaceId, (tx) => listVariants(tx, skuId)))[0]!.imageAssetIds).toEqual([img.id]);
+    await withTenant(t.workspaceId, (tx) => recordVariants(tx, ctx, skuId, 'shopify', [SIZES[0]!, { ...SIZES[1]!, available: true }], 'USD'));
+    const restocked = await withTenant(t.workspaceId, (tx) => listVariants(tx, skuId));
+    expect(restocked[0]!.imageAssetIds).toEqual([img.id]);
+    expect(restocked[1]!.available).toBe(true);
     await withTenant(t.workspaceId, (tx) => recordVariants(tx, ctx, skuId, 'shopify', [{ ...SIZES[0]!, imageUrl: 'https://cdn/30-new.jpg' }], 'USD'));
-    expect((await withTenant(t.workspaceId, (tx) => listVariants(tx, skuId)))[0]!.imageAssetIds).toEqual([]);
+    const resynced = await withTenant(t.workspaceId, (tx) => listVariants(tx, skuId));
+    expect(resynced[0]!.imageAssetIds).toEqual([]);
+    // The 50 ml is no longer listed by the store: kept (ads may exist for it) but unavailable.
+    expect(resynced.map((x) => [x.title, x.available])).toEqual([['30 ml', true], ['50 ml', false]]);
   }, 60_000);
 
   it('a preview with a chosen variant moves into an existing account intact', async () => {

@@ -51,12 +51,17 @@ const rowToVariant = (r: Record<string, unknown>): SkuVariant => ({
   imageAssetIds: (r.image_asset_ids as string[]) ?? [],
 });
 
-/** Upsert a store's variants for a SKU (current catalogue state; the `variants` fact keeps the history). */
+/**
+ * Upsert a store's variants for a SKU (current catalogue state; the `variants` fact keeps the history). A variant
+ * the store no longer lists is kept (an ad may have been made for it) but marked unavailable.
+ */
 export async function recordVariants(tx: Tx, ctx: Pick<TenantContext, 'workspaceId'>, skuId: string, source: 'shopify' | 'json_ld' | 'manual', variants: readonly ExtractedVariant[], currency?: string | null): Promise<number> {
   let n = 0;
+  const seen: string[] = [];
   for (const [i, v] of variants.slice(0, 50).entries()) {
     const externalId = v.externalId ?? v.sku ?? v.title;
     if (!externalId || !v.title) continue;
+    seen.push(externalId);
     const { size, shade } = variantDimensions(v);
     await tx`
       insert into sku_variants (workspace_id, sku_id, source, external_id, title, options, size, shade, price_micros, compare_at_micros,
@@ -71,6 +76,10 @@ export async function recordVariants(tx: Tx, ctx: Pick<TenantContext, 'workspace
         image_asset_ids = case when sku_variants.image_url is distinct from excluded.image_url then '{}' else sku_variants.image_asset_ids end,
         image_url = excluded.image_url`;
     n++;
+  }
+  if (seen.length) {
+    await tx`update sku_variants set available = false
+             where sku_id = ${skuId} and source = ${source} and external_id <> all(${seen}::text[]) and available is distinct from false`;
   }
   return n;
 }
