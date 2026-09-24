@@ -100,6 +100,10 @@ export interface TemplateMap {
   friday_summary: { workspaceName: string; lines: string[]; url: string };
   signal_update: { workspaceName: string; changes: { test: string; from: string; to: string }[]; url: string };
   day30_review: { productName: string; tested: number; actionable: number; url: string };
+  // Standard §48: creator usage rights on footage ended — not used for new ads; history and results are kept.
+  rights_expired: { productName: string; files: number; expiredOn: string; url: string };
+  // Plan 03 P9 edge: a production running past 20 minutes (still working on it; nothing extra to pay).
+  production_delayed: { productName: string; minutes: number; url: string };
   staff_break_glass: { staffName: string; reason: string; when: string; url: string };
   ownership_transfer_confirm: { workspaceName: string; newOwner: string; reason: string; url: string; expiresIn: string };
   intervention: { label: string; headline: string; body: string; cta: string; url: string };
@@ -418,6 +422,34 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
     case 'day30_review': {
       const m = d as TemplateMap['day30_review'];
       return { subject: `${m.productName} · 30-day creative review`, stream: 'transactional', element: (<L preview={`${m.tested} tests, ${m.actionable} actionable learnings`} label="SKU review"><H>Your first 30 days</H><Meta rows={[['Tests run', String(m.tested)], ['Actionable learnings', String(m.actionable)]]} /><Cta href={m.url}>Read the review</Cta></L>) };
+    }
+    case 'rights_expired': {
+      const m = d as TemplateMap['rights_expired'];
+      return {
+        subject: `${m.productName} · creator rights ended on ${m.files} file${m.files === 1 ? '' : 's'}`,
+        stream: 'transactional',
+        element: (
+          <L preview="We won’t use this footage in new ads. Past ads and their results stay in your archive." label="Usage rights">
+            <H>Creator rights have ended</H>
+            <P>The usage rights on {m.files === 1 ? 'one file' : `${m.files} files`} for {m.productName} ended on {m.expiredOn}. We won’t use {m.files === 1 ? 'it' : 'them'} in new ads, and tests that would reuse {m.files === 1 ? 'it' : 'them'} ask for replacement footage first. Ads already made, and what they taught you, stay in your archive.</P>
+            <Cta href={m.url}>Add replacement footage</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'production_delayed': {
+      const m = d as TemplateMap['production_delayed'];
+      return {
+        subject: `Your ${m.productName} ad is taking longer than usual`,
+        stream: 'transactional',
+        element: (
+          <L preview="We’re still working on it. Nothing extra to pay." label="Production">
+            <H>Still working on your ad</H>
+            <P>Your {m.productName} ad has been in production for {m.minutes} minutes, longer than usual. Our team has been alerted and is watching it. You don’t need to do anything, and you won’t be charged more; if we can’t finish it, your credit or payment comes back to you.</P>
+            <Cta href={m.url}>See progress</Cta>
+          </L>
+        ),
+      };
     }
     case 'ownership_transfer_confirm': {
       const m = d as TemplateMap['ownership_transfer_confirm'];

@@ -25,6 +25,7 @@ import {
   retireSupersededRates,
   sweepExpiredAuthorizations,
   sweepExpiringEvidence,
+  sweepExpiredRights,
   sweepLandingGalleryRights,
   sweepOfferGuardrails,
   sweepProvisional,
@@ -237,6 +238,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   'circuit-breaker': { cron: '* * * * *', run: () => withSystem(async (tx) => { const changed = await evaluateCircuits(tx); return changed.length ? changed : 0; }) },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
+  // Standard §48: creator usage rights that ended are reported once (event + email); the files already stay out of
+  // new production (usableAssetIds), their history and results are kept.
+  'asset-rights-expiry': { cron: '10 6 * * *', run: () => withSystem((tx) => sweepExpiredRights(tx)) },
   // Plan 05 §5: an example asset whose rights expire is removed from every landing page's gallery (Pulse alert).
   'landing-gallery-rights': { cron: '12 * * * *', run: () => withSystem(async (tx) => { const changed = await sweepLandingGalleryRights(tx); return changed.length ? changed : 0; }) },
   // Plan 05 §6: a pricing experiment whose guardrail (refund, dispute or support rate) degrades past its threshold stops.

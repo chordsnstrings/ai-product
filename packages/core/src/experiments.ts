@@ -1,4 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
+import { assertAssetUsable, creativeSourceAssets } from './asset-rights';
 import { DomainError, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
@@ -102,6 +103,9 @@ async function insertExperiment(
   input: { skuId: string; proposal: Proposal; projectId: string; recommendationId?: string | null; slot?: 'EXPLOIT' | 'EXPAND' | 'EXPLORE' | null; controlCreativeId?: string | null },
 ) {
   const p = input.proposal;
+  // §48: an ad whose creator rights ended (or that is frozen or held) can't be re-run as a control — the merchant is
+  // told why and offered replacement footage; its past results are untouched.
+  if (input.controlCreativeId) await assertAssetUsable(tx, await creativeSourceAssets(tx, input.controlCreativeId), 'Your current ad');
   const declared = p.primaryVariable;
   const primaryVariable = input.controlCreativeId ? declared : 'hook';
   const controlled = declared === 'hook' || !!input.controlCreativeId;

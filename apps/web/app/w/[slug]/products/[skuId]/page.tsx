@@ -38,7 +38,9 @@ export default async function Product({ params, searchParams }: { params: Promis
     const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
     const assets = await tx`select id, kind, mime, created_at, source, rights_expires_at <= now() as rights_expired, review_status from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
-    const imported = await tx`select id, genome, platform_refs, secondary_sku_ids, created_at, source_deleted_at from creatives where sku_id = ${skuId} and origin = 'imported' order by created_at desc limit 20`;
+    const imported = await tx`select c.id, c.genome, c.platform_refs, c.secondary_sku_ids, c.created_at, c.source_deleted_at,
+                                   exists (select 1 from assets a where a.id = any(c.final_asset_ids) and a.rights_expires_at <= now()) as rights_expired
+                            from creatives c where c.sku_id = ${skuId} and c.origin = 'imported' order by c.created_at desc limit 20`;
     const otherSkus = await tx`select id, name from skus where id <> ${skuId} and status <> 'archived' order by catalogue_no limit 50`;
     return {
       sku,
@@ -213,6 +215,9 @@ export default async function Product({ params, searchParams }: { params: Promis
                 {a.rightsExpired ? <strong> · Rights expired: not used in new ads</strong> : null}
                 {a.reviewStatus === 'pending' ? ' · Waiting for compliance review' : a.reviewStatus === 'rejected' ? ' · Not approved for use' : null}
               </figcaption>
+              {canEdit && a.rightsExpired ? (
+                <ActionForm slug={slug} action="asset-replace" multipart extra={{ assetId: a.id }} submit="Replace footage" fields={[{ name: 'file', label: 'Replacement file', type: 'file', accept: a.kind.includes('footage') || a.kind === 'historical_creative' ? 'video/mp4,video/quicktime' : 'image/*', required: true }]} />
+              ) : null}
               {canEdit && DELETABLE_KINDS.has(a.kind) ? (
                 <ActionButton slug={slug} action="asset-delete" variant="text" danger body={{ assetId: a.id }} confirm="Delete this file? It disappears from Arkiv. Evidence behind an approved claim and delivered ads are kept for our records.">Delete</ActionButton>
               ) : null}
@@ -226,7 +231,7 @@ export default async function Product({ params, searchParams }: { params: Promis
           <div>
             {d.imported.length === 0 ? <p className="ak-muted">Import past ads so recommendations start from what you’ve already tried.</p> : d.imported.map((c) => {
               const g = (c.genome ?? {}) as { angle?: string; hookMechanism?: string; treatment?: string };
-              return <div key={c.id as string} className="ak-index-row"><span>{String((c.platform_refs as { copy?: string }).copy ?? '').slice(0, 90)}</span><span className="ak-index">{g.angle ? `${g.angle} · ${g.hookMechanism}` : 'analysing…'}{c.source_deleted_at ? ' · Deleted on platform' : ''}{(c.secondary_sku_ids as string[] | null)?.length ? ` · also shows ${(c.secondary_sku_ids as string[]).length} other product${(c.secondary_sku_ids as string[]).length === 1 ? '' : 's'}` : ''}{(c.platform_refs as { minorsDeclared?: boolean }).minorsDeclared ? ' · under-18 review' : ''}</span></div>;
+              return <div key={c.id as string} className="ak-index-row"><span>{String((c.platform_refs as { copy?: string }).copy ?? '').slice(0, 90)}</span><span className="ak-index">{g.angle ? `${g.angle} · ${g.hookMechanism}` : 'analysing…'}{c.source_deleted_at ? ' · Deleted on platform' : ''}{(c.secondary_sku_ids as string[] | null)?.length ? ` · also shows ${(c.secondary_sku_ids as string[]).length} other product${(c.secondary_sku_ids as string[]).length === 1 ? '' : 's'}` : ''}{(c.platform_refs as { minorsDeclared?: boolean }).minorsDeclared ? ' · under-18 review' : ''}{c.rights_expired ? ' · Rights expired: results kept, not reused' : ''}</span></div>;
             })}
           </div>
           {canEdit ? (

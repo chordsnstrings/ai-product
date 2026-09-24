@@ -1,8 +1,11 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { closeAll, ownerPool, withSystem, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId } from '@arkiv/shared';
+import { assertAssetUsable, replaceAsset, sweepExpiredRights, unusableAssets } from './asset-rights';
 import { authorize } from './cost-governor';
+import { createExperiment } from './experiments';
+import { mockConcepts } from './mock-intel';
 import { importHistoricalCreative } from './genome';
 import { routedLines } from './model-gateway';
 import { qaScene } from './qa';
@@ -67,5 +70,53 @@ describe('importing a past ad (§48 multiple SKUs; merchant footage with minors)
     expect(await withTenant(t.workspaceId, (tx) => usableAssetIds(tx, [footage.id]))).toEqual([]);
     const [c] = await ownerPool()`select platform_refs from creatives where id = ${id}`;
     expect(c!.platform_refs).toMatchObject({ minorsDeclared: true });
+  });
+});
+
+describe('creator usage rights expire (§48)', () => {
+  async function expiredFootage() {
+    const r = await tenant();
+    const footage = await withTenant(r.t.workspaceId, async (tx) => ingestBytes(tx, r.ctx, await productPhoto(), 'creator_footage', r.skuId));
+    await ownerPool()`update assets set rights_expires_at = now() - interval '1 hour' where id = ${footage.id}`;
+    return { ...r, footageId: footage.id };
+  }
+
+  it('the file is unusable for new work, and reuse is refused with a reason and a replacement offer', async () => {
+    const { t, footageId } = await expiredFootage();
+    expect(await withTenant(t.workspaceId, (tx) => unusableAssets(tx, [footageId]))).toEqual([{ assetId: footageId, reason: 'rights_expired' }]);
+    expect(await withTenant(t.workspaceId, (tx) => usableAssetIds(tx, [footageId]))).toEqual([]);
+    await expect(withTenant(t.workspaceId, (tx) => assertAssetUsable(tx, [footageId]))).rejects.toMatchObject({ code: 'CONFLICT', details: { replaceable: true } });
+  });
+
+  it('an ad made from it can’t be re-run as a control; its history stays', async () => {
+    const { t, ctx, skuId, footageId } = await expiredFootage();
+    const creativeId = await withTenant(t.workspaceId, (tx) => importHistoricalCreative(tx, ctx, { skuId, copy: 'Creator routine ad', assetId: footageId }));
+    const proposal = mockConcepts({ name: 'Glow Serum', category: 'serum', approvedClaims: [], themes: [], testedAngles: [] }).concepts[0]!;
+    await expect(withTenant(t.workspaceId, (tx) => createExperiment(tx, ctx, { skuId, proposal, controlCreativeId: creativeId }))).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/rights have expired/) });
+    expect(await ownerPool()`select 1 from experiments where workspace_id = ${t.workspaceId}`).toHaveLength(0);
+    expect(await ownerPool()`select 1 from creatives where id = ${creativeId}`).toHaveLength(1);
+    // Without the expired control, the same test can be created.
+    await withTenant(t.workspaceId, (tx) => createExperiment(tx, ctx, { skuId, proposal }));
+  });
+
+  it('the daily sweep reports each expiry once (event + one email per product), across workspaces', async () => {
+    const a = await expiredFootage();
+    const b = await expiredFootage();
+    expect(await withSystem((tx) => sweepExpiredRights(tx))).toBe(2);
+    expect(await withSystem((tx) => sweepExpiredRights(tx))).toBe(0);
+    for (const r of [a, b]) {
+      expect(await ownerPool()`select 1 from events where workspace_id = ${r.t.workspaceId} and type = 'ASSET_RIGHTS_EXPIRED' and subject_id = ${r.footageId}`).toHaveLength(1);
+      const mail = await ownerPool()`select payload from outbox where workspace_id = ${r.t.workspaceId} and queue = 'send-email'`;
+      expect(mail.map((m) => m.payload)).toEqual([expect.objectContaining({ template: 'rights_expired', skuId: r.skuId, assetIds: [r.footageId], workspaceId: r.t.workspaceId })]);
+    }
+  });
+
+  it('replacement footage is a new file linked to the one it replaces; the old one is kept', async () => {
+    const { t, ctx, footageId } = await expiredFootage();
+    const r = await withTenant(t.workspaceId, async (tx) => replaceAsset(tx, ctx, footageId, await productPhoto('GLOW SERUM', '#B0907A'), 'new.jpg'));
+    const [n] = await ownerPool()`select kind, lineage, rights_expires_at from assets where id = ${r.assetId}`;
+    expect(n).toMatchObject({ kind: 'creator_footage', lineage: { replaces: footageId }, rights_expires_at: null });
+    expect(await ownerPool()`select 1 from assets where id = ${footageId} and deleted_at is null`).toHaveLength(1);
+    expect(await withTenant(t.workspaceId, (tx) => usableAssetIds(tx, [r.assetId]))).toEqual([r.assetId]);
   });
 });

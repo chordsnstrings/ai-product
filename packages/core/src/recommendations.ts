@@ -428,6 +428,10 @@ export async function refreshProposals(tx: Tx, skuId: string, scored: readonly S
     from experiments e join variants v on v.id = (e.fatigue->>'winnerVariantId')::uuid and v.workspace_id = e.workspace_id
     where e.sku_id = ${skuId} and (e.fatigue->>'fatigued')::boolean is true and e.state not in ('INVALIDATED','ARCHIVED')
       and v.creative_id is not null
+      -- §48: a winner whose files can no longer be used (rights expired or frozen, held, deleted) can't be the control.
+      and not exists (select 1 from creatives c join assets a on a.id = any(c.final_asset_ids) and a.workspace_id = c.workspace_id
+                      where c.id = v.creative_id and (a.rights_expires_at <= now() or a.rights_frozen_at is not null
+                            or a.review_status in ('pending','rejected') or a.deleted_at is not null))
       and not exists (select 1 from recommendations r where r.control_creative_id = v.creative_id and r.status in ('open','accepted')
                         and r.created_at > now() - interval '21 days')
     order by e.created_at desc limit 2`;

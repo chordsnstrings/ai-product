@@ -37,6 +37,7 @@ import {
   proposeClaim,
   Queues,
   removeMember,
+  replaceAsset,
   revokeCreatorPack,
   requestExport,
   saveIntegration,
@@ -56,7 +57,7 @@ import { workspaceBySlug } from '@/lib/tenant';
 
 const uuid = z.string().uuid();
 const PLAN = z.enum(['LAUNCH', 'GROWTH', 'SCALE']);
-const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative']);
+const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative', 'asset-replace']);
 
 /**
  * Workspace-scoped mutations (plan 03 Part B). Every action resolves membership from the session (layer 1),
@@ -108,6 +109,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
           }),
         );
         return json({ ok: true });
+      }
+      case 'asset-replace': {
+        // §48: replacement footage for a file whose creator rights ended; the old file is kept for history.
+        assertCan(ctx, 'sku.edit');
+        const assetId = uuid.parse(form.get('assetId'));
+        if (!(file instanceof File) || !file.size) throw new DomainError('INVALID', 'Choose the replacement file.');
+        const r = await t((tx) => once(tx, { assetId, file: fileIdentity(file) }, async () => replaceAsset(tx, ctx, assetId, Buffer.from(await file.arrayBuffer()), file.name)));
+        return json({ ok: true, ...r });
       }
       case 'import-creative': {
         // A past ad (copy + optional video) → genome extraction (standard §6 cold start).

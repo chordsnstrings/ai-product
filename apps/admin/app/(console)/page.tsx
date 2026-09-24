@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { ACTIVE_PRODUCTION_STATES, costPerUsableExport, firstRenderAcceptance, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
+import { ACTIVE_PRODUCTION_STATES, HEARTBEAT_STALE_SECONDS, costPerUsableExport, firstRenderAcceptance, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
@@ -87,8 +87,11 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       union all select 'Approvals', count(*)::int, min(created_at), '/approvals' from approvals where status = 'pending'
       union all select 'Platform alerts', count(*)::int, min(created_at), '/#alerts' from platform_alerts where resolved_at is null
       union all select 'Stripe reconciliation', count(*)::int, min(created_at), '/billing?tab=recon' from stripe_recon_exceptions where resolved_at is null`;
+    // Plan 06 Phase 0 D8: worker liveness from its heartbeat (not inferred from ledger writes).
+    const [workers] = await tx`select count(*) filter (where last_seen_at > now() - make_interval(secs => ${HEARTBEAT_STALE_SECONDS}))::int as up, max(last_seen_at) as last
+                               from service_heartbeats where service = 'worker'`;
     const alerts = await tx`select id, kind, severity, subject_type, subject_id, message, created_at from platform_alerts where resolved_at is null order by created_at desc limit 50`;
-    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, firstRender, cogs, today, prior, usable, conn, risk, queues, alerts };
+    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, firstRender, cogs, today, prior, usable, conn, risk, queues, alerts, workers };
   });
   const count = (t: string) => Number(m.funnel.find((r) => r.type === t)?.n ?? 0);
   const base = (t: string) => Number(m.funnel.find((r) => r.type === t)?.base ?? 0);
@@ -143,6 +146,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       </Section>
       <Section title="Production">
         <Grid>
+          <Kpi label="Workers alive" value={Number(m.workers?.up ?? 0)} alert={Number(m.workers?.up ?? 0) === 0} alertText="No worker" sub={`last heartbeat ${ago(m.workers?.last as string | null | undefined)}`} href="/system" />
           <Kpi label="Active jobs" value={activeJobs} sub={byState.length ? byState.map(([st, n]) => `${st.toLowerCase().replace(/_/g, ' ')} ${n}`).join(' · ') : 'none in flight'} href="/jobs" />
           <Kpi label="Stuck > 20 min" value={stuck} alert={stuck > 0} alertText="Stuck" href="/jobs?stuck=1" />
           <Kpi label="Oldest queued" value={oldestQueued ? ago(new Date(Date.now() - oldestQueued * 1000)) : '—'} alert={oldestQueued > 600} alertText="Over 10 min" href="/jobs" />

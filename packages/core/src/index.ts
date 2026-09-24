@@ -12,6 +12,7 @@ export * from './leases';
 export * from './allowlist';
 export * from './abuse';
 export * from './rights';
+export * from './asset-rights';
 export * from './integrations-health';
 export * from './retention';
 export * from './status-banner';
