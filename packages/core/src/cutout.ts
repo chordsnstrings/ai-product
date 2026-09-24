@@ -26,7 +26,10 @@ export interface CutoutState {
   keyed: boolean;
   spread: number;
   technique: string | null;
-  /** The route already answered for this photo (successfully or not usable): never paid for again. */
+  /**
+   * The route already answered for this photo (usable or not): never paid for again. A call still in flight
+   * (another storyboard of the same product) counts too, so two storyboards don't both buy one.
+   */
   attempted: boolean;
   /** Staff keep the task routed; without a route there is nothing to call. */
   routed: boolean;
@@ -41,7 +44,8 @@ export async function cutoutState(tx: Tx, skuId: string): Promise<CutoutState | 
   const photo = lineage.from ?? ((fp.reference_asset_ids as string[] | null) ?? [])[0] ?? null;
   const [done] = photo
     ? await tx`select 1 from provider_jobs where task = ${CUTOUT_TASK} and subject_type = 'sku' and subject_id = ${skuId}
-                 and input_refs->>'photoAssetId' = ${photo} and status = 'succeeded' limit 1`
+                 and input_refs->>'photoAssetId' = ${photo}
+                 and (status = 'succeeded' or (status = 'dispatched' and created_at > now() - interval '15 minutes')) limit 1`
     : [];
   const [routed] = await tx`select 1 from model_routes where task = ${CUTOUT_TASK}`;
   return {
@@ -64,7 +68,13 @@ export function wantsSegmentation(s: CutoutState | null): boolean {
 
 const log = logger('cutout');
 
-export type SegmentOutcome = { status: 'skipped' } | { status: 'failed'; error: string } | { status: 'not_aligned'; jobId: string } | { status: 'segmented'; jobId: string; cutoutAssetId: string; version: number };
+export type SegmentOutcome =
+  | { status: 'skipped' }
+  | { status: 'failed'; error: string }
+  | { status: 'not_aligned'; jobId: string }
+  /** The product was re-analysed while the call ran: its new fingerprint has its own cut-out. */
+  | { status: 'superseded'; jobId: string }
+  | { status: 'segmented'; jobId: string; cutoutAssetId: string; version: number };
 
 /**
  * Try the background-removal route for the SKU's cut-out under `token` (whose authorization carries the line).
@@ -73,24 +83,27 @@ export type SegmentOutcome = { status: 'skipped' } | { status: 'failed'; error: 
 export async function segmentCutout(opts: { ctx: TenantContext; token: string; skuId: string }): Promise<SegmentOutcome> {
   const { ctx, token, skuId } = opts;
   const ws = ctx.workspaceId;
+  try {
+    return await segment(ctx, token, skuId);
+  } catch (e) {
+    // Outage, kill switch, budget, provider refusal or storage: the keyed or framed cut-out stays (never blocks).
+    log.warn('background removal failed; keeping the keyed cut-out', { workspaceId: ws, skuId, error: (e as Error).message.slice(0, 200) });
+    return { status: 'failed', error: (e as Error).message };
+  }
+}
+
+async function segment(ctx: TenantContext, token: string, skuId: string): Promise<SegmentOutcome> {
+  const ws = ctx.workspaceId;
   const s = await withTenant(ws, (tx) => cutoutState(tx, skuId));
   if (!wantsSegmentation(s)) return { status: 'skipped' };
   const photoAssetId = s!.photoAssetId!;
   const photo = await withTenant(ws, (tx) => assetBytes(tx, photoAssetId));
-  let r: Awaited<ReturnType<typeof removeBackground>>;
-  try {
-    r = await removeBackground({ ctx, token, task: CUTOUT_TASK, subject: { type: 'sku', id: skuId }, inputRefs: { photoAssetId, cutoutAssetId: s!.cutoutAssetId }, image: photo });
-  } catch (e) {
-    // Outage, kill switch, budget or provider refusal: the keyed or framed cut-out stays (never blocks the work).
-    log.warn('background removal failed; keeping the keyed cut-out', { workspaceId: ws, skuId, error: (e as Error).message.slice(0, 200) });
-    return { status: 'failed', error: (e as Error).message };
-  }
+  const r = await removeBackground({ ctx, token, task: CUTOUT_TASK, subject: { type: 'sku', id: skuId }, inputRefs: { photoAssetId, cutoutAssetId: s!.cutoutAssetId }, image: photo });
   if (!r.aligned) return { status: 'not_aligned', jobId: r.jobId };
   const colors = await dominantColors(r.png);
-  return withTenant(ws, async (tx) => {
+  return withTenant(ws, async (tx): Promise<SegmentOutcome> => {
     const [fp] = await tx`select * from visual_fingerprints where id = ${s!.fingerprintId} and active for update`;
-    // The product was re-analysed meanwhile: its new fingerprint has its own cut-out.
-    if (!fp) return { status: 'not_aligned' as const, jobId: r.jobId };
+    if (!fp) return { status: 'superseded', jobId: r.jobId };
     const c = await saveAsset(tx, ws, {
       bytes: r.png,
       mime: 'image/png',
@@ -106,6 +119,6 @@ export async function segmentCutout(opts: { ctx: TenantContext; token: string; s
              values (${ws}, ${skuId}, ${v!.v}, ${fp.reference_asset_ids}, ${c.id}, ${fp.label_text}, ${fp.brand_text}, ${fp.package_type}, ${fp.closure},
                ${tx.json(colors)}, ${fp.liquid_color}, ${fp.transparency}, ${tx.json(fp.critical_regions as never)}, ${tx.json(fp.thresholds as never)})`;
     await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: true, technique: 'segmentation' }, { providerJobId: r.jobId });
-    return { status: 'segmented' as const, jobId: r.jobId, cutoutAssetId: c.id, version: Number(v!.v) };
+    return { status: 'segmented', jobId: r.jobId, cutoutAssetId: c.id, version: Number(v!.v) };
   });
 }
