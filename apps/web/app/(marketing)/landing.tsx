@@ -6,21 +6,23 @@ import { ExampleAsset, Testimonial } from '@arkiv/ui';
 import { StickyCta } from '@arkiv/ui/client';
 import { LandingBeacon } from '@/components/landing-beacon';
 import { MarketingShell } from '@/components/marketing';
+import { ExampleDemo } from '@/components/example-demo';
 import { HeroCta } from '@/components/hero-cta';
+import { BUILT_IN_EXAMPLES, EXAMPLE_LABEL, exampleFor } from '@/lib/examples';
 import { FIRST_VIEW_COOKIE } from '@/lib/landing-routing';
 import { recordLandingView } from '@/lib/lp-view';
 import { currentUser, hasVisitorCookie, visitorId } from '@/lib/session';
 
 type StoredVariant = { key: string; weight: number; content: unknown };
-type PageRow = { slug: string; content: unknown; variants: unknown; version: unknown } | undefined;
+type PageRow = { slug: string; archetype?: string; content: unknown; variants: unknown; version: unknown } | undefined;
 
 const variantsOf = (page: PageRow) => ((page?.variants as StoredVariant[]) ?? []).map((v) => ({ key: v.key, weight: Number(v.weight), content: landingVariantFrom(v.content) }));
 
 /** The live copy of a page (the default page when it isn't live). */
 async function livePage(slug: string): Promise<PageRow> {
   return globalTx(async (tx) => {
-    const [p] = await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = ${slug} and status = 'live'`;
-    return (p ?? (await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = 'default'`)[0]) as PageRow;
+    const [p] = await tx`select slug, archetype, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = ${slug} and status = 'live'`;
+    return (p ?? (await tx`select slug, archetype, live_content as content, live_variants as variants, live_version as version from landing_pages where slug = 'default'`)[0]) as PageRow;
   });
 }
 
@@ -64,12 +66,12 @@ export async function Landing({ slug, searchParams, preview }: { slug: string; s
   const utmContent = typeof searchParams.utm_content === 'string' ? searchParams.utm_content : null;
   const routed = (await globalTx(async (tx) => {
     if (preview) {
-      const [d] = await tx`select slug, content, variants, version from landing_pages where slug = ${slug}`;
+      const [d] = await tx`select slug, archetype, content, variants, version from landing_pages where slug = ${slug}`;
       if (d) return d;
     }
     // utm_content routing (plan 05 §5): e.g. utm_content=texture* → the texture page.
     if (slug === 'default' && utmContent) {
-      const [m] = await tx`select slug, live_content as content, live_variants as variants, live_version as version from landing_pages where status = 'live'
+      const [m] = await tx`select slug, archetype, live_content as content, live_variants as variants, live_version as version from landing_pages where status = 'live'
                            and exists (select 1 from unnest(utm_match) u where ${utmContent.toLowerCase()} like u || '%') limit 1`;
       if (m) return m;
     }
@@ -129,9 +131,12 @@ function LandingBody({ page, blocks, variant, loggedIn, extras, preview, beacon 
               </ol>
               {heroVisual ? (
                 <div style={{ maxWidth: 220 }}>
-                  <ExampleAsset src={heroVisual.url} video={heroVisual.mime.startsWith('video/')} caption={blocks.hero.visualCaption || 'Example, made for a demo product'} />
+                  <ExampleAsset src={heroVisual.url} video={heroVisual.mime.startsWith('video/')} caption={blocks.hero.visualCaption || EXAMPLE_LABEL} />
                 </div>
-              ) : null}
+              ) : (
+                // Until staff pick a hero visual, the built-in input → output demo of this page's archetype (§8, L1).
+                <ExampleDemo example={exampleFor(page?.archetype)} />
+              )}
             </div>
             <HeroCta page={page?.slug as string} variant={variant} turnstileSiteKey={env().TURNSTILE_SITE_KEY ?? null} assurance={blocks.cta.assurance} />
           </div>
@@ -161,17 +166,19 @@ function LandingBody({ page, blocks, variant, loggedIn, extras, preview, beacon 
           ) : null}
         </section>
 
-        {gallery.length ? (
-          <section className="ak-wrap ak-section" style={{ paddingTop: 0 }}>
+        <section className="ak-wrap ak-section" style={{ paddingTop: 0 }}>
+          <div className="ak-between">
             <h2 className="ak-label">Examples</h2>
-            <hr className="ak-rule-ink" style={{ margin: '12px 0 16px' }} />
-            <div className="ak-grid-3">
-              {gallery.map((g) => (
-                <ExampleAsset key={g.assetId} src={g.media!.url} video={g.media!.mime.startsWith('video/')} caption={g.caption} />
-              ))}
-            </div>
-          </section>
-        ) : null}
+            <a className="ak-small" href="/examples">See all examples</a>
+          </div>
+          <hr className="ak-rule-ink" style={{ margin: '12px 0 16px' }} />
+          <div className="ak-grid-3">
+            {gallery.length
+              ? gallery.map((g) => <ExampleAsset key={g.assetId} src={g.media!.url} video={g.media!.mime.startsWith('video/')} caption={g.caption} />)
+              : // Plan 03 P1 §7: 3–6 labelled skincare examples, 9:16 with a mono caption — built in until staff choose.
+                BUILT_IN_EXAMPLES.slice(0, 3).map((e) => <ExampleAsset key={e.key} src={e.src} caption={`${e.caption} · ${EXAMPLE_LABEL}`} />)}
+          </div>
+        </section>
 
         <section className="ak-wrap ak-section" style={{ paddingTop: 0 }}>
           <h2 className="ak-label">What we check</h2>
