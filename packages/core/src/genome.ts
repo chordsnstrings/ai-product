@@ -1,11 +1,12 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { Taxonomy } from '@arkiv/shared';
+import { DomainError, Taxonomy } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { emit } from './events';
 import { Genome } from './intel-schemas';
 import { mockGenome } from './mock-intel';
+import { holdForReview } from './vision';
 import { canonicalTaxonomy, taxonomyRemaps, type TaxonomyFamily } from './taxonomy';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, Queues } from './outbox';
@@ -19,17 +20,39 @@ import { evidenceFloor } from './statistics';
 export async function importHistoricalCreative(
   tx: Tx,
   ctx: TenantContext,
-  input: { skuId: string; secondarySkuIds?: string[]; copy: string; platform?: 'meta' | 'tiktok' | null; adId?: string | null; assetId?: string | null },
+  input: {
+    skuId: string;
+    /**
+     * Other products this ad also shows (§48 "one ad contains multiple SKUs"): recorded explicitly, while results,
+     * learnings and the claims check stay with the primary SKU.
+     */
+    secondarySkuIds?: string[];
+    copy: string;
+    platform?: 'meta' | 'tiktok' | null;
+    adId?: string | null;
+    assetId?: string | null;
+    /** The merchant declared that people under 18 appear (§48): the footage waits for compliance review. */
+    minorsPresent?: boolean;
+  },
 ) {
   // Import enqueues model spend (genome extraction), so it is a create-level right, not view.
   assertCan(ctx, 'sku.create');
+  const secondary = [...new Set(input.secondarySkuIds ?? [])].filter((id) => id !== input.skuId);
+  if (secondary.length) {
+    // Only this workspace's own products (RLS scopes the lookup; an id from elsewhere simply isn't found).
+    const found = await tx`select id from skus where id = any(${secondary}::uuid[]) and workspace_id = ${ctx.workspaceId}`;
+    if (found.length !== secondary.length) throw new DomainError('INVALID', 'One of the other products shown isn’t in this workspace.');
+  }
+  const refs: Record<string, unknown> = input.adId && input.platform ? { [`${input.platform}_ad_ids`]: [input.adId], copy: input.copy } : { copy: input.copy };
+  if (input.minorsPresent) refs.minorsDeclared = true;
   const [c] = await tx`
     insert into creatives (workspace_id, sku_id, secondary_sku_ids, origin, platform_refs, final_asset_ids)
-    values (${ctx.workspaceId}, ${input.skuId}, ${input.secondarySkuIds ?? []}, 'imported',
-            ${tx.json(input.adId && input.platform ? { [`${input.platform}_ad_ids`]: [input.adId], copy: input.copy } : { copy: input.copy })},
-            ${input.assetId ? [input.assetId] : []})
+    values (${ctx.workspaceId}, ${input.skuId}, ${secondary}, 'imported', ${tx.json(refs as never)}, ${input.assetId ? [input.assetId] : []})
     returning id`;
-  await emit(tx, ctx, 'CREATIVE_IMPORTED', { type: 'creative', id: c!.id as string }, { platform: input.platform ?? null });
+  // Merchant footage involving minors needs rights and platform/policy review before any use (§48): held until a
+  // compliance reviewer decides, and never a production input meanwhile (usableAssetIds).
+  if (input.minorsPresent && input.assetId) await holdForReview(tx, [{ assetId: input.assetId, flags: { beforeAfter: false, possibleMinor: true, sources: ['declared'] } }]);
+  await emit(tx, ctx, 'CREATIVE_IMPORTED', { type: 'creative', id: c!.id as string }, { platform: input.platform ?? null, secondarySkus: secondary.length, minorsDeclared: !!input.minorsPresent });
   await enqueue(tx, ctx.workspaceId, Queues.extractGenome, { creativeId: c!.id });
   return c!.id as string;
 }

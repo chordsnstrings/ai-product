@@ -672,6 +672,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       labelText: (fp?.label_text as string) ?? null,
       closure: (fp?.closure as string) ?? null,
       dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
+      liquidColor: (fp?.liquid_color as string | null) ?? null,
       thresholds: fidelityThresholds(fp?.thresholds),
       cutout: imagery.cutout?.keyed ? imagery.cutout.bytes : null,
     };

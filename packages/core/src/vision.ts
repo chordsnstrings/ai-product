@@ -52,8 +52,8 @@ export async function toDataUrl(input: Buffer): Promise<string> {
 export interface MediaReviewFlags {
   beforeAfter: boolean;
   possibleMinor: boolean;
-  /** What raised the flag: the product analyst looking at the photo, or the file's name/source. */
-  sources: ('vision' | 'name')[];
+  /** What raised the flag: the product analyst looking at the photo, the file's name/source, or the merchant's own declaration. */
+  sources: ('vision' | 'name' | 'declared')[];
 }
 
 const BEFORE_AFTER = /\bbefore\s*(?:and|&|\+|\/|-|_|vs\.?)?\s*after\b|\bb4\s*(?:&|and|-|_)?\s*after\b/i;

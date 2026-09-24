@@ -15,7 +15,7 @@ import { ctxFor } from './testing';
 async function restore() {
   await ownerPool()`update model_routes set canary = null, circuit_open = false, circuit_until = null, circuit_auto = false, circuit_reason = null,
                       circuit_changed_at = null, pinned_model_version = null`;
-  await ownerPool()`update model_routes set prompt_version = 'fidelity@1.1.0' where task = 'qa.fidelity'`;
+  await ownerPool()`update model_routes set prompt_version = 'fidelity@1.2.0' where task = 'qa.fidelity'`;
   await ownerPool()`delete from platform_settings where key like 'circuit.%'`;
   clearSettingsCache();
 }
@@ -168,7 +168,7 @@ describe('prompt registry (plan 05 §11)', () => {
     await inspect(ctx, token);
     await ownerPool()`update model_routes set prompt_version = 'fidelity@1.0.0' where task = 'qa.fidelity'`;
     const r = await inspect(ctx, token);
-    expect(llm.systems[0]).toBe(findPrompt('fidelity@1.1.0')!.text);
+    expect(llm.systems[0]).toBe(findPrompt('fidelity@1.2.0')!.text);
     expect(llm.systems[1]).toBe(findPrompt('fidelity@1.0.0')!.text);
     expect(r.promptVersion).toBe('fidelity@1.0.0');
   });

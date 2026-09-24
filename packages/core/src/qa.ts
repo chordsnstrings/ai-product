@@ -35,8 +35,11 @@ export interface SceneQaInput {
    * The active Visual Fingerprint (§16): OCR label text, closure, dominant colours and its similarity thresholds
    * (`visual_fingerprints.thresholds`), and the product cut-out the deterministic checks locate in the frame.
    */
-  fingerprint: { labelText: string | null; closure: string | null; dominantColors?: string[]; thresholds?: FidelityThresholds; cutout?: Buffer | null };
-  /** Test hook: markers in the visual plan make the mock inspector fail deterministically. */
+  fingerprint: { labelText: string | null; closure: string | null; dominantColors?: string[]; liquidColor?: string | null; thresholds?: FidelityThresholds; cutout?: Buffer | null };
+  /**
+   * Test hook: markers in the visual plan make the mock inspector fail deterministically — [[qa:fidelity]] (first
+   * attempt), [[qa:fidelity_always]], [[qa:color]] (wrong product colour), [[qa:minor]] (a person who looks under 18).
+   */
   planText: string;
   attempt: number;
 }
@@ -54,6 +57,8 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
   // can be located in the frame.
   const det = i.fingerprint.cutout ? await fidelitySignals(frame, i.fingerprint.cutout, th) : null;
   const failMock = /\[\[qa:fidelity_always\]\]/.test(i.planText) || (/\[\[qa:fidelity\]\]/.test(i.planText) && i.attempt === 1);
+  const colorMock = /\[\[qa:colou?r\]\]/.test(i.planText);
+  const minorMock = /\[\[qa:minor\]\]/.test(i.planText);
   const insp = await llmJson({
     ctx: i.ctx,
     token: i.token,
@@ -65,7 +70,7 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
       { type: 'image', mediaType: 'image/jpeg', base64: await toJpegBase64(frame, 768) },
       {
         type: 'text',
-        text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. Reference product colours: ${i.fingerprint.dominantColors?.length ? i.fingerprint.dominantColors.join(', ') : 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}`,
+        text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. Reference product colours: ${i.fingerprint.dominantColors?.length ? i.fingerprint.dominantColors.join(', ') : 'unknown'}. Colour of the product itself: ${i.fingerprint.liquidColor ?? 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}`,
       },
     ],
     schema: FidelityCheck,
@@ -73,12 +78,13 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
       sameProduct: !failMock,
       labelTextMatches: !failMock,
       closureMatches: true,
-      colorMatches: true,
+      colorMatches: !colorMock,
       productCount: 1,
       handsOrFacesDeformed: false,
       skinAlteredUnnaturally: false,
       impliesMedicalResult: false,
-      notes: failMock ? 'Label text differs from reference' : 'Matches reference',
+      apparentMinorPresent: minorMock,
+      notes: failMock ? 'Label text differs from reference' : colorMock ? 'Serum colour differs from reference' : 'Matches reference',
       // A failing mock "reads" a drifted label so the review screen's OCR diff has something to show.
       labelTextRead: i.fingerprint.labelText ? (failMock ? i.fingerprint.labelText.split(/\s+/).slice(0, -1).concat('SERUMM').join(' ') : i.fingerprint.labelText) : null,
     }),
@@ -117,9 +123,10 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     },
     {
       check: 'visual',
-      pass: !f.handsOrFacesDeformed && !f.skinAlteredUnnaturally && !f.impliesMedicalResult,
-      hard: f.skinAlteredUnnaturally || f.impliesMedicalResult,
-      detail: f.handsOrFacesDeformed ? 'Deformed hands or face' : f.skinAlteredUnnaturally ? 'Skin altered unnaturally (possible implied before/after)' : f.impliesMedicalResult ? 'Implies a medical result' : 'No visual defects found',
+      // §48: synthetic talent must present as clearly adult; anyone who may appear under 18 is a hard failure.
+      pass: !f.handsOrFacesDeformed && !f.skinAlteredUnnaturally && !f.impliesMedicalResult && !f.apparentMinorPresent,
+      hard: f.skinAlteredUnnaturally || f.impliesMedicalResult || !!f.apparentMinorPresent,
+      detail: f.apparentMinorPresent ? 'A person who may appear under 18 is shown' : f.handsOrFacesDeformed ? 'Deformed hands or face' : f.skinAlteredUnnaturally ? 'Skin altered unnaturally (possible implied before/after)' : f.impliesMedicalResult ? 'Implies a medical result' : 'No visual defects found',
     },
   ];
 }

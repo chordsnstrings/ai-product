@@ -116,10 +116,13 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         assertCan(ctx, 'sku.create');
         const platform = (form.get('platform') as 'meta' | 'tiktok') || null;
         const adId = (form.get('adId') as string) || null;
+        // §48: the other products the ad shows, and whether people under 18 appear in it.
+        const secondarySkuIds = z.array(uuid).max(10).parse(form.getAll('secondarySkuIds'));
+        const minorsPresent = form.getAll('minors').includes('yes');
         const id = await t((tx) =>
-          once(tx, { skuId, copy, platform, adId, file: fileIdentity(file) }, async () => {
+          once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, file: fileIdentity(file) }, async () => {
             const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
-            return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId });
+            return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId, secondarySkuIds, minorsPresent });
           }),
         );
         return json({ ok: true, creativeId: id });

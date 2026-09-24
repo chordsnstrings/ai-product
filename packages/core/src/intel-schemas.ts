@@ -18,6 +18,11 @@ export const ProductExtraction = z.object({
     transparent: z.boolean(),
     colors: z.array(z.string().max(30)).max(4),
   }),
+  /**
+   * The colour of the product itself (serum, cream, tint or shade) where it shows in the photos — purchase-relevant
+   * for tinted products (standard §48 "shade materially altered"); kept on the Visual Fingerprint.
+   */
+  liquidColor: z.string().max(30).nullable().optional().describe('Colour of the product itself (liquid, cream, tint or shade) if visible; null if not'),
   claimsFound: z.array(z.object({ wording: z.string().max(200), sourceQuote: z.string().max(300) })).max(12),
   missingEvidence: z.array(z.string().max(160)).max(6),
   suggestedViews: z.array(z.enum(['front', 'side', 'back', 'swatch', 'closure', 'in_hand'])).max(4),
@@ -126,6 +131,8 @@ export const FidelityCheck = z.object({
   notes: z.string().max(300),
   /** Label text read on the generated frame (fidelity@1.1.0), for the QA review OCR diff (plan 05 §13). */
   labelTextRead: z.string().max(400).nullable().optional(),
+  /** A person who looks under 18 appears (fidelity@1.2.0; standard §48 "synthetic talent appears under 18"). */
+  apparentMinorPresent: z.boolean().optional(),
 });
 export type FidelityCheck = z.infer<typeof FidelityCheck>;
 
