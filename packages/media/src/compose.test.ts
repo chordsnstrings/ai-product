@@ -22,11 +22,14 @@ describe('composeAd', () => {
           voiceover: vo,
           endCard: { productName: 'Serum No. 3', cta: 'Shop now', durationMs: 500 },
           aspects: ['9x16', '1x1'],
+          metadata: { comment: 'Contains AI-generated media: AI-generated voice.', description: 'ai_generated=true' },
         },
         dir,
       );
       expect(outs).toHaveLength(2);
       const v = await probe(outs[0]!.file);
+      // Standard §40: the AI-content disclosure travels inside every export.
+      expect(v.tags).toMatchObject({ comment: 'Contains AI-generated media: AI-generated voice.', description: 'ai_generated=true' });
       expect(v.width).toBe(1080);
       expect(v.height).toBe(1920);
       expect(v.hasAudio).toBe(true);

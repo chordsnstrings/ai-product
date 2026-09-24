@@ -1,7 +1,8 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import sharp from 'sharp';
 import { closeAll, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
+import { MockImage, MockLlm, MockTts, MockVideo, ProviderError, setProviders, type LlmJsonRequest, type LlmJsonResult } from '@arkiv/providers';
 import { COST_LIMITS } from '@arkiv/shared';
 import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, proposeClaim } from './claims';
@@ -9,7 +10,9 @@ import type { CompositionManifest } from './composition';
 import { authorize } from './cost-governor';
 import { available, append } from './ledger';
 import { generateVideo } from './model-gateway';
-import { approveForProduction, failProduction, produceProject, retryProduction } from './production';
+import { approveForProduction, blockedLines, cancelProduction, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
+import { clearSettingsCache } from './settings';
+import { customerReason } from './projects';
 import { repeatedFidelityFailures } from './qa-metrics';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
@@ -269,12 +272,52 @@ describe('strict product composites (§23: prod-02) and Claim IDs per scene (§2
     await expect(withTenant(r.t.workspaceId, (tx) => editScene(tx, r.ctx, s!.id as string, { spokenLine: 'It hydrates all day.' }))).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
     await ownerPool()`update scenes set spoken_line = 'It hydrates all day.' where id = ${s!.id}`; // bypassing the editor
     await approve(r);
+    await ownerPool()`insert into purchases (workspace_id, kind, project_id, amount_micros, stripe_checkout_session_id, status, created_by, paid_at)
+                      values (${r.t.workspaceId}, 'taste', ${r.projectId}, 19000000, ${'cs_' + r.projectId}, 'paid', 'test', now())`;
     await produceProject(r.ctx, r.projectId);
-    const [p] = await ownerPool()`select state, failure_reason from projects where id = ${r.projectId}`;
+    const [p] = await ownerPool()`select state, failure_reason, failure_code, qa_report from projects where id = ${r.projectId}`;
     expect(p!.state).toBe('BLOCKED_COMPLIANCE');
-    expect(p!.failure_reason).toMatch(/It hydrates all day/);
+    // The customer sees mapped copy and the line itself (with why), never the raw check detail (surf-33).
+    expect(p!.failure_code).toBe('claims_blocked');
+    expect(customerReason(p!)).toBe('A line needs changing before we can finish your ad.');
+    const blocked = blockedLines(p!.qa_report);
+    expect(blocked.map((b) => b.line)).toEqual(['It hydrates all day.']);
+    expect(blocked[0]!.reason).toMatch(/Claims Vault/);
+    expect(blocked[0]!.platforms.length).toBeGreaterThan(0);
     expect(await withTenant(r.t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
+    const renders = async () => (await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`)[0]!.n as number;
+    const rendered = await renders();
+
+    // A way forward (surf-35): back to the storyboard, fix the line, finish — no new checkout, same credit.
+    await expect(withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'CONFLICT' });
+    const reopened = await withTenant(r.t.workspaceId, (tx) => reopenForEdit(tx, r.ctx, r.projectId));
+    expect(reopened).toMatchObject({ storyboardId: r.storyboardId, replayed: false });
+    expect(reopened.lines.map((l) => l.line)).toEqual(['It hydrates all day.']);
+    expect(await withTenant(r.t.workspaceId, (tx) => reopenForEdit(tx, r.ctx, r.projectId))).toMatchObject({ replayed: true });
+    const [again] = await ownerPool()`select p.state, sb.status, sb.approved_at from projects p join storyboards sb on sb.id = p.storyboard_id where p.id = ${r.projectId}`;
+    expect(again).toMatchObject({ state: 'STORYBOARD_READY', status: 'ready' });
+    expect(again!.approved_at).toBeTruthy();
+    expect(await withTenant(r.t.workspaceId, (tx) => resumableAfterEdit(tx, r.t.workspaceId, r.projectId))).toBe(true);
+    // Finishing without fixing the line is refused before any spend.
+    await expect(withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'GATE_BLOCKED', message: expect.stringMatching(/It hydrates all day/) });
+    await withTenant(r.t.workspaceId, (tx) => editScene(tx, r.ctx, s!.id as string, { spokenLine: 'Morning and night, after cleansing.' }));
+    expect(await withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).toMatchObject({ replayed: false });
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    await withTenant(r.t.workspaceId, async (tx) => {
+      expect(await available(tx, 'taste')).toBe(0);
+      const [n] = await tx`select count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed, count(*) filter (where type = 'CREDIT_RELEASED')::int as released from ledger_entries`;
+      expect(n).toMatchObject({ consumed: 1, released: 1 });
+      const [pu] = await tx`select count(*)::int as n from purchases where project_id = ${r.projectId}`;
+      expect(pu!.n).toBe(1); // no second checkout
+    });
+    expect(await renders()).toBe(rendered); // accepted renders were reused: fixing words costs no new footage
   }, 240_000);
+
+  it('a claims block before any storyboard approval has nothing to reopen', async () => {
+    const r = await storyboardReady();
+    await ownerPool()`update projects set state = 'BLOCKED_COMPLIANCE' where id = ${r.projectId}`;
+    await expect(withTenant(r.t.workspaceId, (tx) => reopenForEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'CONFLICT' });
+  }, 120_000);
 });
 
 describe('retry reuses accepted renders (§35: prod-08)', () => {
@@ -294,6 +337,81 @@ describe('retry reuses accepted renders (§35: prod-08)', () => {
     const auths = await produceAuth(r.projectId);
     expect(auths).toHaveLength(2);
     expect(auths[1]!.estimate.lines.filter((l) => l.line.kind === 'video')).toHaveLength(0);
+  }, 240_000);
+});
+
+describe('paid output is kept before QA (standard §39: arch-17)', () => {
+  /** A QA inspector that errors (not an outage) the first time it judges the demonstration render. */
+  class QaErrorsOnce extends MockLlm {
+    thrown = false;
+    override async json<T>(req: LlmJsonRequest<T>): Promise<LlmJsonResult<T>> {
+      const text = req.content.map((c) => (c.type === 'image' ? '' : c.text)).join(' ');
+      if (req.task === 'qa.fidelity' && /hand releases/i.test(text) && !this.thrown) {
+        this.thrown = true;
+        throw new ProviderError('anthropic', 'malformed inspection', false, 'invalid');
+      }
+      return super.json(req);
+    }
+  }
+  afterEach(() => setProviders(undefined));
+
+  it('a render whose QA errored is stored, and a retry judges it instead of paying for another', async () => {
+    setProviders({ llm: new QaErrorsOnce(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const r = await storyboardReady();
+    await approve(r);
+    await expect(produceProject(r.ctx, r.projectId)).rejects.toThrow(/malformed inspection/);
+    expect((await ownerPool()`select state from projects where id = ${r.projectId}`)[0]!.state).toBe('PROVIDER_FAILED');
+    const renders = async () => ownerPool()`select id, output_asset_id from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene' order by created_at`;
+    const before = await renders();
+    expect(before).toHaveLength(1);
+    // The render was copied into our storage the moment it came back, before the inspection failed.
+    expect(before[0]!.output_asset_id).toBeTruthy();
+    const [kept] = await ownerPool()`select kind, lineage from assets where id = ${before[0]!.output_asset_id}`;
+    expect(kept).toMatchObject({ kind: 'scene_render', lineage: { providerJobId: before[0]!.id } });
+    await withTenant(r.t.workspaceId, (tx) => retryProduction(tx, r.ctx, r.projectId));
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    expect(await renders()).toHaveLength(1); // judged, not rendered again
+    const [v] = await ownerPool()`select status from scene_versions where workspace_id = ${r.t.workspaceId} and kind = 'render' and asset_id = ${before[0]!.output_asset_id}`;
+    expect(v!.status).toBe('accepted');
+  }, 240_000);
+});
+
+describe('cancelling a running production (standard §38, §46: arch-11)', () => {
+  afterEach(async () => {
+    setProviders(undefined);
+    await ownerPool()`delete from platform_settings where key = 'production.cancel_release_max_spend_bps'`;
+    clearSettingsCache();
+  });
+
+  it('is recorded while a run works, and the run stops at its next checkpoint and settles it', async () => {
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new MockVideo(1500), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    // Staff policy: up to 100% of the estimate spent, a cancel still returns the credit.
+    await ownerPool()`insert into platform_settings (key, value) values ('production.cancel_release_max_spend_bps', '10000') on conflict (key) do update set value = excluded.value`;
+    clearSettingsCache();
+    const r = await storyboardReady();
+    await approve(r);
+    const run = produceProject(r.ctx, r.projectId);
+    for (let i = 0; i < 400; i++) {
+      if ((await ownerPool()`select 1 from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`).length) break;
+      await new Promise((res) => setTimeout(res, 25));
+    }
+    const c = await withTenant(r.t.workspaceId, (tx) => cancelProduction(tx, r.ctx, r.projectId, { reason: 'wrong shade' }));
+    expect(c.status).toBe('cancelling');
+    expect(c.decision).toMatchObject({ outcome: 'release', dispatched: true });
+    expect(await run).toBe('cancelled');
+    await withTenant(r.t.workspaceId, async (tx) => {
+      const [p] = await tx`select state from projects where id = ${r.projectId}`;
+      expect(p!.state).toBe('CANCELLED');
+      expect(await available(tx, 'taste')).toBe(1); // released under the policy
+      expect((await tx`select count(*)::int as n from assets where kind = 'final_export'`)[0]!.n).toBe(0);
+      const steps = await tx`select status, detail from progress_steps where subject_id = ${r.projectId} and status = 'skipped'`;
+      expect(steps.length).toBeGreaterThan(0);
+      expect(steps.every((s) => s.detail === 'Cancelled by you')).toBe(true);
+      // Nothing more was spent after the checkpoint: one render, then stop.
+      expect((await tx`select count(*)::int as n from provider_jobs where task = 'video.scene'`)[0]!.n).toBe(1);
+    });
+    // A late duplicate delivery of the production job does nothing.
+    expect(await produceProject(r.ctx, r.projectId)).toBe('skipped');
   }, 240_000);
 });
 

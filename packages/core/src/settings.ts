@@ -42,6 +42,9 @@ export const SETTING_DEFAULTS = {
   // Payment fee allocation for Taste contribution / effective CAC (Appendix C): standard card rate.
   'finance.payment_fee_bps': 290,
   'finance.payment_fee_fixed_micros': 300_000,
+  // Standard §46 "cancel after dispatch": up to this share of a production's estimate (basis points) already spent
+  // on providers, a cancel still returns the credit or payment; past it, the credit is used and nothing is refunded.
+  'production.cancel_release_max_spend_bps': 2500,
 } as const;
 export type SettingKey = keyof typeof SETTING_DEFAULTS;
 

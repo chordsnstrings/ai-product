@@ -1,58 +1,18 @@
 import sharp from 'sharp';
-
-/**
- * Deterministic image helpers. Product cut-out (design M3, conversion L3) uses border-colour keying:
- * product photos are usually shot on a plain background. If keying is unreliable we return the original
- * framed on paper rather than a damaged cut-out (product fidelity outranks spectacle).
- */
+import { keyBackground, type KeyedCutout } from '@arkiv/media';
 
 function dist(a: number[], b: number[]) {
   return Math.sqrt((a[0]! - b[0]!) ** 2 + (a[1]! - b[1]!) ** 2 + (a[2]! - b[2]!) ** 2);
 }
 
-export async function cutout(input: Buffer): Promise<{ png: Buffer; keyed: boolean; coverage: number }> {
-  const base = sharp(input).rotate().resize({ width: 1200, height: 1200, fit: 'inside', withoutEnlargement: true });
-  const meta = await base.clone().metadata();
-  if (meta.hasAlpha) {
-    const trimmed = await base.clone().trim().png().toBuffer();
-    return { png: trimmed, keyed: true, coverage: 1 };
-  }
-  const { data, info } = await base.clone().removeAlpha().raw().toBuffer({ resolveWithObject: true });
-  const { width: w, height: h } = info;
-  // Background estimate: median of border pixels.
-  const border: number[][] = [];
-  for (let x = 0; x < w; x += 4) {
-    border.push([data[x * 3]!, data[x * 3 + 1]!, data[x * 3 + 2]!]);
-    const o = ((h - 1) * w + x) * 3;
-    border.push([data[o]!, data[o + 1]!, data[o + 2]!]);
-  }
-  for (let y = 0; y < h; y += 4) {
-    const l = y * w * 3;
-    const r = (y * w + w - 1) * 3;
-    border.push([data[l]!, data[l + 1]!, data[l + 2]!], [data[r]!, data[r + 1]!, data[r + 2]!]);
-  }
-  const med = [0, 1, 2].map((c) => border.map((p) => p[c]!).sort((a, b) => a - b)[Math.floor(border.length / 2)]!);
-  const spread = border.filter((p) => dist(p, med) > 40).length / border.length;
-  const alpha = Buffer.alloc(w * h);
-  let fg = 0;
-  for (let i = 0; i < w * h; i++) {
-    const d = dist([data[i * 3]!, data[i * 3 + 1]!, data[i * 3 + 2]!], med);
-    const a = d < 28 ? 0 : d > 60 ? 255 : Math.round(((d - 28) / 32) * 255);
-    alpha[i] = a;
-    if (a > 128) fg++;
-  }
-  const coverage = fg / (w * h);
-  // Busy backgrounds or nearly-empty/nearly-full masks → keying unreliable.
-  if (spread > 0.25 || coverage < 0.03 || coverage > 0.92) {
-    return { png: await base.clone().png().toBuffer(), keyed: false, coverage };
-  }
-  const mask = await sharp(alpha, { raw: { width: w, height: h, channels: 1 } }).blur(1.2).raw().toBuffer();
-  const png = await sharp(data, { raw: { width: w, height: h, channels: 3 } })
-    .joinChannel(mask, { raw: { width: w, height: h, channels: 1 } })
-    .png()
-    .toBuffer();
-  const trimmed = await sharp(png).trim({ threshold: 1 }).png().toBuffer().catch(() => png);
-  return { png: trimmed, keyed: true, coverage };
+/**
+ * Deterministic image helpers. The product cut-out (design M3, conversion L3) starts with border-colour keying:
+ * product photos are usually shot on a plain background. If keying is unreliable the original is returned framed
+ * on paper rather than a damaged cut-out (product fidelity outranks spectacle); a background-removal provider
+ * then gets a chance at it where the cut-out is first used (see cutout.ts).
+ */
+export async function cutout(input: Buffer): Promise<KeyedCutout> {
+  return keyBackground(input);
 }
 
 /** Dominant colours (hex) via coarse quantization; used by the Visual Fingerprint (§16). */

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, ClaimChip, Ledger, LinkButton, MetadataTable, ProvenanceChip, Rail } from '@arkiv/ui';
 import { api, OfferExpiry, Sheet, StickyCta, usePoll } from '@arkiv/ui/client';
 import type { ProjectView } from '@/lib/views';
@@ -401,6 +401,8 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
   const sb = v.storyboard;
   const q = v.quote;
   const taste = q.kind === 'taste' && q.status === 'active' && !expired;
+  // Reopened after the claims check blocked a line: already paid for, so finishing needs no checkout (surf-35).
+  const resumable = v.project.resumable;
 
   async function call(url: string, body: unknown) {
     setErr(null);
@@ -420,6 +422,14 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
   return (
     <Shell step={3} title={sb?.hook ? `“${sb.hook}”` : 'Building your storyboard'} sub={sb?.status === 'generating' ? 'Drawing each scene with your real product. About a minute.' : '15 seconds, scene by scene. Edit any line for free — every change is checked against cosmetic claim rules.'}>
       {err ? <Banner tone="risk">{err}</Banner> : null}
+      {resumable && v.project.blockedLines.length ? (
+        <Banner tone="warn">
+          Change {v.project.blockedLines.length === 1 ? 'this line' : 'these lines'}, then finish your ad:{' '}
+          {v.project.blockedLines.map((l, i) => (
+            <span key={l.line}>{i ? '; ' : ''}“{l.line}”{l.scene ? ` (scene ${l.scene})` : ''}{l.alternative ? ` — try “${l.alternative}”` : ''}</span>
+          ))}
+        </Banner>
+      ) : null}
       {!sb || sb.status === 'generating' ? <Ledger steps={sb?.steps ?? []} /> : null}
       {sb && sb.scenes.length ? (
         <div className="ak-scroll-row" role="list">
@@ -443,7 +453,15 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
-      {sb && sb.status !== 'generating' ? (
+      {sb && sb.status !== 'generating' && resumable ? (
+        <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
+          <h2 className="ak-label">Finish your ad</h2>
+          <p className="ak-small ak-muted">You’ve already paid for this ad, so there’s nothing more to pay. We check your changes, then produce it — scenes that were already made are reused.</p>
+          <Button block disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/finish`, {})) window.location.assign(`/produce/${projectId}`); }}>Finish my ad</Button>
+          <div style={{ marginTop: 12 }}><CancelProduction projectId={projectId} v={v} onChange={() => window.location.assign(`/produce/${projectId}`)} /></div>
+        </section>
+      ) : null}
+      {sb && sb.status !== 'generating' && !resumable ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="offer">
           <div className="ak-between" style={{ alignItems: 'start', flexWrap: 'wrap', gap: 24 }}>
             <div>
@@ -469,7 +487,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           </div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' ? (
+      {sb && sb.status !== 'generating' && !resumable ? (
         <StickyCta watchId="cta" mobileOnly>
           <LinkButton href={`/checkout/${projectId}`} block>Make my ad · {usd(q.priceMicros)}</LinkButton>
         </StickyCta>
@@ -549,36 +567,162 @@ export function CheckoutFlow({ projectId, publishableKey }: { projectId: string;
 
 export function ProduceFlow({ projectId }: { projectId: string }) {
   // A production paused by a provider outage resumes by itself, so keep polling it.
-  const active = useCallback((v: View | null) => !v || v.project.paused || (v.project.state !== 'COMPLETE' && !['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION', 'CANCELLED'].includes(v.project.state)), []);
+  const active = useCallback((v: View | null) => !v || v.project.paused || (v.project.state !== 'COMPLETE' && !STOPPED.includes(v.project.state)), []);
   const { data: v, error, resume } = useProject(projectId, active);
-  const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
     if (v?.project.state === 'COMPLETE') window.location.replace(`/deliver/${projectId}`);
   }, [v?.project.state, projectId]);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
-  const waitingPayment = v.project.state === 'STORYBOARD_READY';
+  const waitingPayment = v.project.state === 'STORYBOARD_READY' && !v.project.resumable;
   const paused = v.project.paused;
-  const failed = !paused && ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION'].includes(v.project.state);
+  const stopped = !paused && STOPPED.includes(v.project.state);
+  const title = v.project.state === 'BLOCKED_COMPLIANCE' ? 'One line needs changing' : v.project.state === 'CANCELLED' ? 'This ad was cancelled' : stopped ? 'We couldn’t finish this ad' : paused ? 'Your ad is queued' : waitingPayment ? 'Confirming your payment' : 'Making your ad';
   return (
-    <Shell step={4} title={failed ? 'We couldn’t finish this ad' : paused ? 'Your ad is paused' : waitingPayment ? 'Confirming your payment' : 'Making your ad'} sub={failed ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
+    <Shell step={4} title={title} sub={stopped ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
       {waitingPayment ? <p className="ak-muted">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
-      {paused ? <Banner tone="warn">{v.project.failureReason ?? 'A production service is temporarily unavailable. We’ll resume automatically.'}</Banner> : null}
-      {failed ? (
+      {v.project.resumable ? (
         <div className="ak-stack">
-          <Banner tone="risk">{v.project.failureReason ?? 'Something went wrong while producing your ad.'}</Banner>
-          {v.project.state === 'REFUNDED' ? <p>Your payment has been refunded in full. It can take 5–10 days to appear on your statement.</p> : v.purchase?.status === 'paid' && v.project.state === 'PROVIDER_FAILED' ? <p>Your payment is being refunded automatically.</p> : <p>You haven’t lost anything — your credit was returned.</p>}
-          {v.project.state === 'PROVIDER_FAILED' && v.purchase?.status !== 'paid' ? (
-            <Button onClick={async () => { setErr(null); try { await api(`/api/projects/${projectId}/retry`, {}); resume(); } catch (e) { setErr((e as Error).message); } }}>Try again</Button>
-          ) : null}
-          {err ? <p className="ak-error">{err}</p> : null}
+          <p>Your storyboard is open for the change. You won’t be charged again.</p>
+          <LinkButton href={`/storyboard/${projectId}`}>Back to the storyboard</LinkButton>
         </div>
-      ) : (
+      ) : null}
+      {paused ? <QueuedBanner v={v} /> : null}
+      {stopped ? (
+        <ProductionIssue projectId={projectId} v={v} onChange={resume} />
+      ) : v.project.resumable || waitingPayment ? null : (
         <>
           <Ledger steps={v.productionSteps} />
           <Liveness live={v.project.liveness} />
         </>
       )}
+      <div style={{ marginTop: 24 }}><CancelProduction projectId={projectId} v={v} onChange={resume} /></div>
     </Shell>
+  );
+}
+
+/**
+ * Cancel a production (standard §38 "cancel semantics depend on dispatch state"): the sheet says what happens to
+ * the Creative Test or payment right now — before dispatch it all comes back — before the customer confirms.
+ */
+export function CancelProduction({ projectId, v, onChange }: { projectId: string; v: Pick<ProjectView, 'project'>; onChange: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (v.project.cancelling) return <p className="ak-small ak-muted" role="status">Cancelling — we’ll stop at the next step.</p>;
+  const c = v.project.cancel;
+  if (!c) return null;
+  return (
+    <>
+      <button className="ak-textbtn" onClick={() => setOpen(true)}>Cancel this ad</button>
+      <Sheet open={open} onOpenChange={setOpen} title="Cancel this ad?" description={c.message}>
+        <form
+          className="ak-stack"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setErr(null);
+            setBusy(true);
+            try {
+              await api(`/api/projects/${projectId}/cancel`, { reason: reason.trim() || undefined });
+              setOpen(false);
+              onChange();
+            } catch (x) {
+              setErr((x as Error).message);
+            }
+            setBusy(false);
+          }}
+        >
+          <label className="ak-field">
+            <span className="ak-label">Why are you cancelling? (optional)</span>
+            <textarea className="ak-textarea" maxLength={300} value={reason} onChange={(e) => setReason(e.target.value)} />
+          </label>
+          {err ? <p className="ak-error" role="alert">{err}</p> : null}
+          <Button type="submit" variant="secondary" disabled={busy}>{busy ? 'Cancelling…' : 'Cancel the ad'}</Button>
+        </form>
+      </Sheet>
+    </>
+  );
+}
+
+/** Project states in which production has stopped and waits for the customer (or has ended). */
+const STOPPED = ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USER_ACTION', 'CANCELLED'];
+/** Has this production stopped (not merely queued behind a busy partner)? */
+export const productionStopped = (v: Pick<ProjectView, 'project'>) => !v.project.paused && STOPPED.includes(v.project.state);
+
+const clock = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+/** Plan 03 P9: "Queued: our video partner is busy. Your place is held." plus an ETA if known. */
+export function QueuedBanner({ v }: { v: Pick<ProjectView, 'project'> }) {
+  const q = v.project.queue;
+  const eta = q?.etaAt ? (q.etaKind === 'reopen' ? `Expected back around ${clock(q.etaAt)}.` : `We’ll try again around ${clock(q.etaAt)}.`) : null;
+  return (
+    <Banner tone="warn">
+      {v.project.failureReason ?? 'Queued: a production partner is busy. Your place is held.'}
+      {eta ? <> {eta}</> : null} You won’t be charged twice.
+    </Banner>
+  );
+}
+
+/**
+ * Why production stopped, and the way forward (plan 03 P9 "reassure"; standard §14): fix a blocked line in the
+ * storyboard (no new payment), try again, or — for money — what happens to it. Copy is honest about the credit:
+ * a paid one-off is never charged again; a returned Creative Test is back on the balance.
+ */
+export function ProductionIssue({ projectId, v, onChange }: { projectId: string; v: Pick<ProjectView, 'project' | 'purchase'>; onChange: () => void }) {
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const st = v.project.state;
+  const paid = v.purchase?.status === 'paid';
+  const subscriber = v.project.kind === 'creative_test';
+  async function act(action: 'reopen' | 'retry') {
+    setErr(null);
+    setBusy(true);
+    try {
+      const r = await api<{ next?: string }>(`/api/projects/${projectId}/${action}`, {});
+      if (r?.next) window.location.assign(r.next);
+      else onChange();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+  }
+  if (st === 'BLOCKED_COMPLIANCE') {
+    return (
+      <div className="ak-stack">
+        <Banner tone="warn">{v.project.failureReason ?? 'A line needs changing before we can finish your ad.'}</Banner>
+        {v.project.blockedLines.length ? (
+          <ul className="ak-stack" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+            {v.project.blockedLines.map((l) => (
+              <li key={l.line} className="ak-panel ak-stack" style={{ gap: 4 }}>
+                <p style={{ margin: 0 }}><strong>“{l.line}”</strong>{l.scene ? <span className="ak-index"> · scene {l.scene}</span> : null}</p>
+                <p className="ak-small ak-muted" style={{ margin: 0 }}>{l.reason}{l.platforms.length ? ` (${l.platforms.join(', ')})` : ''}</p>
+                {l.alternative ? <p className="ak-small" style={{ margin: 0 }}>Try instead: “{l.alternative}”</p> : null}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        <p>{paid ? 'You won’t be charged again — fix the line and we’ll finish it.' : subscriber ? 'Your Creative Test is back on your balance until you finish — fix the line and we’ll finish it.' : 'Fix the line and we’ll finish it.'}</p>
+        <div><Button disabled={busy} onClick={() => void act('reopen')}>Edit the line</Button></div>
+        {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      </div>
+    );
+  }
+  const canRetry = (st === 'PROVIDER_FAILED' && !paid) || st === 'NEEDS_USER_ACTION';
+  return (
+    <div className="ak-stack">
+      <Banner tone="risk">{v.project.failureReason ?? (st === 'CANCELLED' ? 'This ad was cancelled.' : 'Something went wrong while producing your ad.')}</Banner>
+      {st === 'REFUNDED' ? (
+        <p>Your payment has been refunded in full. It can take 5–10 days to appear on your statement.</p>
+      ) : paid && st === 'PROVIDER_FAILED' ? (
+        <p>Your payment is being refunded automatically.</p>
+      ) : st === 'NEEDS_USER_ACTION' ? null : st === 'CANCELLED' ? (
+        <p>{subscriber ? 'Any Creative Test that wasn’t used is back on your balance.' : 'Nothing more will be charged for this ad.'}</p>
+      ) : (
+        <p>{subscriber ? 'You haven’t lost anything — your Creative Test was returned.' : 'You haven’t been charged for this attempt.'}</p>
+      )}
+      {canRetry ? <div><Button disabled={busy} onClick={() => void act('retry')}>Try again</Button></div> : null}
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
   );
 }
 
@@ -596,6 +740,49 @@ export function Liveness({ live }: { live: View['project']['liveness'] }) {
 
 /* ───────────── P10 · Delivery ───────────── */
 
+/**
+ * Standard §40: AI-generated talent and synthetic media follow each platform's disclosure rules. Shown with the
+ * downloads, so the label goes on when the ad is posted — and generated people are never passed off as customers.
+ */
+export function AiDisclosureSteps({ disclosure }: { disclosure: ProjectView['disclosure'] }) {
+  if (!disclosure?.aiGenerated) return null;
+  const what = [disclosure.syntheticPeople ? 'people' : null, 'scenes', disclosure.syntheticVoice ? 'voice-over' : null].filter(Boolean).join(', ');
+  return (
+    <section className="ak-panel ak-stack" style={{ gap: 6 }} aria-labelledby="ai-disclosure">
+      <h2 className="ak-label" id="ai-disclosure">Before you post: label it as AI-generated</h2>
+      <p className="ak-small" style={{ margin: 0 }}>This ad includes AI-generated {what}. The files say so in their metadata; the platforms also ask you to disclose it.</p>
+      <ul className="ak-small" style={{ margin: 0, paddingLeft: 18 }}>
+        <li><strong>TikTok:</strong> turn on the “AI-generated content” setting when you post, and use the AI-generated content disclosure when you set the ad up in TikTok Ads Manager.</li>
+        <li><strong>Instagram and Facebook:</strong> keep the “AI info” label if Meta adds one, and answer the AI disclosure question in Meta Ads Manager when it’s asked.</li>
+        {disclosure.syntheticPeople ? <li>The people in this ad are AI-generated. Don’t present them as real customers or say they used the product.</li> : null}
+      </ul>
+    </section>
+  );
+}
+
+/** P10 "Watch" (standard §7): the finished ad counts as watched once it has played for 3 seconds or to the end. */
+function WatchedVideo({ projectId, assetId, src }: { projectId: string; assetId: string; src: string }) {
+  const sent = useRef(false);
+  const report = (seconds: number) => {
+    if (sent.current) return;
+    sent.current = true;
+    fetch(`/api/projects/${projectId}/watched`, { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ assetId, seconds: Number.isFinite(seconds) ? Math.round(seconds) : 0 }) }).catch(() => {});
+  };
+  return (
+    <video
+      src={src}
+      controls
+      playsInline
+      preload="metadata"
+      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+      onTimeUpdate={(e) => {
+        if (e.currentTarget.currentTime >= 3) report(e.currentTarget.currentTime);
+      }}
+      onEnded={(e) => report(e.currentTarget.duration || e.currentTarget.currentTime)}
+    />
+  );
+}
+
 const ASPECT: Record<string, string> = { '9x16': 'TikTok · Reels · Stories (9:16)', '4x5': 'Feed (4:5)', '1x1': 'Square (1:1)' };
 
 export function DeliverFlow({ projectId }: { projectId: string }) {
@@ -611,7 +798,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
   return (
     <Shell step={4} title="Your ad is ready" sub={`${v.sku.name} · 15 seconds · checked for product accuracy and claims.`}>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-        <div className="ak-well ak-well--916">{primary ? <video src={primary.url} controls playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : null}</div>
+        <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} /> : null}</div>
         <div className="ak-stack">
           <h2 className="ak-label">Download</h2>
           {v.exports.map((e) => (
@@ -626,6 +813,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
               <ul className="ak-small">{qa.map((c) => <li key={c.label}>{c.label} {c.ok ? '✓' : '•'}</li>)}</ul>
             </details>
           ) : null}
+          <AiDisclosureSteps disclosure={v.disclosure} />
           <hr className="ak-rule" />
           <h2 className="ak-label">What to do next</h2>
           <ol className="ak-small">

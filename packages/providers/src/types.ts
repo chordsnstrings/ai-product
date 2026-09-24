@@ -25,11 +25,20 @@ export interface LlmJsonRequest<T> {
   mock: () => T;
 }
 
+/**
+ * The provider's own response envelope without the payload (standard §39 "raw provider response metadata is
+ * persisted"): request id, usage breakdown, stop reason, status. Never media bytes, signed URLs or tenant text.
+ */
+export type RawMeta = Record<string, unknown>;
+
 export interface LlmJsonResult<T> {
   data: T;
   usage: LlmUsage;
   model: string;
   modelVersion: string;
+  /** The provider's id for this request (e.g. the message id), for reconciliation and support. */
+  providerRequestId?: string;
+  rawMeta?: RawMeta;
 }
 
 export interface LlmProvider {
@@ -53,6 +62,7 @@ export interface ImageResult {
   model: string;
   modelVersion: string;
   providerRequestId: string;
+  rawMeta?: RawMeta;
 }
 export interface ImageProvider {
   readonly name: string;
@@ -76,6 +86,7 @@ export interface VideoPoll {
   error?: string;
   modelVersion?: string;
   outputSeconds?: number;
+  rawMeta?: RawMeta;
 }
 export interface VideoProvider {
   readonly name: string;
@@ -97,10 +108,43 @@ export interface TtsResult {
   durationMs: number;
   model: string;
   providerRequestId: string;
+  rawMeta?: RawMeta;
 }
 export interface TtsProvider {
   readonly name: string;
   synthesize(req: TtsRequest): Promise<TtsResult>;
+}
+
+/**
+ * Background removal for the product cut-out (plan 06 Phase 1 #6, design M3). The request carries the product
+ * photo; the result is the product on a transparent background made from the photo's own pixels, and its mask.
+ */
+export interface SegmentationRequest {
+  model: string;
+  image: Buffer;
+}
+export interface SegmentationResult {
+  /** RGBA PNG trimmed to the product. */
+  png: Buffer;
+  /** Single-channel PNG mask at the normalized photo size (255 = product). */
+  mask: Buffer;
+  /** Share of the frame the product covers. */
+  coverage: number;
+  /**
+   * Whether the output is usable: the mask separates the product cleanly and lines up with the photo. A provider
+   * that answered but moved, redrew or lost the product returns false (the call is still billed).
+   */
+  aligned: boolean;
+  /** How the cut-out was made, recorded in its lineage (e.g. `seedream_edit+key`, `border_key`). */
+  technique: string;
+  model: string;
+  modelVersion: string;
+  providerRequestId: string;
+  rawMeta?: RawMeta;
+}
+export interface SegmentationProvider {
+  readonly name: string;
+  removeBackground(req: SegmentationRequest): Promise<SegmentationResult>;
 }
 
 export class ProviderError extends Error {

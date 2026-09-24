@@ -95,8 +95,12 @@ export const EventType = [
   'STORYBOARD_READY',
   'CHECKOUT_STARTED',
   'TASTE_PAID',
+  // Standard §7 "Taste delivered — QA pass and delivery success": a paid one-off ad reached COMPLETE.
+  'TASTE_DELIVERED',
   'ASSET_WATCHED',
   'ASSET_EXPORTED',
+  // Standard §7 "Ad account connected — Meta/TikTok connection rate".
+  'AD_ACCOUNT_CONNECTED',
   'SUBSCRIPTION_STARTED',
 ] as const;
 export type EventType = (typeof EventType)[number];
@@ -130,6 +134,21 @@ export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
   CLAIM_RESTRICTED: z.object({ reason: z.string() }).strict(),
   // COMPLIANCE lifted a block (four-eyes): the claim goes back to review, never straight to approved.
   CLAIM_UNBLOCKED: z.object({ from: z.literal('BLOCKED'), to: z.enum(ClaimStatus), reason: z.string() }).strict(),
+  // Usage-ledger events of the Model Gateway (§37): one per provider call opened and closed. They carry no money
+  // amount of their own (the ledger's PROVIDER_COST_RECORDED does); estimate/actual are for reconstruction.
+  PROVIDER_JOB_CREATED: z
+    .object({ task: z.string(), provider: z.string(), model: z.string(), promptVersion: z.string(), arm: z.enum(['stable', 'canary']), estimateMicros: z.number().int() })
+    .strict(),
+  PROVIDER_JOB_SUCCEEDED: z
+    .object({ task: z.string(), latencyMs: z.number().int().nullable(), actualMicros: z.number().int(), providerRequestId: z.string().nullable(), modelVersion: z.string().nullable() })
+    .strict(),
+  PROVIDER_JOB_FAILED: z
+    .object({ task: z.string(), latencyMs: z.number().int().nullable(), actualMicros: z.number().int(), providerRequestId: z.string().nullable(), errorKind: z.string() })
+    .strict(),
+  // A creative derived from a delivered one (a hook variant, a recomposition): its parent and what changed.
+  CREATIVE_VERSIONED: z
+    .object({ parentCreativeId: z.string().uuid(), changedVariables: z.array(z.string()).min(1), variantId: z.string().uuid().nullable(), projectId: z.string().uuid().nullable() })
+    .strict(),
 };
 
 /** Throws when a payload doesn't match the registered schema for its type (types without one always pass). */
@@ -289,8 +308,10 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   STORYBOARD_READY: 'project',
   CHECKOUT_STARTED: 'project',
   TASTE_PAID: 'project',
+  TASTE_DELIVERED: 'project',
   ASSET_WATCHED: 'asset',
   ASSET_EXPORTED: 'asset',
+  AD_ACCOUNT_CONNECTED: 'integration',
   SUBSCRIPTION_STARTED: 'subscription',
 };
 
@@ -320,6 +341,10 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   RECOMMENDATION_CREATED: ['recommendationId', 'skuId'],
   RECOMMENDATION_ACCEPTED: ['recommendationId', 'experimentId', 'skuId'],
   GENOME_EXTRACTED: ['creativeId'],
+  CREATIVE_VERSIONED: ['creativeId', 'skuId'],
+  PROVIDER_JOB_CREATED: ['providerJobId', 'authorizationId'],
+  PROVIDER_JOB_SUCCEEDED: ['providerJobId', 'authorizationId'],
+  PROVIDER_JOB_FAILED: ['providerJobId', 'authorizationId'],
 };
 
 /** Merge the subject into the refs and drop empty values. */

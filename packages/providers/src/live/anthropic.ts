@@ -64,6 +64,8 @@ export class AnthropicLlm implements LlmProvider {
         },
         model: req.model,
         modelVersion: response.model,
+        providerRequestId: response.id,
+        rawMeta: { id: response.id, model: response.model, stopReason: response.stop_reason, usage: response.usage },
       };
     } catch (e) {
       if (e instanceof ProviderError) throw e;

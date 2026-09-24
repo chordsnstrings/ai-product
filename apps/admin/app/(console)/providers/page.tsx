@@ -1,8 +1,8 @@
 import { withAdmin } from '@arkiv/db';
-import { staffCan } from '@arkiv/core';
+import { armComparison, staffCan } from '@arkiv/core';
 import { env } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
-import { dt, Mono, Page, pct, Section, Table } from '@/components/ui';
+import { dt, money, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Providers & routes' };
@@ -20,8 +20,7 @@ export default async function Providers() {
                      from provider_jobs where created_at > now() - interval '24 hours' group by provider`,
     drift: await tx`select task, model, model_version_returned, count(*)::int as n, max(created_at) as last from provider_jobs
                     where model_version_returned is not null and model_version_returned <> model and created_at > now() - interval '7 days' group by 1, 2, 3`,
-    arms: await tx`select task, arm, count(*)::int as n, count(*) filter (where status = 'failed')::int as failed from provider_jobs
-                   where arm is not null and created_at > now() - interval '7 days' group by 1, 2 order by 1, 2`,
+    arms: await armComparison(tx, 7),
     // The audit log is SUPER_ADMIN-only (§0.4); others see a rollback as the canary disappearing from the route.
     rollbacks: staffCan(s.roles, 'audit.read') ? await tx`select target_id, reason, at from admin_audit_log where action = 'route.canary_rollback' order by at desc limit 10` : [],
     kills: await tx`select key, enabled from feature_flags where key like 'kill.provider.%' order by key`,
@@ -62,15 +61,27 @@ export default async function Providers() {
         })} />
       </Section>
       <Section title="Routes">
-        <Table head={['Task', 'Provider', 'Model', 'Prompt', 'Rollout', 'Canary', 'Approved fallback', 'Circuit', '']} rows={d0.routes.map((r) => [
-          <Mono key="t">{r.task as string}</Mono>, r.provider as string, <Mono key="m">{r.model as string}</Mono>, <Mono key="p">{r.prompt_version as string}</Mono>, `${r.rollout_pct}%`, r.canary ? <Mono key="c">{JSON.stringify(r.canary)}</Mono> : '—',
+        <Table head={['Task', 'Provider', 'Model', 'Pinned version', 'Prompt', 'Rollout', 'Canary', 'Approved fallback', 'Circuit', '']} rows={d0.routes.map((r) => [
+          <Mono key="t">{r.task as string}</Mono>, r.provider as string, <Mono key="m">{r.model as string}</Mono>, r.pinned_model_version ? <Mono key="v">{r.pinned_model_version as string}</Mono> : '—', <Mono key="p">{r.prompt_version as string}</Mono>, `${r.rollout_pct}%`, r.canary ? <Mono key="c">{JSON.stringify(r.canary)}</Mono> : '—',
           r.fallback_task ? <Mono key="f">{r.fallback_task as string}</Mono> : 'queue on outage',
-          r.circuit_open ? <span key="o" className="ak-chip ak-chip--risk">open</span> : 'closed',
+          r.circuit_open ? <span key="o" className="ak-chip ak-chip--risk">open{r.circuit_until ? ` · back ~${dt(r.circuit_until)}` : ''}</span> : 'closed',
           <span key="a" className="ak-row">
             {staffCan(s.roles, 'providers.circuit') ? <ActButton small action="route.circuit" payload={{ task: r.task, open: !r.circuit_open }} reason danger={!r.circuit_open}>{r.circuit_open ? 'Close circuit' : 'Open circuit'}</ActButton> : null}
           </span>,
         ])} />
       </Section>
+      {staffCan(s.roles, 'providers.circuit') && d0.routes.some((r) => r.circuit_open) ? (
+        <Section title="Queue ETA for an open circuit">
+          <div className="ak-panel" style={{ maxWidth: 560 }}>
+            <p className="ak-small ak-muted">Customers whose ads wait behind an open circuit see “Queued: our … partner is busy. Your place is held.” Add when you expect it back and they see that too.</p>
+            <ActForm action="route.circuit" extra={{ open: true }} submit="Set ETA" fields={[
+              { name: 'task', label: 'Route', type: 'select', options: d0.routes.filter((r) => r.circuit_open).map((r) => r.task as string) },
+              { name: 'reopenMinutes', label: 'Expected back in (minutes)', type: 'number', required: true },
+              { name: 'reason', label: 'Reason', required: true },
+            ]} />
+          </div>
+        </Section>
+      ) : null}
       {staffCan(s.roles, 'routes.manage') ? (
         <Section title="Change a route (needs a passing eval for this template × model; 100% also needs a second approver)">
           <div className="ak-panel" style={{ maxWidth: 560 }}>
@@ -85,8 +96,37 @@ export default async function Providers() {
           </div>
         </Section>
       ) : null}
+      {staffCan(s.roles, 'routes.manage') ? (
+        <Section title="Fallback and version pin (🔐)">
+          <div className="ak-grid-2" style={{ alignItems: 'start' }}>
+            <div className="ak-panel">
+              <p className="ak-small ak-muted">When a route’s circuit is open or its provider is down, the gateway retries the call once on its approved fallback (its own job and rate); without one, productions queue. Same kind of task, priced on a published rate. Leave empty to remove.</p>
+              <ActForm action="route.fallback" submit="🔐 Set fallback" fields={[
+                { name: 'task', label: 'Route', type: 'select', options: d0.routes.map((r) => r.task as string) },
+                { name: 'fallbackTask', label: 'Fallback route (empty = none)', type: 'select', options: ['', ...d0.routes.map((r) => r.task as string)] },
+                { name: 'reason', label: 'Reason', required: true },
+              ]} />
+            </div>
+            <div className="ak-panel">
+              <p className="ak-small ak-muted">Pin the exact provider version a route sends, so a silent provider upgrade can’t change output (§48). Pin to what “Version drift” shows is live. Leave empty to unpin.</p>
+              <ActForm action="route.pin" submit="🔐 Pin version" fields={[
+                { name: 'task', label: 'Route', type: 'select', options: d0.routes.map((r) => r.task as string) },
+                { name: 'version', label: 'Provider version (empty = unpin)' },
+                { name: 'reason', label: 'Reason', required: true },
+              ]} />
+            </div>
+          </div>
+        </Section>
+      ) : null}
       <Section title="Rollout arms (7d)">
-        <Table head={['Task', 'Arm', 'Calls', 'Failed']} rows={d0.arms.map((a) => [<Mono key="t">{a.task as string}</Mono>, a.arm as string, a.n as number, a.failed as number])} empty="No calls in 7 days." />
+        <Table
+          head={['Task', 'Arm', 'Calls', 'Error rate', 'p50', 'Avg cost / call', 'QA first-pass', 'Claim blocks']}
+          rows={d0.arms.map((a) => [
+            <Mono key="t">{a.task}</Mono>, a.arm, a.calls, pct(a.errorRate), a.p50LatencyMs != null ? `${a.p50LatencyMs}ms` : '—', a.avgCostMicros != null ? money(a.avgCostMicros, 4) : '—',
+            a.qaFirst ? `${pct(Number(a.qaFirstPassed) / a.qaFirst)} of ${a.qaFirst}` : '—', a.projects ? `${pct(Number(a.blocked) / a.projects)} of ${a.projects}` : '—',
+          ])}
+          empty="No calls in 7 days."
+        />
         <Table head={['Rolled back', 'Route', 'Why']} rows={d0.rollbacks.map((r) => [dt(r.at), <Mono key="t">{r.target_id as string}</Mono>, r.reason as string])} empty="No automatic canary rollbacks." />
       </Section>
       <Section title="Provider kill switches"><Table head={['Switch', 'State']} rows={d0.kills.map((k) => [<Mono key="k">{k.key as string}</Mono>, k.enabled ? <span key="s" className="ak-chip ak-chip--risk">ON — calls refused</span> : 'off'])} empty="—" /><p className="ak-small ak-muted">Toggle in Flags & config (🔐).</p></Section>

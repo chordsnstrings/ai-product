@@ -44,6 +44,30 @@ export interface CompositionManifest {
   durationMs: number;
   aspects: Aspect[];
   genes: Record<string, unknown>;
+  /** What in this ad is AI-generated (standard §40): drives platform disclosure guidance and export metadata. */
+  disclosure?: AiDisclosure;
+}
+
+/** AI-generated media in an ad (standard §40 "AI-generated talent and synthetic media must follow platform disclosure"). */
+export interface AiDisclosure {
+  /** Any AI-generated footage, image, setting or voice. */
+  aiGenerated: boolean;
+  /** AI-generated people (hands, skin, faces) on screen. */
+  syntheticPeople: boolean;
+  /** A synthesized voice-over. */
+  syntheticVoice: boolean;
+  /** Scenes whose visuals are (partly) AI-generated. */
+  generatedScenes: string[];
+}
+
+/** Container metadata for an export: a human-readable note and a machine-readable summary. */
+export function disclosureMetadata(d: AiDisclosure | null | undefined): Record<string, string> {
+  if (!d?.aiGenerated) return {};
+  const parts = [d.generatedScenes.length ? 'AI-generated visuals' : null, d.syntheticPeople ? 'AI-generated people' : null, d.syntheticVoice ? 'AI-generated voice' : null].filter(Boolean);
+  return {
+    comment: `Contains AI-generated media: ${parts.join(', ')}. Disclose as AI-generated where the platform requires it.`,
+    description: `ai_generated=true; synthetic_people=${d.syntheticPeople}; synthetic_voice=${d.syntheticVoice}`,
+  };
 }
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);

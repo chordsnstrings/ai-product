@@ -7,11 +7,12 @@ import {
   approveForProduction,
   authorize,
   available,
+  cancelProduction,
   generateStoryboard,
   heartbeat,
   ingestBytes,
   liveness,
-  OUTAGE_MESSAGE,
+  outageStatus,
   produceProject,
   selectConcept,
   startPreview,
@@ -53,10 +54,17 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
     const { t, ctx, projectId, storyboardId } = await readyForProduction('[[fail:render]]');
     expect(await produceProject(ctx, projectId)).toBe('paused');
     await withTenant(t.workspaceId, async (tx) => {
-      const [p] = await tx`select state, outage, failure_reason, qa_report from projects where id = ${projectId}`;
+      const [p] = await tx`select state, outage, failure_reason, failure_code, qa_report from projects where id = ${projectId}`;
       expect(p!.state).toBe('NEEDS_USER_ACTION');
       expect((p!.outage as { task: string }).task).toBe('video.scene');
-      expect(p!.failure_reason).toBe(OUTAGE_MESSAGE);
+      // Plan 03 P9: the customer sees a queued status naming the partner, never the provider's error.
+      expect(p!.failure_reason).toBe('Queued: our video partner is busy. Your place is held.');
+      expect(p!.failure_code).toBe('provider_outage');
+      const q = await outageStatus(tx, t.workspaceId, projectId);
+      expect(q).toMatchObject({ message: 'Queued: our video partner is busy. Your place is held.', etaKind: 'retry' });
+      expect(new Date(q!.etaAt!).getTime()).toBeGreaterThan(Date.now());
+      const steps = await tx`select detail from progress_steps where subject_id = ${projectId} and status = 'active'`;
+      expect(steps.map((x) => x.detail)).toEqual(['Queued: our video partner is busy. Your place is held.']);
       expect(JSON.stringify(p!.qa_report)).not.toMatch(/switched to exact product composite/); // no degraded output
       expect(await available(tx, 'taste')).toBe(0); // reservation held, not released
       const [a] = await tx`select status, expires_at > now() + interval '5 hours' as held from cost_authorizations where project_id = ${projectId} and idempotency_key like 'produce:%'`;
@@ -102,6 +110,59 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
       expect(r!.n).toBe(rendersBefore);
     });
     expect(await renderJobs()).toBe(renderJobsBefore); // no render was sent to the provider again (prod-08)
+  }, 240_000);
+});
+
+describe('cancel during an outage pause (§38 cancel semantics; §44 preserve reservation)', () => {
+  it('ends the paused order at once, returns the held credit, and the resume sweep leaves it alone', async () => {
+    const { t, ctx, projectId } = await readyForProduction('[[fail:render]]');
+    expect(await produceProject(ctx, projectId)).toBe('paused');
+    expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(0); // held through the pause
+    const r = await withTenant(t.workspaceId, (tx) => cancelProduction(tx, ctx, projectId, { reason: 'no longer needed' }));
+    expect(r).toMatchObject({ status: 'cancelled', decision: { outcome: 'release' } }); // the failed renders cost nothing
+    await withTenant(t.workspaceId, async (tx) => {
+      const [p] = await tx`select state, outage from projects where id = ${projectId}`;
+      expect(p).toMatchObject({ state: 'CANCELLED', outage: null });
+      expect(await available(tx, 'taste')).toBe(1);
+    });
+    // A late resume (sweep or duplicate delivery) never restarts it.
+    expect(await produceProject(ctx, projectId)).toBe('skipped');
+  }, 240_000);
+});
+
+describe('open circuit (§44 "optional approved fallback provider"; plan 05 §10)', () => {
+  const restoreRoutes = () =>
+    ownerPool()`update model_routes set circuit_open = false, circuit_until = null, fallback_task = case when task = 'tts.voiceover' then fallback_task else null end`.then(() =>
+      ownerPool()`delete from model_routes where task = 'video.scene_fallback'`,
+    );
+
+  it('fails renders over to the approved route; with none, the order queues with the announced ETA', async () => {
+    try {
+      await ownerPool()`insert into model_routes (task, provider, model, prompt_version)
+                        select 'video.scene_fallback', provider, model, prompt_version from model_routes where task = 'video.scene'`;
+      await ownerPool()`update model_routes set fallback_task = 'video.scene_fallback' where task = 'video.scene'`;
+      await ownerPool()`update model_routes set circuit_open = true, circuit_until = now() + interval '40 minutes' where task = 'video.scene'`;
+      const a = await readyForProduction();
+      expect(await produceProject(a.ctx, a.projectId)).toBe('complete');
+      const jobs = await ownerPool()`select distinct task from provider_jobs where workspace_id = ${a.t.workspaceId} and task like 'video.%'`;
+      expect(jobs.map((j) => j.task)).toEqual(['video.scene_fallback']);
+
+      // Without an approved fallback the order waits, its credit held, telling the customer when it's expected back.
+      await ownerPool()`update model_routes set fallback_task = null where task = 'video.scene'`;
+      const b = await readyForProduction();
+      expect(await produceProject(b.ctx, b.projectId)).toBe('paused');
+      await withTenant(b.t.workspaceId, async (tx) => {
+        const q = await outageStatus(tx, b.t.workspaceId, b.projectId);
+        expect(q).toMatchObject({ message: 'Queued: our video partner is busy. Your place is held.', etaKind: 'reopen' });
+        const [r] = await tx`select circuit_until from model_routes where task = 'video.scene'`;
+        expect(q!.etaAt).toBe(new Date(r!.circuit_until as string).toISOString());
+        expect(await available(tx, 'taste')).toBe(0); // held, not released
+      });
+      // Nothing was dispatched on the open route.
+      expect((await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${b.t.workspaceId} and task like 'video.%'`)[0]!.n).toBe(0);
+    } finally {
+      await restoreRoutes();
+    }
   }, 240_000);
 });
 

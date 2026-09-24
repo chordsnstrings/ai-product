@@ -63,6 +63,24 @@ describe('Production Planner pricing (§5, §6, §37: arch-22)', () => {
     expect(priceLine(rates, line).micros).toBe(Math.max(...prices));
   });
 
+  it('prices renders at the dearer of the video route and its approved fallback (§44: either may serve)', async () => {
+    const { routes, rates } = await pricing();
+    expect(routes.video).toHaveLength(1); // no fallback approved by default
+    const primary = routes.video[0]!;
+    const base = rates.get(`${primary.provider}/${primary.model}`)!;
+    const dear = new Map(rates);
+    dear.set(`${primary.provider}/pricier-video`, { ...base, model: 'pricier-video', rates: Object.fromEntries(Object.entries(base.rates).map(([k, v]) => [k, v * 2])) });
+    const scenes = [scene('a', 'GENERATIVE_INTERACTION')];
+    const alone = planProduction(scenes, 0, routes, dear);
+    const withFallback = planProduction(scenes, 0, { ...routes, video: [primary, { provider: primary.provider, model: 'pricier-video' }] }, dear);
+    expect(videoLines(alone.lines).every((v) => v.model === primary.model)).toBe(true);
+    expect(videoLines(withFallback.lines).every((v) => v.model === 'pricier-video')).toBe(true);
+    expect(estimate(dear, withFallback.lines).totalMicros).toBeGreaterThan(estimate(dear, alone.lines).totalMicros);
+    // A fallback with no published rate can't serve a call, so it doesn't shape the price.
+    const unpriced = planProduction(scenes, 0, { ...routes, video: [primary, { provider: primary.provider, model: 'unpriced-video' }] }, dear);
+    expect(videoLines(unpriced.lines).every((v) => v.model === primary.model)).toBe(true);
+  });
+
   it('caps generated-interaction scenes per 15s output and refuses a voice-over that cannot fit', () => {
     const s = (purpose: StoryboardPlan['scenes'][number]['purpose'], spokenLine: string | null = null): StoryboardPlan['scenes'][number] => ({ purpose, durationMs: 2500, visualPlan: 'x', productBehavior: null, spokenLine, overlayText: null, productionMode: 'GENERATIVE_INTERACTION', showsHumanSkin: false });
     const plan: StoryboardPlan = { hook: 'Hello', cta: 'Shop now', voiceover: '', scenes: [s('hook'), s('demonstration'), s('proof'), s('benefit'), s('routine'), s('problem')] };
@@ -71,6 +89,14 @@ describe('Production Planner pricing (§5, §6, §37: arch-22)', () => {
     expect(n.scenes.filter((x) => x.productionMode === 'HYBRID')).toHaveLength(6 - MAX_GENERATIVE_SCENES);
     const long = { ...plan, scenes: plan.scenes.map((x) => ({ ...x, spokenLine: 'one two three four five six seven eight nine ten' })) };
     expect(() => normalizePlan(long, [])).toThrow(/timing check/);
+  });
+
+  it('refuses a first-person customer line on a scene with an AI-generated person (standard §40)', () => {
+    const s = (purpose: StoryboardPlan['scenes'][number]['purpose'], mode: StoryboardPlan['scenes'][number]['productionMode'], showsHumanSkin: boolean, spokenLine: string | null = null): StoryboardPlan['scenes'][number] => ({ purpose, durationMs: 3000, visualPlan: 'x', productBehavior: null, spokenLine, overlayText: null, productionMode: mode, showsHumanSkin });
+    const plan = (demoLine: string, skin: boolean): StoryboardPlan => ({ hook: 'Hello', cta: 'Shop now', voiceover: '', scenes: [s('hook', 'STRICT_COMPOSITE', false), s('demonstration', 'GENERATIVE_INTERACTION', skin, demoLine), s('cta', 'STRICT_COMPOSITE', false)] });
+    expect(() => normalizePlan(plan('I’ve used it for two weeks.', true), [])).toThrow(/testimonial check/);
+    expect(normalizePlan(plan('Two drops, morning and night.', true), []).scenes).toHaveLength(3);
+    expect(normalizePlan(plan('I’ve used it for two weeks.', false), []).scenes).toHaveLength(3); // no person shown
   });
 });
 

@@ -1,5 +1,5 @@
 import { withAdmin, type Tx } from '@arkiv/db';
-import { append, audit, type Staff, type TenantContext } from '@arkiv/core';
+import { append, audit, stopForRefund, type Staff, type TenantContext } from '@arkiv/core';
 import { sendEmail } from '@arkiv/email';
 import { DomainError, env, formatUsd, type RefundReason } from '@arkiv/shared';
 import { billingGateway } from './gateway';
@@ -104,6 +104,12 @@ export async function applySucceededRefund(tx: Tx, ctx: Pick<TenantContext, 'wor
     reason: `${row.reason_code as string}: ${formatUsd(Number(row.amount_micros))} refunded${amount < 0 ? ' before use (credit withdrawn)' : ''}`,
     idempotencyKey: `refund:${row.id}`,
   });
+  // Paid in full back while its ad isn't delivered: production stops and the project ends REFUNDED (a running
+  // production stops at its next checkpoint and withdraws the credit it held then).
+  if (projectId && row.purchase_id && unit !== 'creative_test') {
+    const [pu] = await tx`select status from purchases where id = ${row.purchase_id} and workspace_id = ${ws}`;
+    if (pu?.status === 'refunded') await stopForRefund(tx, ctx, projectId, row.purchase_id as string);
+  }
   return { replayed: false, revoked: amount < 0 };
 }
 

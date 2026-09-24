@@ -446,7 +446,21 @@ export const ACTIONS = {
   'rates.publish': a({ perm: 'rates.propose', reauth: true, schema: z.object({ rateTableId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'rates.publish', { rateTableId: i.rateTableId }, i.reason) }),
 
   /* ── Providers & routes ── */
-  'route.circuit': a({ perm: 'providers.circuit', schema: z.object({ task: z.string(), open: z.boolean(), reason }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select circuit_open from model_routes where task = ${i.task}`; await tx`update model_routes set circuit_open = ${i.open}, updated_at = now() where task = ${i.task}`; await audit(tx, s, i.open ? 'route.circuit_open' : 'route.circuit_close', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: { circuit_open: i.open } }); }) }),
+  // Opening a circuit may carry staff's estimate of when it closes: customers whose ads are queued behind it see
+  // it as the ETA (plan 03 P9 "plus an ETA if known"). Closing clears it.
+  'route.circuit': a({
+    perm: 'providers.circuit',
+    schema: z.object({ task: z.string(), open: z.boolean(), reopenMinutes: z.coerce.number().int().min(1).max(7 * 24 * 60).optional(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select circuit_open, circuit_until from model_routes where task = ${i.task}`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Unknown route');
+        const [a0] = await tx`update model_routes set circuit_open = ${i.open},
+                                circuit_until = ${i.open && i.reopenMinutes ? tx`now() + make_interval(mins => ${i.reopenMinutes})` : i.open ? tx`circuit_until` : null},
+                                updated_at = now() where task = ${i.task} returning circuit_open, circuit_until`;
+        await audit(tx, s, i.open ? 'route.circuit_open' : 'route.circuit_close', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: a0 });
+      }),
+  }),
   /* §10 Provider registry: status, region, concurrency limit, per-request timeout and retry policy (the Model
      Gateway reads them on every call). Secret values are never shown or set here. */
   'provider.update': a({
@@ -511,6 +525,47 @@ export const ACTIONS = {
         return { message: `Canary at ${i.rolloutPct}%. It rolls back automatically if QA first-pass or claim-block rates regress.` };
       });
     },
+  }),
+  // §48 "pin where possible": the exact provider version a route sends (empty clears the pin). Pinning to what is
+  // live freezes behaviour, so it needs no eval; any change of model still goes through route.update.
+  'route.pin': a({
+    perm: 'routes.manage',
+    reauth: true,
+    schema: z.object({ task: z.string(), version: z.string().trim().max(120).optional(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select pinned_model_version from model_routes where task = ${i.task}`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Unknown route');
+        const version = i.version || null;
+        await tx`update model_routes set pinned_model_version = ${version}, updated_at = now() where task = ${i.task}`;
+        await audit(tx, s, 'route.pin', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: { pinned_model_version: version } });
+        return { message: version ? `Pinned ${i.task} to ${version}.` : `Unpinned ${i.task}.` };
+      }),
+  }),
+  // §44 / plan 05 §10: the route the gateway fails over to when this one's circuit is open or its provider is down.
+  // Only a route of the same kind, priced on a published rate, that doesn't fall back to this one.
+  'route.fallback': a({
+    perm: 'routes.manage',
+    reauth: true,
+    schema: z.object({ task: z.string(), fallbackTask: z.string().optional(), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [cur] = await tx`select fallback_task from model_routes where task = ${i.task}`;
+        if (!cur) throw new DomainError('NOT_FOUND', 'Unknown route');
+        const fb = i.fallbackTask || null;
+        if (fb) {
+          const [f] = await tx`select task, provider, model, fallback_task from model_routes where task = ${fb}`;
+          if (!f) throw new DomainError('NOT_FOUND', 'Unknown fallback route');
+          if (fb === i.task) throw new DomainError('INVALID', 'A route can’t be its own fallback.');
+          if (fb.split('.')[0] !== i.task.split('.')[0]) throw new DomainError('INVALID', `${fb} does a different kind of work than ${i.task}.`);
+          if (f.fallback_task === i.task) throw new DomainError('INVALID', `${fb} already falls back to ${i.task}.`);
+          const [rate] = await tx`select 1 from provider_rate_tables where provider = ${f.provider as string} and model = ${f.model as string} and status = 'published' and effective_from <= now() limit 1`;
+          if (!rate) throw new DomainError('CONFLICT', `No published rate for ${f.provider as string}/${f.model as string}; calls on it can’t be priced.`);
+        }
+        await tx`update model_routes set fallback_task = ${fb}, updated_at = now() where task = ${i.task}`;
+        await audit(tx, s, 'route.fallback', { type: 'route', id: i.task }, { reason: i.reason, before: cur, after: { fallback_task: fb } });
+        return { message: fb ? `${i.task} now fails over to ${fb}.` : `${i.task} queues on outage (no fallback).` };
+      }),
   }),
   // A dataset alone runs the rules baseline; with a task, the run is recorded for that template × model and is
   // what route.update requires before a change (plan 05 §10–11).

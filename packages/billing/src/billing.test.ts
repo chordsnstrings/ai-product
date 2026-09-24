@@ -83,6 +83,9 @@ describe('Taste checkout (P7/P8, plan 02 B1–B5)', () => {
     await processStripeEvent('evt_second');
     expect(gw.refunds.map((r) => r.pi)).toContain('pi_second');
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
+    // Refunding the duplicate leaves the order it duplicated alone: still paid, still going to production.
+    const [p] = await ownerPool()`select state, cancel_requested_at from projects where id = ${projectId}`;
+    expect(p).toMatchObject({ state: 'STORYBOARD_APPROVED', cancel_requested_at: null });
   }, 60_000);
 });
 

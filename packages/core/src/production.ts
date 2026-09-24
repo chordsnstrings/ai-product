@@ -8,20 +8,22 @@ import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
-import type { LineMapping } from './compliance';
+import { classifyClaim, showsSyntheticPeople, syntheticTestimonials, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
-import { diffCompositions, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
+import { diffCompositions, disclosureMetadata, type AiDisclosure, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
 import { authorize, holdAuthorization, reissueToken, settle, type Purpose } from './cost-governor';
 import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, type LedgerUnit } from './ledger';
-import { generateImage, generateVideo, lineFor, route, synthesizeVoice, type Route } from './model-gateway';
+import { setting } from './settings';
+import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
-import { getProject, IN_PRODUCTION, isTerminal, PATH, transition } from './projects';
+import { projectVisitor, recordFunnel } from './funnel';
+import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { qaClaims, qaExperimentIntegrity, qaExport, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 
@@ -64,6 +66,16 @@ export async function claimsQaForExports(tx: Tx, skuId: string, lines: string[],
   };
 }
 
+/**
+ * Standard §40 as a QA check: a scene with an AI-generated person never carries a first-person customer line. It
+ * blocks like a claims failure (the merchant changes the line), and lists the lines as violations.
+ */
+export function testimonialCheck(scenes: Parameters<typeof syntheticTestimonials>[0]): CheckResult | null {
+  const found = syntheticTestimonials(scenes);
+  if (!found.length) return null;
+  return { check: 'claims', pass: false, hard: true, detail: found.map((f) => `“${f.text}”: ${f.reason}`).join('; '), data: { violations: found, unmapped: [] } };
+}
+
 /** Claim IDs a scene's own lines use, from a claims-QA mapping (§24: a scene stores the claims it uses). */
 export function sceneClaimIds(lines: (string | null | undefined)[], mapping: readonly LineMapping[]): string[] {
   const own = new Set(lines.filter((l): l is string => !!l && !!l.trim()).map((l) => l.trim()));
@@ -75,24 +87,31 @@ export const genSeconds = (durationMs: number) => Math.max(MIN_GEN_SECONDS, Math
 
 type RouteModel = Pick<Route, 'provider' | 'model'>;
 
-/** The routes a production is priced on — the same routes (canary arm included) the gateway dispatches on. */
+/**
+ * The routes a production is priced on — the same routes (canary arm included) the gateway dispatches on. Each is
+ * the task's route followed by its approved fallback route, if any: either may serve the call (§44), so a
+ * planned call is priced at the dearer of the two.
+ */
 export interface ProductionRoutes {
-  video: RouteModel;
-  /** The voice-over route and its approved fallback: the voice line covers whichever is dearer. */
+  video: RouteModel[];
   tts: RouteModel[];
-  qa: RouteModel;
-  plate: RouteModel | null;
+  qa: RouteModel[];
+  plate: RouteModel[] | null;
+}
+
+/** A task's route and its approved fallback route (when one is set). */
+async function withFallbackRoute(tx: Tx, task: string, workspaceId: string | null): Promise<RouteModel[]> {
+  const r = await route(tx, task, workspaceId);
+  return r.fallbackTask ? [r, await route(tx, r.fallbackTask, workspaceId)] : [r];
 }
 
 export async function productionRoutes(tx: Tx, workspaceId: string | null): Promise<ProductionRoutes> {
-  const tts = await route(tx, 'tts.voiceover', workspaceId);
-  const fallback = tts.fallbackTask ? await route(tx, tts.fallbackTask, workspaceId) : null;
   const [plate] = await tx`select 1 from model_routes where task = ${PLATE_TASK}`;
   return {
-    video: await route(tx, 'video.scene', workspaceId),
-    tts: fallback ? [tts, fallback] : [tts],
-    qa: await route(tx, 'qa.fidelity', workspaceId),
-    plate: plate ? await route(tx, PLATE_TASK, workspaceId) : null,
+    video: await withFallbackRoute(tx, 'video.scene', workspaceId),
+    tts: await withFallbackRoute(tx, 'tts.voiceover', workspaceId),
+    qa: await withFallbackRoute(tx, 'qa.fidelity', workspaceId),
+    plate: plate ? await withFallbackRoute(tx, PLATE_TASK, workspaceId) : null,
   };
 }
 
@@ -111,19 +130,24 @@ export interface ProductionPlan {
 }
 
 /**
- * A voice line priced at the dearer of the voice route and its approved fallback, since either may serve the
- * call (§34 Voice). A route without a published rate can't be used, so it doesn't shape the line.
+ * A line priced at the dearer of a route and its approved fallback, since either may serve the call (§34 Voice,
+ * §44 provider outage). A route without a published rate can't be used, so it doesn't shape the line.
  */
-export function voiceLine(routes: Pick<ProductionRoutes, 'tts'>, rates: Map<string, RateTable>, chars: number): CostLine {
-  const priced = routes.tts.flatMap((r) => {
-    const line = lineFor(r, { kind: 'tts', chars });
+export function dearerLine(routes: readonly RouteModel[], rates: Map<string, RateTable>, units: TaskUnits): CostLine {
+  const priced = routes.flatMap((r) => {
+    const line = lineFor(r, units);
     try {
       return [{ line, micros: priceLine(rates, line).micros }];
     } catch {
       return [];
     }
   });
-  return priced.sort((a, b) => b.micros - a.micros)[0]?.line ?? lineFor(routes.tts[0]!, { kind: 'tts', chars });
+  return priced.sort((a, b) => b.micros - a.micros)[0]?.line ?? lineFor(routes[0]!, units);
+}
+
+/** A voice line at the dearer of the voice route and its approved fallback (§34 Voice). */
+export function voiceLine(routes: Pick<ProductionRoutes, 'tts'>, rates: Map<string, RateTable>, chars: number): CostLine {
+  return dearerLine(routes.tts, rates, { kind: 'tts', chars });
 }
 
 /**
@@ -146,7 +170,7 @@ export function planProduction(
   const generative = scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION' && !opts.reuse?.has(s.id)).map((s) => s.id);
   const seconds = Object.fromEntries(generative.map((id) => [id, genSeconds(scenes.find((x) => x.id === id)!.duration_ms)])) as Record<string, number>;
   const secs = Object.values(seconds);
-  const renders: CostLine[] = generative.map((id) => lineFor(routes.video, { kind: 'video', seconds: seconds[id]!, resolution: '720p' }));
+  const renders: CostLine[] = generative.map((id) => dearerLine(routes.video, rates, { kind: 'video', seconds: seconds[id]!, resolution: '720p' }));
   const pooled = secs.reduce((a, b) => a + b, 0) * COST_LIMITS.RETRY_RESERVE_FRACTION;
   const longest = secs.length ? Math.max(...secs) : 0;
   const shortest = secs.length ? Math.min(...secs) : 0;
@@ -157,13 +181,13 @@ export function planProduction(
     const inspections = 2 * generative.length + repairs + plates + 1;
     return [
       ...voice(),
-      lineFor(routes.qa, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
-      ...(plates && routes.plate ? [lineFor(routes.plate, { kind: 'image', images: plates })] : []),
+      dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
+      ...(plates && routes.plate ? [dearerLine(routes.plate, rates, { kind: 'image', images: plates })] : []),
       { kind: 'media', outputs: 1 },
     ];
   };
   if (longest > pooled + 1e-6) {
-    const topUp = lineFor(routes.video, { kind: 'video', seconds: longest - pooled, resolution: '720p', retryReserve: false });
+    const topUp = dearerLine(routes.video, rates, { kind: 'video', seconds: longest - pooled, resolution: '720p', retryReserve: false });
     const lines = [...renders, topUp, ...tail(longest)];
     if (opts.ceilingMicros == null || estimate(rates, lines).totalMicros <= opts.ceilingMicros) return { lines, generative, seconds, reserveSeconds: longest };
   }
@@ -238,11 +262,23 @@ export const OUTAGE_MAX_HOURS = 6;
 const AUTH_TTL_MINUTES = 180;
 const leaseResource = (projectId: string) => `produce:${projectId}`;
 
-/** Customer-facing copy (failure_reason is shown in the funnel); internal causes go on the event only. */
-export const OUTAGE_MESSAGE = 'A production service we use is temporarily unavailable. Your ad is paused and will resume automatically — your credit is held and you won’t be charged twice.';
-const FAILED_MESSAGE = 'We couldn’t produce this ad to our quality standard. You haven’t been charged for it.';
+/**
+ * Customer-facing queue copy for a paused production (plan 03 P9 "Queued: our video partner is busy. Your place
+ * is held."). Internal causes (provider, error) go on the event and the outage record only.
+ */
+export function queuedCopy(task: string): string {
+  if (task === 'renders') return FAILURE_COPY.renders_paused;
+  return `Queued: ${partnerFor(task)} is busy. Your place is held.`;
+}
 
-export type ProduceOutcome = 'complete' | 'failed' | 'skipped' | 'paused';
+export type ProduceOutcome = 'complete' | 'failed' | 'skipped' | 'paused' | 'cancelled';
+
+/** The customer (or staff, or a refund) cancelled this production while it was running: stop at this checkpoint. */
+class ProductionCancelled extends Error {
+  constructor() {
+    super('production cancelled');
+  }
+}
 
 /** Another run took over this production (our lease lapsed): stop without touching state or spend. */
 class LeaseLost extends Error {
@@ -377,6 +413,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
   });
   const { p, scenes, sb, sku, fp, variant, versions, brand, imagery } = load;
+  // Cancelled while queued or while a previous run was stopping: this run holds the lease, so it settles the cancel.
+  if (p.cancel_requested_at && RUNNABLE.includes(p.state as ProjectState)) return withTenant(ws, async (tx) => ((await finalizeCancel(tx, ctx, projectId)) ? 'cancelled' : 'skipped'));
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
   const unit = (p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'>) ?? 'taste';
   const purpose: Purpose = unit === 'creative_test' ? 'creative_test' : unit;
@@ -385,11 +423,18 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   let authorizationId: string | null = (p.authorization_id as string | null) ?? null;
   const heartbeat = async () => {
     await renewLease(ctx, projectId, runId);
-    await withTenant(ws, (tx) => beat(tx, ws, projectId, authorizationId));
+    const [c] = await withTenant(ws, async (tx) => {
+      await beat(tx, ws, projectId, authorizationId);
+      return tx`select cancel_requested_at from projects where id = ${projectId} and workspace_id = ${ws}`;
+    });
+    // A cancel that arrived while we were working: stop before the next spend (§35, §38 cancel semantics).
+    if (c?.cancel_requested_at) throw new ProductionCancelled();
   };
   const voice: LogicalVoice = brand?.brain.voice ?? DEFAULT_VOICE;
   const names = [sku.name as string, brand?.name ?? null];
   const reusable = reusableRenders(scenes, versions);
+  /** Strict scenes shown on a generated (AI) setting: part of the ad's AI-content disclosure (§40). */
+  const platedScenes = new Set<string>();
   const hashes = new Map(scenes.map((s) => [s.id, renderInputHash(s)]));
   const sameInputs = (v: VersionRow, s: SceneRow) => v.input_hash == null || v.input_hash === hashes.get(s.id);
   const ownFrames = versions.filter((v) => v.kind === 'frame' && v.lineage?.projectId === projectId && v.status === 'accepted');
@@ -452,7 +497,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   } catch (e) {
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     if (e instanceof DomainError && (e.code === 'PAYMENT_REQUIRED' || e.code === 'GATE_BLOCKED')) {
-      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: e.message }));
+      // A Cost Governor refusal is written for the customer (what to do next); the code says which kind it is.
+      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: e.message, code: e.code === 'PAYMENT_REQUIRED' ? 'entitlement' : 'gate_blocked' }));
       return 'failed';
     }
     // Anomaly hold / open circuit / unpriceable route before anything was reserved: pause and try again later.
@@ -567,11 +613,22 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const seconds = genSeconds(s.duration_ms);
         // Attempts already spent on these inputs by an interrupted run count: a resume never grants an extra repair.
         let attempt = versions.filter((v) => v.scene_id === s.id && v.kind === 'render' && v.status === 'qa_failed' && sameInputs(v, s)).length;
+        // A render already paid for with these inputs but never judged — the run crashed between the render and its
+        // QA, or the reconciler collected it from the provider — is judged instead of paying for another (§35, §39).
+        let pending = await withTenant(ws, async (tx) => {
+          const [a] = await tx`select a.id, a.lineage, j.id as job_id, j.prompt_version, j.model_version_returned
+                               from assets a left join provider_jobs j on j.workspace_id = a.workspace_id and j.id::text = a.lineage->>'providerJobId'
+                               where a.workspace_id = ${ws} and a.kind = 'scene_render' and a.lineage->>'sceneId' = ${s.id} and a.lineage->>'inputHash' = ${hashes.get(s.id)!}
+                                 and not exists (select 1 from scene_versions v where v.workspace_id = a.workspace_id and v.scene_id = ${s.id} and v.asset_id = a.id)
+                               order by a.created_at desc limit 1`;
+          return a?.job_id ? { assetId: a.id as string, jobId: a.job_id as string, promptVersion: a.prompt_version as string, modelVersion: (a.model_version_returned as string | null) ?? undefined, bytes: await assetBytes(tx, a.id as string) } : null;
+        });
         let why = 'repeated QA failure';
         let lastFailure = 'QA';
         while (attempt < 2) {
           attempt++;
-          if (attempt === 2) {
+          // A pending render was paid for already (its repair, if it is one, drew on the reserve then).
+          if (attempt === 2 && !pending) {
             if (!reserve.take(seconds)) {
               why = 'repair reserve used';
               break;
@@ -582,23 +639,39 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             });
           }
           try {
-            const vid = await generateVideo({
-              ctx,
-              token: auth.token,
-              task: 'video.scene',
-              subject: { type: 'scene', id: s.id },
-              prompt: `${s.visual_plan as string}. ${s.product_behavior ?? ''} Keep the product identical to the reference image. Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`,
-              references: [`data:image/png;base64,${frame.bytes.toString('base64')}`],
-              seconds,
-              resolution: '720p',
-              ratio: '9:16',
-              mockLabel: `${s.purpose} · ${(s.visual_plan as string).slice(0, 60)}`,
-              heartbeat,
-            });
+            let vid: { bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string };
+            let assetId: string;
+            if (pending) {
+              ({ assetId, ...vid } = pending);
+              pending = null;
+            } else {
+              vid = await generateVideo({
+                ctx,
+                token: auth.token,
+                task: 'video.scene',
+                subject: { type: 'scene', id: s.id },
+                inputRefs: { skuId: sku.id, sceneId: s.id, inputHash: hashes.get(s.id), frameVersionId: s.current_version_id ?? null, attempt },
+                prompt: `${s.visual_plan as string}. ${s.product_behavior ?? ''} Keep the product identical to the reference image. Natural adult skin, no retouching, no text.${attempt === 2 ? ' Keep the product fully still and clearly readable; simpler hand motion.' : ''}`,
+                references: [`data:image/png;base64,${frame.bytes.toString('base64')}`],
+                seconds,
+                resolution: '720p',
+                ratio: '9:16',
+                mockLabel: `${s.purpose} · ${(s.visual_plan as string).slice(0, 60)}`,
+                heartbeat,
+              });
+              // Paid output goes to our own storage before anything else can fail (§39 "every output is copied to
+              // owned object storage immediately"): a crash or a QA error never loses a render we paid for.
+              const v0 = vid;
+              assetId = await withTenant(ws, async (tx) => {
+                const a = await saveAsset(tx, ws, { bytes: v0.bytes, mime: 'video/mp4', kind: 'scene_render', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, attempt, providerJobId: v0.jobId, model: v0.modelVersion, promptVersion: v0.promptVersion, inputHash: hashes.get(s.id) } });
+                await tx`update provider_jobs set output_asset_id = ${a.id} where id = ${v0.jobId} and workspace_id = ${ws}`;
+                return a.id;
+              });
+            }
             const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, videoBytes: vid.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt });
             const ok = res.every((c) => c.pass);
             const saved = await withTenant(ws, async (tx) => {
-              const a = await saveAsset(tx, ws, { bytes: vid.bytes, mime: 'video/mp4', kind: 'scene_render', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, attempt, providerJobId: vid.jobId, model: vid.modelVersion, promptVersion: vid.promptVersion, inputHash: hashes.get(s.id) } });
+              const a = { id: assetId };
               const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
               const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage)
                                      values (${ws}, ${s.id}, ${v!.v}, 'render', ${a.id}, 'generative', ${vid.modelVersion ?? null}, ${vid.promptVersion},
@@ -647,7 +720,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const approved = await frameOf(s, n);
         if (!imagery.cutout?.keyed || !routes.plate) return still(s, n, approved);
         const prior = plateFrame(s.id);
-        if (prior?.asset_id) return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
+        if (prior?.asset_id) {
+          platedScenes.add(s.id);
+          return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
+        }
         try {
           const img = await generateImage({ ctx, token: auth.token, task: PLATE_TASK, subject: { type: 'scene', id: s.id }, prompt: platePrompt(s), references: [], width: 1080, height: 1920, mockLabel: '' });
           const plate = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: img.bytes, mime: img.mime, kind: 'storyboard_frame', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, projectId, plate: true, providerJobId: img.jobId, promptVersion: img.promptVersion } }));
@@ -658,10 +734,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             return still(s, n, approved);
           }
           checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: exact product on a generated setting — ${c.detail}` })));
+          platedScenes.add(s.id);
           const saved = await saveFrame(s, fb.bytes, fb.technique, fb.lineage, res);
           return still(s, n, { bytes: fb.bytes, ...saved, technique: fb.technique });
         } catch (e) {
-          if (e instanceof LeaseLost) throw e;
+          if (e instanceof LeaseLost || e instanceof ProductionCancelled) throw e;
           if (e instanceof ProviderError || (e instanceof DomainError && (e.code === 'UNAVAILABLE' || e.code === 'FORBIDDEN'))) {
             checks.push({ check: 'visual', pass: true, hard: false, detail: `Scene ${n}: no generated setting (${(e as Error).message.slice(0, 80)}); using the studio backdrop` });
             return still(s, n, approved);
@@ -694,16 +771,20 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb.hook_text, sb.cta_text].filter(Boolean) as string[];
       const claimCheck = await withTenant(ws, (tx) => claimsQaForExports(tx, sku.id as string, lines, ASPECTS, { names }));
       checks.push(claimCheck);
+      // §40: AI-generated people never speak as customers (checked on the scenes as produced).
+      const testimonials = testimonialCheck(scenes);
+      if (testimonials) checks.push(testimonials);
       const mapping = ((claimCheck.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? []) as LineMapping[];
       const claimIds = new Map(scenes.map((s) => [s.id, sceneClaimIds([s.spoken_line as string | null, s.overlay_text as string | null], mapping)]));
       await withTenant(ws, async (tx) => {
         for (const s of scenes) await tx`update scenes set claim_ids = ${claimIds.get(s.id)!}::uuid[] where id = ${s.id}`;
       });
       for (const slot of slots) slot.entry.claimIds = claimIds.get(slot.entry.sceneId) ?? [];
-      if (!claimCheck.pass) {
+      if (!claimCheck.pass || testimonials) {
         await withTenant(ws, async (tx) => {
           await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
-          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: claimCheck.detail });
+          // The lines and why are in the QA report (shown with a compliant alternative); the reason is customer copy.
+          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: [claimCheck.pass ? null : claimCheck.detail, testimonials?.detail].filter(Boolean).join(' | '), code: 'claims_blocked' });
           await tx`update projects set qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
           await settle(tx, ctx, auth.authorizationId, 'released');
         });
@@ -776,7 +857,16 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await step(tx, ws, projectId, 'platforms', 'active');
       });
       const endCard = { productName: sku.name as string, cta: (sb.cta_text as string) ?? 'Shop now', index: `NO. ${String(sku.catalogue_no).padStart(3, '0')}`, durationMs: endCardMs };
-      const outs = await composeAd({ scenes: slots.map((s) => s.input), voiceover: voPath, captions, endCard, aspects: ASPECTS }, dir);
+      // §40: what in this ad is AI-generated — written into every export's metadata, the manifest and the creative,
+      // and shown with each platform's disclosure steps on delivery.
+      const generatedScenes = slots.filter((sl) => sl.entry.technique === 'generative' || sl.entry.technique.startsWith('generated') || platedScenes.has(sl.entry.sceneId)).map((sl) => sl.entry.sceneId);
+      const disclosure: AiDisclosure = {
+        aiGenerated: generatedScenes.length > 0 || segments.length > 0,
+        syntheticPeople: scenes.some((s) => showsSyntheticPeople(s) && generatedScenes.includes(s.id) && !platedScenes.has(s.id)),
+        syntheticVoice: segments.length > 0,
+        generatedScenes,
+      };
+      const outs = await composeAd({ scenes: slots.map((s) => s.input), voiceover: voPath, captions, endCard, aspects: ASPECTS, metadata: disclosureMetadata(disclosure) }, dir);
       const [concept] = await withTenant(ws, (tx) => tx`select proposal from concepts where id = ${p.selected_concept_id}`);
       const proposal = (concept?.proposal ?? {}) as Record<string, unknown>;
       const manifest: CompositionManifest = {
@@ -790,6 +880,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         durationMs: totalMs,
         aspects: ASPECTS,
         genes: { angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment },
+        disclosure,
       };
 
       // Final QA: platform/audio per export + asset integrity + experiment integrity.
@@ -800,7 +891,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         checks.push(...(await qaExport(o.file, o.aspect, totalMs)));
         const bytes = await readFile(o.file);
         const a = await withTenant(ws, (tx) =>
-          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, storyboardId: sb.id } }),
+          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, storyboardId: sb.id, disclosure } }),
         );
         exportAssets.push({ aspect: o.aspect, assetId: a.id });
       }
@@ -816,10 +907,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, async (tx) => {
         const [cr] = await tx`
-          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition)
+          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0 } as never)},
-            1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)})
+            1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
@@ -830,6 +921,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         // An experiment's master is its control variant; a one-off ad has no variant (COMPOSITION_COMPLETED only).
         if (p.variant_id) await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: p.variant_id as string }, { creativeId: cr!.id, exports: exportAssets, master: true }, refs);
         await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets }, refs);
+        // Standard §7 "Taste delivered — QA pass and delivery success": a paid one-off ad passed final QA.
+        if (p.kind === 'taste' || p.kind === 'standalone') {
+          await recordFunnel('TASTE_DELIVERED', { workspaceId: ws, visitorId: await projectVisitor(tx, ws, projectId), props: { kind: p.kind } }, tx);
+        }
         await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
         if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
       });
@@ -838,6 +933,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     return final!.state === 'COMPLETE' ? 'complete' : 'failed';
   } catch (e) {
     if (e instanceof LeaseLost) return 'skipped';
+    if (e instanceof ProductionCancelled) return withTenant(ws, async (tx) => ((await finalizeCancel(tx, ctx, projectId)) ? 'cancelled' : 'skipped'));
     if (isProviderOutage(e)) return pauseForOutage(ctx, projectId, e instanceof ProviderOutage ? e.task : 'production', e, checks);
     // Hard failures: the customer is not charged for what we could not deliver (§25 retry policy).
     await withTenant(ws, (tx) => failProduction(tx, ctx, projectId, (e as Error).message, { checks }));
@@ -871,26 +967,66 @@ async function masterIntegrity(tx: Tx, variant: Record<string, unknown> | null, 
  * pause, and resumption by the resume sweep once the provider (or its circuit) recovers. An outage longer than
  * OUTAGE_MAX_HOURS ends the attempt: entitlement returned, paid one-off orders refunded.
  */
-async function pauseForOutage(ctx: TenantContext, projectId: string, task: string, e: unknown, checks: CheckResult[]): Promise<ProduceOutcome> {
+async function pauseForOutage(ctx: TenantContext, projectId: string, stage: string, e: unknown, checks: CheckResult[]): Promise<ProduceOutcome> {
   const detail = ((e as Error)?.message ?? String(e)).slice(0, 300);
+  // The route that is actually down (an open circuit names its task), so the resume sweep watches that circuit and
+  // the customer copy names the right partner.
+  const cause = e instanceof ProviderOutage ? e.underlying : e;
+  const details = cause instanceof DomainError ? (cause.details as { circuitOpen?: string; killSwitch?: string } | undefined) : undefined;
+  const task = stage === 'renders' || details?.killSwitch === 'renders' ? 'renders' : (details?.circuitOpen ?? stage);
+  const code: FailureCode = task === 'renders' ? 'renders_paused' : 'provider_outage';
   return withTenant(ctx.workspaceId, async (tx) => {
     const [p] = await tx`select state, outage, authorization_id from projects where id = ${projectId} for update`;
     if (!p || isTerminal(p.state as ProjectState) || p.state === 'PROVIDER_FAILED') return 'skipped';
     const prev = (p.outage ?? null) as { since?: string; attempts?: number } | null;
     const since = prev?.since ? new Date(prev.since) : new Date();
     if (Date.now() - since.getTime() > OUTAGE_MAX_HOURS * 3600_000) {
-      await failProduction(tx, ctx, projectId, `provider outage over ${OUTAGE_MAX_HOURS}h (${task}): ${detail}`, { checks });
+      await failProduction(tx, ctx, projectId, `provider outage over ${OUTAGE_MAX_HOURS}h (${task}): ${detail}`, { checks, code: 'outage_expired' });
       return 'failed';
     }
-    if (p.state !== 'NEEDS_USER_ACTION') await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: OUTAGE_MESSAGE, detail: `provider outage (${task}): ${detail}` });
+    const copy = queuedCopy(task);
+    if (p.state !== 'NEEDS_USER_ACTION') await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: copy, code, detail: `provider outage (${task}): ${detail}` });
     const outage = { task, since: since.toISOString(), attempts: (prev?.attempts ?? 0) + 1, lastAt: new Date().toISOString(), lastError: detail };
-    await tx`update projects set outage = ${tx.json(outage as never)}, failure_reason = ${OUTAGE_MESSAGE},
+    await tx`update projects set outage = ${tx.json(outage as never)}, failure_reason = ${copy}, failure_code = ${code},
                qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
     if (p.authorization_id) await holdAuthorization(tx, p.authorization_id as string, new Date(since.getTime() + (OUTAGE_MAX_HOURS + 1) * 3600_000));
-    await tx`update progress_steps set detail = 'Paused while a provider recovers — we’ll continue automatically.'
+    await tx`update progress_steps set detail = ${copy}
              where workspace_id = ${ctx.workspaceId} and subject_id = ${projectId} and status = 'active'`;
     return 'paused';
   });
+}
+
+/** Minutes the resume sweep waits after a paused production's last attempt (exponential, capped at 30). */
+export const outageBackoffMinutes = (attempts: number) => Math.min(30, 2 ** Math.max(0, attempts - 1));
+
+export interface QueueStatus {
+  /** Customer copy: "Queued: our video partner is busy. Your place is held." */
+  message: string;
+  /** When we expect to continue, if known: the circuit's announced reopening, or the next automatic attempt. */
+  etaAt: string | null;
+  etaKind: 'reopen' | 'retry' | null;
+}
+
+/**
+ * Truthful queue state of a production paused by an outage (plan 03 P9 "plus an ETA if known", §48 "expose
+ * truthful queued state/ETA where available"): the partner that is busy and, when known, when we expect to go
+ * on. An open circuit with no announced reopening has no ETA; kill-switched renders never do.
+ */
+export async function outageStatus(tx: Tx, workspaceId: string, projectId: string, now = new Date()): Promise<QueueStatus | null> {
+  const [p] = await tx`select state, outage from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
+  if (!p || p.state !== 'NEEDS_USER_ACTION' || !p.outage) return null;
+  const o = p.outage as { task?: string; lastAt?: string; attempts?: number };
+  const task = o.task ?? 'production';
+  if (task === 'renders' || (await isFlagOn(tx, 'kill.renders', workspaceId))) return { message: queuedCopy('renders'), etaAt: null, etaKind: null };
+  const message = queuedCopy(task);
+  const [r] = await tx`select circuit_open, circuit_until from model_routes where task = ${task}`;
+  if (r?.circuit_open) {
+    const until = r.circuit_until ? new Date(r.circuit_until as string) : null;
+    return until && until > now ? { message, etaAt: until.toISOString(), etaKind: 'reopen' } : { message, etaAt: null, etaKind: null };
+  }
+  const last = o.lastAt ? new Date(o.lastAt) : now;
+  const next = new Date(Math.max(now.getTime(), last.getTime() + outageBackoffMinutes(o.attempts ?? 1) * 60_000));
+  return { message, etaAt: next.toISOString(), etaKind: 'retry' };
 }
 
 /**
@@ -898,11 +1034,12 @@ async function pauseForOutage(ctx: TenantContext, projectId: string, task: strin
  * settled as refunded (entitlement returned), and — for paid one-off orders — the automatic refund queued
  * (the L12 guarantee: you don't pay for an ad we couldn't deliver to our quality standard). Idempotent.
  */
-export async function failProduction(tx: Tx, ctx: TenantContext, projectId: string, detail: string, opts: { checks?: CheckResult[] } = {}): Promise<boolean> {
+export async function failProduction(tx: Tx, ctx: TenantContext, projectId: string, detail: string, opts: { checks?: CheckResult[]; code?: FailureCode } = {}): Promise<boolean> {
   const [p] = await tx`select state, authorization_id from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!p || isTerminal(p.state as ProjectState) || p.state === 'PROVIDER_FAILED') return false;
   if (opts.checks) await tx`update projects set qa_report = ${tx.json({ ...summarize(opts.checks), error: detail.slice(0, 300) } as never)} where id = ${projectId}`;
-  await transition(tx, ctx, projectId, 'PROVIDER_FAILED', { reason: FAILED_MESSAGE, detail: detail.slice(0, 500) });
+  const code = opts.code ?? 'quality_failed';
+  await transition(tx, ctx, projectId, 'PROVIDER_FAILED', { reason: FAILURE_COPY[code], code, detail: detail.slice(0, 500) });
   await tx`update projects set outage = null where id = ${projectId}`;
   if (p.authorization_id) await settle(tx, ctx, p.authorization_id as string, 'refunded');
   await tx`update progress_steps set status = 'failed', detail = 'We hit a problem on our side. You have not been charged for this attempt.', completed_at = now()
@@ -911,6 +1048,230 @@ export async function failProduction(tx: Tx, ctx: TenantContext, projectId: stri
                         and status = 'paid' and kind in ('taste','standalone') order by created_at desc limit 1`;
   if (pu) await enqueue(tx, ctx.workspaceId, Queues.refundPurchase, { projectId, purchaseId: pu.id, reason: 'guarantee' }, { singletonKey: `refund:${pu.id}`, priority: 20 });
   return true;
+}
+
+/** A line that stopped production at the claims check, with why and a compliant alternative when one is known. */
+export interface BlockedLine {
+  line: string;
+  reason: string;
+  alternative: string | null;
+  /** Platforms (customer labels) on which the line is not allowed. */
+  platforms: string[];
+}
+
+type ScanGroup = { platform?: Platform | null; violations?: { text: string; reason: string; alternative?: string }[]; unmapped?: string[] };
+
+/** The blocked lines recorded in a project's QA report (the claims check of its last production run). */
+export function blockedLines(report: unknown): BlockedLine[] {
+  const checks = ((report as { checks?: CheckResult[] } | null)?.checks ?? []).filter((c) => c.check === 'claims' && !c.pass);
+  const out = new Map<string, BlockedLine>();
+  const add = (line: string, reason: string, alternative: string | null | undefined, platform: Platform | null | undefined) => {
+    const cur = out.get(line) ?? { line, reason, alternative: alternative ?? classifyClaim(line).matched.find((m) => m.alternative)?.alternative ?? null, platforms: [] };
+    if (platform && !cur.platforms.includes(PLATFORM_LABEL[platform])) cur.platforms.push(PLATFORM_LABEL[platform]);
+    out.set(line, cur);
+  };
+  for (const c of checks) {
+    const d = (c.data ?? {}) as ScanGroup & { platforms?: ScanGroup[] };
+    for (const g of d.platforms ?? [d]) {
+      for (const v of g.violations ?? []) add(v.text, v.reason, v.alternative, g.platform);
+      for (const u of g.unmapped ?? []) add(u, 'It makes a product claim that isn’t approved in your Claims Vault.', null, g.platform);
+    }
+  }
+  return [...out.values()];
+}
+
+/** Every line an ad says or shows, as production checks them (scenes, hook, CTA). */
+async function adLines(tx: Tx, storyboardId: string): Promise<string[]> {
+  const scenes = await tx`select spoken_line, overlay_text from scenes where storyboard_id = ${storyboardId} order by position`;
+  const [sb] = await tx`select hook_text, cta_text from storyboards where id = ${storyboardId}`;
+  return [...scenes.flatMap((x) => [x.spoken_line, x.overlay_text]), sb?.hook_text, sb?.cta_text].filter(Boolean) as string[];
+}
+
+/**
+ * A production stopped at the claims check (BLOCKED_COMPLIANCE) goes back to its storyboard so the merchant can
+ * fix the line (plan 03 P9 "reassure and build anticipation"; standard §14). The purchase stays paid and the
+ * approval is remembered (storyboards.approved_at): finishAfterEdit resumes with the same entitlement, without a
+ * new checkout. Accepted renders are reused when production resumes (their inputs don't include the words).
+ */
+export async function reopenForEdit(tx: Tx, ctx: TenantContext, projectId: string) {
+  assertCan(ctx, 'sku.edit');
+  const [p] = await tx`select state, storyboard_id, qa_report from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  const lines = blockedLines(p.qa_report);
+  if (p.state === 'STORYBOARD_READY' && p.storyboard_id) return { storyboardId: p.storyboard_id as string, lines, replayed: true };
+  if (p.state !== 'BLOCKED_COMPLIANCE' || !p.storyboard_id) throw new DomainError('CONFLICT', 'There’s nothing to change on this ad right now.');
+  const [sb] = await tx`select status from storyboards where id = ${p.storyboard_id} for update`;
+  // A product blocked before any storyboard was approved (e.g. not skincare) has no line to fix.
+  if (sb?.status !== 'approved') throw new DomainError('CONFLICT', 'There’s nothing to change on this ad right now.');
+  await tx`update storyboards set status = 'ready' where id = ${p.storyboard_id}`;
+  await transition(tx, ctx, projectId, 'STORYBOARD_READY', { from: 'BLOCKED_COMPLIANCE', detail: 'reopened to fix a blocked line' });
+  // The next run starts its progress afresh.
+  await tx`update progress_steps set status = 'pending', detail = null, started_at = null, completed_at = null, expected_ms = null
+           where workspace_id = ${ctx.workspaceId} and subject_id = ${projectId} and step_key = any(${PRODUCTION_STEPS.map((x) => x.key)})`;
+  return { storyboardId: p.storyboard_id as string, lines, replayed: false };
+}
+
+/** Can this storyboard go back into production without a new checkout (it was approved, and paid for)? */
+export async function resumableAfterEdit(tx: Tx, workspaceId: string, projectId: string): Promise<boolean> {
+  const [r] = await tx`select p.state, p.entitlement_unit, sb.approved_at,
+                              exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.project_id = p.id and pu.status = 'paid') as paid
+                       from projects p left join storyboards sb on sb.id = p.storyboard_id and sb.workspace_id = p.workspace_id
+                       where p.id = ${projectId} and p.workspace_id = ${workspaceId}`;
+  if (!r || r.state !== 'STORYBOARD_READY' || !r.entitlement_unit || !r.approved_at) return false;
+  return r.entitlement_unit === 'creative_test' || !!r.paid;
+}
+
+/**
+ * Finish an ad after the merchant fixed its blocked line: the edited lines are checked first (no spend on a line
+ * that would be blocked again), then production is approved again with the entitlement unit it was bought with.
+ */
+export async function finishAfterEdit(tx: Tx, ctx: TenantContext, projectId: string) {
+  const [p] = await tx`select state, entitlement_unit, storyboard_id, sku_id from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  const unit = p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'> | null;
+  if (ctx.actor.kind === 'user') assertCan(ctx, unit === 'creative_test' ? 'spend.creative_test' : 'storyboard.approve');
+  if (p.state === 'STORYBOARD_APPROVED' || p.state === 'COMPLETE' || IN_PRODUCTION.includes(p.state as ProjectState)) return { replayed: true, lines: [] as BlockedLine[] };
+  if (!unit || !(await resumableAfterEdit(tx, ctx.workspaceId, projectId))) throw new DomainError('CONFLICT', 'This storyboard hasn’t been paid for yet.');
+  const [sku] = await tx`select name from skus where id = ${p.sku_id}`;
+  const check = await claimsQaForExports(tx, p.sku_id as string, await adLines(tx, p.storyboard_id as string), ASPECTS, { names: [sku?.name as string, (await brandBrainFor(tx, p.sku_id as string))?.name ?? null] });
+  const testimonials = testimonialCheck(await tx`select production_mode, shows_human_skin, spoken_line, overlay_text from scenes where storyboard_id = ${p.storyboard_id}`);
+  if (!check.pass || testimonials) {
+    const lines = blockedLines({ checks: [check, ...(testimonials ? [testimonials] : [])] });
+    throw new DomainError('GATE_BLOCKED', `“${lines[0]?.line ?? 'A line'}” still can’t be used: ${lines[0]?.reason ?? check.detail}`, { lines });
+  }
+  await approveForProduction(tx, ctx, projectId, unit);
+  return { replayed: false, lines: [] as BlockedLine[] };
+}
+
+// ───────────── Cancellation (standard §25 retry policy, §35, §38 "cancel semantics depend on dispatch state") ─────
+
+/** States in which a paid-for / approved production can still be cancelled (before delivery). */
+const CANCELLABLE: readonly ProjectState[] = ['STORYBOARD_APPROVED', ...IN_PRODUCTION, 'NEEDS_USER_ACTION', 'BLOCKED_COMPLIANCE', 'STORYBOARD_READY'];
+
+export interface CancelDecision {
+  allowed: boolean;
+  /** release: the Creative Test (or paid one-off) comes back; consume: production had spent too much to return it. */
+  outcome: 'release' | 'consume';
+  /** A paid Taste/Standalone order whose payment goes back to the customer. */
+  refund: boolean;
+  dispatched: boolean;
+  spentMicros: number;
+  /** What happens, in customer words, before they confirm. */
+  message: string;
+}
+
+/**
+ * What cancelling would do now (standard §25 "Cancellation before dispatch | No charge | Release reserved
+ * entitlement"; §46 "Cancel after dispatch: commercial policy depends on provider cost; do not promise a refund
+ * that creates guaranteed loss"): before any provider call — or with only a small share of the budget spent — the
+ * credit (or the payment of a one-off order) comes back; past that, the credit is used and no refund is promised.
+ * A production that already stopped with its credit returned (blocked line, waiting for the customer) releases.
+ */
+export async function cancelDecision(tx: Tx, workspaceId: string, projectId: string): Promise<CancelDecision> {
+  const [p] = await tx`select p.state, p.authorization_id, p.entitlement_unit, sb.approved_at,
+                              exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.project_id = p.id and pu.status = 'paid' and pu.kind in ('taste','standalone')) as paid
+                       from projects p left join storyboards sb on sb.id = p.storyboard_id and sb.workspace_id = p.workspace_id
+                       where p.id = ${projectId} and p.workspace_id = ${workspaceId}`;
+  const no = (message: string): CancelDecision => ({ allowed: false, outcome: 'release', refund: false, dispatched: false, spentMicros: 0, message });
+  if (!p) return no('Project not found');
+  if (p.state === 'COMPLETE') return no('This ad has already been delivered.');
+  if (!CANCELLABLE.includes(p.state as ProjectState) || !p.entitlement_unit) return no('There’s no production to cancel.');
+  if (p.state === 'STORYBOARD_READY' && !p.approved_at) return no('There’s no production to cancel.');
+  const paid = !!p.paid;
+  const [a] = p.authorization_id
+    ? await tx`select a.status, (a.estimate->>'totalMicros')::bigint as estimate,
+                      coalesce((select sum(coalesce(j.actual_micros, j.estimate_micros)) from provider_jobs j
+                                where j.workspace_id = a.workspace_id and j.authorization_id = a.id and j.status <> 'failed'), 0)::bigint as spent,
+                      exists (select 1 from provider_jobs j where j.workspace_id = a.workspace_id and j.authorization_id = a.id) as dispatched
+               from cost_authorizations a where a.id = ${p.authorization_id} and a.workspace_id = ${workspaceId}`
+    : [];
+  const live = a?.status === 'active';
+  const spent = live ? Number(a!.spent) : 0;
+  const dispatched = live && !!a!.dispatched;
+  const maxBps = await setting(tx, 'production.cancel_release_max_spend_bps');
+  const release = !live || !dispatched || spent * 10_000 <= Number(a!.estimate ?? 0) * maxBps;
+  const unit = p.entitlement_unit === 'creative_test' ? 'Creative Test' : 'credit';
+  const message = release
+    ? paid
+      ? 'Cancel now and your payment is refunded in full.'
+      : `Cancel now and your ${unit} goes back on your balance.`
+    : `Production is well under way, so cancelling now uses this ad’s ${paid ? 'payment' : unit} and nothing is refunded.`;
+  return { allowed: true, outcome: release ? 'release' : 'consume', refund: release && paid, dispatched, spentMicros: spent, message };
+}
+
+/**
+ * Cancel a production (customer, staff or job cancel). With no run producing right now, it ends at once: the
+ * reservation is settled per cancelDecision, the project ends CANCELLED (REFUNDED for a paid one-off whose payment
+ * goes back, queued through the refund job) and its steps are marked skipped. While a run is producing, the cancel
+ * is recorded and the run stops at its next checkpoint (between scenes, while waiting on a render — the provider
+ * task is cancelled too — or before delivery) and finishes the cancel itself.
+ */
+export async function cancelProduction(tx: Tx, ctx: TenantContext, projectId: string, opts: { reason?: string } = {}): Promise<{ status: 'cancelled' | 'refunded' | 'cancelling'; decision: CancelDecision }> {
+  const [p] = await tx`select state, entitlement_unit, cancel_requested_at from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  if (ctx.actor.kind === 'user') assertCan(ctx, p.entitlement_unit === 'creative_test' ? 'spend.creative_test' : 'storyboard.approve');
+  const decision = await cancelDecision(tx, ctx.workspaceId, projectId);
+  if (!decision.allowed) throw new DomainError('CONFLICT', decision.message);
+  const request = { by: `${ctx.actor.kind}:${ctx.actor.id}`, reason: (opts.reason ?? '').slice(0, 300) || null, at: new Date().toISOString() };
+  await tx`update projects set cancel_requested_at = coalesce(cancel_requested_at, now()), cancel_request = coalesce(cancel_request, ${tx.json(request as never)})
+           where id = ${projectId} and workspace_id = ${ctx.workspaceId}`;
+  if (await productionRunning(tx, ctx.workspaceId, projectId)) return { status: 'cancelling', decision };
+  const done = await finalizeCancel(tx, ctx, projectId);
+  return { status: done === 'REFUNDED' ? 'refunded' : 'cancelled', decision };
+}
+
+/**
+ * A refund of the order's payment (Stripe dashboard, console, dispute) while its ad isn't delivered stops the
+ * production and ends the project REFUNDED: the money went back, so the credit it bought is withdrawn too. A
+ * delivered ad stays delivered (plan 02 B9), and a refunded duplicate payment leaves a still-paid order alone. Runs in the refund's transaction (tenant or staff role; every query is
+ * scoped to the workspace).
+ */
+export async function stopForRefund(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, projectId: string, purchaseId: string): Promise<'none' | 'requested' | 'refunded'> {
+  const [p] = await tx`select state from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p || p.state === 'COMPLETE' || isTerminal(p.state as ProjectState)) return 'none';
+  // A duplicate payment refunded while the order's own payment stands (a second tab, a double charge) changes
+  // nothing: the production is still paid for.
+  const [paid] = await tx`select 1 from purchases where workspace_id = ${ctx.workspaceId} and project_id = ${projectId} and id <> ${purchaseId}
+                          and status = 'paid' and kind in ('taste', 'standalone') limit 1`;
+  if (paid) return 'none';
+  const request = { by: 'refund', purchaseId, at: new Date().toISOString() };
+  await tx`update projects set cancel_requested_at = coalesce(cancel_requested_at, now()), cancel_request = ${tx.json(request as never)}
+           where id = ${projectId} and workspace_id = ${ctx.workspaceId}`;
+  if (await productionRunning(tx, ctx.workspaceId, projectId)) return 'requested';
+  return (await finalizeCancel(tx, ctx, projectId)) ? 'refunded' : 'none';
+}
+
+/** Finish a recorded cancel: settle, end the project, return money or credit per the decision. Idempotent. */
+async function finalizeCancel(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, projectId: string): Promise<ProjectState | null> {
+  const ws = ctx.workspaceId;
+  const [p] = await tx`select state, authorization_id, cancel_request, entitlement_unit from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+  if (!p || isTerminal(p.state as ProjectState)) return null;
+  const req = (p.cancel_request ?? {}) as { by?: string; reason?: string | null; purchaseId?: string };
+  const byRefund = req.by === 'refund';
+  const decision = await cancelDecision(tx, ws, projectId);
+  const sysCtx = { ...ctx, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, requestId: 'cancel' };
+  if (p.authorization_id) await settle(tx, sysCtx, p.authorization_id as string, byRefund || decision.outcome === 'release' ? 'released' : 'consumed');
+  let to: ProjectState = 'CANCELLED';
+  if (byRefund) {
+    to = 'REFUNDED';
+    // The payment went back, so the credit it bought goes too (unless the refund already withdrew it).
+    const [pu] = await tx`select kind from purchases where id = ${req.purchaseId ?? null} and workspace_id = ${ws}`;
+    const [already] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and project_id = ${projectId} and type = 'CREDIT_REFUNDED' and amount < 0 limit 1`;
+    const [consumed] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and project_id = ${projectId} and type = 'CREDIT_CONSUMED' limit 1`;
+    if (pu && !already && !consumed) {
+      await append(tx, sysCtx, { type: 'CREDIT_REFUNDED', unit: pu.kind as 'taste' | 'standalone', amount: -1, projectId, reference: req.purchaseId, idempotencyKey: `refund:withdraw:${projectId}`, reason: 'Payment refunded before delivery: production stopped, credit withdrawn' });
+    }
+  } else if (decision.refund) {
+    to = 'REFUNDED';
+    const [pu] = await tx`select id from purchases where workspace_id = ${ws} and project_id = ${projectId} and status = 'paid' and kind in ('taste','standalone') order by created_at desc limit 1`;
+    if (pu) await enqueue(tx, ws, Queues.refundPurchase, { projectId, purchaseId: pu.id, reason: 'cancelled' }, { singletonKey: `refund:${pu.id}`, priority: 20 });
+  }
+  const who = req.by?.startsWith('staff') ? 'Arkiv support' : req.by === 'refund' ? 'a refund of this order' : 'you';
+  await transition(tx, ctx, projectId, to, { detail: `cancelled by ${req.by ?? 'unknown'}${req.reason ? `: ${req.reason}` : ''} (${decision.outcome}, spent ${decision.spentMicros})` });
+  await tx`update projects set outage = null where id = ${projectId} and workspace_id = ${ws}`;
+  await tx`update progress_steps set status = 'skipped', detail = ${`Cancelled by ${who}`}, completed_at = now()
+           where workspace_id = ${ws} and subject_id = ${projectId} and status in ('pending','active')`;
+  return to;
 }
 
 /**

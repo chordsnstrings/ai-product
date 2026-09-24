@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { placeholderFrame, stillToClip, toneAudio, withTempDir, type Aspect } from '@arkiv/media';
+import { keyBackground, placeholderFrame, stillToClip, toneAudio, withTempDir, type Aspect } from '@arkiv/media';
 import type {
   ImageProvider,
   ImageRequest,
@@ -9,6 +9,9 @@ import type {
   LlmJsonRequest,
   LlmJsonResult,
   LlmProvider,
+  SegmentationProvider,
+  SegmentationRequest,
+  SegmentationResult,
   TtsProvider,
   TtsRequest,
   TtsResult,
@@ -46,6 +49,30 @@ export class MockLlm implements LlmProvider {
       },
       model: req.model,
       modelVersion: `${req.model}-mock`,
+      providerRequestId: `mock-msg-${randomUUID()}`,
+      rawMeta: { mock: true, stopReason: 'end_turn' },
+    };
+  }
+}
+
+/**
+ * Background removal stand-in: the same border-colour keying the worker does itself, so a photo keying can't cut
+ * out (a busy background) comes back not aligned — as a provider that couldn't separate the product would.
+ */
+export class MockSegmentation implements SegmentationProvider {
+  readonly name = 'byteplus';
+  async removeBackground(req: SegmentationRequest): Promise<SegmentationResult> {
+    const k = await keyBackground(req.image);
+    return {
+      png: k.png,
+      mask: k.mask,
+      coverage: k.coverage,
+      aligned: k.keyed,
+      technique: 'mock_key',
+      model: req.model,
+      modelVersion: `${req.model}-mock`,
+      providerRequestId: `mock-cutout-${randomUUID()}`,
+      rawMeta: { mock: true, spread: k.spread },
     };
   }
 }
@@ -59,7 +86,7 @@ export class MockImage implements ImageProvider {
     if (fail) throw new ProviderError(this.name, `injected ${fail}`, fail !== 'invalid', fail as never);
     const seed = parseInt(createHash('sha1').update(req.prompt).digest('hex').slice(0, 4), 16);
     const bytes = await placeholderFrame(req.mockLabel ?? req.prompt.slice(0, 80), aspectFor(req.width, req.height), seed);
-    return { bytes, mime: 'image/png', model: req.model, modelVersion: `${req.model}-mock`, providerRequestId: `mock-img-${randomUUID()}` };
+    return { bytes, mime: 'image/png', model: req.model, modelVersion: `${req.model}-mock`, providerRequestId: `mock-img-${randomUUID()}`, rawMeta: { mock: true } };
   }
 }
 
@@ -108,7 +135,7 @@ export class MockVideo implements VideoProvider {
       return readFile(out);
     });
     t.status = 'succeeded';
-    return { status: 'succeeded', bytes: t.bytes, modelVersion: `${t.req.model}-mock`, outputSeconds: t.req.seconds };
+    return { status: 'succeeded', bytes: t.bytes, modelVersion: `${t.req.model}-mock`, outputSeconds: t.req.seconds, rawMeta: { mock: true, status: 'succeeded', seconds: t.req.seconds } };
   }
 
   async cancel(id: string): Promise<void> {

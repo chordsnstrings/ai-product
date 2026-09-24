@@ -100,11 +100,26 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
   const cameraRef = useRef<HTMLInputElement>(null);
 
   const validUrl = /^https?:\/\/[^\s.]+\.[^\s]{2,}/i.test(url.trim());
+  // Upload started (standard §7): recorded once, when the first photo or a product link is added — not only when
+  // the form reaches the server — so starts lost in transit still count. The server dedupes it with the submit.
+  const started = useRef(false);
+  const markStarted = useCallback(
+    (method: 'url' | 'photos') => {
+      if (started.current) return;
+      started.current = true;
+      fetch('/api/funnel/upload-start', { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ page, variant: variant ?? null, method }) }).catch(() => {});
+    },
+    [page, variant],
+  );
+  useEffect(() => {
+    if (validUrl) markStarted('url');
+  }, [validUrl, markStarted]);
   const addFiles = (list: FileList | null) => {
     if (!list) return;
     // Some desktop browsers report iPhone HEIC files with an empty type; the server converts them.
     const imgs = [...list].filter((f) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name)).slice(0, 6);
     if (!imgs.length) return setError('Choose a photo (JPG or PNG).');
+    markStarted('photos');
     setError(null);
     setFiles((prev) => [...prev, ...imgs].slice(0, 6));
   };

@@ -6,7 +6,7 @@ import { analyzeProduct, startPreview } from './analysis';
 import { AD_PLATFORMS, approveClaim, proposeClaim, renderableClaims } from './claims';
 import { allowedClaimTexts, buildContext } from './creative-director';
 import { append } from './ledger';
-import { approveForProduction, produceProject } from './production';
+import { approveForProduction, blockedLines, produceProject } from './production';
 import { generateStoryboard, selectConcept } from './storyboard';
 import { ingestBytes } from './uploads';
 import { ctxFor, productPhoto } from './testing';
@@ -111,9 +111,14 @@ describe('production claims QA uses the real export platforms', () => {
       await approveForProduction(tx, narrow.ctx, narrow.projectId, 'taste');
     });
     await produceProject(narrow.ctx, narrow.projectId);
-    const [p] = await ownerPool()`select state, failure_reason from projects where id = ${narrow.projectId}`;
+    const [p] = await ownerPool()`select state, failure_code, qa_report from projects where id = ${narrow.projectId}`;
     expect(p!.state).toBe('BLOCKED_COMPLIANCE');
-    expect(p!.failure_reason).toMatch(/Facebook\/Instagram feed/);
-    expect(p!.failure_reason).not.toMatch(/TikTok:/);
+    expect(p!.failure_code).toBe('claims_blocked');
+    // The blocked line is shown to the merchant with the platform it can't run on — Feed, not TikTok.
+    const blocked = blockedLines(p!.qa_report);
+    expect(blocked.some((b) => /Non-comedogenic/.test(b.line))).toBe(true);
+    const platforms = blocked.flatMap((b) => b.platforms);
+    expect(platforms).toContain('Facebook/Instagram feed');
+    expect(platforms).not.toContain('TikTok');
   }, 240_000);
 });

@@ -14,6 +14,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { autoLinkByCode } from './experiments';
+import { recordFunnel, workspaceVisitor } from './funnel';
 import { enqueue, Queues } from './outbox';
 import { recordFacts } from './product-truth';
 import { nextCatalogueNo } from './workspaces';
@@ -53,6 +54,10 @@ export async function saveIntegration(
              on conflict (shop_domain) do nothing`;
   }
   await emit(tx, ctx, 'INTEGRATION_CONNECTED', { type: 'integration', id: row!.id as string }, { provider: input.provider, scopes: input.scopes });
+  // Standard §7 "Ad account connected — Meta/TikTok connection rate".
+  if (input.provider === 'meta' || input.provider === 'tiktok') {
+    await recordFunnel('AD_ACCOUNT_CONNECTED', { workspaceId: ctx.workspaceId, visitorId: await workspaceVisitor(tx, ctx.workspaceId), props: { provider: input.provider } }, tx);
+  }
   await enqueue(tx, ctx.workspaceId, Queues.syncIntegration, { integrationId: row!.id, full: true }, { singletonKey: `sync:${row!.id}` });
   return row!.id as string;
 }

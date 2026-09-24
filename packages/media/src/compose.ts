@@ -69,13 +69,14 @@ export async function overlayTimed(video: string, overlays: TimedOverlay[], out:
  * Mix voice-over (if any) and normalize loudness to −14 LUFS (plan 06 Phase 3). Always outputs an AAC track:
  * Meta reports Reels with audio outperform silent creative (§25), and platforms expect one.
  */
-export async function finalizeAudio(video: string, voiceover: string | null, durationMs: number, out: string): Promise<void> {
+export async function finalizeAudio(video: string, voiceover: string | null, durationMs: number, out: string, metadata: Record<string, string> = {}): Promise<void> {
   const base = ['-i', video];
   const audioIn = voiceover ? ['-i', voiceover] : ['-f', 'lavfi', '-t', sec(durationMs), '-i', 'anullsrc=r=48000:cl=stereo'];
   await ffmpeg([
     ...base, ...audioIn,
     '-filter_complex', `[1:a]apad,atrim=0:${sec(durationMs)},loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]`,
     '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-t', sec(durationMs),
+    ...Object.entries(metadata).flatMap(([k, v]) => ['-metadata', `${k}=${v}`]),
     '-movflags', '+faststart', out,
   ]);
 }
@@ -215,6 +216,8 @@ export interface ComposeSpec {
   captions?: Cue[];
   endCard?: { productName: string; cta: string; index?: string; durationMs: number } | null;
   aspects: Aspect[];
+  /** Container metadata written into every export (e.g. the AI-content disclosure, standard §40). */
+  metadata?: Record<string, string>;
 }
 
 export interface ComposedOutput {
@@ -267,7 +270,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
       const withOv = path.join(dir, 'overlaid.mp4');
       await overlayTimed(joined, overlays, withOv);
       const out = path.join(outDir, `final-${aspect}.mp4`);
-      await finalizeAudio(withOv, spec.voiceover ?? null, t, out);
+      await finalizeAudio(withOv, spec.voiceover ?? null, t, out, spec.metadata);
       results.push({ aspect, file: out, durationMs: t, srt: toSrt(cues) });
     });
   }

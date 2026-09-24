@@ -16,6 +16,7 @@ import {
   evaluateCanaries,
   expiredFlagAlerts,
   expireOffers,
+  reconcileProviderJobs,
   refreshRiskFlags,
   retireSupersededRates,
   sweepExpiredAuthorizations,
@@ -102,7 +103,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       let n = 0;
       for (const r of rows) {
         if (r.exhausted) {
-          await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'outage-sweep'), r.id as string, 'provider outage did not recover in time'));
+          await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'outage-sweep'), r.id as string, 'provider outage did not recover in time', { code: 'outage_expired' }));
           n++;
         } else if (!r.blocked && r.due) {
           const attempts = Number((r.outage as { attempts?: number }).attempts ?? 1);
@@ -130,7 +131,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
           and ${notHeld(tx)}
         limit 200`);
       for (const r of rows) {
-        if (r.overdue) await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'stuck-sweep'), r.id as string, 'production stalled (no live worker) past the deadline'));
+        if (r.overdue) await withTenant(r.workspace_id as string, (tx) => failProduction(tx, sysCtx(r.workspace_id as string, 'stuck-sweep'), r.id as string, 'production stalled (no live worker) past the deadline', { code: 'stalled' }));
         else await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:stuck:${Math.floor(Date.now() / 300_000)}`, 20));
       }
       return rows.length;
@@ -191,6 +192,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return sent;
     },
   },
+  // §39: provider jobs a crashed worker left dispatched are reconciled by provider request id — finished renders
+  // are copied into our storage and booked at their real cost; abandoned calls are closed (never under-counted).
+  'reconcile-provider-jobs': { cron: '*/5 * * * *', run: async () => { const r = await reconcileProviderJobs(); return r.succeeded + r.failed ? r : 0; } },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
   // Plan 05 §5: an example asset whose rights expire is removed from every landing page's gallery (Pulse alert).

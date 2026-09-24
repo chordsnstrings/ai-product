@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { decideFact, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { cancelProduction, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -12,8 +12,12 @@ import { projectAccess } from '@/lib/tenant';
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
  *   retry     – retry a failed production (entitlement was returned on failure)
+ *   reopen    – back to the storyboard to fix a line the claims check blocked (purchase kept)
+ *   finish    – produce again after that fix, with the same entitlement (no new checkout)
+ *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
+ *   watched   – the finished ad was played (P10 "Watch", standard §7); recorded once per project
  */
 export const POST = route(async (req, { params }: { params: Promise<{ id: string; action: string }> }) => {
   const { id, action } = await params;
@@ -47,10 +51,29 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     case 'retry':
       await withTenant(a.ctx.workspaceId, (tx) => retryProduction(tx, a.ctx, id));
       return json({ ok: true });
+    case 'reopen': {
+      const r = await withTenant(a.ctx.workspaceId, (tx) => reopenForEdit(tx, a.ctx, id));
+      return json({ ok: true, next: `/storyboard/${id}`, lines: r.lines });
+    }
+    case 'cancel': {
+      if (a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const { reason } = await body(req, z.object({ reason: z.string().trim().max(300).optional() }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => cancelProduction(tx, a.ctx, id, { reason }));
+      return json({ ok: true, status: r.status, message: r.decision.message });
+    }
+    case 'finish': {
+      await withTenant(a.ctx.workspaceId, (tx) => finishAfterEdit(tx, a.ctx, id));
+      return json({ ok: true, next: `/produce/${id}` });
+    }
     case 'variant': {
       const { variantId } = await body(req, z.object({ variantId: z.string().uuid().nullable() }));
       const v = await withTenant(a.ctx.workspaceId, (tx) => selectVariant(tx, a.ctx, id, variantId));
       return json({ ok: true, variant: v });
+    }
+    case 'watched': {
+      const { assetId, seconds } = await body(req, z.object({ assetId: z.string().uuid(), seconds: z.number().min(0).max(3600) }));
+      const recorded = await withTenant(a.ctx.workspaceId, (tx) => recordAssetWatched(tx, a.ctx, id, assetId, seconds));
+      return json({ ok: true, recorded });
     }
     case 'retry-analysis': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));

@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, canRetryQueue, NO_SPEND_QUEUES, shouldMaskPii, staffCan } from '@arkiv/core';
+import { auditView, canRetryQueue, IN_PRODUCTION, NO_SPEND_QUEUES, shouldMaskPii, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { ago, dt, Mono, Page, Section, Table } from '@/components/ui';
 import { piiView } from '@/lib/mask';
@@ -44,7 +44,11 @@ export default async function Jobs({ searchParams }: { searchParams: Promise<{ s
   const stuck = d0.stuck.filter((p) => Date.now() - new Date(p.updated_at as string).getTime() > (EXPECTED_MIN[p.state as string] ?? 10) * 60_000);
   const stuckTable = (
     <Section title="Stuck detector">
-      <Table head={['Project', 'Workspace', 'State', 'Since', 'Suggested action']} rows={stuck.map((p) => [<Mono key="i">{String(p.id).slice(0, 8)}</Mono>, <Link key="w" href={`/tenants/${p.workspace_id}?tab=projects&project=${p.id}`}>{p.name as string}</Link>, p.state as string, ago(p.updated_at), p.state === 'RENDERING' ? 'Check provider jobs; circuit-break the provider if widespread' : 'Retry the step (no new spend)'])} empty="Nothing stuck." />
+      <Table head={['Project', 'Workspace', 'State', 'Since', 'Suggested action', '']} rows={stuck.map((p) => [<Mono key="i">{String(p.id).slice(0, 8)}</Mono>, <Link key="w" href={`/tenants/${p.workspace_id}?tab=projects&project=${p.id}`}>{p.name as string}</Link>, p.state as string, ago(p.updated_at), p.state === 'RENDERING' ? 'Check provider jobs; circuit-break the provider if widespread' : 'Resume from where it stopped (no new spend)',
+        // §39: a production with no live run resumes from durable state under the reservation it holds.
+        canManage && (IN_PRODUCTION as readonly string[]).includes(p.state as string) ? (
+          <ActButton key="r" small action="tenant.project_retry" payload={{ workspaceId: p.workspace_id, projectId: p.id }} confirm="Resume this stalled production? It continues from where it stopped under the reservation it already holds; nothing is reserved or charged again." reason="Resume reason (ticket / incident)">Resume</ActButton>
+        ) : null])} empty="Nothing stuck." />
     </Section>
   );
   if (stuckOnly) {

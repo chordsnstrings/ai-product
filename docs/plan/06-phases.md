@@ -39,7 +39,7 @@ not added later.
 3. Upload P2: URL + photos, HEIC conversion, resumable uploads, non-skincare and drug/SPF detection.
 4. URL import: fetch (with timeout, size cap, SSRF protection: public IPs only, no redirects to private ranges) → JSON-LD / Shopify `products/<handle>.json` / OpenGraph → fallback to photos.
 5. `ProductFact` store with OBSERVED/INFERRED/DECIDED, source precedence, DISPUTED handling; `PRODUCT_*` events.
-6. Background removal for the product cut-out (M3). A provider decision is needed: BytePlus/Seedream edit or an open model in the worker; evaluated on the golden set.
+6. Background removal for the product cut-out (M3): border keying first; when it can't separate the product, a BytePlus/Seedream edit onto a flat backdrop, keyed in the worker (decision log below). Evaluated on the golden set.
 7. Visual Fingerprint v0: reference views, label OCR (Opus vision), dominant colours, closure type.
 8. Claims extraction → Claims Vault v0 (statuses per §17; nothing auto-VERIFIED); banned-phrase list v1.
 9. The P3 cataloguing stream (SSE from real events) + the P4 confirmation screen.
@@ -151,6 +151,6 @@ not added later.
 | Hosting | DigitalOcean App Platform + Managed Postgres + Spaces | Decided |
 | Product analytics | PostHog (privacy mode, marketing/funnel pages only) | **Default: confirm** |
 | Observability | OpenTelemetry → Grafana Cloud | **Default: confirm** |
-| Background removal | Evaluate provider vs open model in Phase 1 | Open |
+| Background removal | Seedream image edit onto a flat backdrop (route `vision.cutout`), keyed in the worker with the mask applied to the merchant's own photo; used only when border keying can't separate the product, once per photo, under the storyboard's authorization. An open model in the worker stays the alternative if golden-set fidelity or cost says so. | **Decided; golden-set check pending (live credentials)** |
 | Brands/members per plan | 1/1/3 brands; 2/5/10 members | **Default: confirm** |
 | Cancelled-workspace retention | 90 days | **Default: confirm (§55 legal review)** |
