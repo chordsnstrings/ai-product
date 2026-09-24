@@ -1,4 +1,5 @@
 import type { Tx } from '@arkiv/db';
+import { firstRenderAcceptance, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures } from './qa-metrics';
 
 /**
  * Retention analytics for the console (plan 05 §17). Staff/admin role, aggregate only.
@@ -98,4 +99,105 @@ export async function day30ReviewDelivery(tx: Tx, opts: { days?: number; include
     }
   }
   return { reviews, summary };
+}
+
+// ───────────── Standard §10 internal retention targets ─────────────
+
+export interface RetentionTarget {
+  key: 'first_export' | 'performance_source' | 'growth_tests' | 'month2_retention' | 'monthly_churn' | 'first_render' | 'repeated_fidelity';
+  label: string;
+  /** The measured value: a share (0–1), or for growth_tests the median tests per customer. Null: nobody to measure yet. */
+  value: number | null;
+  /** How many customers / projects the value is over. */
+  n: number;
+  target: number;
+  /** Whether the value must be above (min) or below (max) the target. */
+  direction: 'min' | 'max';
+  /** Below / above target (never raised without anyone to measure). */
+  alert: boolean;
+  unit: 'share' | 'tests';
+}
+
+const target = (t: Omit<RetentionTarget, 'alert'>): RetentionTarget => ({
+  ...t,
+  alert: t.value != null && (t.direction === 'min' ? t.value < t.target : t.value > t.target),
+});
+
+/**
+ * Standard §10 internal retention targets, measured over customers who started paying in the last `days` (180 by
+ * default) and, for the per-project ones, the last 90 days. "If retention misses, … diagnose whether
+ * recommendations, trust, output quality or integration value are failing" — so each is shown with its threshold.
+ *  - first paid output export > 80%: a customer's first delivered paid ad was exported;
+ *  - performance source within 14 days > 60%: a Meta/TikTok account connected or a performance CSV imported within
+ *    14 days of the first payment (customers paying for at least 14 days);
+ *  - Growth customers complete ≥ 3 Creative Tests in their first 30 days: the median Growth customer does;
+ *  - Month-2 logo retention > 70%: still subscribed 60 days after the first plan started;
+ *  - monthly logo churn < 5%: subscribers 30 days ago whose plans have all ended since;
+ *  - first-render acceptance after automatic QA/repair > 70% and repeated product-fidelity failure < 3% of paid
+ *    projects: the Appendix C / QA definitions (qa-metrics.ts).
+ * Staff/admin role, aggregate only; test workspaces excluded unless `includeTest`.
+ */
+export async function retentionTargets(tx: Tx, opts: { days?: number; includeTest?: boolean } = {}): Promise<RetentionTarget[]> {
+  const days = opts.days ?? 180;
+  const test = !!opts.includeTest;
+  const [x] = await tx`
+    with ws as (select id from workspaces where ${test} or not is_test),
+    first_paid as (
+      select workspace_id, min(at) as at from (
+        select workspace_id, paid_at as at from purchases where status in ('paid', 'refunded') and paid_at is not null
+        union all select workspace_id, created_at from subscriptions) p
+      where workspace_id in (select id from ws) group by workspace_id),
+    cohort as (select * from first_paid where at > now() - make_interval(days => ${days})),
+    first_delivered as (
+      select distinct on (p.workspace_id) p.workspace_id, p.id from projects p join cohort c on c.workspace_id = p.workspace_id
+      where p.kind in ('taste', 'standalone', 'creative_test') and p.state = 'COMPLETE' order by p.workspace_id, p.updated_at),
+    exported as (
+      select f.workspace_id from first_delivered f
+      where exists (select 1 from events e join assets a on a.id = e.subject_id and a.workspace_id = e.workspace_id and a.kind = 'final_export'
+                    where e.type = 'ASSET_EXPORTED' and e.workspace_id = f.workspace_id and a.lineage->>'projectId' = f.id::text)),
+    perf_cohort as (select * from cohort where at <= now() - interval '14 days'),
+    perf_connected as (
+      select c.workspace_id from perf_cohort c
+      where exists (select 1 from integrations i where i.workspace_id = c.workspace_id and i.provider in ('meta', 'tiktok') and i.created_at <= c.at + interval '14 days')
+         or exists (select 1 from performance_observations o where o.workspace_id = c.workspace_id and o.platform = 'manual' and o.ingested_at <= c.at + interval '14 days'))
+    select (select count(*) from first_delivered)::int as delivered, (select count(*) from exported)::int as exported,
+           (select count(*) from perf_cohort)::int as perf_n, (select count(*) from perf_connected)::int as perf_ok`;
+  // Growth customers' Creative Tests (consumed entitlements) in their first 30 days.
+  const growth = await tx`
+    select s.workspace_id,
+           (select count(*) from ledger_entries l where l.workspace_id = s.workspace_id and l.type = 'CREDIT_CONSUMED' and l.unit = 'creative_test'
+              and l.created_at between s.created_at and s.created_at + interval '30 days')::int as tests
+    from (select distinct on (workspace_id) workspace_id, plan_code, created_at from subscriptions order by workspace_id, created_at) s
+    join workspaces w on w.id = s.workspace_id
+    where s.plan_code = 'GROWTH' and s.created_at <= now() - interval '30 days' and s.created_at > now() - make_interval(days => ${days})
+      and (${test} or not w.is_test)`;
+  const tests = growth.map((g) => Number(g.tests)).sort((a, b) => a - b);
+  const median = tests.length ? (tests.length % 2 ? tests[(tests.length - 1) / 2]! : (tests[tests.length / 2 - 1]! + tests[tests.length / 2]!) / 2) : null;
+  // Month-2 logo retention across all plans (the M2 checkpoint of the cohort table).
+  const m2 = (await retentionCohorts(tx, { by: 'plan', days: Math.max(days, 365), includeTest: test })).reduce(
+    (a, r) => ({ eligible: a.eligible + r.points.m2.eligible, retained: a.retained + r.points.m2.retained }),
+    { eligible: 0, retained: 0 },
+  );
+  // Monthly logo churn: live 30 days ago, no live plan since its last plan ended in the window.
+  const [churn] = await tx`
+    with subs as (
+      select s.workspace_id, s.created_at as started,
+             case when s.status in ('active', 'trialing', 'past_due') then null
+                  else coalesce((select min(e.at) from events e where e.workspace_id = s.workspace_id and e.type = 'SUBSCRIPTION_ENDED' and e.subject_id = s.id), s.updated_at) end as ended
+      from subscriptions s join workspaces w on w.id = s.workspace_id where ${test} or not w.is_test),
+    start_live as (select distinct workspace_id from subs where started <= now() - interval '30 days' and (ended is null or ended > now() - interval '30 days')),
+    still as (select distinct workspace_id from subs where ended is null)
+    select (select count(*) from start_live)::int as base, (select count(*) from start_live s where s.workspace_id not in (select workspace_id from still))::int as churned`;
+  const fr = await firstRenderAcceptance(tx, 90, { includeTest: test });
+  const fid = await repeatedFidelityFailures(tx, 90, { includeTest: test });
+  const share = (a: number, b: number) => (b ? a / b : null);
+  return [
+    target({ key: 'first_export', label: 'First paid output exported', value: share(Number(x!.exported), Number(x!.delivered)), n: Number(x!.delivered), target: 0.8, direction: 'min', unit: 'share' }),
+    target({ key: 'performance_source', label: 'Performance source connected within 14 days of paying', value: share(Number(x!.perf_ok), Number(x!.perf_n)), n: Number(x!.perf_n), target: 0.6, direction: 'min', unit: 'share' }),
+    target({ key: 'growth_tests', label: 'Growth: Creative Tests completed in the first 30 days (median)', value: median, n: tests.length, target: 3, direction: 'min', unit: 'tests' }),
+    target({ key: 'month2_retention', label: 'Month-2 logo retention', value: share(m2.retained, m2.eligible), n: m2.eligible, target: 0.7, direction: 'min', unit: 'share' }),
+    target({ key: 'monthly_churn', label: 'Monthly logo churn (last 30 days)', value: share(Number(churn!.churned), Number(churn!.base)), n: Number(churn!.base), target: 0.05, direction: 'max', unit: 'share' }),
+    target({ key: 'first_render', label: 'First-render acceptance after automatic QA/repair (90 days)', value: fr.delivered ? fr.rate : null, n: fr.delivered, target: 0.7, direction: 'min', unit: 'share' }),
+    target({ key: 'repeated_fidelity', label: 'Repeated product-fidelity failure, paid projects (90 days)', value: fid.paid ? fid.rate : null, n: fid.paid, target: REPEATED_FIDELITY_TARGET, direction: 'max', unit: 'share' }),
+  ];
 }
