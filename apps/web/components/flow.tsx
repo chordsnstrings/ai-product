@@ -487,7 +487,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
   }
   const primary = v.exports[0];
   const slug = v.access.workspaceSlug;
-  const qa = v.project.qa as { overall?: string; checks?: { name: string; passed: boolean }[] } | null;
+  const qa = v.project.qa;
   return (
     <Shell step={4} title="Your ad is ready" sub={`${v.sku.name} · 15 seconds · checked for product accuracy and claims.`}>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
@@ -500,10 +500,10 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
               <span className="ak-index">MP4 ↓</span>
             </a>
           ))}
-          {qa?.checks?.length ? (
+          {qa.length ? (
             <details>
               <summary className="ak-small">What we checked</summary>
-              <ul className="ak-small">{qa.checks.map((c) => <li key={c.name}>{c.passed ? '✓' : '•'} {c.name}</li>)}</ul>
+              <ul className="ak-small">{qa.map((c) => <li key={c.label}>{c.label} {c.ok ? '✓' : '•'}</li>)}</ul>
             </details>
           ) : null}
           <hr className="ak-rule" />

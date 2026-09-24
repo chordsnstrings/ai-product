@@ -36,8 +36,9 @@ export default async function Providers() {
       <Table head={['Provider', 'Secret (name only)', 'Configured']} rows={keys.map(([p, k, set]) => [p, <Mono key="k">{k}</Mono>, set ? 'yes' : 'no (mock)'])} />
       <Section title="Health (24h)"><Table head={['Provider', 'Calls', 'Error rate', 'p50', 'p95', 'Moderation rejects']} rows={d0.health.map((h) => [h.provider as string, h.n as number, pct(Number(h.failed) / Number(h.n)), `${h.p50 ?? '—'}ms`, `${h.p95 ?? '—'}ms`, h.moderated as number])} empty="No calls in 24h." /></Section>
       <Section title="Routes">
-        <Table head={['Task', 'Provider', 'Model', 'Prompt', 'Rollout', 'Canary', 'Circuit', '']} rows={d0.routes.map((r) => [
+        <Table head={['Task', 'Provider', 'Model', 'Prompt', 'Rollout', 'Canary', 'Approved fallback', 'Circuit', '']} rows={d0.routes.map((r) => [
           <Mono key="t">{r.task as string}</Mono>, r.provider as string, <Mono key="m">{r.model as string}</Mono>, <Mono key="p">{r.prompt_version as string}</Mono>, `${r.rollout_pct}%`, r.canary ? <Mono key="c">{JSON.stringify(r.canary)}</Mono> : '—',
+          r.fallback_task ? <Mono key="f">{r.fallback_task as string}</Mono> : 'queue on outage',
           r.circuit_open ? <span key="o" className="ak-chip ak-chip--risk">open</span> : 'closed',
           <span key="a" className="ak-row">
             {staffCan(s.roles, 'providers.circuit') ? <ActButton small action="route.circuit" payload={{ task: r.task, open: !r.circuit_open }} reason danger={!r.circuit_open}>{r.circuit_open ? 'Close circuit' : 'Open circuit'}</ActButton> : null}

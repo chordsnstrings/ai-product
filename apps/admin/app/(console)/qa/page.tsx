@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import type { QaReport } from '@arkiv/core';
 import { withAdmin } from '@arkiv/db';
 import { ago, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -21,7 +22,7 @@ export default async function Qa() {
     <Page title="QA review" sub="Content view requires break-glass on each tenant. Verdicts calibrate automated checks; they never enter golden sets without consent.">
       <Table head={['Project', 'Workspace', 'Why', 'State', 'Failed checks', 'Updated']} rows={d0.queue.map((p) => [
         <Link key="p" href={`/qa/${p.id}?ws=${p.workspace_id}`}><Mono>{String(p.id).slice(0, 8)}</Mono></Link>, p.name as string, p.why as string, p.state as string,
-        <span key="c" className="ak-small">{((p.qa_report as { checks?: { name: string; pass: boolean }[] } | null)?.checks ?? []).filter((c) => !c.pass).map((c) => c.name).join(', ') || '—'}</span>, ago(p.updated_at),
+        <span key="c" className="ak-small">{[...new Set(((p.qa_report as QaReport | null)?.checks ?? []).filter((c) => !c.pass).map((c) => `${c.check}${c.hard ? ' (hard)' : ''}`))].join(', ') || '—'}</span>, ago(p.updated_at),
       ])} empty="Queue is empty." />
       <Section title="Human agreement with automated checks">
         <Table head={['Check', 'Reviews', 'Agree', 'Agreement']} rows={d0.agreement.map((a) => [a.check_name as string, a.n as number, a.agree as number, pct(Number(a.agree) / Number(a.n))])} empty="No reviews yet." />

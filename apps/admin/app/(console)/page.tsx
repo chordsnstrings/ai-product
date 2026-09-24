@@ -1,3 +1,4 @@
+import { REPEATED_FIDELITY_TARGET, repeatedFidelityFailures } from '@arkiv/core';
 import { withAdmin } from '@arkiv/db';
 import { PLANS, type PlanCode } from '@arkiv/shared';
 import { Grid, Kpi, money, Page, pct, Section, Table, ago } from '@/components/ui';
@@ -44,9 +45,10 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       /* pg-boss schema not visible yet (worker grants on start) */
     }
     const prov = await tx`select provider, count(*)::int as n, count(*) filter (where status = 'failed')::int as failed from provider_jobs where created_at > now() - interval '1 hour' group by provider`;
-    const [qa] = await tx`select count(*) filter (where type = 'QA_PASSED')::int as passed, count(*) filter (where type = 'QA_FAILED')::int as failed,
-                                 count(*) filter (where type = 'QA_FAILED' and payload->>'hardFail' = 'true')::int as hard
+    const [qa] = await tx`select count(*) filter (where type = 'QA_PASSED')::int as passed, count(*) filter (where type = 'QA_FAILED')::int as failed
                           from events where type in ('QA_PASSED','QA_FAILED') and at > now() - make_interval(days => ${days}) and workspace_id not in ${test}`;
+    // Standard §10: repeated product-fidelity failure on < 3% of paid projects.
+    const fidelity = await repeatedFidelityFailures(tx, days);
     const [cogs] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > now() - make_interval(days => ${days}) and workspace_id not in ${test}`;
     const [today] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > date_trunc('day', now())`;
     const [prior] = await tx`select coalesce(sum(amount), 0)::bigint / 7 as avg from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at between date_trunc('day', now()) - interval '7 days' and date_trunc('day', now())`;
@@ -60,7 +62,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       union all select 'Abuse signals (24h)', count(*)::int, min(at), '/abuse' from abuse_signals where at > now() - interval '24 hours'
       union all select 'Approvals', count(*)::int, min(created_at), '/approvals' from approvals where status = 'pending'
       union all select 'QA needs review', count(*)::int, min(updated_at), '/qa' from projects where state in ('NEEDS_USER_ACTION','PROVIDER_FAILED') and updated_at > now() - interval '7 days'`;
-    return { funnel, cur, rev, subs, newSubs, jobs, outbox, queued, prov, qa, cogs, today, prior, exports, conn, risk, queues };
+    return { funnel, cur, rev, subs, newSubs, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, exports, conn, risk, queues };
   });
   const count = (t: string) => Number(m.cur.find((r) => r.type === t)?.n ?? 0);
   const prev = (t: string) => Number(m.funnel.find((r) => r.type === t)?.prev ?? 0);
@@ -105,7 +107,8 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
         <Grid>
           <Kpi label="Active jobs" value={m.jobs!.active} sub={`${m.jobs!.stuck} stuck > 20 min`} alert={Number(m.jobs!.stuck) > 0} href="/jobs" />
           <Kpi label="Oldest queued" value={oldestQueued ? ago(new Date(Date.now() - oldestQueued * 1000)) : '—'} alert={oldestQueued > 600} href="/jobs" />
-          <Kpi label="QA first-pass" value={pct(firstPass, 0)} alert={Number.isFinite(firstPass) && firstPass < 0.7} sub={`hard fidelity fails ${qaTotal ? pct(Number(m.qa!.hard) / qaTotal) : '—'}`} href="/qa" />
+          <Kpi label="QA first-pass" value={pct(firstPass, 0)} alert={Number.isFinite(firstPass) && firstPass < 0.7} sub={`${qaTotal} scene checks`} href="/qa" />
+          <Kpi label="Repeated fidelity fails" value={pct(m.fidelity.rate)} alert={Number.isFinite(m.fidelity.rate) && m.fidelity.rate > REPEATED_FIDELITY_TARGET} sub={`${m.fidelity.repeated} of ${m.fidelity.paid} paid projects · target < ${pct(REPEATED_FIDELITY_TARGET, 0)}`} href="/qa" />
           <Kpi label="Connector freshness" value={pct(freshPct, 0)} alert={Number.isFinite(freshPct) && freshPct < 0.9} sub={`${m.conn!.fresh}/${m.conn!.n} fresh`} href="/integrations" />
           <Kpi label="Churn-risk (new today)" value={m.risk!.n} href="/retention" />
         </Grid>
