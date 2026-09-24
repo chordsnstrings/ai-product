@@ -4,7 +4,9 @@ import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId } from '@arkiv/shared';
 import { assertAssetUsable, replaceAsset, sweepExpiredRights, unusableAssets } from './asset-rights';
 import { authorize } from './cost-governor';
-import { createExperiment } from './experiments';
+import { createExperiment, linkAdToVariant } from './experiments';
+import { ingestObservations } from './performance';
+import type { NormalizedObservation } from '@arkiv/integrations';
 import { mockConcepts } from './mock-intel';
 import { sweepDelayedProductions } from './production-delays';
 import { importHistoricalCreative } from './genome';
@@ -151,5 +153,37 @@ describe('production running past 20 minutes (plan 03 P9 edge)', () => {
     const alerts = await ownerPool()`select subject_id, severity from platform_alerts where kind = 'production_delayed' and resolved_at is null`;
     expect(alerts).toEqual([{ subject_id: late.projectId, severity: 'risk' }]);
     for (const other of [onTime, done, held]) expect(await ownerPool()`select 1 from outbox where workspace_id = ${other.t.workspaceId} and queue = 'send-email'`).toHaveLength(0);
+  });
+});
+
+describe('delivery settings change mid-test (§48 audience/bid/optimization)', () => {
+  const day = (n: number) => new Date(Date.now() - n * 86400_000).toISOString().slice(0, 10);
+  const obs = (adId: string, date: string, optimizationEvent: string, campaignType = 'OUTCOME_SALES'): NormalizedObservation => ({
+    platform: 'meta', accountId: 'act_1', campaignId: 'c1', adgroupId: 'as1', adId, adName: 'Serum ad', date, currency: 'USD',
+    spendMicros: 20_000_000, impressions: 4000, reach: null, frequency: null, clicks: 48, outboundClicks: null,
+    videoStarts: 2400, video25: null, video50: null, video75: 600, video100: null, avgWatchMs: null,
+    addToCart: null, checkout: null, purchases: 1, purchaseValueMicros: 38_000_000,
+    attributionModel: 'meta_default', attributionWindow: '7d_click_1d_view', optimizationEvent, campaignType, measurementContext: 'META_PAID_ATTRIBUTED',
+  });
+
+  it('a changed optimization event on a test ad records one automatic bid_change confounder for that day', async () => {
+    const { t, ctx, skuId } = await tenant();
+    const proposal = mockConcepts({ name: 'Glow Serum', category: 'serum', approvedClaims: [], themes: [], testedAngles: [] }).concepts[0]!;
+    const { experimentId } = await withTenant(t.workspaceId, (tx) => createExperiment(tx, ctx, { skuId, proposal }));
+    const [v] = await ownerPool()`select id from variants where experiment_id = ${experimentId} order by code limit 1`;
+    await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [obs('ad_1', day(3), 'OFFSITE_CONVERSIONS'), obs('ad_1', day(2), 'OFFSITE_CONVERSIONS')]));
+    await withTenant(t.workspaceId, (tx) => linkAdToVariant(tx, ctx, 'meta', 'ad_1', v!.id as string));
+    expect(await ownerPool()`select 1 from confounders where workspace_id = ${t.workspaceId}`).toHaveLength(0);
+    await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [obs('ad_1', day(1), 'LINK_CLICKS')]));
+    // A revised reading of the same day does not open a second one.
+    await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [{ ...obs('ad_1', day(1), 'LINK_CLICKS'), clicks: 60 }]));
+    const cs = await ownerPool()`select sku_id, kind, source, status, starts_at::date::text as starts, note from confounders where workspace_id = ${t.workspaceId}`;
+    expect(cs).toEqual([{ sku_id: skuId, kind: 'bid_change', source: 'automatic', status: 'active', starts: day(1), note: expect.stringMatching(/OFFSITE_CONVERSIONS → LINK_CLICKS/) }]);
+  });
+
+  it('an ad that is not in a test records nothing', async () => {
+    const { t, ctx } = await tenant();
+    await withTenant(t.workspaceId, (tx) => ingestObservations(tx, ctx, null, [obs('ad_x', day(2), 'OFFSITE_CONVERSIONS'), obs('ad_x', day(1), 'LINK_CLICKS')]));
+    expect(await ownerPool()`select 1 from confounders where workspace_id = ${t.workspaceId}`).toHaveLength(0);
   });
 });

@@ -34,7 +34,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
             <SheetButton label="Mark a confounder" title="Mark a confounder" description="Something outside the ads that could skew results — we’ll exclude or flag the affected days.">
               <ActionForm slug={slug} action="confounder" submit="Save" fields={[
                 { name: 'skuId', label: 'Product', type: 'select', options: [{ value: '', label: 'All products' }, ...d.skus.map((s) => ({ value: s.id as string, label: s.name as string }))] },
-                { name: 'kind', label: 'What happened', type: 'select', options: [['stockout', 'Stockout'], ['site_outage', 'Site outage'], ['price_change', 'Price change'], ['offer_change', 'Promotion / offer change'], ['influencer_event', 'Influencer spike'], ['viral_event', 'Viral moment'], ['landing_change', 'Landing page change'], ['other', 'Other']].map(([value, label]) => ({ value: value!, label: label! })) },
+                { name: 'kind', label: 'What happened', type: 'select', options: [['stockout', 'Stockout'], ['site_outage', 'Site outage'], ['price_change', 'Price change'], ['offer_change', 'Promotion / offer change'], ['influencer_event', 'Influencer spike'], ['viral_event', 'Viral moment'], ['landing_change', 'Landing page change'], ['audience_change', 'Audience change'], ['bid_change', 'Bid / optimization change'], ['other', 'Other']].map(([value, label]) => ({ value: value!, label: label! })) },
                 { name: 'startsAt', label: 'From', type: 'date', required: true },
                 { name: 'endsAt', label: 'To (optional)', type: 'date' },
                 { name: 'note', label: 'Note', max: 300 },

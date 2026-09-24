@@ -322,6 +322,7 @@ export async function ingestObservations(tx: Tx, ctx: TenantContext, integration
     } else {
       await autoLinkByCode(tx, o.platform, o.adId, o.adName);
     }
+    await detectDeliveryChange(tx, ctx, o);
   }
   if (inserted) {
     await emit(tx, ctx, 'PERFORMANCE_INGESTED', integrationId ? { type: 'integration', id: integrationId } : null, { inserted, revised });
@@ -330,6 +331,37 @@ export async function ingestObservations(tx: Tx, ctx: TenantContext, integration
     for (const e of exps) await enqueue(tx, ctx.workspaceId, Queues.computeResults, { experimentId: e.experiment_id, reason: 'new_data' }, { singletonKey: `results:${e.experiment_id}` });
   }
   return { inserted, revised };
+}
+
+/**
+ * §48 "Audience, bid strategy or optimization event changes mid-test: record the change as context/confounder; do
+ * not attribute the resulting performance shift solely to creative." When a test ad's optimization event or campaign
+ * type differs from its previous day's delivery, an automatic bid_change confounder covers the changeover day on
+ * the test's SKU (which marks and recomputes its running tests). One per ad and day.
+ */
+async function detectDeliveryChange(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, o: NormalizedObservation) {
+  if (!o.optimizationEvent && !o.campaignType) return;
+  const [prev] = await tx`
+    select o.optimization_event, o.campaign_type, e.sku_id from performance_observations o
+    join variants v on v.id = o.variant_id join experiments e on e.id = v.experiment_id
+    where o.platform = ${o.platform} and o.ad_id = ${o.adId} and o.measurement_context = ${o.measurementContext} and o.superseded_at is null
+      and o.date < ${o.date} and o.variant_id is not null
+    order by o.date desc limit 1`;
+  if (!prev) return;
+  const changed: string[] = [];
+  if (o.optimizationEvent && prev.optimization_event && prev.optimization_event !== o.optimizationEvent) changed.push(`optimization event ${prev.optimization_event as string} → ${o.optimizationEvent}`);
+  if (o.campaignType && prev.campaign_type && prev.campaign_type !== o.campaignType) changed.push(`campaign objective ${prev.campaign_type as string} → ${o.campaignType}`);
+  if (!changed.length) return;
+  const [seen] = await tx`select 1 from confounders where source = 'automatic' and kind = 'bid_change' and detail->>'adId' = ${o.adId} and detail->>'date' = ${o.date} limit 1`;
+  if (seen) return;
+  await recordAutomaticConfounder(tx, ctx, {
+    skuId: prev.sku_id as string,
+    kind: 'bid_change',
+    startsAt: o.date,
+    endsAt: 'P1D',
+    note: `Delivery changed on ad ${o.adId}: ${changed.join('; ')}`,
+    detail: { adId: o.adId, platform: o.platform, date: o.date, changed },
+  });
 }
 
 /** Consecutive transient failures (outages, dropped connections) before a connection is shown as degraded. */
