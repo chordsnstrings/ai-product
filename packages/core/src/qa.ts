@@ -2,7 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import { probe, withTempDir, extractFrames, ASPECT_SIZE, type Aspect } from '@arkiv/media';
-import { scanCreativeText } from './compliance';
+import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
 import { FidelityCheck } from './intel-schemas';
 import { llmJson } from './model-gateway';
@@ -92,15 +92,25 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
   ];
 }
 
-/** Claims check on everything said or shown (§25 check 3; Launch Gate 3). */
-export function qaClaims(lines: string[], allowed: { id: string; wording: string; qualifier?: string | null }[]): CheckResult {
-  const scan = scanCreativeText(lines, allowed);
+/**
+ * Claims check on everything said or shown (§25 check 3; Launch Gate 3): every material product statement must
+ * map to an allowed Claim ID. Blocked or unapproved claims and effect statements that map to no claim both fail
+ * hard. The per-line mapping (line → Claim ID, neutral, violation or unmapped) is kept for review and lineage.
+ */
+export function qaClaims(lines: string[], allowed: { id: string; wording: string; qualifier?: string | null }[], opts: { names?: (string | null | undefined)[] } = {}): CheckResult {
+  const scan = scanCreativeText(lines, allowed, opts);
+  const pass = scanPasses(scan);
+  const used = new Set(scan.mapping.filter((m) => m.status === 'claim').map((m) => m.claimId));
+  const problems = [
+    ...scan.violations.map((v) => `“${v.text}”: ${v.reason}`),
+    ...scan.unmapped.map((u) => `“${u}”: makes a product claim that isn’t approved in your Claims Vault`),
+  ];
   return {
     check: 'claims',
-    pass: scan.ok,
-    hard: !scan.ok,
-    detail: scan.ok ? `${lines.length} lines checked; ${scan.unmapped.length} descriptive` : scan.violations.map((v) => `“${v.text}”: ${v.reason}`).join('; '),
-    data: { violations: scan.violations, unmapped: scan.unmapped },
+    pass,
+    hard: !pass,
+    detail: pass ? `${lines.length} lines checked; ${used.size} claim${used.size === 1 ? '' : 's'} used, all approved` : problems.join('; '),
+    data: { violations: scan.violations, unmapped: scan.unmapped, mapping: scan.mapping, claimsUsed: used.size },
   };
 }
 
@@ -123,7 +133,11 @@ export async function qaExport(file: string, aspect: Aspect, expectedMs: number)
   ];
 }
 
-/** Experiment integrity (§25 check 6): the variant changed the intended variable and held the rest. */
+/**
+ * Experiment integrity (§25 check 6): the variant actually changed the intended variable and preserved the
+ * held-constant components. `actual.changed` must be *computed* — diffCompositions() over the two composition
+ * manifests — never copied from the declaration it is checked against.
+ */
 export function qaExperimentIntegrity(
   intended: { changed: string[]; heldConstant: string[] } | null,
   actual: { changed: string[] },
@@ -136,7 +150,8 @@ export function qaExperimentIntegrity(
     check: 'experiment_integrity',
     pass,
     hard: leaked.length > 0,
-    detail: pass ? `Changed ${intended.changed.join(', ')}; held ${intended.heldConstant.join(', ') || 'nothing'}` : `Missing: ${missing.join(', ') || '—'}; unexpectedly changed: ${leaked.join(', ') || '—'}`,
+    detail: pass ? `Changed ${intended.changed.join(', ') || 'nothing'}; held ${intended.heldConstant.join(', ') || 'nothing'}` : `Missing: ${missing.join(', ') || '—'}; unexpectedly changed: ${leaked.join(', ') || '—'}`,
+    data: { intended: intended.changed, heldConstant: intended.heldConstant, actual: actual.changed, missing, leaked },
   };
 }
 

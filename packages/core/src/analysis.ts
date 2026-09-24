@@ -13,7 +13,7 @@ import { recordFunnel } from './funnel';
 import { fetchImage, importProductUrl, type ExtractedProduct } from './ingest';
 import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
-import { llmJson, route } from './model-gateway';
+import { llmJson, routedLines } from './model-gateway';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
@@ -163,15 +163,15 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
   }
 
   // 4. Free preview authorization (extraction + concepts ≤ $0.20, standard §5).
-  const auth = await withTenant(ws, (tx) =>
+  const auth = await withTenant(ws, async (tx) =>
     authorize(tx, ctx, {
       purpose: 'free_preview',
       skuId,
       projectId,
-      lines: [
-        { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 14_000, outputTokens: 2_000 },
-        { kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 6_000, outputTokens: 3_500 },
-      ],
+      lines: await routedLines(tx, ws, [
+        { task: 'extract.product_facts', kind: 'llm', inputTokens: 14_000, outputTokens: 2_000 },
+        { task: 'creative_director.concepts', kind: 'llm', inputTokens: 6_000, outputTokens: 3_500 },
+      ]),
       idempotencyKey: `preview:${skuId}`,
     }),
   );
@@ -327,8 +327,7 @@ export async function generateConceptBatch(ctx: TenantContext, projectId: string
   let auth: Awaited<ReturnType<typeof authorize>>;
   try {
     auth = await withTenant(ws, async (tx) => {
-      // Priced on the routed model for the concepts task, with the call's full output budget.
-      const r = await route(tx, 'creative_director.concepts');
+      // Priced on the model the concepts task routes to for this workspace, with the call's full output budget.
       const a = await authorizeOrTakeOver(
         tx,
         ctx,
@@ -336,7 +335,7 @@ export async function generateConceptBatch(ctx: TenantContext, projectId: string
           purpose: ctx.workspaceState === 'PROVISIONAL' ? 'free_preview' : 'storyboard',
           skuId: info.skuId,
           projectId,
-          lines: [{ kind: 'llm', provider: r.provider, model: r.model, inputTokens: 6_000, outputTokens: CONCEPTS_MAX_TOKENS }],
+          lines: await routedLines(tx, ws, [{ task: 'creative_director.concepts', kind: 'llm', inputTokens: 6_000, outputTokens: CONCEPTS_MAX_TOKENS }]),
           idempotencyKey: `concepts:${projectId}:${batch}`,
         },
         CONCEPT_REQUEST_STALE_MINUTES,

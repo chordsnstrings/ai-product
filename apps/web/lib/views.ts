@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { assetUrl, currentFacts, currentQuote, DELIVERY_HOLD_STATES, listClaims, listSteps, storyboardView, type Proposal } from '@arkiv/core';
+import { assetUrl, currentFacts, currentQuote, customerQaSummary, DELIVERY_HOLD_STATES, listClaims, listSteps, storyboardView, type Proposal, type QaReport } from '@arkiv/core';
 import type { WorkspaceState } from '@arkiv/shared';
 
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
@@ -59,7 +59,8 @@ export async function projectView(workspaceId: string, projectId: string) {
         failureReason: (p.failure_reason as string) ?? null,
         /** Paused by a provider outage: resumes automatically with the reservation held (§44). */
         paused: p.state === 'NEEDS_USER_ACTION' && !!p.outage,
-        qa: p.qa_report ?? null,
+        /** What we checked, in customer words (plan 03 P10), derived from the stored QA report. */
+        qa: customerQaSummary(p.qa_report as QaReport | null),
         storyboardId: (p.storyboard_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
         deliveryHeld,

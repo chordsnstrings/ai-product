@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closeAll, withTenant } from '@arkiv/db';
+import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { MockImage, MockLlm, MockVideo, ProviderError, setProviders, type TtsProvider, type TtsRequest } from '@arkiv/providers';
 import { providerVoiceId, resetEnvCache } from '@arkiv/shared';
@@ -64,5 +64,69 @@ describe('voice catalogue', () => {
     const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
     await expect(synthesizeVoice({ ctx, token, task: 'tts.voiceover', text: 'Two drops.', voice: 'warm_female' })).rejects.toBeInstanceOf(ProviderError);
     expect(fallback.calls).toHaveLength(0);
+  });
+});
+
+/** The approved fallback is a separate provider job on its own route, priced at its own rate (§34, §41: arch-23, prod-29). */
+describe('voice-over fallback route', () => {
+  async function routeOf(task: string) {
+    const [r] = await ownerPool()`select provider, model from model_routes where task = ${task}`;
+    return r as { provider: string; model: string };
+  }
+  async function charMillion(provider: string, model: string) {
+    const [r] = await ownerPool()`select (rates->>'char_million')::bigint as c from provider_rate_tables where provider = ${provider} and model = ${model} and status = 'published' order by version desc limit 1`;
+    return Number(r!.c);
+  }
+
+  it('a failed primary is closed unbilled and the fallback records its own provider, model and cost', async () => {
+    const primary = recorder('minimax', true);
+    const fallback = recorder('byteplus-speech', false);
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new MockVideo(), tts: primary, ttsFallback: fallback, wireModel: (m) => m });
+    const t = await makeTenant();
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
+    const text = 'Two drops, morning and night.';
+    const r = await synthesizeVoice({ ctx, token, task: 'tts.voiceover', text, voice: 'warm_female' });
+    const fb = await routeOf('tts.voiceover_fallback');
+    const pr = await routeOf('tts.voiceover');
+    expect(fb.provider).not.toBe(pr.provider);
+    expect(r).toMatchObject({ task: 'tts.voiceover_fallback', provider: fb.provider });
+    expect(fallback.calls[0]!.model).toBe(fb.model); // the fallback's own wire model, not the primary's
+    const jobs = await ownerPool()`select task, provider, model, status, actual_micros, provider_request_id from provider_jobs where workspace_id = ${t.workspaceId} order by created_at`;
+    expect(jobs.map((j) => ({ task: j.task, provider: j.provider, model: j.model, status: j.status }))).toEqual([
+      { task: 'tts.voiceover', provider: pr.provider, model: pr.model, status: 'failed' },
+      { task: 'tts.voiceover_fallback', provider: fb.provider, model: fb.model, status: 'succeeded' },
+    ]);
+    expect(Number(jobs[0]!.actual_micros)).toBe(0);
+    expect(Number(jobs[1]!.actual_micros)).toBe(Math.ceil((text.length * (await charMillion(fb.provider, fb.model))) / 1_000_000));
+    expect(jobs[1]!.provider_request_id).toBe('byteplus-speech-1');
+    const [cost] = await ownerPool()`select coalesce(sum(amount), 0)::bigint as n from ledger_entries where workspace_id = ${t.workspaceId} and type = 'PROVIDER_COST_RECORDED'`;
+    expect(Number(cost!.n)).toBe(Number(jobs[1]!.actual_micros));
+  });
+
+  it('an open primary circuit goes straight to the approved fallback (plan 05 §10)', async () => {
+    const primary = recorder('minimax', false);
+    const fallback = recorder('byteplus-speech', false);
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new MockVideo(), tts: primary, ttsFallback: fallback, wireModel: (m) => m });
+    const t = await makeTenant();
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
+    await ownerPool()`update model_routes set circuit_open = true where task = 'tts.voiceover'`;
+    try {
+      const r = await synthesizeVoice({ ctx, token, task: 'tts.voiceover', text: 'Tap to try it.', voice: 'warm_female' });
+      expect(r.task).toBe('tts.voiceover_fallback');
+      expect(primary.calls).toHaveLength(0);
+      const jobs = await ownerPool()`select task from provider_jobs where workspace_id = ${t.workspaceId}`;
+      expect(jobs.map((j) => j.task)).toEqual(['tts.voiceover_fallback']);
+    } finally {
+      await ownerPool()`update model_routes set circuit_open = false where task = 'tts.voiceover'`;
+    }
+  });
+
+  it('without a configured fallback adapter the primary failure stands (never an alias of the primary)', async () => {
+    const primary = recorder('minimax', true);
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new MockVideo(), tts: primary, ttsFallback: null, wireModel: (m) => m });
+    const t = await makeTenant();
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
+    await expect(synthesizeVoice({ ctx, token, task: 'tts.voiceover', text: 'Hi.', voice: 'warm_female' })).rejects.toBeInstanceOf(ProviderError);
+    expect(primary.calls).toHaveLength(1);
   });
 });

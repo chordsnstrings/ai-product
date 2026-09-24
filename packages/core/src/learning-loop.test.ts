@@ -15,6 +15,7 @@ import { generateStoryboard } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
 import { produceHookVariants } from './variants';
+import { diffCompositions, type CompositionManifest } from './composition';
 
 beforeEach(truncateAll);
 afterAll(closeAll);
@@ -58,9 +59,34 @@ describe('learning loop (Phases 4–5)', () => {
     expect(await produceHookVariants(ctx, projectId)).toBe(2);
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'creative_test'))).toBe(6); // hook variants cost no extra test
 
-    const variants = await withTenant(t.workspaceId, (tx) => tx`select id, code, creative_id from variants where experiment_id = ${experimentId} order by code`);
+    const variants = await withTenant(t.workspaceId, (tx) => tx`select id, code, label, creative_id from variants where experiment_id = ${experimentId} order by code`);
     expect(variants).toHaveLength(3);
     expect(variants.every((v) => v.creative_id)).toBe(true);
+
+    // Hook variants hold everything but the hook constant (§20 CONTROLLED; exp-01, prod-24, prod-25): the master's
+    // footage, its voice-over for every later scene, its end card and every export — only the opening changes.
+    const comps = await ownerPool()`select v.code, v.label, c.composition, c.final_asset_ids from variants v join creatives c on c.id = v.creative_id
+                                    where v.experiment_id = ${experimentId} order by v.code`;
+    const master = comps[0]!.composition as CompositionManifest;
+    expect(master.voiceover?.segments.length).toBeGreaterThan(1);
+    for (const v of comps.slice(1)) {
+      const m = v.composition as CompositionManifest;
+      expect((v.final_asset_ids as string[]).length).toBe(3); // 9:16, 4:5 and 1:1
+      expect(m.aspects).toEqual(['9x16', '4x5', '1x1']);
+      expect(m.endCard).toEqual(master.endCard); // same end card (index included)
+      expect(m.scenes.slice(1)).toEqual(master.scenes.slice(1));
+      expect(m.scenes[0]!.assetId).toBe(master.scenes[0]!.assetId);
+      expect(m.scenes[0]!.overlayText).toBe((v.label as string).slice(0, 60));
+      const [hook, ...rest] = m.voiceover!.segments;
+      const [masterHook, ...masterRest] = master.voiceover!.segments;
+      expect(rest).toEqual(masterRest); // the body voice-over is the master's, clip for clip
+      expect(hook!.text).toBe(v.label); // the spoken hook is re-voiced with the variant's hook
+      expect(hook!.clipAssetId).not.toBe(masterHook!.clipAssetId);
+      expect(hook!.startMs).toBe(masterHook!.startMs);
+      expect(diffCompositions(master, m)).toEqual(['hook']);
+    }
+    const generated = await ownerPool()`select payload from events where workspace_id = ${t.workspaceId} and type = 'VARIANT_GENERATED' and subject_type = 'variant'`;
+    expect(generated.map((e) => (e.payload as { changed: string[] }).changed)).toEqual([['hook'], ['hook']]);
     const [exp0] = await ownerPool()`select state, mode from experiments where id = ${experimentId}`;
     expect(exp0!.state).toBe('READY_TO_RUN');
     expect(exp0!.mode).toBe('CONTROLLED');

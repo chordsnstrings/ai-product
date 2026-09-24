@@ -3,7 +3,7 @@ import { DomainError, type Angle } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
 import { brandBrainFor } from './brand';
 import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
-import { classifyClaim, scanCreativeText } from './compliance';
+import { classifyClaim, scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { ConceptSet, StoryboardPlan, type Proposal } from './intel-schemas';
@@ -68,18 +68,22 @@ export async function buildContext(tx: Tx, skuId: string) {
     platform: 'TikTok + Instagram Reels (9:16)',
     objective: 'Find the next creative test worth running for this SKU',
   };
-  return { sku, facts, productContext, packet, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
+  // Product and brand names are names, not claims ("Glow Serum" makes no glow claim).
+  const names = [sku.name as string, brand?.name ?? null];
+  return { sku, facts, productContext, packet, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
 }
 
 /** Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). */
-export function gateProposal(p: Proposal, approved: string[]): { ok: boolean; reasons: string[]; cleaned: Proposal } {
+export function gateProposal(p: Proposal, approved: string[], names: (string | null | undefined)[] = []): { ok: boolean; reasons: string[]; cleaned: Proposal } {
   const reasons: string[] = [];
   const vault = approved.map((w, i) => ({ id: String(i), wording: w }));
-  // Only customer-facing copy is claims-scanned; hypothesis/body are internal strategy notes.
+  // Only customer-facing copy is claims-scanned; hypothesis/body are internal strategy notes. A hook that makes a
+  // product claim no approved claim covers would be refused by claims QA after render spend, so it goes now.
   const cleanHooks = p.hookOptions.filter((h) => {
-    const scan = scanCreativeText([h], vault);
+    const scan = scanCreativeText([h], vault, { names });
     if (!scan.ok) reasons.push(`hook removed: ${scan.violations[0]!.reason}`);
-    return scan.ok;
+    else if (scan.unmapped.length) reasons.push(`hook removed: “${h}” makes a claim that isn’t approved`);
+    return scanPasses(scan);
   });
   const blockedStrategy = [p.bodyStrategy, p.hypothesis].some((t) => classifyClaim(t).status === 'BLOCKED');
   if (blockedStrategy) reasons.push('strategy relies on a blocked claim');
@@ -111,7 +115,7 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, brandBrainVersionId } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -133,7 +137,7 @@ export async function generateConcepts(run: ConceptRun) {
       effort: 'high',
       maxTokens: CONCEPTS_MAX_TOKENS,
     });
-    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims));
+    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names));
     const valid = gated.filter((g) => g.ok);
     if (valid.length === 3 && conceptsAreDistinct(valid.map((v) => v.cleaned))) break;
     content.push({ type: 'text', text: `Previous attempt was rejected by compliance/diversity gates: ${gated.flatMap((g) => g.reasons).join('; ') || 'concepts too similar'}. Fix and return three distinct compliant concepts.` });
@@ -166,28 +170,45 @@ export interface StoryboardRun {
   conceptId: string;
 }
 
+/**
+ * Generated-interaction scenes per standard 15s output. With the 25% QA retry reserve this keeps a standard test
+ * well inside the §5 ceiling; further interaction scenes become hybrids (generated setting + exact product).
+ */
+export const MAX_GENERATIVE_SCENES = 4;
+/** Natural voice-over pace (words per second) and the fastest we fit a line to its scene. */
+const VO_WORDS_PER_SECOND = 2.6;
+const VO_MAX_TEMPO = 1.35;
+
 /** Normalize a plan to exactly 15s and enforce scene-level compliance before frames are generated. */
-export function normalizePlan(plan: StoryboardPlan, approved: string[]): StoryboardPlan {
+export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (string | null | undefined)[] = []): StoryboardPlan {
   const total = plan.scenes.reduce((s, x) => s + x.durationMs, 0);
   const scale = 15000 / total;
   let acc = 0;
+  let generative = 0;
   const scenes = plan.scenes.map((s, i) => {
     const d = i === plan.scenes.length - 1 ? 15000 - acc : Math.max(1000, Math.round((s.durationMs * scale) / 250) * 250);
     acc += d;
     // Close-ups of packaging are always exact-product composites (§23).
-    const mode = s.purpose === 'product_reveal' || s.purpose === 'cta' ? 'STRICT_COMPOSITE' : s.productionMode;
+    let mode = s.purpose === 'product_reveal' || s.purpose === 'cta' ? 'STRICT_COMPOSITE' : s.productionMode;
+    if (mode === 'GENERATIVE_INTERACTION' && ++generative > MAX_GENERATIVE_SCENES) mode = 'HYBRID';
     return { ...s, durationMs: d, productionMode: mode };
   });
   const lines = scenes.flatMap((s) => [s.spokenLine, s.overlayText]).filter(Boolean) as string[];
-  const scan = scanCreativeText([...lines, plan.hook], approved.map((w, i) => ({ id: String(i), wording: w })));
-  if (!scan.ok) {
-    throw new DomainError('GATE_BLOCKED', `Storyboard failed claims check: ${scan.violations.map((v) => `"${v.text}" (${v.reason})`).join('; ')}`, { violations: scan.violations });
+  const scan = scanCreativeText([...lines, plan.hook], approved.map((w, i) => ({ id: String(i), wording: w })), { names });
+  if (!scanPasses(scan)) {
+    const problems = [...scan.violations.map((v) => `"${v.text}" (${v.reason})`), ...scan.unmapped.map((u) => `"${u}" (makes a product claim that isn't approved)`)];
+    throw new DomainError('GATE_BLOCKED', `Storyboard failed claims check: ${problems.join('; ')}`, { violations: scan.violations, unmapped: scan.unmapped });
+  }
+  // Every spoken word must fit the 15 seconds (captions follow the speech; a line is never cut off, §25 check 4).
+  const words = scenes.reduce((n, s) => n + (s.spokenLine ?? '').split(/\s+/).filter(Boolean).length, 0);
+  if (words / (VO_WORDS_PER_SECOND * VO_MAX_TEMPO) > 15) {
+    throw new DomainError('GATE_BLOCKED', `Storyboard failed the timing check: ${words} spoken words don't fit 15 seconds. Shorten the spoken lines.`);
   }
   return { ...plan, scenes };
 }
 
 export async function planStoryboard(run: StoryboardRun): Promise<{ plan: StoryboardPlan; promptVersion: string; model: string; brandBrainVersionId: string | null }> {
-  const { productContext, packet, concept, brandBrainVersionId } = await withTenant(run.ctx.workspaceId, async (tx) => {
+  const { productContext, packet, concept, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, async (tx) => {
     const c = await buildContext(tx, run.skuId);
     const [row] = await tx`select proposal from concepts where id = ${run.conceptId}`;
     if (!row) throw new DomainError('NOT_FOUND', 'Concept not found');
@@ -212,7 +233,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       maxTokens: 5000,
     });
     try {
-      return { plan: normalizePlan(res.data, productContext.approvedClaims), promptVersion: res.promptVersion, model: res.model, brandBrainVersionId };
+      return { plan: normalizePlan(res.data, productContext.approvedClaims, names), promptVersion: res.promptVersion, model: res.model, brandBrainVersionId };
     } catch (e) {
       lastErr = e;
     }

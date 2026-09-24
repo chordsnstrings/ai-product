@@ -10,7 +10,8 @@ export interface ProviderSet {
   image: ImageProvider;
   video: VideoProvider;
   tts: TtsProvider;
-  ttsFallback: TtsProvider;
+  /** Adapter for the approved TTS fallback route; null when that provider isn't configured (never an alias of the primary). */
+  ttsFallback: TtsProvider | null;
   /** Logical model name (used for rate tables) → provider model id actually sent on the wire. */
   wireModel(logical: string): string;
 }
@@ -48,10 +49,8 @@ export async function providers(): Promise<ProviderSet> {
     image: new SeedreamImage(need('ARK_API_KEY'), e.ARK_BASE_URL),
     video: new SeedanceVideo(need('ARK_API_KEY'), e.ARK_BASE_URL),
     tts: new MiniMaxTts(need('MINIMAX_API_KEY'), e.MINIMAX_BASE_URL),
-    ttsFallback:
-      e.BYTEPLUS_SPEECH_APP_ID && e.BYTEPLUS_SPEECH_TOKEN
-        ? new SeedSpeechTts(e.BYTEPLUS_SPEECH_APP_ID, e.BYTEPLUS_SPEECH_TOKEN)
-        : new MiniMaxTts(need('MINIMAX_API_KEY'), e.MINIMAX_BASE_URL),
+    // The fallback route is priced and recorded as Seed Speech, so only a Seed Speech adapter may serve it.
+    ttsFallback: e.BYTEPLUS_SPEECH_APP_ID && e.BYTEPLUS_SPEECH_TOKEN ? new SeedSpeechTts(e.BYTEPLUS_SPEECH_APP_ID, e.BYTEPLUS_SPEECH_TOKEN) : null,
     wireModel,
   };
   return cached;

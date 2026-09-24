@@ -121,8 +121,16 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       expect(renders.map((r) => r.status)).toEqual(['qa_failed', 'qa_failed']); // exactly one repair, no loop
       const [retry] = await tx`select count(*)::int as n from ledger_entries where type = 'FREE_QA_RETRY'`;
       expect(retry!.n).toBe(1);
-      const [p] = await tx`select qa_report from projects where id = ${projectId}`;
+      const [p] = await tx`select qa_report, final_creative_id, sku_id from projects where id = ${projectId}`;
       expect(JSON.stringify(p!.qa_report)).toMatch(/switched to exact product composite/);
+      // The switch is the exact product from the merchant's own cut-out, QA-checked — never the generated frame.
+      const [fp] = await tx`select cutout_asset_id from visual_fingerprints where sku_id = ${p!.sku_id} and active`;
+      const [fb] = await tx`select id, technique, lineage, qa from scene_versions where kind = 'frame' and lineage->>'fallback' = 'true'`;
+      expect(fb!.technique).toBe('exact_product_composite');
+      expect((fb!.lineage as { cutoutAssetId: string }).cutoutAssetId).toBe(fp!.cutout_asset_id);
+      expect((fb!.qa as { check: string; pass: boolean }[]).filter((c) => c.check === 'product_fidelity')).toEqual([expect.objectContaining({ pass: true })]);
+      const [cr] = await tx`select composition from creatives where id = ${p!.final_creative_id}`;
+      expect((cr!.composition as { scenes: { versionId: string; kind: string }[] }).scenes.find((s) => s.versionId === fb!.id)).toMatchObject({ kind: 'still' });
     });
   }, 120_000);
 

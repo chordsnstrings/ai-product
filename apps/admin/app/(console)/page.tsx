@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { ACTIVE_PRODUCTION_STATES, mrrMovement, qaQueueSql } from '@arkiv/core';
+import { ACTIVE_PRODUCTION_STATES, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures } from '@arkiv/core';
 import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs, daysFrom } from '@/lib/prefs';
@@ -55,6 +55,8 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
                                  count(*) filter (where type = 'QA_FAILED' and exists (select 1 from jsonb_array_elements(case when jsonb_typeof(payload->'checks') = 'array' then payload->'checks' else '[]'::jsonb end) c
                                    where c->>'check' = 'product_fidelity' and coalesce((c->>'hard')::boolean, false) and not coalesce((c->>'pass')::boolean, true)))::int as hard
                           from events where type in ('QA_PASSED','QA_FAILED') and at > now() - make_interval(days => ${days}) ${t()}`;
+    // Standard §10: repeated product-fidelity failure on < 3% of paid projects.
+    const fidelity = await repeatedFidelityFailures(tx, days, { includeTest: prefs.includeTest });
     const [cogs] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at > now() - make_interval(days => ${days}) ${t()}`;
     // "Today" and the forecast baseline use calendar days in the console timezone.
     const [today] = await tx`select coalesce(sum(amount), 0)::bigint as spend from ledger_entries where type = 'PROVIDER_COST_RECORDED' and created_at >= date_trunc('day', now(), ${tz}) ${t()}`;
@@ -70,7 +72,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       union all select 'Data requests', count(*)::int, min(created_at), '/privacy' from data_requests where status in ('open','in_progress') ${t()}
       union all select 'Abuse signals (24h)', count(*)::int, min(at), '/abuse' from abuse_signals where at > now() - interval '24 hours' ${t()}
       union all select 'Approvals', count(*)::int, min(created_at), '/approvals' from approvals where status = 'pending'`;
-    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, cogs, today, prior, exports, conn, risk, queues };
+    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, cogs, today, prior, exports, conn, risk, queues };
   });
   const count = (t: string) => Number(m.funnel.find((r) => r.type === t)?.n ?? 0);
   const base = (t: string) => Number(m.funnel.find((r) => r.type === t)?.base ?? 0);
@@ -130,6 +132,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
           <Kpi label="Oldest queued" value={oldestQueued ? ago(new Date(Date.now() - oldestQueued * 1000)) : '—'} alert={oldestQueued > 600} alertText="Over 10 min" href="/jobs" />
           <Kpi label="QA first-pass" value={pct(firstPass, 0)} alert={Number.isFinite(firstPass) && firstPass < 0.7} alertText="Below 70%" sub={`${qaTotal} checks`} href="/qa" />
           <Kpi label="Hard fidelity fails" value={pct(hardRate)} alert={hardFailAlert(Number(m.qa!.hard), qaTotal)} alertText="Above 3%" sub={`${m.qa!.hard} of ${qaTotal}`} href="/qa" />
+          <Kpi label="Repeated fidelity fails" value={pct(m.fidelity.rate)} alert={Number.isFinite(m.fidelity.rate) && m.fidelity.rate > REPEATED_FIDELITY_TARGET} alertText={`Above ${pct(REPEATED_FIDELITY_TARGET, 0)}`} sub={`${m.fidelity.repeated} of ${m.fidelity.paid} paid projects · target < ${pct(REPEATED_FIDELITY_TARGET, 0)}`} href="/qa" />
           <Kpi label="Connector freshness" value={pct(freshPct, 0)} alert={Number.isFinite(freshPct) && freshPct < 0.9} alertText="Below 90%" sub={`${m.conn!.fresh}/${m.conn!.n} fresh`} href="/integrations?stale=1" />
           <Kpi label="Churn-risk (new today)" value={m.risk!.n} href="/retention?since=today" />
         </Grid>

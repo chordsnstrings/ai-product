@@ -79,6 +79,8 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
     await ownerPool()`update scenes set spoken_line = coalesce(spoken_line, 'Soft skin.') || ' [[fail:server]]' where storyboard_id = ${storyboardId} and position = 0`;
     expect(await produceProject(ctx, projectId)).toBe('paused');
     const rendersBefore = (await ownerPool()`select count(*)::int as n from scene_versions where kind = 'render' and workspace_id = ${t.workspaceId}`)[0]!.n;
+    const renderJobs = async () => (await ownerPool()`select count(*)::int as n from provider_jobs where task = 'video.scene' and workspace_id = ${t.workspaceId}`)[0]!.n as number;
+    const renderJobsBefore = await renderJobs();
     await withTenant(t.workspaceId, async (tx) => {
       const [p] = await tx`select state, outage from projects where id = ${projectId}`;
       expect(p!.state).toBe('NEEDS_USER_ACTION');
@@ -97,6 +99,7 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
       const [r] = await tx`select count(*)::int as n from scene_versions where kind = 'render'`;
       expect(r!.n).toBe(rendersBefore);
     });
+    expect(await renderJobs()).toBe(renderJobsBefore); // no render was sent to the provider again (prod-08)
   }, 240_000);
 });
 

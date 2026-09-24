@@ -8,7 +8,7 @@ import { buildContext, gateProposal } from './creative-director';
 import { emit } from './events';
 import { ConceptSet, type Proposal } from './intel-schemas';
 import { mockConcepts } from './mock-intel';
-import { llmJson } from './model-gateway';
+import { llmJson, routedLines } from './model-gateway';
 import { CONCEPTS_SYSTEM } from './prompts';
 
 /**
@@ -181,10 +181,10 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
   const ws = ctx.workspaceId;
   const existing = await withTenant(ws, (tx) => tx`select id from recommendations where sku_id = ${skuId} and week_of = ${week}`);
   if (existing.length) return 0; // idempotent per week
-  const { productContext, packet } = await withTenant(ws, (tx) => buildContext(tx, skuId));
+  const { productContext, packet, names } = await withTenant(ws, (tx) => buildContext(tx, skuId));
   const sc = await withTenant(ws, (tx) => scoringContext(tx, skuId));
-  const auth = await withTenant(ws, (tx) =>
-    authorize(tx, ctx, { purpose: 'storyboard', projectId: null, lines: [{ kind: 'llm', provider: 'anthropic', model: 'claude-opus-5-5', inputTokens: 12_000, outputTokens: 8_000 }], idempotencyKey: `recs:${skuId}:${week}` }),
+  const auth = await withTenant(ws, async (tx) =>
+    authorize(tx, ctx, { purpose: 'storyboard', projectId: null, lines: await routedLines(tx, ws, [{ task: 'creative_director.recommendations', kind: 'llm', inputTokens: 12_000, outputTokens: 8_000 }]), idempotencyKey: `recs:${skuId}:${week}` }),
   );
   try {
     const batches = [1, 2];
@@ -205,7 +205,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
         effort: 'high',
         maxTokens: 6000,
       });
-      candidates.push(...r.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims).cleaned));
+      candidates.push(...r.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names).cleaned));
     }
     const picked = composePortfolio(candidates.map((c) => scoreProposal(c, sc)), sc.maturity, 3);
     await withTenant(ws, async (tx) => {
