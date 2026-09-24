@@ -1,4 +1,6 @@
 import type { Tx } from '@arkiv/db';
+import { zipSync } from 'fflate';
+import { assetBytes } from './assets';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { projectVisitor, recordFunnel } from './funnel';
@@ -35,4 +37,30 @@ export async function recordAssetExport(tx: Tx, ctx: Pick<TenantContext, 'worksp
   const visitorId = await projectVisitor(tx, ctx.workspaceId, projectId);
   await recordFunnel('ASSET_EXPORTED', { workspaceId: ctx.workspaceId, visitorId, props: { aspect: out.aspect, projectId, variantId } }, tx);
   return out;
+}
+
+/**
+ * P10 "Download all" (plan 03 P10): every finished export of the project — the ad in each format, plus the offer's
+ * bonus hook versions — in one zip (stored, not re-compressed: MP4 is compressed already). Each file counts as an
+ * export like a single download. Null when the project has nothing delivered.
+ */
+export async function deliveryBundle(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, projectId: string): Promise<{ zip: Uint8Array; files: number } | null> {
+  const [p] = await tx`select p.final_creative_id, p.bonus_hook_creative_id, s.name as sku_name from projects p join skus s on s.id = p.sku_id
+                       where p.id = ${projectId} and p.workspace_id = ${ctx.workspaceId} and p.state = 'COMPLETE'`;
+  if (!p?.final_creative_id) return null;
+  const creatives = await tx`select id, final_asset_ids from creatives where workspace_id = ${ctx.workspaceId}
+                             and id = any(${[p.final_creative_id as string, ...(p.bonus_hook_creative_id ? [p.bonus_hook_creative_id as string] : [])]}::uuid[])`;
+  const base = String(p.sku_name).replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-|-$/g, '') || 'arkiv-ad';
+  const files: Record<string, [Uint8Array, { level: 0 }]> = {};
+  for (const c of creatives) {
+    const bonus = c.id === p.bonus_hook_creative_id;
+    for (const assetId of (c.final_asset_ids as string[]) ?? []) {
+      const exported = await recordAssetExport(tx, ctx, assetId, projectId);
+      if (!exported) continue;
+      const name = `${base}${bonus ? '-alt-hook' : ''}-${exported.aspect ?? assetId.slice(0, 8)}.mp4`;
+      files[name] = [new Uint8Array(await assetBytes(tx, assetId)), { level: 0 }];
+    }
+  }
+  const count = Object.keys(files).length;
+  return count ? { zip: zipSync(files), files: count } : null;
 }

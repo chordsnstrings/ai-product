@@ -323,6 +323,13 @@ describe('one-off payments (plan 02 B4/B9, M9)', () => {
     expect(p2).toEqual({ state: 'STORYBOARD_APPROVED', storyboard_id: storyboardId });
   }, 90_000);
 
+  it('a free re-plan ("Not right?", product accuracy) never opens a checkout', async () => {
+    const r = await storyboardReady();
+    await ownerPool()`update projects set revision_free = true, revision_of = ${r.projectId} where id = ${r.projectId}`;
+    await expect(withTenant(r.t.workspaceId, (tx) => startProductionCheckout(tx, r.ctx, r.projectId, { id: r.t.userId, email: r.t.email }))).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await ownerPool()`select 1 from purchases where project_id = ${r.projectId}`).toHaveLength(0);
+  }, 90_000);
+
   it('an out-of-stock product is flagged before the offer and checkout; stating a waitlist starts both (§42)', async () => {
     const t = await makeTenant();
     const ctx = ctxFor(t.workspaceId, t.userId);

@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Banner, Button } from '@arkiv/ui';
 import { api } from '@arkiv/ui/client';
 import { formatDate } from '@arkiv/shared/format';
+import { downgradeOffer } from '@/lib/cancel-offer';
 
 const REASONS = [
   ['too_expensive', 'Too expensive'],
@@ -26,6 +27,7 @@ export function CancelFlow({ slug, endsOn, planCode, archiveDays, pastDue = fals
   const [busy, setBusy] = useState(false);
   const [ends, setEnds] = useState(endsOn);
   const [immediate, setImmediate] = useState(false);
+  const offer = downgradeOffer(reason, planCode, pastDue);
 
   if (step === 0) return <Button variant="secondary" onClick={() => setStep(1)}>Cancel plan</Button>;
   if (step === 2 && immediate)
@@ -74,8 +76,10 @@ export function CancelFlow({ slug, endsOn, planCode, archiveDays, pastDue = fals
           <textarea className="ak-textarea" maxLength={500} value={detail} onChange={(e) => setDetail(e.target.value)} />
         </label>
       ) : null}
-      {!pastDue && planCode !== 'LAUNCH' && (reason === 'too_expensive' || reason === 'not_enough_value') ? (
+      {offer === 'price' ? (
         <p className="ak-small">Alternatively, Launch is $49/month with 3 tests — you can switch at renewal from “Change plan” above.</p>
+      ) : offer === 'seasonal' ? (
+        <p className="ak-small">Pausing ads for a season? Keep your archive and learnings on Launch ($49/month, 3 tests) while ads are paused — switch at renewal from “Change plan” above, and move back up when you restart.</p>
       ) : null}
       {err ? <Banner tone="risk">{err}</Banner> : null}
       <div className="ak-row">

@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, type Angle } from '@arkiv/shared';
+import { CREATIVE_GOAL_BRIEF, CreativeGoal, DomainError, type Angle } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
 import { brandBrainFor } from './brand';
 import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
@@ -30,6 +30,14 @@ export function verifiedIngredients(facts: Awaited<ReturnType<typeof currentFact
     return ok ? factText(facts, key) : null;
   };
   const split = (t: string, max: number) => t.split(/[,;\n]/).map((s) => s.trim()).filter((s) => s && s.length <= 60).slice(0, max);
+  // A merchant's correction wins (§15/§16), whichever row they corrected: the P4 "Key ingredients" row and the
+  // full INCI list are separate facts, so a decision on either beats an observed list on the other. When both were
+  // decided, the most recent decision stands.
+  const decided = (['key_ingredients', 'ingredients'] as const)
+    .map((k) => ({ k, f: facts[k] }))
+    .filter((x) => x.f && !x.f.disputed && x.f.value.state === 'DECIDED' && usable(x.k))
+    .sort((a, b) => b.f!.value.observedAt.localeCompare(a.f!.value.observedAt))[0];
+  if (decided) return { list: split(usable(decided.k)!, decided.k === 'key_ingredients' ? 8 : 6), verified: true };
   const key = usable('key_ingredients');
   if (key) return { list: split(key, 8), verified: true };
   const full = usable('ingredients');
@@ -69,6 +77,9 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   // §42 variants: the advertised variant's size, shade and price — never another variant's (e.g. variants[0]).
   const variants = await listVariants(tx, skuId);
   const chosen = opts.projectId ? await projectVariant(tx, opts.projectId) : null;
+  // §8: the merchant's chosen goal for this project; recommendations (no project) stay performance-oriented.
+  const [proj] = opts.projectId ? await tx`select goal from projects where id = ${opts.projectId}` : [];
+  const goal: CreativeGoal = (CreativeGoal as readonly string[]).includes(proj?.goal as string) ? (proj!.goal as CreativeGoal) : 'performance';
   const factPrice = facts.price?.value.valueNumber;
   const truth = variantTruth(variants, chosen, { size: factText(facts, 'size'), priceMicros: factPrice != null ? Math.round(factPrice * 1_000_000) : null });
   const productContext: ProductContext = {
@@ -80,6 +91,7 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
     approvedClaims: approvedRows.map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording)),
     themes: themes.map((t) => ({ label: t.label as string, signalType: t.signal_type as string })),
     testedAngles: coverage.map((c) => c.angle as string).filter(Boolean),
+    goal,
     rationaleIds: { themes: themes.map((t) => t.id as string), claims: approvedRows.map((c) => c.id), facts: Object.values(factIds), learnings: learnings.map((l) => l.id as string) },
   };
   const packet = {
@@ -112,7 +124,8 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
       ? { name: brand.name, tone: brand.brain.tone, neverShowOrSay: brand.brain.prohibited, requiredDisclosures: brand.brain.disclosures, preferredCta: brand.brain.cta, colors: brand.brain.colors, market: brand.brain.market }
       : null,
     platform: 'TikTok + Instagram Reels (9:16)',
-    objective: 'Find the next creative test worth running for this SKU',
+    objective: goal === 'performance' ? 'Find the next creative test worth running for this SKU' : `${CREATIVE_GOAL_BRIEF[goal]}. Each concept is still a test with one primary variable.`,
+    goal,
   };
   // Product and brand names are names, not claims ("Glow Serum" makes no glow claim).
   const names = [sku.name as string, brand?.name ?? null];

@@ -10,6 +10,7 @@ export type Action =
   | 'storyboard.approve'
   | 'spend.creative_test'
   | 'claim.approve'
+  | 'footage.accept'
   | 'integration.manage'
   | 'member.invite'
   | 'member.remove'
@@ -29,6 +30,8 @@ const MATRIX: Record<Action, readonly Role[]> = {
   'storyboard.approve': ['OWNER', 'ADMIN', 'MEMBER'],
   'spend.creative_test': ['OWNER', 'ADMIN', 'MEMBER'],
   'claim.approve': ['OWNER', 'ADMIN'],
+  // §26 / plan 03 A7: taking creator footage into a test is a rights decision (the merchant attests on accept).
+  'footage.accept': ['OWNER', 'ADMIN'],
   'integration.manage': ['OWNER', 'ADMIN'],
   'member.invite': ['OWNER', 'ADMIN'],
   'member.remove': ['OWNER', 'ADMIN'],

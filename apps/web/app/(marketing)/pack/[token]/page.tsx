@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import { globalTx } from '@arkiv/db';
-import { openCreatorPack } from '@arkiv/core';
+import { CREATOR_SAFE_ZONE, openCreatorPack } from '@arkiv/core';
 import { MarketingShell } from '@/components/marketing';
 import { CreatorUpload } from '@/components/creator-upload';
 import { formatDate } from '@arkiv/shared/format';
@@ -11,6 +11,34 @@ export const metadata: Metadata = { title: 'Creator brief', robots: { index: fal
  * A Creator Pack (standard §26): the brief a brand shares with a creator by a private, expiring link — goal, hooks,
  * shots, approved and forbidden claims, CTA and framing — and where the creator uploads the footage back.
  */
+/**
+ * Plan 03 A7 "safe-zone overlay diagram": a 9:16 frame with the areas the platforms cover (top, bottom captions and
+ * buttons, right-hand icons) shaded, and the safe centre where the product and any text belong.
+ */
+function SafeZoneDiagram() {
+  const W = 90;
+  const H = 160;
+  const z = CREATOR_SAFE_ZONE;
+  const safe = { x: W * z.left, y: H * z.top, w: W * (1 - z.left - z.right), h: H * (1 - z.top - z.bottom) };
+  return (
+    <figure className="ak-row" style={{ gap: 16, alignItems: 'center', margin: 0 }}>
+      <svg viewBox={`0 0 ${W} ${H}`} width={W * 1.5} height={H * 1.5} role="img" aria-labelledby="safe-zone-title">
+        <title id="safe-zone-title">9:16 frame: keep the product and text inside the centre box; the shaded edges are covered by the app.</title>
+        <rect x="0.5" y="0.5" width={W - 1} height={H - 1} fill="none" stroke="currentColor" />
+        <rect x="0" y="0" width={W} height={H * z.top} fill="currentColor" opacity="0.15" />
+        <rect x="0" y={H * (1 - z.bottom)} width={W} height={H * z.bottom} fill="currentColor" opacity="0.15" />
+        <rect x={W * (1 - z.right)} y={H * z.top} width={W * z.right} height={H * (1 - z.top - z.bottom)} fill="currentColor" opacity="0.15" />
+        <rect x={safe.x} y={safe.y} width={safe.w} height={safe.h} fill="none" stroke="currentColor" strokeDasharray="3 2" />
+        <text x={safe.x + safe.w / 2} y={safe.y + safe.h / 2} textAnchor="middle" fontSize="7" fill="currentColor">Safe area</text>
+        <text x={W / 2} y={H * (1 - z.bottom / 2) + 2} textAnchor="middle" fontSize="6" fill="currentColor">Captions · buttons</text>
+      </svg>
+      <figcaption className="ak-small ak-muted" style={{ maxWidth: 280 }}>
+        The shaded edges are covered by TikTok and Reels: the top {Math.round(z.top * 100)}%, the bottom {Math.round(z.bottom * 100)}% and the right {Math.round(z.right * 100)}%. Keep the product, the label and any text inside the dashed box.
+      </figcaption>
+    </figure>
+  );
+}
+
 export default async function CreatorPackPage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   const pack = await globalTx((tx) => openCreatorPack(tx, token));
@@ -62,6 +90,7 @@ export default async function CreatorPackPage({ params }: { params: Promise<{ to
         <p>{c.cta}</p>
         <h2 className="ak-label">Framing</h2>
         <ul>{c.framing.map((f) => <li key={f}>{f}</li>)}</ul>
+        <SafeZoneDiagram />
         {c.voiceover ? (
           <>
             <h2 className="ak-label">Example voice-over (optional)</h2>
@@ -69,9 +98,12 @@ export default async function CreatorPackPage({ params }: { params: Promise<{ to
           </>
         ) : null}
 
-        <hr className="ak-rule" />
-        <h2 className="ak-label">Send your footage</h2>
-        <CreatorUpload token={token} brand={c.brandName ?? c.productName} />
+        {/* Printable (plan 03 A7): the brief prints on its own; the upload form is for the screen. */}
+        <div className="ak-no-print ak-stack">
+          <hr className="ak-rule" />
+          <h2 className="ak-label">Send your footage</h2>
+          <CreatorUpload token={token} brand={c.brandName ?? c.productName} />
+        </div>
         <p className="ak-small ak-muted">This link works until {formatDate(pack.expiresAt)}.</p>
       </article>
     </MarketingShell>

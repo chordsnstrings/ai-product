@@ -1,14 +1,14 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, selectHeroProduct, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
-import { DomainError } from '@arkiv/shared';
+import { CreativeGoal, DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
 
 /**
  * Funnel actions on a project:
- *   concepts  – "Try 3 more" (limited for provisional workspaces). Queued: 202 + the batch to poll for
+ *   concepts  – "Try 3 more" (limited for provisional workspaces), optionally for a new §8 goal. Queued: 202 + the batch to poll for
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
  *   retry     – retry a failed production (entitlement was returned on failure)
@@ -16,12 +16,15 @@ import { projectAccess } from '@/lib/tenant';
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   recompose – "Update my ad" after the product's price or size changed: new on-screen text, same footage (§42)
+ *   select-product – mark the hero product in a photo that shows several (plan 03 P2); the analysis resumes
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   photos    – add photos to this product (multipart `photos`): resumes an analysis waiting for them (the URL
  *               failed, §13), or adds side/back reference views to an analysed one (P4)
  *   confirm   – "Looks right" on the confirmation screen (P4): the shown facts become merchant-confirmed
  *   fact-accept-source – use the store's newer value instead of the merchant's earlier correction (§28, §42)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
+ *   not-right – "Not right?" on a delivered ad: diagnosis + re-plan (free once for product accuracy, §48)
+ *   produce-free – produce a free re-plan's storyboard (no checkout)
  *   watched   – the finished ad was played (P10 "Watch", standard §7); recorded once per project
  */
 export const POST = route(async (req, { params }: { params: Promise<{ id: string; action: string }> }) => {
@@ -32,8 +35,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       // Drafting runs in the worker (§34); the funnel polls GET /api/projects/:id until the batch appears.
       // A checkout still open for the storyboard being replaced is closed once the change is made (a payment
       // already made is still honoured for the storyboard it was for).
+      // Optional §8 goal (sell / UGC review / explainer / premium): the new ideas are drafted for it.
+      const { goal } = await body(req, z.object({ goal: z.enum(CreativeGoal).optional() }));
       const r = await withTenant(a.ctx.workspaceId, async (tx) => {
-        const out = await requestConcepts(tx, a.ctx, id);
+        const out = await requestConcepts(tx, a.ctx, id, { goal });
         if (!a.provisional) await closeOpenCheckouts(tx, a.ctx, id);
         return out;
       });
@@ -58,7 +63,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     }
     case 'fact': {
       // Confirmation screen (P4): the merchant's correction becomes a DECIDED fact and wins over page/photo values.
-      const f = await body(req, z.object({ key: z.enum(['name', 'brand', 'size', 'price', 'category', 'texture', 'packaging', 'ingredients']), value: z.string().trim().min(1).max(400) }));
+      const f = await body(req, z.object({ key: z.enum(['name', 'brand', 'size', 'price', 'category', 'texture', 'packaging', 'key_ingredients', 'ingredients']), value: z.string().trim().min(1).max(400) }));
       const [p] = await withTenant(a.ctx.workspaceId, (tx) => tx`select sku_id from projects where id = ${id}`);
       const num = f.key === 'price' ? Number(f.value.replace(/[^0-9.]/g, '')) : null;
       if (f.key === 'price' && !(num! > 0)) throw new DomainError('INVALID', 'Enter a price like 38.00');
@@ -106,6 +111,19 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const v = await withTenant(a.ctx.workspaceId, (tx) => selectVariant(tx, a.ctx, id, variantId));
       return json({ ok: true, variant: v });
     }
+    case 'not-right': {
+      // P10 "Not right?": the diagnosis, and a re-plan (free once for product accuracy) as a new project.
+      if (!a.user || a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const i = await body(req, z.object({ reason: z.enum(['strategy', 'accuracy', 'style']), note: z.string().trim().max(500).optional() }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => reportNotRight(tx, a.ctx, id, { reason: i.reason, note: i.note ?? null }));
+      return json({ ok: true, ...r });
+    }
+    case 'produce-free': {
+      // A free re-plan's storyboard goes into production without a checkout (the credit was granted for it).
+      if (!a.user || a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const r = await withTenant(a.ctx.workspaceId, (tx) => produceFreeRevision(tx, a.ctx, id));
+      return json({ ok: true, ...r });
+    }
     case 'watched': {
       const { assetId, seconds } = await body(req, z.object({ assetId: z.string().uuid(), seconds: z.number().min(0).max(3600) }));
       const recorded = await withTenant(a.ctx.workspaceId, (tx) => recordAssetWatched(tx, a.ctx, id, assetId, seconds));
@@ -118,6 +136,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const photos = await Promise.all(files.map(async (f) => ({ bytes: Buffer.from(await f.arrayBuffer()), filename: f.name })));
       const r = await withTenant(a.ctx.workspaceId, (tx) => addProductPhotos(tx, a.ctx, id, photos));
       return json({ ok: true, ...r }, r.mode === 'resumed' ? 202 : 200);
+    }
+    case 'select-product': {
+      // Plan 03 P2: the photo shows several products — the box (fractions of the photo) marks the hero one.
+      const box = await body(req, z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1), w: z.number().gt(0).max(1), h: z.number().gt(0).max(1) }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => selectHeroProduct(tx, a.ctx, id, box));
+      return json({ ok: true, queued: true, ...r }, 202);
     }
     case 'retry-analysis': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));

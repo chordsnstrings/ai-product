@@ -18,7 +18,7 @@ export type SourceType = 'product_page' | 'json_ld' | 'shopify' | 'photo_ocr' | 
 const PRECEDENCE: Record<SourceType, number> = { merchant: 100, staff: 90, shopify: 80, json_ld: 70, import: 60, product_page: 50, photo_ocr: 40, vision: 30 };
 
 /** Keys where disagreement between sources is material and must be surfaced. */
-const MATERIAL_KEYS = new Set(['name', 'price', 'size', 'category', 'ingredients', 'shade']);
+const MATERIAL_KEYS = new Set(['name', 'price', 'size', 'category', 'ingredients', 'key_ingredients', 'shade']);
 
 export interface FactInput {
   key: string;

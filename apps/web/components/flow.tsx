@@ -8,6 +8,8 @@ import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
 import { EmailLinkForm } from './email-link';
 import { registerPasskey } from './profile';
 import type { ProjectView } from '@/lib/views';
+import { awaitingPayment, conceptCost, disputeChoices, tapBox, tensionSourceWords } from '@/lib/flow-helpers';
+import type { CreativeGoal } from '@arkiv/shared';
 
 type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null; passkeyPrompt?: boolean } };
 
@@ -96,8 +98,13 @@ function Loading() {
 
 /* ───────────── P3/P4 · Analysis → confirmation ───────────── */
 
-const FACT_LABELS: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at', category: 'Category', texture: 'Texture', ingredients: 'Key ingredients', sku_code: 'SKU', gtin: 'GTIN' };
-const EDITABLE = new Set(['name', 'brand', 'size', 'price', 'category', 'texture', 'ingredients']);
+/**
+ * P3/P4 rows, in the plan's order (name, size, price, category, key ingredients, INCI, texture/format). The key
+ * ingredients the ideas are built on and the full INCI list are separate facts; each is shown and correctable
+ * (a correction of either reaches the Creative Director, x-contracts-03).
+ */
+const FACT_LABELS: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at', category: 'Category', key_ingredients: 'Key ingredients', ingredients: 'Ingredients (INCI)', texture: 'Texture', format: 'Format', sku_code: 'SKU', gtin: 'GTIN' };
+const EDITABLE = new Set(['name', 'brand', 'size', 'price', 'category', 'texture', 'key_ingredients', 'ingredients']);
 /** Where a disagreeing value came from, in customer words. */
 const SOURCE_WORDS: Record<string, string> = { shopify: 'Your Shopify store', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label in your photos', import: 'Your import' };
 
@@ -228,6 +235,66 @@ function VariantPicker({ projectId, v, onSaved }: { projectId: string; v: View; 
   );
 }
 
+/**
+ * Plan 03 P2 "Photo shows several products → tap-to-select the hero product": tap the product (a box is placed
+ * around the tap) or drag a box around it; the analysis carries on from that crop.
+ */
+function HeroPicker({ projectId, photoUrl, onPicked }: { projectId: string; photoUrl: string; onPicked: () => void }) {
+  const [box, setBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const start = useRef<{ x: number; y: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const at = (e: React.PointerEvent<HTMLDivElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
+  };
+  async function use() {
+    if (!box) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/select-product`, box);
+      onPicked();
+    } catch (e) {
+      setErr((e as Error).message);
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="ak-panel ak-stack">
+      <h2 className="ak-label">Which product is this ad for?</h2>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>Your photo shows more than one product. Tap it, or drag a box around it.</p>
+      <div
+        style={{ position: 'relative', touchAction: 'none', userSelect: 'none', cursor: 'crosshair' }}
+        onPointerDown={(e) => {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          start.current = at(e);
+          setBox(null);
+        }}
+        onPointerMove={(e) => {
+          if (!start.current) return;
+          const p = at(e);
+          const s0 = start.current;
+          setBox({ x: Math.min(s0.x, p.x), y: Math.min(s0.y, p.y), w: Math.abs(p.x - s0.x), h: Math.abs(p.y - s0.y) });
+        }}
+        onPointerUp={(e) => {
+          const s0 = start.current;
+          start.current = null;
+          if (!s0) return;
+          const p = at(e);
+          // A tap (no drag): a box around the tapped point, a third of the photo each way.
+          if (Math.abs(p.x - s0.x) < 0.03 && Math.abs(p.y - s0.y) < 0.03) setBox(tapBox(s0));
+        }}
+      >
+        <img src={photoUrl} alt="Your product photo" style={{ display: 'block', width: '100%', height: 'auto' }} draggable={false} />
+        {box ? <div aria-hidden style={{ position: 'absolute', left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%`, border: '2px solid var(--ink)', boxShadow: '0 0 0 9999px rgba(0,0,0,0.35)' }} /> : null}
+      </div>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+      <div><Button disabled={!box || box.w < 0.05 || box.h < 0.05 || busy} onClick={() => void use()}>{busy ? 'Carrying on…' : 'This one — carry on'}</Button></div>
+    </div>
+  );
+}
+
 /** Plan 03 P2: an out-of-scope product gets a waitlist email instead (no generation spend). */
 function WaitlistForm({ projectId }: { projectId: string }) {
   const [email, setEmail] = useState('');
@@ -335,6 +402,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
     }
   }
   const disputed = v.facts.filter((f) => f.disputed);
+  const conceptsDrafting = !ready && !failed && v.project.state !== 'NEEDS_USER_ACTION' && (v.steps.some((st) => st.key === 'concepts' && st.status === 'active') || (!analyzing && v.sku.status === 'active'));
   // "Looks right" confirms what the merchant was shown (§13, §16 merchant_confirmed), then moves on. A failed
   // confirmation never blocks the ideas: the facts stay as observed.
   async function confirmAndGo() {
@@ -392,8 +460,18 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                     </form>
                   ) : (
                     <span>
-                      {f.key === 'ingredients' && f.value.length > 120 ? `${f.value.slice(0, 120)}…` : f.value}
-                      {EDITABLE.has(f.key) && !analyzing ? <button className="ak-textbtn" style={{ marginLeft: 8 }} onClick={() => { setEditing(f.key); setDraft(f.value); }}>Fix</button> : null}
+                      {(f.key === 'ingredients' || f.key === 'key_ingredients') && f.value.length > 120 ? `${f.value.slice(0, 120)}…` : f.value}
+                      {EDITABLE.has(f.key) && !analyzing && !f.disputed ? <button className="ak-textbtn" style={{ marginLeft: 8 }} onClick={() => { setEditing(f.key); setDraft(f.value); }}>Fix</button> : null}
+                      {f.disputed && EDITABLE.has(f.key) && !analyzing ? (
+                        <span className="ak-row" style={{ flexWrap: 'wrap', gap: 6, marginTop: 6 }} role="group" aria-label={`Which ${FACT_LABELS[f.key]} is right?`}>
+                          {disputeChoices(f.key, f.candidates).map((c) => (
+                            <button key={c.value} type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => void resolveSource(f.key, { value: c.value })}>
+                              {c.label}
+                            </button>
+                          ))}
+                          <button type="button" className="ak-textbtn" onClick={() => { setEditing(f.key); setDraft(''); }}>Something else</button>
+                        </span>
+                      ) : null}
                       {f.sourceConflict && !analyzing ? (
                         <span className="ak-small ak-muted" style={{ display: 'block' }}>
                           {SOURCE_WORDS[f.sourceConflict.source] ?? 'Another source'} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.value}”
@@ -416,12 +494,35 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                 ),
               }))}
           />
+          {/* Claims appear as they are found (M2), each with its chip. */}
+          {v.claims.length ? (
+            <div>
+              <h2 className="ak-label">Claims we found</h2>
+              <ul className="ak-stack" style={{ listStyle: 'none', padding: 0 }}>
+                {v.claims.map((c) => (
+                  <li key={c.id} className="ak-between ak-small" style={{ gap: 12 }}>
+                    <span>“{c.wording}”{c.reason ? <span className="ak-muted"> — {c.reason}</span> : null}</span>
+                    <ClaimChip status={c.status} />
+                  </li>
+                ))}
+              </ul>
+              <p className="ak-small ak-muted">Blocked claims never appear in your ads. Cosmetic products can’t claim to treat or change the skin’s structure (FDA).</p>
+            </div>
+          ) : null}
+          {conceptsDrafting ? (
+            <ul className="ak-stack" style={{ listStyle: 'none', padding: 0, margin: 0 }} aria-live="polite" aria-label="Test ideas being drafted">
+              {['A', 'B', 'C'].map((x) => (
+                <li key={x} className="ak-between ak-small ak-muted"><span className="ak-index">Test idea {x}</span><span>drafting…</span></li>
+              ))}
+            </ul>
+          ) : null}
           {!analyzing ? (
             <>
               {err ? <p className="ak-error" role="alert" id="fact-error">{err}</p> : null}
               {failed ? (
                 <div className="ak-stack">
                   <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
+                  {v.sku.selectProduct ? <HeroPicker projectId={projectId} photoUrl={v.sku.selectProduct.photoUrl} onPicked={() => { resume(); refresh(); }} /> : null}
                   {v.sku.sourceUrl ? <p className="ak-small ak-muted" style={{ margin: 0, overflowWrap: 'anywhere' }}>Your link is saved: {v.sku.sourceUrl}</p> : null}
                   <PhotoAdder
                     projectId={projectId}
@@ -430,7 +531,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                     cta="Add photos and continue"
                     onAdded={() => { resume(); refresh(); }}
                   />
-                  {v.sku.usablePhotos ? (
+                  {v.sku.usablePhotos && !v.sku.selectProduct ? (
                     <>
                       <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
                       <div><Button variant="secondary" onClick={() => void retryAnalysis()}>Try again</Button></div>
@@ -441,7 +542,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                 <div className="ak-panel ak-stack">
                   <h2 className="ak-label">Add your ingredient list to unlock ingredient tests</h2>
                   <p className="ak-small ak-muted" style={{ margin: 0 }}>We didn’t find an ingredient list on your page or label, so we won’t suggest ingredient-led ads or guess ingredients from the category.</p>
-                  <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Key ingredients', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
+                  <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Ingredient list', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
                 </div>
               ) : null}
               {!failed && ready && v.sku.addedViews === 0 && v.sku.suggestedViews.length > 0 && (v.sku.fidelityConfidence ?? 1) < LOW_FIDELITY ? (
@@ -460,25 +561,17 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <ul className="ak-small" style={{ margin: 0 }}>{v.sku.missingEvidence.map((m) => <li key={m}>{m}</li>)}</ul>
                 </div>
               ) : null}
-              {v.claims.length ? (
-                <div>
-                  <h2 className="ak-label">Claims we found</h2>
-                  <ul className="ak-stack" style={{ listStyle: 'none', padding: 0 }}>
-                    {v.claims.map((c) => (
-                      <li key={c.id} className="ak-between ak-small" style={{ gap: 12 }}>
-                        <span>“{c.wording}”{c.reason ? <span className="ak-muted"> — {c.reason}</span> : null}</span>
-                        <ClaimChip status={c.status} />
-                      </li>
-                    ))}
-                  </ul>
-                  <p className="ak-small ak-muted">Blocked claims never appear in your ads. Cosmetic products can’t claim to treat or change the skin’s structure (FDA).</p>
-                </div>
-              ) : null}
               {failed ? null : ready ? (
-                <LinkButton href={`/concepts/${projectId}`} block id="cta" onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
+                <>
+                  <LinkButton href={`/concepts/${projectId}`} block id="cta" onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
+                  {/* Plan 04 L19: the next step stays in reach on a phone once the button scrolls away. */}
+                  <StickyCta watchId="cta" mobileOnly>
+                    <LinkButton href={`/concepts/${projectId}`} block onClick={(e) => { e.preventDefault(); void confirmAndGo(); }}>Looks right — show me 3 ad ideas</LinkButton>
+                  </StickyCta>
+                </>
               ) : v.project.state === 'NEEDS_USER_ACTION' ? (
                 <Banner tone="warn">{v.project.failureReason ?? 'We need a clearer photo of the product. Add one to continue.'}</Banner>
-              ) : (
+              ) : conceptsDrafting ? null : (
                 <p className="ak-muted ak-small">Drafting three test ideas…</p>
               )}
             </>
@@ -493,6 +586,32 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
 
 const RISK: Record<string, string> = { lower_risk: 'Safer bet', adjacent: 'Adjacent', exploratory: 'Exploratory' };
 
+/** §8 goals, in customer words; the default is performance ("sell the product"). */
+const GOALS: { value: CreativeGoal; label: string }[] = [
+  { value: 'performance', label: 'Sell the product' },
+  { value: 'ugc_review', label: 'UGC-style review' },
+  { value: 'explainer', label: 'Explain the product' },
+  { value: 'premium', label: 'Premium look' },
+];
+
+type ConceptCard = View['concepts'][number];
+
+/** P5 "Why this?" (M6, standard §13): the evidence and the gap behind a recommended idea, one click away. */
+export function WhyThis({ c, pickReason }: { c: Pick<ConceptCard, 'whyNow' | 'customerTension' | 'customerTensionSource' | 'primaryVariable' | 'angle' | 'ifTestFails'>; pickReason?: string | null }) {
+  return (
+    <details className="ak-small">
+      <summary>Why this?</summary>
+      <dl className="ak-meta" style={{ marginTop: 8 }}>
+        <dt>Why now</dt><dd>{c.whyNow}</dd>
+        <dt>Evidence</dt><dd>{tensionSourceWords(c.customerTensionSource)}: {c.customerTension}</dd>
+        <dt>The gap</dt><dd>It changes only the {String(c.primaryVariable).replace(/_/g, ' ')} to test the {String(c.angle).replace(/_/g, ' ').toLowerCase()} angle.</dd>
+        {pickReason ? <><dt>Our pick</dt><dd>{pickReason}</dd></> : null}
+        <dt>If it loses</dt><dd>{c.ifTestFails}</dd>
+      </dl>
+    </details>
+  );
+}
+
 export function ConceptsFlow({ projectId, providers }: { projectId: string; providers: { google: boolean; apple: boolean } }) {
   const active = useCallback(
     (v: View | null) => !v || v.concepts.length === 0 || v.project.state === 'CONCEPT_SELECTED' || v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active',
@@ -500,6 +619,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
   );
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [gate, setGate] = useState<string | null>(null);
+  const [gateDismissed, setGateDismissed] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   if (!v) return error ? <PreviewUnavailable projectId={projectId} error={error} /> : <Loading />;
@@ -516,12 +636,12 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
       setErr((e as Error).message);
     }
   }
-  async function more() {
-    setBusy('more');
+  async function more(goal?: CreativeGoal) {
+    setBusy(goal ? `goal:${goal}` : 'more');
     setErr(null);
     try {
       // Queued server-side (202); polling picks up the new batch or the request's failure.
-      await api(`/api/projects/${projectId}/concepts`, {});
+      await api(`/api/projects/${projectId}/concepts`, goal ? { goal } : {});
       resume();
       refresh();
     } catch (e) {
@@ -530,19 +650,38 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
     setBusy(null);
   }
   const drafting = v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active';
+  const pick = v.concepts.find((c) => c.isPick) ?? v.concepts[0];
+  const cost = conceptCost(v.project.kind, v.quote);
 
   return (
-    <Shell step={2} title="Three ways to test this product" sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.</>}>
+    // While the save gate is open, steps 1–2 are done (plan 04 L4: we ask for the account after the value).
+    <Shell
+      step={gate ? 3 : 2}
+      title="Three ways to test this product"
+      sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.{v.access.provisional ? null : ' Your concepts are saved in your archive.'}</>}
+    >
       {err ? <Banner tone="risk">{err}</Banner> : null}
+      {gateDismissed && v.access.provisional ? <Banner>Your ideas are kept in this browser for {v.previewDays} days. Save your work to keep them in your archive.</Banner> : null}
       {v.conceptRequest?.status === 'failed' && v.conceptRequest.batch > (v.concepts[0]?.batch ?? 0) ? <Banner tone="warn">{v.conceptRequest.detail ?? 'We couldn’t draft more ideas just now. Please try again.'}</Banner> : null}
+      {v.concepts.length ? (
+        <fieldset className="ak-row" style={{ flexWrap: 'wrap', gap: 8, border: 0, padding: 0, margin: '0 0 24px' }} disabled={!!busy || drafting}>
+          <legend className="ak-label" style={{ marginBottom: 8 }}>What should this ad do?</legend>
+          {GOALS.map((g) => (
+            <label key={g.value} className={`ak-chip${v.project.goal === g.value ? ' ak-chip--dec' : ''}`} style={{ cursor: 'pointer' }}>
+              <input type="radio" name="goal" value={g.value} className="ak-sr" checked={v.project.goal === g.value} onChange={() => void more(g.value)} />
+              {g.label}
+            </label>
+          ))}
+        </fieldset>
+      ) : null}
       {v.concepts.length === 0 ? (
         <p className="ak-muted">Drafting ideas…</p>
       ) : (
-        <div className="ak-grid-3">
+        <div className="ak-carousel" role="list" aria-label="Ad ideas">
           {v.concepts.map((c) => {
             const hooks = c.hookOptions ?? [];
             return (
-              <article key={c.id} className={`ak-card${c.isPick ? ' ak-card--pick' : ''}`}>
+              <article key={c.id} role="listitem" className={`ak-card${c.isPick ? ' ak-card--pick' : ''}`}>
                 <div className="ak-between">
                   <span className="ak-index">{c.idx}</span>
                   {c.isPick ? <span className="ak-chip ak-chip--dec">Our pick</span> : <span className="ak-chip">{RISK[c.riskProfile] ?? ''}</span>}
@@ -550,12 +689,16 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
                 <h2 className="ak-h2 ak-serif" style={{ marginTop: 16 }}>“{hooks[0]}”</h2>
                 <p className="ak-small">{c.hypothesis}</p>
                 <dl className="ak-meta ak-small">
+                  <dt>Customer tension</dt>
+                  <dd>{c.customerTension} <span className="ak-chip" style={{ marginLeft: 4 }}>{tensionSourceWords(c.customerTensionSource)}</span></dd>
                   <dt>Tests</dt><dd>{String(c.primaryVariable)}</dd>
                   <dt>Angle</dt><dd>{String(c.angle).replace(/_/g, ' ')}</dd>
                   <dt>Proof</dt><dd>{String(c.proofMechanism).replace(/_/g, ' ')}</dd>
+                  <dt>Production style</dt><dd className="ak-mono">{String(c.treatment).replace(/_/g, ' ').toLowerCase()}</dd>
                   <dt>You’ll learn</dt><dd>{c.expectedLearning}</dd>
+                  <dt>Cost</dt><dd>{cost}{c.estimatedGenerationClass === 'premium' ? <span className="ak-chip" style={{ marginLeft: 4 }}>Premium production</span> : null}</dd>
                 </dl>
-                {c.isPick && c.pickReason ? <p className="ak-small ak-muted">Why: {c.pickReason}</p> : null}
+                <WhyThis c={c} pickReason={c.isPick ? c.pickReason : null} />
                 <Button block variant={c.isPick ? 'primary' : 'secondary'} disabled={!!busy} onClick={() => choose(c.id)} id={c.isPick ? 'cta' : undefined}>
                   {busy === c.id ? 'Building storyboard…' : 'Build this storyboard'}
                 </Button>
@@ -566,10 +709,26 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
       )}
       {v.concepts.length ? (
         <p style={{ marginTop: 24 }}>
-          <button className="ak-textbtn" disabled={!!busy || drafting} onClick={more} aria-live="polite">{busy === 'more' || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
+          <button className="ak-textbtn" disabled={!!busy || drafting} onClick={() => void more()} aria-live="polite">{busy === 'more' || busy?.startsWith('goal:') || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
         </p>
       ) : null}
-      <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} providers={providers} />
+      {pick ? (
+        <StickyCta watchId="cta" mobileOnly>
+          <Button block disabled={!!busy} onClick={() => choose(pick.id)}>Build the storyboard for idea {pick.idx}</Button>
+        </StickyCta>
+      ) : null}
+      <SaveGate
+        open={!!gate}
+        onOpenChange={(o) => {
+          if (!o) {
+            setGate(null);
+            setGateDismissed(true);
+          }
+        }}
+        next={`/concepts/${projectId}`}
+        productName={v.sku.name}
+        providers={providers}
+      />
     </Shell>
   );
 }
@@ -673,6 +832,13 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
+      {sb && sb.status !== 'generating' && v.project.revisionFree && !resumable ? (
+        <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
+          <h2 className="ak-label">Make it again — free</h2>
+          <p className="ak-small ak-muted">This re-plan is on us, because your first ad didn’t show your product accurately. Check the scenes, then we’ll make it — nothing to pay.</p>
+          <Button block id="cta" disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/produce-free`, {})) window.location.assign(`/produce/${projectId}`); }}>Make my ad</Button>
+        </section>
+      ) : null}
       {sb && sb.status !== 'generating' && resumable ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
           <h2 className="ak-label">Finish your ad</h2>
@@ -681,7 +847,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           <div style={{ marginTop: 12 }}><CancelProduction projectId={projectId} v={v} onChange={() => window.location.assign(`/produce/${projectId}`)} /></div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && !resumable ? (
+      {sb && sb.status !== 'generating' && !resumable && !v.project.revisionFree ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="offer">
           <div className="ak-between" style={{ alignItems: 'start', flexWrap: 'wrap', gap: 24 }}>
             <div>
@@ -708,7 +874,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           </div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && !resumable ? (
+      {sb && sb.status !== 'generating' && !resumable && !v.project.revisionFree ? (
         <StickyCta watchId="cta" mobileOnly>
           <LinkButton href={`/checkout/${projectId}`} block>Make my ad · {usd(q.priceMicros)}</LinkButton>
         </StickyCta>
@@ -742,10 +908,57 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
 
 /* ───────────── P8 · Checkout ───────────── */
 
-export function CheckoutFlow({ projectId, publishableKey }: { projectId: string; publishableKey: string | null }) {
+/**
+ * P8 order summary (plan 03 P8, plan 04 L11/L12, standard §8): personalised to the SKU and the chosen idea — what
+ * will be produced, the storyboard, the price and when the offer ends — beside a sealed payment panel.
+ */
+function OrderSummary({ v, priceMicros }: { v: View; priceMicros: number }) {
+  const sb = v.storyboard;
+  const frames = (sb?.scenes ?? []).filter((s) => s.frameUrl);
+  const taste = v.quote.kind === 'taste' && v.quote.status === 'active';
+  return (
+    <section className="ak-panel ak-stack" aria-labelledby="order-summary" style={{ gap: 12 }}>
+      <h2 className="ak-label" id="order-summary">Your order</h2>
+      <div className="ak-row" style={{ alignItems: 'start', gap: 16 }}>
+        {frames[0] ? <div className="ak-well ak-well--916" style={{ width: 72, flex: 'none' }}><img src={frames[0].frameUrl!} alt={`First scene of your storyboard for ${v.sku.name}`} /></div> : null}
+        <div className="ak-stack" style={{ gap: 4 }}>
+          <p style={{ margin: 0 }}><strong>{v.sku.name}</strong> <span className="ak-index">No. {String(v.sku.catalogueNo).padStart(3, '0')}</span></p>
+          {sb?.hook ? <p className="ak-small ak-serif" style={{ margin: 0 }}>“{sb.hook}”</p> : null}
+          <p className="ak-small ak-muted" style={{ margin: 0 }}>15-second ad · one-time {usd(priceMicros)}</p>
+        </div>
+      </div>
+      {frames.length > 1 ? (
+        <div className="ak-row" style={{ gap: 6, overflowX: 'auto' }} aria-label="Your storyboard">
+          {frames.map((s) => (
+            <div key={s.id} className="ak-well ak-well--916" style={{ width: 40, flex: 'none' }}><img src={s.frameUrl!} alt="" /></div>
+          ))}
+        </div>
+      ) : null}
+      <ul className="ak-small" style={{ margin: 0, paddingLeft: 18 }}>
+        <li>One finished 15-second ad with voiceover and captions</li>
+        <li>Exports for TikTok, Reels (9:16), Feed (4:5) and Square</li>
+        {taste && v.bonus.offered ? <li>+ An alternate opening hook, free with this price</li> : null}
+      </ul>
+      <dl className="ak-meta ak-small" style={{ margin: 0 }}>
+        <dt>Ad</dt>
+        <dd>
+          {usd(priceMicros)}
+          {taste && v.quote.referencePriceMicros ? <span className="ak-strike ak-muted" style={{ marginLeft: 8 }}>{usd(v.quote.referencePriceMicros)}</span> : null}
+        </dd>
+        <dt>Tax</dt><dd>Calculated by Stripe from your address, before you pay</dd>
+        <dt>Total</dt><dd>{usd(priceMicros)} + any tax · one-time, no subscription</dd>
+      </dl>
+      {taste && v.quote.expiresAt ? <OfferExpiry expiresAt={v.quote.expiresAt} serverNow={v.serverNow} /> : null}
+    </section>
+  );
+}
+
+export function CheckoutFlow({ projectId, publishableKey, supportEmail }: { projectId: string; publishableKey: string | null; supportEmail?: string | null }) {
   const [state, setState] = useState<{ clientSecret: string | null; url: string | null; quote: { priceMicros: number } } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [Embedded, setEmbedded] = useState<React.ComponentType<{ clientSecret: string; pk: string }> | null>(null);
+  // The storyboard and the SKU stay in view while paying (plan 04 L11): one read of the project view.
+  const view = usePoll<View>(`/api/projects/${projectId}`, 60_000, false);
   useEffect(() => {
     let alive = true;
     api<{ clientSecret: string | null; url: string | null; quote: { priceMicros: number } }>(`/api/projects/${projectId}/checkout`, {})
@@ -768,18 +981,31 @@ export function CheckoutFlow({ projectId, publishableKey }: { projectId: string;
       alive = false;
     };
   }, [projectId, publishableKey]);
+  const v = view.data;
   return (
-    <Shell step={4} title="Checkout" sub="One-time payment. No subscription is created.">
-      {err ? (
-        <>
-          <Banner tone="risk">{err}</Banner>
-          <LinkButton variant="secondary" href={`/storyboard/${projectId}`}>Back to storyboard</LinkButton>
-        </>
-      ) : Embedded && state?.clientSecret && publishableKey ? (
-        <Embedded clientSecret={state.clientSecret} pk={publishableKey} />
-      ) : (
-        <p className="ak-muted">Opening secure checkout…</p>
-      )}
+    <Shell step={4} title="Make your ad" sub="Step 4 of 4: we’ve done the strategy; this produces it. One-time payment — no subscription is created.">
+      <div className="ak-grid-2" style={{ alignItems: 'start' }}>
+        <div className="ak-stack">
+          {v ? <OrderSummary v={v} priceMicros={state?.quote.priceMicros ?? v.quote.priceMicros} /> : null}
+          {/* Closing checkout keeps the offer: back to the storyboard, where it is still live (plan 03 P8). */}
+          <p className="ak-small" style={{ margin: 0 }}><a href={`/storyboard/${projectId}`}>← Back to storyboard</a></p>
+        </div>
+        <div className="ak-sealed ak-stack" style={{ gap: 12 }}>
+          {err ? (
+            <>
+              <Banner tone="risk">{err}</Banner>
+              <LinkButton variant="secondary" href={`/storyboard/${projectId}`}>Back to storyboard</LinkButton>
+            </>
+          ) : Embedded && state?.clientSecret && publishableKey ? (
+            <Embedded clientSecret={state.clientSecret} pk={publishableKey} />
+          ) : (
+            <p className="ak-muted">Opening secure checkout…</p>
+          )}
+          <p className="ak-small ak-muted" style={{ margin: 0 }}>
+            Payments by Stripe · we never see your card.{supportEmail ? <> Questions? <a href={`mailto:${supportEmail}`}>{supportEmail}</a></> : null}
+          </p>
+        </div>
+      </div>
     </Shell>
   );
 }
@@ -790,17 +1016,31 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
   // A production paused by a provider outage resumes by itself, so keep polling it.
   const active = useCallback((v: View | null) => !v || v.project.paused || (v.project.state !== 'COMPLETE' && !STOPPED.includes(v.project.state)), []);
   const { data: v, error, resume } = useProject(projectId, active);
+  // "Payment confirmed, starting production" once the wait for Stripe ends (plan 03 P8).
+  const [confirmed, setConfirmed] = useState(false);
+  const wasWaiting = useRef(false);
+  const wait = v ? awaitingPayment(v) : null;
   useEffect(() => {
     if (v?.project.state === 'COMPLETE') window.location.replace(`/deliver/${projectId}`);
   }, [v?.project.state, projectId]);
+  useEffect(() => {
+    if (wait === 'unpaid') window.location.replace(`/storyboard/${projectId}`);
+    if (wait === 'confirming') wasWaiting.current = true;
+    else if (wasWaiting.current && v && PRODUCING.includes(v.project.state)) {
+      wasWaiting.current = false;
+      setConfirmed(true);
+    }
+  }, [wait, v, projectId]);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
-  const waitingPayment = v.project.state === 'STORYBOARD_READY' && !v.project.resumable;
+  if (wait === 'unpaid') return <Loading />;
+  const waitingPayment = wait === 'confirming';
   const paused = v.project.paused;
   const stopped = !paused && STOPPED.includes(v.project.state);
   const title = v.project.state === 'BLOCKED_COMPLIANCE' ? 'One line needs changing' : v.project.state === 'CANCELLED' ? 'This ad was cancelled' : stopped ? 'We couldn’t finish this ad' : paused ? 'Your ad is queued' : waitingPayment ? 'Confirming your payment' : 'Making your ad';
   return (
     <Shell step={4} title={title} sub={stopped ? undefined : 'Usually about 10 minutes. We’ll email you when it’s ready — you can close this tab.'}>
-      {waitingPayment ? <p className="ak-muted">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
+      {waitingPayment ? <p className="ak-muted" role="status">Waiting for confirmation from Stripe… this usually takes a few seconds.</p> : null}
+      {confirmed && !waitingPayment ? <Banner>Payment confirmed, starting production.</Banner> : null}
       {v.project.resumable ? (
         <div className="ak-stack">
           <p>Your storyboard is open for the change. You won’t be charged again.</p>
@@ -983,9 +1223,10 @@ export function AiDisclosureSteps({ disclosure }: { disclosure: ProjectView['dis
 }
 
 /** P10 "Watch" (standard §7): the finished ad counts as watched once it has played for 3 seconds or to the end. */
-function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked }: { projectId: string; assetId: string; src: string; onPlaying?: () => void; onBlocked?: () => void }) {
+function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked, onProgress }: { projectId: string; assetId: string; src: string; onPlaying?: () => void; onBlocked?: () => void; onProgress?: (seconds: number, ended: boolean) => void }) {
   const sent = useRef(false);
   const el = useRef<HTMLVideoElement>(null);
+  const [muted, setMuted] = useState(true);
   // M12: plays inline at once, muted (captions are burned in). A browser that refuses autoplay gets the controls.
   useEffect(() => {
     const p = el.current?.play();
@@ -997,6 +1238,7 @@ function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked }: { proje
     fetch(`/api/projects/${projectId}/watched`, { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ assetId, seconds: Number.isFinite(seconds) ? Math.round(seconds) : 0 }) }).catch(() => {});
   };
   return (
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
     <video
       ref={el}
       src={src}
@@ -1006,14 +1248,70 @@ function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked }: { proje
       playsInline
       preload="auto"
       onPlaying={onPlaying}
+      onVolumeChange={(e) => setMuted(e.currentTarget.muted)}
       style={{ width: '100%', height: '100%', objectFit: 'contain' }}
       onTimeUpdate={(e) => {
         if (e.currentTarget.currentTime >= 3) report(e.currentTarget.currentTime);
+        onProgress?.(e.currentTarget.currentTime, false);
       }}
-      onEnded={(e) => report(e.currentTarget.duration || e.currentTarget.currentTime)}
+      onEnded={(e) => {
+        report(e.currentTarget.duration || e.currentTarget.currentTime);
+        onProgress?.(e.currentTarget.duration || e.currentTarget.currentTime, true);
+      }}
     />
+    {/* P10: plays muted with captions burned in; one tap turns the sound on. */}
+    {muted ? (
+      <button
+        type="button"
+        className="ak-btn ak-btn--secondary ak-btn--sm"
+        style={{ position: 'absolute', top: 12, left: 12 }}
+        onClick={() => {
+          if (!el.current) return;
+          el.current.muted = false;
+          void el.current.play().catch(() => {});
+        }}
+      >
+        Tap for sound
+      </button>
+    ) : null}
+    </div>
   );
 }
+
+/** iOS Safari saves videos through the share sheet ("Save Video"), not the download link (plan 03 P10 edge case). */
+const isIos = () => typeof navigator !== 'undefined' && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+
+/**
+ * A tracked download that, on iOS with file sharing, opens the share sheet with the video instead; anything that
+ * can't share (or fails to) falls back to the normal download.
+ */
+function DownloadLink({ href, filename, className, id, onDownload, children }: { href: string; filename: string; className: string; id?: string; onDownload?: () => void; children: React.ReactNode }) {
+  return (
+    <a
+      id={id}
+      className={className}
+      href={href}
+      download
+      onClick={async (e) => {
+        onDownload?.();
+        if (!isIos() || typeof navigator.canShare !== 'function') return;
+        e.preventDefault();
+        try {
+          const blob = await (await fetch(href)).blob();
+          const file = new File([blob], filename, { type: blob.type || 'video/mp4' });
+          if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
+          else window.location.assign(href);
+        } catch (err) {
+          if ((err as Error).name !== 'AbortError') window.location.assign(href);
+        }
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+const fileName = (href: string) => new URL(href, 'https://x').searchParams.get('name') ?? 'arkiv-ad.mp4';
 
 const ASPECT: Record<string, string> = { '9x16': 'TikTok · Reels · Stories (9:16)', '4x5': 'Feed (4:5)', '1x1': 'Square (1:1)' };
 
@@ -1122,10 +1420,133 @@ function useShowAfterPlay() {
   return { show, onPlaying, reveal };
 }
 
+/**
+ * "Not right?" (plan 03 P10, standard §48): the merchant says what missed — the strategy, the product's accuracy or
+ * the style — and gets a re-plan: free once when the product wasn't shown accurately (our QA should have caught
+ * it), otherwise at the one-off price. The delivered ad is kept either way.
+ */
+function NotRight({ projectId, v }: { projectId: string; v: View }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState<'strategy' | 'accuracy' | 'style' | null>(null);
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (v.project.kind !== 'taste' && v.project.kind !== 'standalone') return null;
+  const price = usd(v.quote.priceMicros);
+  const outcome = (r: typeof reason) =>
+    r === 'accuracy' && v.project.freeReplanAvailable ? 'We’ll re-plan the same idea and make it again, free.' : r === 'strategy' ? `Pick another direction for ${v.sku.name}; making it is ${price}.` : r ? `We’ll re-plan the same idea with a new storyboard; making it is ${price}.` : null;
+  return (
+    <>
+      <button type="button" className="ak-textbtn" onClick={() => setOpen(true)}>Not right?</button>
+      <Sheet open={open} onOpenChange={setOpen} title="What isn’t right?" description="Your ad stays in your archive either way.">
+        <form
+          className="ak-stack"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (!reason) return;
+            setBusy(true);
+            setErr(null);
+            try {
+              const r = await api<{ next: string }>(`/api/projects/${projectId}/not-right`, { reason, note: note.trim() || undefined });
+              window.location.assign(r.next);
+            } catch (x) {
+              setErr((x as Error).message);
+              setBusy(false);
+            }
+          }}
+        >
+          <fieldset className="ak-stack" style={{ border: 0, padding: 0, margin: 0, gap: 8 }}>
+            <legend className="ak-sr">What isn’t right?</legend>
+            {([
+              ['strategy', 'The idea — it’s the wrong angle for my customers'],
+              ['accuracy', 'My product — it doesn’t look like my real product'],
+              ['style', 'The look and feel — the idea is right, the execution isn’t'],
+            ] as const).map(([value, label]) => (
+              <label key={value} className="ak-row" style={{ gap: 8, alignItems: 'flex-start' }}>
+                <input type="radio" name="not-right" value={value} checked={reason === value} onChange={() => setReason(value)} />
+                <span>{label}</span>
+              </label>
+            ))}
+          </fieldset>
+          <label className="ak-field">
+            <span className="ak-label">Anything specific? (optional)</span>
+            <textarea className="ak-textarea" maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} />
+          </label>
+          {reason ? <p className="ak-small" role="status" style={{ margin: 0 }}>{outcome(reason)}</p> : null}
+          {err ? <p className="ak-error" role="alert">{err}</p> : null}
+          <Button type="submit" disabled={!reason || busy}>{busy ? 'Starting…' : 'Continue'}</Button>
+        </form>
+      </Sheet>
+    </>
+  );
+}
+
+/**
+ * Plan 03 P10 #4 / plan 04 L17 / standard §8: the continuation card appears only once the finished ad has been
+ * watched (10 seconds, or to the end) or exported — never before. It names the two strategic directions that are
+ * still untested, and for a one-off buyer leads to the plans.
+ */
+function Continuation({ v }: { v: View }) {
+  const selected = v.project.selectedConceptId;
+  const rest = v.concepts.filter((c) => c.id !== selected).slice(0, 2);
+  const subscriber = v.project.kind === 'creative_test';
+  const slug = v.access.workspaceSlug;
+  if (!rest.length) return subscriber ? null : <LinkButton href="/app/plan">See plans</LinkButton>;
+  return (
+    <section className="ak-panel ak-stack" aria-labelledby="continuation" style={{ gap: 12 }}>
+      <h2 className="ak-label" id="continuation">
+        {rest.length === 1 ? 'One more direction' : `${rest.length} more directions`} for {v.sku.name} {rest.length === 1 ? 'is' : 'are'} ready to test
+      </h2>
+      <ul className="ak-stack" style={{ listStyle: 'none', padding: 0, margin: 0, gap: 8 }}>
+        {rest.map((c) => (
+          <li key={c.id} className="ak-row" style={{ alignItems: 'baseline', gap: 12 }}>
+            <span className="ak-index">{c.idx}</span>
+            <span>
+              <span className="ak-serif">“{(c.hookOptions ?? [])[0] ?? c.hypothesis}”</span>
+              <span className="ak-small ak-muted" style={{ display: 'block' }}>Tests {String(c.primaryVariable)} · {String(c.angle).replace(/_/g, ' ').toLowerCase()}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+      {subscriber ? (
+        slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Test the next one</LinkButton> : null
+      ) : (
+        <>
+          <p className="ak-small ak-muted" style={{ margin: 0 }}>This ad tests one of three bets. A plan tests the others, every month — {v.upsell.growthTestsPerMonth} tests a month on {v.upsell.growthName}.</p>
+          <LinkButton href="/app/plan?plan=GROWTH">See plans</LinkButton>
+        </>
+      )}
+    </section>
+  );
+}
+
+/** Watched for 10 seconds (or to the end) or exported: the moment the continuation may be shown (plan 03 P10 #4). */
+const CONTINUE_AFTER_S = 10;
+
 export function DeliverFlow({ projectId }: { projectId: string }) {
   // Kept live only while the offer's bonus hook is still being made.
   const { data: v, error } = useProject(projectId, useCallback((x: View | null) => !!x?.bonus.pending, []));
   const after = useShowAfterPlay();
+  const [earned, setEarned] = useState(false);
+  const earn = useCallback(() => {
+    setEarned(true);
+    try {
+      localStorage.setItem(`ak-watched-${projectId}`, '1');
+    } catch {
+      /* storage blocked: shown again after the next watch */
+    }
+  }, [projectId]);
+  // Already watched on an earlier visit (this browser): no need to watch again.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(`ak-watched-${projectId}`)) setEarned(true);
+    } catch {
+      /* ignore */
+    }
+  }, [projectId]);
+  const onProgress = useCallback((sec: number, ended: boolean) => {
+    if (ended || sec >= CONTINUE_AFTER_S) earn();
+  }, [earn]);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
   if (v.project.state !== 'COMPLETE') {
     if (typeof window !== 'undefined') window.location.replace(`/produce/${projectId}`);
@@ -1137,26 +1558,32 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
   return (
     <Shell step={4} title="Your ad is ready" sub={`${v.sku.name} · 15 seconds · checked for product accuracy and claims.`}>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-        <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} onPlaying={after.onPlaying} onBlocked={after.reveal} /> : null}</div>
+        <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} onPlaying={after.onPlaying} onBlocked={after.reveal} onProgress={onProgress} /> : null}</div>
         <div className="ak-stack">
           <FactUpdate projectId={projectId} update={v.project.factUpdate} />
           <div className="ak-stack ak-after-play" data-show={after.show || !primary}>
             <h2 className="ak-label">Download</h2>
-            {v.exports.map((e) => (
-              <a key={e.assetId} className="ak-index-row" href={e.download} download>
+            {v.exports.map((e, i) => (
+              <DownloadLink key={e.assetId} id={i === 0 ? 'cta' : undefined} className="ak-index-row" href={e.download} filename={fileName(e.download)} onDownload={earn}>
                 <span>{ASPECT[e.aspect] ?? e.aspect}</span>
                 <span className="ak-index">MP4 ↓</span>
-              </a>
+              </DownloadLink>
             ))}
+            {v.exports.length > 1 ? (
+              <a className="ak-index-row" href={`/api/projects/${projectId}/download-all`} download onClick={earn}>
+                <span>Download all{v.bonus.exports.length ? ' (with the bonus hook)' : ''}</span>
+                <span className="ak-index">ZIP ↓</span>
+              </a>
+            ) : null}
             {v.bonus.exports.length || v.bonus.pending || v.bonus.failed ? (
               <>
                 <h2 className="ak-label">Bonus · alternate opening hook</h2>
                 {v.bonus.exports.length ? (
                   v.bonus.exports.map((e) => (
-                    <a key={e.assetId} className="ak-index-row" href={e.download} download>
+                    <DownloadLink key={e.assetId} className="ak-index-row" href={e.download} filename={fileName(e.download)} onDownload={earn}>
                       <span>{ASPECT[e.aspect] ?? e.aspect} · new first line</span>
                       <span className="ak-index">MP4 ↓</span>
-                    </a>
+                    </DownloadLink>
                   ))
                 ) : v.bonus.failed ? (
                   <p className="ak-small ak-muted">We couldn’t make this one automatically. Our team has been told and will send it to you.</p>
@@ -1164,6 +1591,13 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
                   <p className="ak-small ak-muted">Being made now: the same ad with a different opening line. It appears here in a few minutes.</p>
                 )}
               </>
+            ) : null}
+            {qa.length ? (
+              <p className="ak-small" style={{ margin: 0 }}>
+                {qa.slice(0, 2).map((c, i) => (
+                  <span key={c.label}>{i ? ' · ' : ''}{c.label} <span aria-hidden>{c.ok ? '✓' : '•'}</span><span className="ak-sr">{c.ok ? ' passed' : ' flagged and reviewed'}</span></span>
+                ))}
+              </p>
             ) : null}
             {qa.length ? (
               <details>
@@ -1184,10 +1618,16 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
             <ol className="ak-small">
               <li>Upload the 9:16 file to TikTok or Reels as a new ad.</li>
               <li>Run it for 5–7 days alongside your current best ad.</li>
-              <li>Connect your ad account and we’ll tell you what it taught you.</li>
+              <li>{slug ? <a href={`/w/${slug}/settings/integrations`}>Connect your ad account</a> : 'Connect your ad account'} and we’ll tell you what it taught you.</li>
             </ol>
             {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
-            <LinkButton href="/app/plan">Test 3 ideas a month · see plans</LinkButton>
+            <NotRight projectId={projectId} v={v} />
+            {earned || !primary ? <Continuation v={v} /> : null}
+            {primary ? (
+              <StickyCta watchId="cta" mobileOnly>
+                <DownloadLink className="ak-btn ak-btn--block" href={primary.download} filename={fileName(primary.download)} onDownload={earn}>Download · {ASPECT[primary.aspect] ?? primary.aspect}</DownloadLink>
+              </StickyCta>
+            ) : null}
             <PasskeyPrompt v={v} />
           </div>
         </div>

@@ -15,6 +15,8 @@ export interface ProductContext {
   approvedClaims: string[];
   themes: { label: string; signalType: string }[];
   testedAngles: string[];
+  /** §8 the merchant's creative goal for this project (performance when unset). */
+  goal?: 'performance' | 'ugc_review' | 'explainer' | 'premium';
   /** Ids of the context-packet items the mock cites as rationale (themes, claims, facts, learnings). */
   rationaleIds?: { themes: string[]; claims: string[]; facts: string[]; learnings: string[] };
 }
@@ -138,6 +140,22 @@ export function mockConcepts(ctx: ProductContext, batch = 1): ConceptSet {
   const offset = (batch - 1) % 3;
   const concepts = [...base.slice(offset), ...base.slice(0, offset)] as [Proposal, Proposal, Proposal];
   if (batch > 1) concepts.forEach((c, i) => (c.hookOptions = [c.hookOptions[(i + batch) % 3]!, ...c.hookOptions.filter((_, j) => j !== (i + batch) % 3)]));
+  // §8 goal: the idea that fits the goal leads (and is our pick), shaped to it; performance keeps the default.
+  const goal = ctx.goal ?? 'performance';
+  if (goal !== 'performance') {
+    const fits = (c: Proposal) =>
+      goal === 'ugc_review' ? c.angle === 'OBJECTION_HANDLING' : goal === 'explainer' ? c.angle === 'INGREDIENT_EDUCATION' || c.angle === 'ROUTINE' : c.angle === 'TEXTURE_SENSORY';
+    const i = Math.max(0, concepts.findIndex(fits));
+    const lead = concepts[i]!;
+    if (goal === 'ugc_review') lead.treatment = 'RAW_UGC';
+    if (goal === 'premium') {
+      lead.treatment = 'PREMIUM_STUDIO';
+      lead.estimatedGenerationClass = 'premium';
+    }
+    const ordered = [lead, ...concepts.filter((_, j) => j !== i)] as [Proposal, Proposal, Proposal];
+    const words = { ugc_review: 'a UGC-style review', explainer: 'an explainer', premium: 'a premium look' }[goal];
+    return { concepts: ordered, pickIndex: 0, pickReason: `It fits ${words} best and still tests one clear variable: the ${lead.angle.toLowerCase().replace(/_/g, ' ')} angle.` };
+  }
   return { concepts, pickIndex: 0, pickReason: `Lowest production risk and it tests the ${concepts[0].angle.toLowerCase().replace(/_/g, ' ')} angle this SKU has not tried yet.` };
 }
 

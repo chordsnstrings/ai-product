@@ -85,6 +85,17 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
+  // Standard §13: Shopify connection is first-class on the upload step (plan 03 P2).
+  const [shopOpen, setShopOpen] = useState(false);
+  const [shop, setShop] = useState('');
+  useEffect(() => {
+    // A store connection that didn't go through comes back here with the reason.
+    const msg = new URLSearchParams(window.location.search).get('shopify_error');
+    if (msg) {
+      setShopOpen(true);
+      setError(msg.slice(0, 200));
+    }
+  }, []);
 
   const validUrl = /^https?:\/\/[^\s.]+\.[^\s]{2,}/i.test(url.trim());
   // Upload started (standard §7): recorded once, when the first photo or a product link is added — not only when
@@ -180,6 +191,9 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
             onChange={(e) => setUrl(e.target.value)}
             aria-describedby="upload-help"
           />
+          {/* Plan 03 P2: validated as the user types — a valid link shape gets a subtle ✓. */}
+          {validUrl ? <span className="ak-url-ok" aria-hidden>✓</span> : null}
+          <span className="ak-sr" aria-live="polite">{validUrl ? 'Link looks good' : ''}</span>
           <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={pasteFromClipboard} aria-label="Paste link from clipboard">Paste</button>
         </div>
       </div>
@@ -187,9 +201,34 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
         <span className="ak-label">or</span>
         <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => cameraRef.current?.click()}>Take a photo</button>
         <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => fileRef.current?.click()}>Upload photos</button>
+        <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" aria-expanded={shopOpen} aria-controls="shopify-connect" onClick={() => setShopOpen((o) => !o)}>Connect Shopify</button>
         <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={(e) => addFiles(e.target.files)} />
         <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden onChange={(e) => addFiles(e.target.files)} />
       </div>
+      {shopOpen ? (
+        <div className="ak-field" id="shopify-connect">
+          <label className="ak-label" htmlFor="shopify-shop">Your Shopify store</label>
+          <div className="ak-row">
+            <input
+              id="shopify-shop"
+              className="ak-input"
+              inputMode="url"
+              autoComplete="off"
+              placeholder="yourstore.myshopify.com"
+              value={shop}
+              onChange={(e) => setShop(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  if (shop.trim()) window.location.assign(`/api/preview/shopify?${new URLSearchParams({ shop: shop.trim() })}`);
+                }
+              }}
+            />
+            <button type="button" className="ak-btn ak-btn--sm" disabled={!shop.trim()} onClick={() => window.location.assign(`/api/preview/shopify?${new URLSearchParams({ shop: shop.trim() })}`)}>Connect</button>
+          </div>
+          <span className="ak-small ak-muted">Read-only: we read your products to pick one. Nothing in your store changes.</span>
+        </div>
+      ) : null}
       {uploads.items.length > 0 && (
         <div className="ak-row" style={{ flexWrap: 'wrap' }} aria-live="polite">
           {uploads.items.map((f) => (

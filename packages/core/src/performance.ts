@@ -571,6 +571,10 @@ async function markPlatformDeletedCreatives(ctx: TenantContext, integrationId: s
 
 /** Shopify is the canonical commerce source (§28): capture IDs and keep raw snapshots via facts provenance. */
 async function syncShopifyProducts(ctx: TenantContext, integrationId: string, shop: string, token: string) {
+  // An unsaved preview workspace (a visitor who connected their store from the upload step, plan 03 P2) imports
+  // only the product the visitor picks (pickShopifyProduct), within the preview's product cap — never the catalogue.
+  const [ws] = await withTenant(ctx.workspaceId, (tx) => tx`select state from workspaces where id = ${ctx.workspaceId}`);
+  if (ws?.state === 'PROVISIONAL') return;
   let cursor: string | null = null;
   let seen = 0;
   do {
@@ -708,6 +712,52 @@ async function withinShopifyImportAllowance(tx: Tx, ctx: TenantContext): Promise
   if (!isFreeTier(ctx)) return true;
   const [n] = await tx`select count(*)::int as n from skus where created_at > now() - interval '24 hours'`;
   return n!.n < FREE_EXPLORATION.SKUS_PER_DAY;
+}
+
+/**
+ * "Connect Shopify" from the upload step (standard §13 "Shopify connection must be first-class"; plan 03 P2): the
+ * visitor's store products, to pick the one to preview. Reads the connected store's live catalogue (first page).
+ */
+export async function listShopifyProductsForPick(ctx: TenantContext): Promise<{ shop: string; products: { id: string; title: string; image: string | null; priceMicros: number | null; currency: string | null }[] } | null> {
+  const [i] = await withTenant(ctx.workspaceId, (tx) => tx`select external_account_id, token_enc from integrations where provider = 'shopify' and status = 'active' and workspace_id = ${ctx.workspaceId} order by created_at desc limit 1`);
+  if (!i) return null;
+  const page = await shopifyFetchProducts(i.external_account_id as string, decryptToken(i.token_enc as string), null);
+  return {
+    shop: i.external_account_id as string,
+    products: page.products
+      .filter((p) => p.status === 'ACTIVE')
+      .slice(0, 60)
+      .map((p) => ({ id: p.id, title: p.title, image: p.images[0] ?? null, priceMicros: p.variants[0]?.price ? Math.round(p.variants[0].price * 1_000_000) : null, currency: page.currency })),
+  };
+}
+
+/**
+ * The visitor picked a product from their connected store: it becomes a SKU with its store facts (OBSERVED,
+ * source shopify) and a preview project, analysed like a link import. Within the same product caps as any
+ * preview (provisional: PROVISIONAL.MAX_SKUS; free accounts: products a day). A product already imported
+ * opens its latest project.
+ */
+export async function pickShopifyProduct(ctx: TenantContext, productId: string, opts: { ip?: string | null; visitorId?: string | null } = {}): Promise<{ skuId: string; projectId: string }> {
+  assertCan(ctx, 'sku.create');
+  const [i] = await withTenant(ctx.workspaceId, (tx) => tx`select id, external_account_id, token_enc, currency from integrations where provider = 'shopify' and status = 'active' and workspace_id = ${ctx.workspaceId} order by created_at desc limit 1`);
+  if (!i) throw new DomainError('NOT_FOUND', 'Connect your Shopify store first.');
+  const r = await shopifyFetchProduct(i.external_account_id as string, decryptToken(i.token_enc as string), productId);
+  if (!r.product || r.product.status !== 'ACTIVE') throw new DomainError('NOT_FOUND', 'That product isn’t available in your store.');
+  const product = r.product;
+  return withTenant(ctx.workspaceId, async (tx) => {
+    const gid = shopifyGid('Product', product.id);
+    const [existing] = await tx`select s.id, (select p.id from projects p where p.sku_id = s.id order by p.created_at desc limit 1) as project_id from skus s where s.shopify_product_id = ${gid}`;
+    if (existing?.project_id) return { skuId: existing.id as string, projectId: existing.project_id as string };
+    const { assertCanAddSku } = await import('./analysis');
+    await assertCanAddSku(tx, ctx, opts.ip ?? null);
+    const outcome = await applyShopifyProduct(tx, ctx, i.external_account_id as string, product, r.currency ?? (i.currency as string | null), { integrationId: i.id as string });
+    const [created] = await tx`select s.id, (select p.id from projects p where p.sku_id = s.id order by p.created_at desc limit 1) as project_id from skus s where s.shopify_product_id = ${gid}`;
+    if (outcome === 'skipped' || !created?.project_id) throw new DomainError('PAYMENT_REQUIRED', 'You’ve added all the products you can for now. Save your work to add more.', { needsAccount: ctx.workspaceState === 'PROVISIONAL' });
+    // Funnel attribution like any preview (the visitor who started it; an upload completed by store pick).
+    await tx`update skus set origin_visitor_id = coalesce(origin_visitor_id, ${opts.visitorId ?? null}) where id = ${created.id}`;
+    await recordFunnel('UPLOAD_COMPLETED', { visitorId: opts.visitorId ?? null, workspaceId: ctx.workspaceId, props: { method: 'shopify' } }, tx);
+    return { skuId: created.id as string, projectId: created.project_id as string };
+  });
 }
 
 /**

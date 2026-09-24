@@ -50,6 +50,12 @@ export const EventType = [
   'RECOMMENDATION_DISMISSED',
   // Production
   'PROJECT_STATE_CHANGED',
+  // §8: the merchant chose a creative goal (sell, UGC review, explainer, premium) for the next ideas.
+  'PROJECT_GOAL_CHANGED',
+  // Plan 03 P10 "Not right?": the merchant said the delivered ad missed (strategy / product accuracy / style).
+  'OUTPUT_REJECTED',
+  // §26: the merchant accepted creator footage into the experiment it answers (Creative Genome input).
+  'CREATOR_FOOTAGE_ACCEPTED',
   'PROVIDER_JOB_CREATED',
   'PROVIDER_JOB_SUCCEEDED',
   'PROVIDER_JOB_FAILED',
@@ -284,6 +290,9 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   RECOMMENDATION_ACCEPTED: 'recommendation',
   RECOMMENDATION_DISMISSED: 'recommendation',
   PROJECT_STATE_CHANGED: 'project',
+  PROJECT_GOAL_CHANGED: 'project',
+  OUTPUT_REJECTED: 'project',
+  CREATOR_FOOTAGE_ACCEPTED: 'asset',
   PROVIDER_JOB_CREATED: 'provider_job',
   PROVIDER_JOB_SUCCEEDED: 'provider_job',
   PROVIDER_JOB_FAILED: 'provider_job',

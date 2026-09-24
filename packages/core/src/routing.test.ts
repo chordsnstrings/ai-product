@@ -32,7 +32,8 @@ async function speak(workspaceId: string, userId: string) {
 describe('canary routing (plan 05 §11)', () => {
   it('splits traffic deterministically per workspace and tags each call with its arm', async () => {
     await ownerPool()`update model_routes set canary = ${ownerPool().json({ model: 'speech-2.8-turbo', promptVersion: 'voiceover@1.1.0', pct: 25 })} where task = 'tts.voiceover'`;
-    const ids = Array.from({ length: 400 }, () => newId());
+    // Fixed ids: the split is a deterministic hash, so a random sample made this bound flaky (~1 run in 700).
+    const ids = Array.from({ length: 400 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
     const arms = await withSystem(async (tx) => Promise.all(ids.map(async (id) => (await route(tx, 'tts.voiceover', id)).arm)));
     const share = arms.filter((a) => a === 'canary').length / ids.length;
     expect(share).toBeGreaterThan(0.18);

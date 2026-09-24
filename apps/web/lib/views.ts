@@ -27,7 +27,7 @@ import {
   type QaReport,
 } from '@arkiv/core';
 import type { ProjectState } from '@arkiv/shared';
-import type { WorkspaceState } from '@arkiv/shared';
+import { CreativeGoal, PLANS, PROVISIONAL, type WorkspaceState } from '@arkiv/shared';
 
 /** Serializable project view for funnel pages (P3–P10). Asset URLs are short-lived signed URLs (plan 02 layer 4). */
 export async function projectView(workspaceId: string, projectId: string) {
@@ -158,6 +158,13 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** The size/shade this ad is for (§42). */
         variantId: (p.sku_variant_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
+        /** A free re-plan ("Not right?", product accuracy): produced without a checkout. */
+        revisionFree: !!p.revision_free,
+        /** A delivered one-off ad can still get its one free re-plan for product accuracy. */
+        freeReplanAvailable:
+          p.state === 'COMPLETE' && (p.kind === 'taste' || p.kind === 'standalone') && !(await tx`select 1 from projects where workspace_id = ${workspaceId} and revision_of = ${projectId} and revision_free`).length,
+        /** §8 creative goal the ideas are drafted for (performance by default). */
+        goal: ((CreativeGoal as readonly string[]).includes(p.goal as string) ? p.goal : 'performance') as CreativeGoal,
         deliveryHeld,
       },
       sku: {
@@ -184,6 +191,12 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** Views the analyst suggested (e.g. "back label"), and how many the merchant has added since. */
         suggestedViews: ((p.analysis as { suggestedViews?: string[] } | null)?.suggestedViews ?? []).slice(0, 4),
         addedViews: Number((p.analysis as { addedViews?: number } | null)?.addedViews ?? 0),
+        /** The photo shows several products: the merchant taps the hero one (plan 03 P2), on this photo. */
+        selectProduct: await (async () => {
+          const a = (p.analysis ?? {}) as { selectPhotoId?: string; heroSelected?: boolean };
+          if (p.sku_status !== 'needs_input' || p.state !== 'NEEDS_USER_ACTION' || !a.selectPhotoId || a.heroSelected) return null;
+          return { photoUrl: await assetUrl(tx, a.selectPhotoId, 3600) };
+        })(),
         /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
         missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
       },
@@ -201,6 +214,10 @@ export async function projectView(workspaceId: string, projectId: string) {
       // An offer bonus is shown only when the offer carries it (what is shown is what is delivered, §8).
       bonus: { offered: quote.kind === 'taste' && bonusHooks(quote.bonus) > 0, exports: bonusExports, pending: bonusPending, failed: !!p.bonus_hook_failed_at },
       disclosure,
+      /** How long an unsaved preview is kept (plan 02 §2.1), for truthful "saved" copy. */
+      previewDays: PROVISIONAL.TTL_DAYS,
+      /** The plan the delivery continuation points to (plan 04 L17). */
+      upsell: { growthName: PLANS.GROWTH.name, growthTestsPerMonth: PLANS.GROWTH.creativeTestsPerMonth },
     };
   });
 }

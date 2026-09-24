@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
-import { assetUrl, balances, experimentView, listCreatorPacks } from '@arkiv/core';
+import { assetUrl, balances, experimentView, listCreatorFootage, listCreatorPacks } from '@arkiv/core';
 import type { Platform, PlatformAsset } from '@arkiv/shared';
 import { SignalChip } from '@arkiv/ui';
 import { CreatorPacks } from '@/components/creator-packs';
@@ -53,7 +53,8 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
       : [];
     const disclosure = dc ? { aiGenerated: !!dc.ai_generated, syntheticPeople: !!dc.synthetic_people, syntheticVoice: dc.synthetic_voice === 'true' } : null;
     const packs = (await listCreatorPacks(tx, experimentId)).map((p) => ({ id: p.id as string, expiresAt: new Date(p.expires_at as string).toISOString(), revokedAt: p.revoked_at ? new Date(p.revoked_at as string).toISOString() : null, views: Number(p.views), uploads: Number(p.uploads), createdAt: new Date(p.created_at as string).toISOString() }));
-    return { e: v.experiment, sku, variants, results: v.results, bal: await balances(tx), disclosure, packs };
+    const footage = await listCreatorFootage(tx, experimentId);
+    return { e: v.experiment, sku, variants, results: v.results, bal: await balances(tx), disclosure, packs, footage };
   });
   if (!d) notFound();
   const master = d.variants.find((v) => v.projectId);
@@ -81,7 +82,7 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
         canApprove={['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role)}
         disclosure={d.disclosure}
       />
-      <CreatorPacks slug={slug} experimentId={experimentId} packs={d.packs} canEdit={['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role)} />
+      <CreatorPacks slug={slug} experimentId={experimentId} packs={d.packs} footage={d.footage} canEdit={['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role)} canAccept={['OWNER', 'ADMIN'].includes(w.ctx.role)} />
     </>
   );
 }
