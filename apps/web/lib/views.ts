@@ -45,7 +45,7 @@ export async function projectView(workspaceId: string, projectId: string) {
     const claims = await listClaims(tx, p.sku_id as string);
     const [fp] = await tx`select cutout_asset_id, label_text, package_type, closure from visual_fingerprints where sku_id = ${p.sku_id} and active`;
     const [maxBatch] = await tx`select coalesce(max(batch), 0) as b from concepts where project_id = ${projectId}`;
-    const concepts = await tx`select id, idx, proposal, is_pick, pick_reason, batch from concepts where project_id = ${projectId} and batch = ${maxBatch!.b} order by idx`;
+    const concepts = await tx`select id, idx, proposal, is_pick, pick_reason, batch, gate_results from concepts where project_id = ${projectId} and batch = ${maxBatch!.b} order by idx`;
     let storyboard: Awaited<ReturnType<typeof storyboardBlock>> | null = null;
     if (p.storyboard_id) storyboard = await storyboardBlock(tx, p.storyboard_id as string);
     // Project-subject steps also hold queued concept requests ("concepts.batch.N"); production shows only its own.
@@ -196,7 +196,20 @@ export async function projectView(workspaceId: string, projectId: string) {
       steps: skuSteps.map(stepJson),
       facts: factRows,
       claims: claims.map((c) => ({ id: c.id, wording: c.preferredWording, status: c.status, reason: c.blockReason, qualifier: c.mandatoryQualifier })),
-      concepts: concepts.map((c) => ({ ...(c.proposal as Proposal), id: c.id as string, idx: c.idx as string, isPick: c.is_pick as boolean, pickReason: c.pick_reason as string | null, batch: Number(c.batch) })),
+      concepts: concepts.map((c) => {
+        const dropped = droppedClaims(c.gate_results);
+        return {
+          ...(c.proposal as Proposal),
+          id: c.id as string,
+          idx: c.idx as string,
+          isPick: c.is_pick as boolean,
+          pickReason: c.pick_reason as string | null,
+          batch: Number(c.batch),
+          /** The idea leaned on a claim the Claims Vault can't support yet (plan 03 P5): the storyboard uses a compliant line. */
+          needsEvidence: dropped.length > 0,
+          droppedClaims: dropped,
+        };
+      }),
       /** Latest "try 3 more" request, drafted by the worker: the UI polls until it is done or failed. */
       conceptRequest: conceptStep ? { batch: Number(String(conceptStep.step_key).split('.').pop()), status: conceptStep.status as string, detail: (conceptStep.detail as string) ?? null } : null,
       storyboard,
@@ -211,6 +224,14 @@ export async function projectView(workspaceId: string, projectId: string) {
       disclosure,
     };
   });
+}
+
+/** Claims the concept gate dropped because they aren't approved yet (older rows kept only the reasons). */
+function droppedClaims(gate: unknown): string[] {
+  const g = (gate ?? {}) as { droppedClaims?: unknown; reasons?: unknown };
+  if (Array.isArray(g.droppedClaims)) return g.droppedClaims.map(String).slice(0, 3);
+  const reasons = Array.isArray(g.reasons) ? (g.reasons as unknown[]).map(String) : [];
+  return reasons.map((r) => /^claim not approved: "(.*)"$/.exec(r)?.[1]).filter((x): x is string => !!x).slice(0, 3);
 }
 
 /** Honest "still working" copy for a slow step, from the estimate recorded when it started (plan 03 P3). */

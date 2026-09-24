@@ -141,6 +141,10 @@ function MissingFacts({ projectId, fields, onSaved }: { projectId: string; field
   );
 }
 
+/** How clearly the photos show the product, in words (the analyst's fidelity confidence, 0–1). */
+const photoQuality = (c: number) =>
+  c >= 0.8 ? 'Good — we can match your packaging closely.' : c >= LOW_FIDELITY ? 'Fair — clear enough to match your packaging.' : 'Low — the product may look less exact in generated scenes.';
+
 /** Views the analyst may suggest, in customer words. */
 const VIEW_WORDS: Record<string, string> = { front: 'the front', side: 'a side view', back: 'the back label', swatch: 'a swatch of the product', closure: 'the cap or pump', in_hand: 'the product in hand' };
 
@@ -445,6 +449,16 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   <MissingFacts projectId={projectId} fields={[{ key: 'ingredients', label: 'Key ingredients', hint: 'As printed on the pack, e.g. “Niacinamide, Zinc PCA”.' }]} onSaved={refresh} />
                 </div>
               ) : null}
+              {!failed && v.sku.fidelityConfidence != null ? (
+                // Standard §8 Product Brain confirmation: asset-quality confidence, and whether more views would help.
+                <p className="ak-small" style={{ margin: 0 }}>
+                  <span className="ak-label">Photo quality</span>{' '}
+                  {photoQuality(v.sku.fidelityConfidence)}
+                  {v.sku.fidelityConfidence < LOW_FIDELITY && v.sku.suggestedViews.length && v.sku.addedViews === 0
+                    ? ` — ${v.sku.suggestedViews.map((x) => VIEW_WORDS[x] ?? x).join(', ')} would make the product sharper in your ad.`
+                    : ''}
+                </p>
+              ) : null}
               {!failed && ready && v.sku.addedViews === 0 && v.sku.suggestedViews.length > 0 && (v.sku.fidelityConfidence ?? 1) < LOW_FIDELITY ? (
                 <PhotoAdder
                   projectId={projectId}
@@ -503,6 +517,24 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
   const [gate, setGate] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // The idea chosen before the save gate (plan 03 P6) comes back as ?select=<concept> after sign-in: it is picked
+  // for the merchant, once, instead of asking them to choose again.
+  const carried = useRef(false);
+  useEffect(() => {
+    if (!v || v.access.provisional || carried.current) return;
+    const sel = new URLSearchParams(window.location.search).get('select');
+    if (!sel) return;
+    carried.current = true;
+    window.history.replaceState(null, '', `/concepts/${projectId}`);
+    if (!v.concepts.some((c) => c.id === sel)) return;
+    setBusy(sel);
+    api(`/api/projects/${projectId}/select`, { conceptId: sel })
+      .then(() => window.location.assign(`/storyboard/${projectId}`))
+      .catch((e) => {
+        setBusy(null);
+        setErr((e as Error).message);
+      });
+  }, [v, projectId]);
   if (!v) return error ? <PreviewUnavailable projectId={projectId} error={error} /> : <Loading />;
 
   async function choose(conceptId: string) {
@@ -533,9 +565,15 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
   const drafting = v.conceptRequest?.status === 'pending' || v.conceptRequest?.status === 'active';
 
   return (
-    <Shell step={2} title="Three ways to test this product" sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.</>}>
+    <Shell step={2} title={v.concepts.length > 0 && v.concepts.length < 3 ? `${v.concepts.length === 1 ? 'One way' : 'Two ways'} to test this product` : 'Three ways to test this product'} sub={<>Each idea is a different bet on why a customer would stop scrolling. We marked the one we’d test first — pick any.</>}>
       {err ? <Banner tone="risk">{err}</Banner> : null}
       {v.conceptRequest?.status === 'failed' && v.conceptRequest.batch > (v.concepts[0]?.batch ?? 0) ? <Banner tone="warn">{v.conceptRequest.detail ?? 'We couldn’t draft more ideas just now. Please try again.'}</Banner> : null}
+      {v.concepts.length > 0 && v.concepts.length < 3 && !drafting ? (
+        // Plan 03 P5: after a retry, fewer than three passed our claims and diversity checks — say so, never pad.
+        <Banner>
+          We found {v.concepts.length === 1 ? 'one strong direction' : 'two strong directions'} for this product, not three — the others didn’t pass our claims checks, and we don’t fill the gap with weaker ideas.
+        </Banner>
+      ) : null}
       {v.concepts.length === 0 ? (
         <p className="ak-muted">Drafting ideas…</p>
       ) : (
@@ -557,6 +595,12 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
                   <dt>You’ll learn</dt><dd>{c.expectedLearning}</dd>
                 </dl>
                 {c.isPick && c.pickReason ? <p className="ak-small ak-muted">Why: {c.pickReason}</p> : null}
+                {c.needsEvidence ? (
+                  <p className="ak-small" style={{ margin: 0 }}>
+                    <span className="ak-chip ak-chip--warn" title={c.droppedClaims.map((w) => `“${w}”`).join(', ')}>A claim needs your evidence</span>{' '}
+                    <span className="ak-muted">We’ll use a compliant line in the storyboard. Add evidence in Claims to use it later.</span>
+                  </p>
+                ) : null}
                 <Button block variant={c.isPick ? 'primary' : 'secondary'} disabled={!!busy} onClick={() => choose(c.id)} id={c.isPick ? 'cta' : undefined}>
                   {busy === c.id ? 'Building storyboard…' : 'Build this storyboard'}
                 </Button>
@@ -570,7 +614,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
           <button className="ak-textbtn" disabled={!!busy || drafting} onClick={more} aria-live="polite">{busy === 'more' || drafting ? 'Drafting three more ideas…' : 'None of these — try 3 more'}</button>
         </p>
       ) : null}
-      <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={`/concepts/${projectId}`} productName={v.sku.name} providers={providers} />
+      <SaveGate open={!!gate} onOpenChange={(o) => !o && setGate(null)} next={gate ? `/concepts/${projectId}?select=${gate}` : `/concepts/${projectId}`} productName={v.sku.name} providers={providers} />
     </Shell>
   );
 }
@@ -582,7 +626,7 @@ export function ConceptsFlow({ projectId, providers }: { projectId: string; prov
 export function SaveGate({ open, onOpenChange, next, productName, providers }: { open: boolean; onOpenChange: (o: boolean) => void; next: string; productName: string; providers: { google: boolean; apple: boolean } }) {
   const n = encodeURIComponent(next);
   return (
-    <Sheet open={open} onOpenChange={onOpenChange} title="Save your work to continue" description={`Your ${productName} catalogue and ideas are kept. No card needed.`}>
+    <Sheet open={open} onOpenChange={onOpenChange} title={`Save ${productName} and see its storyboard`} description={`Your ${productName} catalogue and ideas are kept, and we’ll draw the idea you picked as soon as you’re in. No card needed.`}>
       <EmailLinkForm next={next} label="Work email" submitLabel="Email me a sign-in link" ttlMinutes={MAGIC_LINK_TTL_MIN} sentNote="We sent a sign-in link. It opens right back here — or keep this tab open and it will follow along.">
         {providers.apple || providers.google ? (
           <div className="ak-row" style={{ justifyContent: 'center' }}>

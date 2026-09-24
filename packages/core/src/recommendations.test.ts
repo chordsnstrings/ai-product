@@ -183,6 +183,17 @@ describe('hard gates before scoring (§20 “the score cannot override a gate”
     const cleaned = gateProposal({ ...p!, hookOptions: ['Heals eczema in a week', 'a', 'b'] }, []);
     expect(cleaned.cleaned.hookOptions).toHaveLength(3);
     expect(gateProposal({ ...p!, hookOptions: ['Heals eczema in a week', 'a', 'b'] }, [], [], { pad: false }).cleaned.hookOptions).toHaveLength(2);
+    // Filler is recorded and never becomes the headline; with no compliant hook at all the idea is refused (P5).
+    expect(cleaned.paddedHooks).toBe(1);
+    expect(cleaned.cleaned.hookOptions[0]).toBe('a');
+    const noHook = gateProposal({ ...p!, hookOptions: ['Heals eczema in a week', 'Cures acne overnight'] }, []);
+    expect(noHook.ok).toBe(false);
+    expect(noHook.reasons).toContain('no compliant opening line');
+    expect(noHook.cleaned.hookOptions).toEqual([]);
+    // A claim the vault can't support is dropped and reported, for the "needs your evidence" chip.
+    const claimed = gateProposal({ ...p!, claimWordings: ['Clinically proven to firm'] }, []);
+    expect(claimed.droppedClaims).toEqual(['Clinically proven to firm']);
+    expect(claimed.cleaned.claimWordings).toEqual([]);
   });
 
   it('a clean candidate scores normally', () => {

@@ -26,6 +26,13 @@ describe('storyboard view: plan and free picture changes (standard §5, §13; pl
     expect((await projectView(t.workspaceId, projectId))!.storyboard!.freeRegenerationsLeft).toBe(1);
     await ownerPool()`update scenes set free_regenerations_used = 2 where storyboard_id = ${storyboardId} and position in (0, 1)`;
     expect((await projectView(t.workspaceId, projectId))!.storyboard!.freeRegenerationsLeft).toBe(0);
+    // A concept whose claim the gate dropped shows the "needs your evidence" chip (plan 03 P5); older rows kept only reasons.
+    await ownerPool()`update concepts set gate_results = ${ownerPool().json({ reasons: [], droppedClaims: ['Clinically proven to firm'] })} where id = ${c!.id}`;
+    await ownerPool()`update concepts set gate_results = ${ownerPool().json({ reasons: ['claim not approved: "Boosts collagen"'] })} where project_id = ${projectId} and idx = 'B'`;
+    const cs = (await projectView(t.workspaceId, projectId))!.concepts;
+    expect(cs.find((x) => x.id === c!.id)).toMatchObject({ needsEvidence: true, droppedClaims: ['Clinically proven to firm'] });
+    expect(cs.find((x) => x.idx === 'B')).toMatchObject({ needsEvidence: true, droppedClaims: ['Boosts collagen'] });
+    expect(cs.find((x) => x.idx === 'C')).toMatchObject({ needsEvidence: false });
   }, 120_000);
 });
 
