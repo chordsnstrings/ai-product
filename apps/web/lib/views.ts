@@ -3,6 +3,7 @@ import {
   ANALYSIS_KEY_FACTS,
   assetUrl,
   blockedLines,
+  cancelDecision,
   currentFacts,
   customerReason,
   currentQuote,
@@ -68,6 +69,8 @@ export async function projectView(workspaceId: string, projectId: string) {
     // (partner + ETA), otherwise the copy mapped from the stored reason code — never an internal error.
     const queue = p.outage ? await outageStatus(tx, workspaceId, projectId) : null;
     const resumable = p.state === 'STORYBOARD_READY' && (await resumableAfterEdit(tx, workspaceId, projectId));
+    // What cancelling would do right now (dispatch/spend state), shown before the customer confirms (§38, §46).
+    const cancel = p.state !== 'COMPLETE' && p.entitlement_unit ? await cancelDecision(tx, workspaceId, projectId) : null;
     // Lines that stopped production at the claims check, tied to the scene that says or shows them.
     const blocked =
       p.state === 'BLOCKED_COMPLIANCE' || resumable
@@ -101,6 +104,9 @@ export async function projectView(workspaceId: string, projectId: string) {
         blockedLines: blocked,
         /** Paid for and reopened to fix a line: finishing needs no new checkout. */
         resumable,
+        /** Cancel is offered while this is set; `message` says what happens to the credit or payment. */
+        cancel: cancel?.allowed ? { message: cancel.message, refund: cancel.refund, outcome: cancel.outcome } : null,
+        cancelling: !!p.cancel_requested_at && !['CANCELLED', 'REFUNDED', 'COMPLETE'].includes(p.state as string),
         /** Is the production run alive? From its heartbeat, never from elapsed time alone (§39). */
         liveness: liveness(IN_PRODUCTION.includes(p.state as ProjectState), (p.heartbeat_at as string | null) ?? null),
         /** What we checked, in customer words (plan 03 P10), derived from the stored QA report. */

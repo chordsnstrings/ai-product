@@ -17,6 +17,7 @@ import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, type LedgerUnit } from './ledger';
+import { setting } from './settings';
 import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
@@ -259,7 +260,14 @@ export function queuedCopy(task: string): string {
   return `Queued: ${partnerFor(task)} is busy. Your place is held.`;
 }
 
-export type ProduceOutcome = 'complete' | 'failed' | 'skipped' | 'paused';
+export type ProduceOutcome = 'complete' | 'failed' | 'skipped' | 'paused' | 'cancelled';
+
+/** The customer (or staff, or a refund) cancelled this production while it was running: stop at this checkpoint. */
+class ProductionCancelled extends Error {
+  constructor() {
+    super('production cancelled');
+  }
+}
 
 /** Another run took over this production (our lease lapsed): stop without touching state or spend. */
 class LeaseLost extends Error {
@@ -394,6 +402,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
   });
   const { p, scenes, sb, sku, fp, variant, versions, brand, imagery } = load;
+  // Cancelled while queued or while a previous run was stopping: this run holds the lease, so it settles the cancel.
+  if (p.cancel_requested_at && RUNNABLE.includes(p.state as ProjectState)) return withTenant(ws, async (tx) => ((await finalizeCancel(tx, ctx, projectId)) ? 'cancelled' : 'skipped'));
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
   const unit = (p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'>) ?? 'taste';
   const purpose: Purpose = unit === 'creative_test' ? 'creative_test' : unit;
@@ -402,7 +412,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   let authorizationId: string | null = (p.authorization_id as string | null) ?? null;
   const heartbeat = async () => {
     await renewLease(ctx, projectId, runId);
-    await withTenant(ws, (tx) => beat(tx, ws, projectId, authorizationId));
+    const [c] = await withTenant(ws, async (tx) => {
+      await beat(tx, ws, projectId, authorizationId);
+      return tx`select cancel_requested_at from projects where id = ${projectId} and workspace_id = ${ws}`;
+    });
+    // A cancel that arrived while we were working: stop before the next spend (§35, §38 cancel semantics).
+    if (c?.cancel_requested_at) throw new ProductionCancelled();
   };
   const voice: LogicalVoice = brand?.brain.voice ?? DEFAULT_VOICE;
   const names = [sku.name as string, brand?.name ?? null];
@@ -706,7 +721,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           const saved = await saveFrame(s, fb.bytes, fb.technique, fb.lineage, res);
           return still(s, n, { bytes: fb.bytes, ...saved, technique: fb.technique });
         } catch (e) {
-          if (e instanceof LeaseLost) throw e;
+          if (e instanceof LeaseLost || e instanceof ProductionCancelled) throw e;
           if (e instanceof ProviderError || (e instanceof DomainError && (e.code === 'UNAVAILABLE' || e.code === 'FORBIDDEN'))) {
             checks.push({ check: 'visual', pass: true, hard: false, detail: `Scene ${n}: no generated setting (${(e as Error).message.slice(0, 80)}); using the studio backdrop` });
             return still(s, n, approved);
@@ -884,6 +899,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     return final!.state === 'COMPLETE' ? 'complete' : 'failed';
   } catch (e) {
     if (e instanceof LeaseLost) return 'skipped';
+    if (e instanceof ProductionCancelled) return withTenant(ws, async (tx) => ((await finalizeCancel(tx, ctx, projectId)) ? 'cancelled' : 'skipped'));
     if (isProviderOutage(e)) return pauseForOutage(ctx, projectId, e instanceof ProviderOutage ? e.task : 'production', e, checks);
     // Hard failures: the customer is not charged for what we could not deliver (§25 retry policy).
     await withTenant(ws, (tx) => failProduction(tx, ctx, projectId, (e as Error).message, { checks }));
@@ -1090,6 +1106,132 @@ export async function finishAfterEdit(tx: Tx, ctx: TenantContext, projectId: str
   }
   await approveForProduction(tx, ctx, projectId, unit);
   return { replayed: false, lines: [] as BlockedLine[] };
+}
+
+// ───────────── Cancellation (standard §25 retry policy, §35, §38 "cancel semantics depend on dispatch state") ─────
+
+/** States in which a paid-for / approved production can still be cancelled (before delivery). */
+const CANCELLABLE: readonly ProjectState[] = ['STORYBOARD_APPROVED', ...IN_PRODUCTION, 'NEEDS_USER_ACTION', 'BLOCKED_COMPLIANCE', 'STORYBOARD_READY'];
+
+export interface CancelDecision {
+  allowed: boolean;
+  /** release: the Creative Test (or paid one-off) comes back; consume: production had spent too much to return it. */
+  outcome: 'release' | 'consume';
+  /** A paid Taste/Standalone order whose payment goes back to the customer. */
+  refund: boolean;
+  dispatched: boolean;
+  spentMicros: number;
+  /** What happens, in customer words, before they confirm. */
+  message: string;
+}
+
+/**
+ * What cancelling would do now (standard §25 "Cancellation before dispatch | No charge | Release reserved
+ * entitlement"; §46 "Cancel after dispatch: commercial policy depends on provider cost; do not promise a refund
+ * that creates guaranteed loss"): before any provider call — or with only a small share of the budget spent — the
+ * credit (or the payment of a one-off order) comes back; past that, the credit is used and no refund is promised.
+ * A production that already stopped with its credit returned (blocked line, waiting for the customer) releases.
+ */
+export async function cancelDecision(tx: Tx, workspaceId: string, projectId: string): Promise<CancelDecision> {
+  const [p] = await tx`select p.state, p.authorization_id, p.entitlement_unit, sb.approved_at,
+                              exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.project_id = p.id and pu.status = 'paid' and pu.kind in ('taste','standalone')) as paid
+                       from projects p left join storyboards sb on sb.id = p.storyboard_id and sb.workspace_id = p.workspace_id
+                       where p.id = ${projectId} and p.workspace_id = ${workspaceId}`;
+  const no = (message: string): CancelDecision => ({ allowed: false, outcome: 'release', refund: false, dispatched: false, spentMicros: 0, message });
+  if (!p) return no('Project not found');
+  if (p.state === 'COMPLETE') return no('This ad has already been delivered.');
+  if (!CANCELLABLE.includes(p.state as ProjectState) || !p.entitlement_unit) return no('There’s no production to cancel.');
+  if (p.state === 'STORYBOARD_READY' && !p.approved_at) return no('There’s no production to cancel.');
+  const paid = !!p.paid;
+  const [a] = p.authorization_id
+    ? await tx`select a.status, (a.estimate->>'totalMicros')::bigint as estimate,
+                      coalesce((select sum(coalesce(j.actual_micros, j.estimate_micros)) from provider_jobs j
+                                where j.workspace_id = a.workspace_id and j.authorization_id = a.id and j.status <> 'failed'), 0)::bigint as spent,
+                      exists (select 1 from provider_jobs j where j.workspace_id = a.workspace_id and j.authorization_id = a.id) as dispatched
+               from cost_authorizations a where a.id = ${p.authorization_id} and a.workspace_id = ${workspaceId}`
+    : [];
+  const live = a?.status === 'active';
+  const spent = live ? Number(a!.spent) : 0;
+  const dispatched = live && !!a!.dispatched;
+  const maxBps = await setting(tx, 'production.cancel_release_max_spend_bps');
+  const release = !live || !dispatched || spent * 10_000 <= Number(a!.estimate ?? 0) * maxBps;
+  const unit = p.entitlement_unit === 'creative_test' ? 'Creative Test' : 'credit';
+  const message = release
+    ? paid
+      ? 'Cancel now and your payment is refunded in full.'
+      : `Cancel now and your ${unit} goes back on your balance.`
+    : `Production is well under way, so cancelling now uses this ad’s ${paid ? 'payment' : unit} and nothing is refunded.`;
+  return { allowed: true, outcome: release ? 'release' : 'consume', refund: release && paid, dispatched, spentMicros: spent, message };
+}
+
+/**
+ * Cancel a production (customer, staff or job cancel). With no run producing right now, it ends at once: the
+ * reservation is settled per cancelDecision, the project ends CANCELLED (REFUNDED for a paid one-off whose payment
+ * goes back, queued through the refund job) and its steps are marked skipped. While a run is producing, the cancel
+ * is recorded and the run stops at its next checkpoint (between scenes, while waiting on a render — the provider
+ * task is cancelled too — or before delivery) and finishes the cancel itself.
+ */
+export async function cancelProduction(tx: Tx, ctx: TenantContext, projectId: string, opts: { reason?: string } = {}): Promise<{ status: 'cancelled' | 'refunded' | 'cancelling'; decision: CancelDecision }> {
+  const [p] = await tx`select state, entitlement_unit, cancel_requested_at from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  if (ctx.actor.kind === 'user') assertCan(ctx, p.entitlement_unit === 'creative_test' ? 'spend.creative_test' : 'storyboard.approve');
+  const decision = await cancelDecision(tx, ctx.workspaceId, projectId);
+  if (!decision.allowed) throw new DomainError('CONFLICT', decision.message);
+  const request = { by: `${ctx.actor.kind}:${ctx.actor.id}`, reason: (opts.reason ?? '').slice(0, 300) || null, at: new Date().toISOString() };
+  await tx`update projects set cancel_requested_at = coalesce(cancel_requested_at, now()), cancel_request = coalesce(cancel_request, ${tx.json(request as never)})
+           where id = ${projectId} and workspace_id = ${ctx.workspaceId}`;
+  if (await productionRunning(tx, ctx.workspaceId, projectId)) return { status: 'cancelling', decision };
+  const done = await finalizeCancel(tx, ctx, projectId);
+  return { status: done === 'REFUNDED' ? 'refunded' : 'cancelled', decision };
+}
+
+/**
+ * A refund of the order's payment (Stripe dashboard, console, dispute) while its ad isn't delivered stops the
+ * production and ends the project REFUNDED: the money went back, so the credit it bought is withdrawn too. A
+ * delivered ad stays delivered (plan 02 B9). Runs in the refund's transaction (tenant or staff role; every query is
+ * scoped to the workspace).
+ */
+export async function stopForRefund(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, projectId: string, purchaseId: string): Promise<'none' | 'requested' | 'refunded'> {
+  const [p] = await tx`select state from projects where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!p || p.state === 'COMPLETE' || isTerminal(p.state as ProjectState)) return 'none';
+  const request = { by: 'refund', purchaseId, at: new Date().toISOString() };
+  await tx`update projects set cancel_requested_at = coalesce(cancel_requested_at, now()), cancel_request = ${tx.json(request as never)}
+           where id = ${projectId} and workspace_id = ${ctx.workspaceId}`;
+  if (await productionRunning(tx, ctx.workspaceId, projectId)) return 'requested';
+  return (await finalizeCancel(tx, ctx, projectId)) ? 'refunded' : 'none';
+}
+
+/** Finish a recorded cancel: settle, end the project, return money or credit per the decision. Idempotent. */
+async function finalizeCancel(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, projectId: string): Promise<ProjectState | null> {
+  const ws = ctx.workspaceId;
+  const [p] = await tx`select state, authorization_id, cancel_request, entitlement_unit from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+  if (!p || isTerminal(p.state as ProjectState)) return null;
+  const req = (p.cancel_request ?? {}) as { by?: string; reason?: string | null; purchaseId?: string };
+  const byRefund = req.by === 'refund';
+  const decision = await cancelDecision(tx, ws, projectId);
+  const sysCtx = { ...ctx, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, requestId: 'cancel' };
+  if (p.authorization_id) await settle(tx, sysCtx, p.authorization_id as string, byRefund || decision.outcome === 'release' ? 'released' : 'consumed');
+  let to: ProjectState = 'CANCELLED';
+  if (byRefund) {
+    to = 'REFUNDED';
+    // The payment went back, so the credit it bought goes too (unless the refund already withdrew it).
+    const [pu] = await tx`select kind from purchases where id = ${req.purchaseId ?? null} and workspace_id = ${ws}`;
+    const [already] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and project_id = ${projectId} and type = 'CREDIT_REFUNDED' and amount < 0 limit 1`;
+    const [consumed] = await tx`select 1 from ledger_entries where workspace_id = ${ws} and project_id = ${projectId} and type = 'CREDIT_CONSUMED' limit 1`;
+    if (pu && !already && !consumed) {
+      await append(tx, sysCtx, { type: 'CREDIT_REFUNDED', unit: pu.kind as 'taste' | 'standalone', amount: -1, projectId, reference: req.purchaseId, idempotencyKey: `refund:withdraw:${projectId}`, reason: 'Payment refunded before delivery: production stopped, credit withdrawn' });
+    }
+  } else if (decision.refund) {
+    to = 'REFUNDED';
+    const [pu] = await tx`select id from purchases where workspace_id = ${ws} and project_id = ${projectId} and status = 'paid' and kind in ('taste','standalone') order by created_at desc limit 1`;
+    if (pu) await enqueue(tx, ws, Queues.refundPurchase, { projectId, purchaseId: pu.id, reason: 'cancelled' }, { singletonKey: `refund:${pu.id}`, priority: 20 });
+  }
+  const who = req.by?.startsWith('staff') ? 'Arkiv support' : req.by === 'refund' ? 'a refund of this order' : 'you';
+  await transition(tx, ctx, projectId, to, { detail: `cancelled by ${req.by ?? 'unknown'}${req.reason ? `: ${req.reason}` : ''} (${decision.outcome}, spent ${decision.spentMicros})` });
+  await tx`update projects set outage = null where id = ${projectId} and workspace_id = ${ws}`;
+  await tx`update progress_steps set status = 'skipped', detail = ${`Cancelled by ${who}`}, completed_at = now()
+           where workspace_id = ${ws} and subject_id = ${projectId} and status in ('pending','active')`;
+  return to;
 }
 
 /**

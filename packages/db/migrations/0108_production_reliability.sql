@@ -22,3 +22,9 @@ delete from model_routes where task in ('extract.claims', 'vision.fingerprint', 
 alter table provider_jobs add column raw_meta jsonb;
 -- Jobs left `dispatched` by a crashed worker are found and reconciled by provider request id.
 create index provider_jobs_dispatched on provider_jobs (created_at) where status = 'dispatched';
+
+-- ───────────── Cancellation (standard §25 retry policy, §35, §38 "cancel semantics depend on dispatch state") ─────
+-- A cancel (customer, staff job cancel, or a refund of the order) that arrives while a run is producing is recorded
+-- here; the run stops at its next checkpoint and settles it. Who asked and why stay with the request.
+alter table projects add column cancel_requested_at timestamptz;
+alter table projects add column cancel_request jsonb;

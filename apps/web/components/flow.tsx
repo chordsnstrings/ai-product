@@ -458,6 +458,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           <h2 className="ak-label">Finish your ad</h2>
           <p className="ak-small ak-muted">You’ve already paid for this ad, so there’s nothing more to pay. We check your changes, then produce it — scenes that were already made are reused.</p>
           <Button block disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/finish`, {})) window.location.assign(`/produce/${projectId}`); }}>Finish my ad</Button>
+          <div style={{ marginTop: 12 }}><CancelProduction projectId={projectId} v={v} onChange={() => window.location.assign(`/produce/${projectId}`)} /></div>
         </section>
       ) : null}
       {sb && sb.status !== 'generating' && !resumable ? (
@@ -594,7 +595,52 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
           <Liveness live={v.project.liveness} />
         </>
       )}
+      <div style={{ marginTop: 24 }}><CancelProduction projectId={projectId} v={v} onChange={resume} /></div>
     </Shell>
+  );
+}
+
+/**
+ * Cancel a production (standard §38 "cancel semantics depend on dispatch state"): the sheet says what happens to
+ * the Creative Test or payment right now — before dispatch it all comes back — before the customer confirms.
+ */
+export function CancelProduction({ projectId, v, onChange }: { projectId: string; v: Pick<ProjectView, 'project'>; onChange: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (v.project.cancelling) return <p className="ak-small ak-muted" role="status">Cancelling — we’ll stop at the next step.</p>;
+  const c = v.project.cancel;
+  if (!c) return null;
+  return (
+    <>
+      <button className="ak-textbtn" onClick={() => setOpen(true)}>Cancel this ad</button>
+      <Sheet open={open} onOpenChange={setOpen} title="Cancel this ad?" description={c.message}>
+        <form
+          className="ak-stack"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setErr(null);
+            setBusy(true);
+            try {
+              await api(`/api/projects/${projectId}/cancel`, { reason: reason.trim() || undefined });
+              setOpen(false);
+              onChange();
+            } catch (x) {
+              setErr((x as Error).message);
+            }
+            setBusy(false);
+          }}
+        >
+          <label className="ak-field">
+            <span className="ak-label">Why are you cancelling? (optional)</span>
+            <textarea className="ak-textarea" maxLength={300} value={reason} onChange={(e) => setReason(e.target.value)} />
+          </label>
+          {err ? <p className="ak-error" role="alert">{err}</p> : null}
+          <Button type="submit" variant="secondary" disabled={busy}>{busy ? 'Cancelling…' : 'Cancel the ad'}</Button>
+        </form>
+      </Sheet>
+    </>
   );
 }
 

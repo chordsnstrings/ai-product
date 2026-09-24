@@ -558,8 +558,10 @@ export async function refundProjectPurchase(ctx: TenantContext, purchaseId: stri
     await transition(tx, ctx, row.project_id as string, 'REFUNDED', { from: 'PROVIDER_FAILED', reason: 'Refunded automatically: this ad didn’t pass our quality checks.' });
     const remaining = Number(row.amount_micros) - Number(row.refunded_micros ?? 0);
     if (row.stripe_payment_intent_id && remaining > 0) {
+      const cancelled = reason === 'cancelled';
       await tx`insert into refunds (workspace_id, purchase_id, payment_intent_id, amount_micros, reason_code, customer_note, idempotency_key)
-               values (${ws}, ${purchaseId}, ${row.stripe_payment_intent_id as string}, ${remaining}, 'service_failure', 'Quality guarantee: the ad did not pass our checks', ${idem})
+               values (${ws}, ${purchaseId}, ${row.stripe_payment_intent_id as string}, ${remaining}, ${cancelled ? 'requested_by_customer' : 'service_failure'},
+                       ${cancelled ? 'Cancelled before delivery' : 'Quality guarantee: the ad did not pass our checks'}, ${idem})
                on conflict (workspace_id, idempotency_key) do nothing`;
     }
     return row;

@@ -10,7 +10,8 @@ import type { CompositionManifest } from './composition';
 import { authorize } from './cost-governor';
 import { available, append } from './ledger';
 import { generateVideo } from './model-gateway';
-import { approveForProduction, blockedLines, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
+import { approveForProduction, blockedLines, cancelProduction, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
+import { clearSettingsCache } from './settings';
 import { customerReason } from './projects';
 import { repeatedFidelityFailures } from './qa-metrics';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
@@ -372,6 +373,45 @@ describe('paid output is kept before QA (standard §39: arch-17)', () => {
     expect(await renders()).toHaveLength(1); // judged, not rendered again
     const [v] = await ownerPool()`select status from scene_versions where workspace_id = ${r.t.workspaceId} and kind = 'render' and asset_id = ${before[0]!.output_asset_id}`;
     expect(v!.status).toBe('accepted');
+  }, 240_000);
+});
+
+describe('cancelling a running production (standard §38, §46: arch-11)', () => {
+  afterEach(async () => {
+    setProviders(undefined);
+    await ownerPool()`delete from platform_settings where key = 'production.cancel_release_max_spend_bps'`;
+    clearSettingsCache();
+  });
+
+  it('is recorded while a run works, and the run stops at its next checkpoint and settles it', async () => {
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new MockVideo(1500), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    // Staff policy: up to 100% of the estimate spent, a cancel still returns the credit.
+    await ownerPool()`insert into platform_settings (key, value) values ('production.cancel_release_max_spend_bps', '10000') on conflict (key) do update set value = excluded.value`;
+    clearSettingsCache();
+    const r = await storyboardReady();
+    await approve(r);
+    const run = produceProject(r.ctx, r.projectId);
+    for (let i = 0; i < 400; i++) {
+      if ((await ownerPool()`select 1 from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`).length) break;
+      await new Promise((res) => setTimeout(res, 25));
+    }
+    const c = await withTenant(r.t.workspaceId, (tx) => cancelProduction(tx, r.ctx, r.projectId, { reason: 'wrong shade' }));
+    expect(c.status).toBe('cancelling');
+    expect(c.decision).toMatchObject({ outcome: 'release', dispatched: true });
+    expect(await run).toBe('cancelled');
+    await withTenant(r.t.workspaceId, async (tx) => {
+      const [p] = await tx`select state from projects where id = ${r.projectId}`;
+      expect(p!.state).toBe('CANCELLED');
+      expect(await available(tx, 'taste')).toBe(1); // released under the policy
+      expect((await tx`select count(*)::int as n from assets where kind = 'final_export'`)[0]!.n).toBe(0);
+      const steps = await tx`select status, detail from progress_steps where subject_id = ${r.projectId} and status = 'skipped'`;
+      expect(steps.length).toBeGreaterThan(0);
+      expect(steps.every((s) => s.detail === 'Cancelled by you')).toBe(true);
+      // Nothing more was spent after the checkpoint: one render, then stop.
+      expect((await tx`select count(*)::int as n from provider_jobs where task = 'video.scene'`)[0]!.n).toBe(1);
+    });
+    // A late duplicate delivery of the production job does nothing.
+    expect(await produceProject(r.ctx, r.projectId)).toBe('skipped');
   }, 240_000);
 });
 

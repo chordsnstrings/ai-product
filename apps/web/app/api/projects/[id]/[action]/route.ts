@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { decideFact, finishAfterEdit, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { cancelProduction, decideFact, finishAfterEdit, reopenForEdit, requestConcepts, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -14,6 +14,7 @@ import { projectAccess } from '@/lib/tenant';
  *   retry     – retry a failed production (entitlement was returned on failure)
  *   reopen    – back to the storyboard to fix a line the claims check blocked (purchase kept)
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
+ *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
  */
@@ -52,6 +53,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     case 'reopen': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => reopenForEdit(tx, a.ctx, id));
       return json({ ok: true, next: `/storyboard/${id}`, lines: r.lines });
+    }
+    case 'cancel': {
+      if (a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const { reason } = await body(req, z.object({ reason: z.string().trim().max(300).optional() }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => cancelProduction(tx, a.ctx, id, { reason }));
+      return json({ ok: true, status: r.status, message: r.decision.message });
     }
     case 'finish': {
       await withTenant(a.ctx.workspaceId, (tx) => finishAfterEdit(tx, a.ctx, id));

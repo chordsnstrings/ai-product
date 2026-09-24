@@ -7,6 +7,7 @@ import {
   approveForProduction,
   authorize,
   available,
+  cancelProduction,
   generateStoryboard,
   heartbeat,
   ingestBytes,
@@ -109,6 +110,23 @@ describe('provider outage (§44: queue/pause, preserve reservation, clear status
       expect(r!.n).toBe(rendersBefore);
     });
     expect(await renderJobs()).toBe(renderJobsBefore); // no render was sent to the provider again (prod-08)
+  }, 240_000);
+});
+
+describe('cancel during an outage pause (§38 cancel semantics; §44 preserve reservation)', () => {
+  it('ends the paused order at once, returns the held credit, and the resume sweep leaves it alone', async () => {
+    const { t, ctx, projectId } = await readyForProduction('[[fail:render]]');
+    expect(await produceProject(ctx, projectId)).toBe('paused');
+    expect(await withTenant(t.workspaceId, (tx) => available(tx, 'taste'))).toBe(0); // held through the pause
+    const r = await withTenant(t.workspaceId, (tx) => cancelProduction(tx, ctx, projectId, { reason: 'no longer needed' }));
+    expect(r).toMatchObject({ status: 'cancelled', decision: { outcome: 'release' } }); // the failed renders cost nothing
+    await withTenant(t.workspaceId, async (tx) => {
+      const [p] = await tx`select state, outage from projects where id = ${projectId}`;
+      expect(p).toMatchObject({ state: 'CANCELLED', outage: null });
+      expect(await available(tx, 'taste')).toBe(1);
+    });
+    // A late resume (sweep or duplicate delivery) never restarts it.
+    expect(await produceProject(ctx, projectId)).toBe('skipped');
   }, 240_000);
 });
 

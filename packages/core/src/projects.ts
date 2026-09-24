@@ -51,10 +51,11 @@ export function customerReason(p: { failure_code?: string | null; failure_reason
  *    has been approved;
  *  - recovery: a retry re-approves (→ STORYBOARD_APPROVED), an outage pause resumes rendering, a fixed claim
  *    returns to the storyboard, a new photo resumes analysis, a retried analysis starts again (→ PRODUCT_UPLOADED);
- *  - CANCELLED before anything is dispatched; REFUNDED once money or entitlement is involved.
+ *  - CANCELLED when the customer or staff cancel (before dispatch the credit comes back; after it, per the cancel
+ *    policy); REFUNDED when the order's payment goes back (a cancelled or undeliverable one-off, or a refund).
  */
 const PRE_RENDER_SIDE: ProjectState[] = ['NEEDS_USER_ACTION', 'BLOCKED_COMPLIANCE', 'CANCELLED'];
-const IN_FLIGHT_SIDE: ProjectState[] = ['NEEDS_USER_ACTION', 'PROVIDER_FAILED', 'REFUNDED'];
+const IN_FLIGHT_SIDE: ProjectState[] = ['NEEDS_USER_ACTION', 'PROVIDER_FAILED', 'REFUNDED', 'CANCELLED'];
 
 export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
   PRODUCT_UPLOADED: ['PRODUCT_ANALYZED', ...PRE_RENDER_SIDE],
@@ -62,10 +63,11 @@ export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
   BRIEF_READY: ['CONCEPTS_READY', ...PRE_RENDER_SIDE],
   CONCEPTS_READY: ['CONCEPT_SELECTED', ...PRE_RENDER_SIDE],
   CONCEPT_SELECTED: ['STORYBOARD_READY', 'CONCEPTS_READY', ...PRE_RENDER_SIDE],
-  STORYBOARD_READY: ['STORYBOARD_APPROVED', 'CONCEPT_SELECTED', 'CONCEPTS_READY', ...PRE_RENDER_SIDE],
+  // REFUNDED: a paid storyboard reopened to fix a blocked line, then cancelled (its payment goes back).
+  STORYBOARD_READY: ['STORYBOARD_APPROVED', 'CONCEPT_SELECTED', 'CONCEPTS_READY', 'REFUNDED', ...PRE_RENDER_SIDE],
   // Approved = paid for / entitlement committed. Cancelling is still possible before anything is dispatched.
-  STORYBOARD_APPROVED: ['RENDER_RESERVED', 'CANCELLED', ...IN_FLIGHT_SIDE],
-  RENDER_RESERVED: ['RENDERING', 'CANCELLED', ...IN_FLIGHT_SIDE],
+  STORYBOARD_APPROVED: ['RENDER_RESERVED', ...IN_FLIGHT_SIDE],
+  RENDER_RESERVED: ['RENDERING', ...IN_FLIGHT_SIDE],
   RENDERING: ['QA_RUNNING', ...IN_FLIGHT_SIDE],
   QA_RUNNING: ['COMPOSING', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
   COMPOSING: ['PLATFORM_VARIANTS', ...IN_FLIGHT_SIDE],

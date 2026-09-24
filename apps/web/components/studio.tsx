@@ -6,7 +6,7 @@ import { Banner, Button, Ledger } from '@arkiv/ui';
 import { api, Sheet, usePoll } from '@arkiv/ui/client';
 import type { ProjectView } from '@/lib/views';
 import { ActionButton, ActionForm, SheetButton } from './actions';
-import { Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
+import { CancelProduction, Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
 
 type V = { id: string; code: string; label: string; role: string; projectId: string | null; projectState: string | null; files: { aspect: string; url: string }[] };
 
@@ -90,6 +90,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
               {v ? <Liveness live={v.project.liveness} /> : null}
             </>
           )}
+          {v && masterProjectId ? <CancelProduction projectId={masterProjectId} v={v} onChange={done} /> : null}
         </>
       ) : null}
 
