@@ -766,7 +766,7 @@ function WatchedVideo({ projectId, assetId, src }: { projectId: string; assetId:
   const report = (seconds: number) => {
     if (sent.current) return;
     sent.current = true;
-    fetch(`/api/projects/${projectId}/watched`, { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ assetId, seconds: Math.round(seconds) }) }).catch(() => {});
+    fetch(`/api/projects/${projectId}/watched`, { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ assetId, seconds: Number.isFinite(seconds) ? Math.round(seconds) : 0 }) }).catch(() => {});
   };
   return (
     <video
