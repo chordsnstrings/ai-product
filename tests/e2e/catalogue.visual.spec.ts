@@ -63,11 +63,14 @@ test('ledger steps say their status in words and announce changes', async ({ pag
   await expect(page.locator('#ak-announcer')).toHaveText('Checking accuracy — done');
 });
 
-test('provenance chips show source and time on focus', async ({ page }) => {
+test('provenance chips show source and time on focus and hover', async ({ page }) => {
   await page.goto('/internal/catalogue?theme=light');
   const chip = page.getByRole('button', { name: /^Observed · product page · 23 Sep 2026 14:02 ET$/ });
+  const tip = page.locator('.ak-popover');
   await chip.focus();
-  await page.keyboard.press('Shift+Tab');
-  await page.keyboard.press('Tab');
-  await expect(page.getByText('Observed · product page · 23 Sep 2026 14:02 ET', { exact: true }).last()).toBeVisible();
+  await expect(tip).toHaveText('Observed · product page · 23 Sep 2026 14:02 ET');
+  await page.keyboard.press('Escape');
+  await expect(tip).toBeHidden();
+  await page.getByRole('button', { name: /^Inferred by the system/ }).hover();
+  await expect(tip).toHaveText('Inferred by the system · photo ocr · 23 Sep 2026 14:02 ET');
 });
