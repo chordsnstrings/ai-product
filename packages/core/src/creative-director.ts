@@ -3,7 +3,7 @@ import { DomainError, type Angle } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
 import { brandBrainFor } from './brand';
 import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
-import { classifyClaim, scanCreativeText, scanPasses } from './compliance';
+import { classifyClaim, scanCreativeText, scanPasses, syntheticTestimonials } from './compliance';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { ConceptSet, StoryboardPlan, type Proposal } from './intel-schemas';
@@ -262,6 +262,11 @@ export function normalizePlan(plan: StoryboardPlan, approved: string[], names: (
   if (!scanPasses(scan)) {
     const problems = [...scan.violations.map((v) => `"${v.text}" (${v.reason})`), ...scan.unmapped.map((u) => `"${u}" (makes a product claim that isn't approved)`)];
     throw new DomainError('GATE_BLOCKED', `Storyboard failed claims check: ${problems.join('; ')}`, { violations: scan.violations, unmapped: scan.unmapped });
+  }
+  // §40: an AI-generated person never speaks as a customer.
+  const testimonials = syntheticTestimonials(scenes);
+  if (testimonials.length) {
+    throw new DomainError('GATE_BLOCKED', `Storyboard failed the testimonial check: ${testimonials.map((t) => `"${t.text}" (a scene with an AI-generated person can't speak as a customer)`).join('; ')}`, { testimonials });
   }
   // Every spoken word must fit the 15 seconds (captions follow the speech; a line is never cut off, §25 check 4).
   const words = scenes.reduce((n, s) => n + (s.spokenLine ?? '').split(/\s+/).filter(Boolean).length, 0);

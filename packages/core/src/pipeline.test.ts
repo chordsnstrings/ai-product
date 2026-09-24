@@ -1,10 +1,14 @@
+import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { probe, withTempDir } from '@arkiv/media';
+import { assetBytes } from './assets';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { analyzeProduct, startPreview } from './analysis';
 import { approveClaim, listClaims, proposeClaim } from './claims';
 import { append, available } from './ledger';
-import { approveForProduction, produceProject } from './production';
+import { approveForProduction, blockedLines, produceProject } from './production';
 import { editScene, generateStoryboard, selectConcept, storyboardView } from './storyboard';
 import { currentQuote } from './offers';
 import { ingestBytes } from './uploads';
@@ -106,7 +110,49 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       expect(consumed!.n).toBe(1);
       const steps = await tx`select status from progress_steps where subject_id = ${projectId}`;
       expect(steps.every((s) => s.status === 'done')).toBe(true);
+
+      // Standard §37: every provider call is opened and closed with a usage event (arch-05).
+      const [jobs] = await tx`select count(*)::int as n, count(*) filter (where status = 'succeeded')::int as ok, count(*) filter (where status = 'failed')::int as failed from provider_jobs`;
+      const [ev] = await tx`select count(*) filter (where type = 'PROVIDER_JOB_CREATED')::int as created, count(*) filter (where type = 'PROVIDER_JOB_SUCCEEDED')::int as ok,
+                                   count(*) filter (where type = 'PROVIDER_JOB_FAILED')::int as failed from events`;
+      expect(jobs!.n).toBeGreaterThan(0);
+      expect(ev).toEqual({ created: jobs!.n, ok: jobs!.ok, failed: jobs!.failed });
+
+      // Standard §40: the demonstration scene shows AI-generated hands, so the ad is marked as AI-generated with
+      // synthetic people — on the creative, in its manifest, on every export and inside the files (arch-31).
+      const [demo] = await tx`select shows_human_skin from scenes where purpose = 'demonstration'`;
+      expect(demo!.shows_human_skin).toBe(true);
+      const [c] = await tx`select ai_generated, synthetic_people, composition->'disclosure' as disclosure from creatives where id = ${p!.final_creative_id}`;
+      expect(c).toMatchObject({ ai_generated: true, synthetic_people: true, disclosure: { aiGenerated: true, syntheticPeople: true, syntheticVoice: true } });
+      const exports = await tx`select id, lineage from assets where id = any(${cr!.final_asset_ids as string[]}::uuid[])`;
+      expect(exports.every((e) => (e.lineage as { disclosure?: { aiGenerated: boolean } }).disclosure?.aiGenerated === true)).toBe(true);
+      const bytes = await assetBytes(tx, exports[0]!.id as string);
+      const tags = await withTempDir(async (dir) => {
+        const f = path.join(dir, 'x.mp4');
+        await writeFile(f, bytes);
+        return (await probe(f)).tags;
+      });
+      expect(tags.comment).toMatch(/AI-generated people/);
+      expect(tags.description).toBe('ai_generated=true; synthetic_people=true; synthetic_voice=true');
     });
+  }, 120_000);
+
+  it('an AI-generated person never speaks as a customer: the editor refuses it and production stops on it (§40)', async () => {
+    const { t, ctx, projectId, storyboardId } = await previewToStoryboard();
+    const [demo] = await ownerPool()`select id from scenes where storyboard_id = ${storyboardId} and purpose = 'demonstration'`;
+    const [hook] = await ownerPool()`select id from scenes where storyboard_id = ${storyboardId} and position = 0`;
+    await expect(withTenant(t.workspaceId, (tx) => editScene(tx, ctx, demo!.id as string, { spokenLine: 'I’ve used it for two weeks.' }))).rejects.toMatchObject({ code: 'GATE_BLOCKED', message: expect.stringMatching(/AI-generated person/) });
+    // A scene without a generated person may speak in the first person.
+    await withTenant(t.workspaceId, (tx) => editScene(tx, ctx, hook!.id as string, { overlayText: 'I’ve used it for two weeks' }));
+    await ownerPool()`update scenes set spoken_line = 'I’ve used it for two weeks.' where id = ${demo!.id}`; // bypassing the editor
+    await withTenant(t.workspaceId, async (tx) => {
+      await append(tx, ctx, { type: 'CREDIT_GRANTED', unit: 'taste', amount: 1, idempotencyKey: 'pay:testimonial' });
+      await approveForProduction(tx, ctx, projectId, 'taste');
+    });
+    await produceProject(ctx, projectId);
+    const [p] = await ownerPool()`select state, qa_report from projects where id = ${projectId}`;
+    expect(p!.state).toBe('BLOCKED_COMPLIANCE');
+    expect(blockedLines(p!.qa_report)).toEqual([expect.objectContaining({ line: 'I’ve used it for two weeks.', reason: expect.stringMatching(/AI-generated person/) })]);
   }, 120_000);
 
   it('repairs once for free, then switches technique after repeated fidelity failure', async () => {

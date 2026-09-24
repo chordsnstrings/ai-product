@@ -113,7 +113,7 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
       const [c3] = await ownerPool()`select canary from model_routes where task = ${task}`;
       expect(c3!.canary).toBeNull();
       // A candidate model the Cost Governor can't price is refused even with a passing eval.
-      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.0.0', 'unpriced-model', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.1.0', 'unpriced-model', 'compliance.scan', 'passed', ${eng.staffId})`;
       await expect(act(eng, 'route.update', { task, rolloutPct: '5', model: 'unpriced-model', reason: 'try it' })).rejects.toThrow(/No published rate for anthropic\/unpriced-model/);
     } finally {
       await ownerPool()`update model_routes set canary = null`;

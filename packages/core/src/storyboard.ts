@@ -4,7 +4,7 @@ import { compositeProduct, productionBackdrop } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
-import { classifyClaim, scanCreativeText, type LineMapping } from './compliance';
+import { classifyClaim, isFirstPersonTestimonial, scanCreativeText, showsSyntheticPeople, SYNTHETIC_TESTIMONIAL_REASON, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
 import type { TenantContext } from './context';
 import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
@@ -106,9 +106,9 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
       await tx`delete from scenes where storyboard_id = ${storyboardId}`;
       for (const [i, s] of plan.scenes.entries()) {
         await tx`insert into scenes (workspace_id, storyboard_id, position, purpose, duration_ms, visual_plan, product_behavior,
-                   spoken_line, overlay_text, production_mode)
+                   spoken_line, overlay_text, production_mode, shows_human_skin)
                  values (${ws}, ${storyboardId}, ${i}, ${s.purpose}, ${s.durationMs}, ${s.visualPlan}, ${s.productBehavior},
-                   ${s.spokenLine}, ${s.overlayText}, ${s.productionMode})`;
+                   ${s.spokenLine}, ${s.overlayText}, ${s.productionMode}, ${s.showsHumanSkin})`;
       }
       await tx`update storyboards set status = 'generating' where id = ${storyboardId}`;
       await step(tx, ws, storyboardId, 'frames', 'active');
@@ -146,7 +146,7 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
           token: auth.token,
           task: 'image.storyboard_frame',
           subject: { type: 'scene', id: s.id as string },
-          prompt: framePrompt({ purpose: s.purpose, durationMs: s.duration_ms, visualPlan: s.visual_plan, productBehavior: s.product_behavior, spokenLine: s.spoken_line, overlayText: s.overlay_text, productionMode: s.production_mode, showsHumanSkin: false }, productName),
+          prompt: framePrompt({ purpose: s.purpose, durationMs: s.duration_ms, visualPlan: s.visual_plan, productBehavior: s.product_behavior, spokenLine: s.spoken_line, overlayText: s.overlay_text, productionMode: s.production_mode, showsHumanSkin: !!s.shows_human_skin }, productName),
           references: refs,
           ...FRAME,
           mockLabel: `${s.purpose} · ${s.visual_plan}`.slice(0, 90),
@@ -220,6 +220,9 @@ export async function editScene(
       const v = scan.violations[0]!;
       throw new DomainError('GATE_BLOCKED', `“${v.text}” can’t be used: ${v.reason}`, { alternative: v.alternative ?? classifyClaim(v.text).matched[0]?.alternative });
     }
+    // §40: a scene with an AI-generated person never speaks as a customer.
+    const testimonial = lines.find((l) => isFirstPersonTestimonial(l));
+    if (testimonial && showsSyntheticPeople(s)) throw new DomainError('GATE_BLOCKED', `“${testimonial}” can’t be used here. ${SYNTHETIC_TESTIMONIAL_REASON}`, { testimonial });
     // Every product-effect statement needs an approved claim (§25 check 3) — or production would stop on it later.
     if (scan.unmapped.length) {
       throw new DomainError('GATE_BLOCKED', `“${scan.unmapped[0]}” makes a product claim that isn’t approved yet. Add it to your Claims Vault with evidence, or describe the look or feel instead.`, { unmapped: scan.unmapped });
@@ -351,7 +354,7 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
       token: auth.token,
       task: 'image.storyboard_frame',
       subject: { type: 'scene', id: sceneId },
-      prompt: `${framePrompt({ purpose: info.s.purpose, durationMs: info.s.duration_ms, visualPlan: `${info.s.visual_plan}. Change: ${instruction}`, productBehavior: info.s.product_behavior, spokenLine: null, overlayText: null, productionMode: info.s.production_mode, showsHumanSkin: false }, info.s.name as string)}`,
+      prompt: `${framePrompt({ purpose: info.s.purpose, durationMs: info.s.duration_ms, visualPlan: `${info.s.visual_plan}. Change: ${instruction}`, productBehavior: info.s.product_behavior, spokenLine: null, overlayText: null, productionMode: info.s.production_mode, showsHumanSkin: !!info.s.shows_human_skin }, info.s.name as string)}`,
       references: info.refs,
       ...FRAME,
       mockLabel: `${info.s.purpose} · ${instruction}`.slice(0, 90),

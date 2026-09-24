@@ -74,6 +74,9 @@ describe('learning loop (Phases 4–5)', () => {
       expect(e.payload).toMatchObject({ parentCreativeId: proj!.final_creative_id, changedVariables: ['hook'], projectId });
       expect(e.refs).toMatchObject({ creativeId: e.subject_id, skuId, experimentId, projectId });
     }
+    // Variants reuse the master's media, so they carry its AI-content disclosure (standard §40).
+    const flags = await ownerPool()`select ai_generated, synthetic_people from creatives where parent_creative_id = ${proj!.final_creative_id}`;
+    expect(flags.every((f) => f.ai_generated === true && f.synthetic_people === true)).toBe(true);
 
     const variants = await withTenant(t.workspaceId, (tx) => tx`select id, code, label, creative_id from variants where experiment_id = ${experimentId} order by code`);
     expect(variants).toHaveLength(3);

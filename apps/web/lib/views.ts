@@ -50,11 +50,14 @@ export async function projectView(workspaceId: string, projectId: string) {
     const quote = await currentQuote(tx);
     const [purchase] = await tx`select status, kind, amount_micros from purchases where project_id = ${projectId} order by created_at desc limit 1`;
     let exports: { aspect: string; assetId: string; url: string; download: string }[] = [];
+    // What in the delivered ad is AI-generated (standard §40), for the platform disclosure steps on delivery.
+    let disclosure: { aiGenerated: boolean; syntheticPeople: boolean; syntheticVoice: boolean } | null = null;
     // Finished work is stored but not delivered while the workspace is suspended (plan 05 §2.3).
     const [ws] = await tx`select state from workspaces where id = ${workspaceId}`;
     const deliveryHeld = DELIVERY_HOLD_STATES.has(ws?.state as WorkspaceState);
     if (p.final_creative_id && !deliveryHeld) {
-      const [cr] = await tx`select final_asset_ids from creatives where id = ${p.final_creative_id}`;
+      const [cr] = await tx`select final_asset_ids, ai_generated, synthetic_people, composition->'disclosure'->>'syntheticVoice' as synthetic_voice from creatives where id = ${p.final_creative_id}`;
+      if (cr) disclosure = { aiGenerated: !!cr.ai_generated, syntheticPeople: !!cr.synthetic_people, syntheticVoice: cr.synthetic_voice === 'true' };
       const assets = await tx`select id, lineage from assets where id in ${tx((cr?.final_asset_ids as string[]) ?? ['00000000-0000-0000-0000-000000000000'])}`;
       exports = await Promise.all(
         assets.map(async (a) => {
@@ -146,6 +149,7 @@ export async function projectView(workspaceId: string, projectId: string) {
       quote,
       purchase: purchase ? { status: purchase.status as string, kind: purchase.kind as string, amountMicros: Number(purchase.amount_micros) } : null,
       exports,
+      disclosure,
     };
   });
 }

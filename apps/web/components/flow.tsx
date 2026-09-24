@@ -740,6 +740,26 @@ export function Liveness({ live }: { live: View['project']['liveness'] }) {
 
 /* ───────────── P10 · Delivery ───────────── */
 
+/**
+ * Standard §40: AI-generated talent and synthetic media follow each platform's disclosure rules. Shown with the
+ * downloads, so the label goes on when the ad is posted — and generated people are never passed off as customers.
+ */
+export function AiDisclosureSteps({ disclosure }: { disclosure: ProjectView['disclosure'] }) {
+  if (!disclosure?.aiGenerated) return null;
+  const what = [disclosure.syntheticPeople ? 'people' : null, 'scenes', disclosure.syntheticVoice ? 'voice-over' : null].filter(Boolean).join(', ');
+  return (
+    <section className="ak-panel ak-stack" style={{ gap: 6 }} aria-labelledby="ai-disclosure">
+      <h2 className="ak-label" id="ai-disclosure">Before you post: label it as AI-generated</h2>
+      <p className="ak-small" style={{ margin: 0 }}>This ad includes AI-generated {what}. The files say so in their metadata; the platforms also ask you to disclose it.</p>
+      <ul className="ak-small" style={{ margin: 0, paddingLeft: 18 }}>
+        <li><strong>TikTok:</strong> turn on the “AI-generated content” setting when you post, and use the AI-generated content disclosure when you set the ad up in TikTok Ads Manager.</li>
+        <li><strong>Instagram and Facebook:</strong> keep the “AI info” label if Meta adds one, and answer the AI disclosure question in Meta Ads Manager when it’s asked.</li>
+        {disclosure.syntheticPeople ? <li>The people in this ad are AI-generated. Don’t present them as real customers or say they used the product.</li> : null}
+      </ul>
+    </section>
+  );
+}
+
 const ASPECT: Record<string, string> = { '9x16': 'TikTok · Reels · Stories (9:16)', '4x5': 'Feed (4:5)', '1x1': 'Square (1:1)' };
 
 export function DeliverFlow({ projectId }: { projectId: string }) {
@@ -770,6 +790,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
               <ul className="ak-small">{qa.map((c) => <li key={c.label}>{c.label} {c.ok ? '✓' : '•'}</li>)}</ul>
             </details>
           ) : null}
+          <AiDisclosureSteps disclosure={v.disclosure} />
           <hr className="ak-rule" />
           <h2 className="ak-label">What to do next</h2>
           <ol className="ak-small">

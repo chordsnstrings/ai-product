@@ -90,6 +90,14 @@ describe('Production Planner pricing (§5, §6, §37: arch-22)', () => {
     const long = { ...plan, scenes: plan.scenes.map((x) => ({ ...x, spokenLine: 'one two three four five six seven eight nine ten' })) };
     expect(() => normalizePlan(long, [])).toThrow(/timing check/);
   });
+
+  it('refuses a first-person customer line on a scene with an AI-generated person (standard §40)', () => {
+    const s = (purpose: StoryboardPlan['scenes'][number]['purpose'], mode: StoryboardPlan['scenes'][number]['productionMode'], showsHumanSkin: boolean, spokenLine: string | null = null): StoryboardPlan['scenes'][number] => ({ purpose, durationMs: 3000, visualPlan: 'x', productBehavior: null, spokenLine, overlayText: null, productionMode: mode, showsHumanSkin });
+    const plan = (demoLine: string, skin: boolean): StoryboardPlan => ({ hook: 'Hello', cta: 'Shop now', voiceover: '', scenes: [s('hook', 'STRICT_COMPOSITE', false), s('demonstration', 'GENERATIVE_INTERACTION', skin, demoLine), s('cta', 'STRICT_COMPOSITE', false)] });
+    expect(() => normalizePlan(plan('I’ve used it for two weeks.', true), [])).toThrow(/testimonial check/);
+    expect(normalizePlan(plan('Two drops, morning and night.', true), []).scenes).toHaveLength(3);
+    expect(normalizePlan(plan('I’ve used it for two weeks.', false), []).scenes).toHaveLength(3); // no person shown
+  });
 });
 
 const manifest = (): CompositionManifest => ({

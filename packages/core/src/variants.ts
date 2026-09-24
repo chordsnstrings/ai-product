@@ -7,7 +7,7 @@ import { captionCues, composeAd, layoutVoice, probe, withTempDir, type SceneInpu
 import { assetBytes, saveAsset } from './assets';
 import { brandBrainFor } from './brand';
 import { scanCreativeText, scanPasses } from './compliance';
-import { diffCompositions, type CompositionManifest, type VoiceSegment } from './composition';
+import { diffCompositions, disclosureMetadata, type CompositionManifest, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
 import { authorizeOrTakeOver, settle } from './cost-governor';
 import { versionCreative } from './creatives';
@@ -154,7 +154,8 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
       }
       const e = variantManifest.endCard;
       const endCard = { productName: e.productName, cta: e.cta, index: e.index, durationMs: e.durationMs };
-      const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: variantManifest.captions, endCard, aspects: VARIANT_ASPECTS }, dir);
+      // The variant is the master's footage with a re-voiced hook: it carries the master's AI-content disclosure (§40).
+      const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: variantManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(variantManifest.disclosure) }, dir);
       const checks: CheckResult[] = [integrity];
       for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, variantManifest.durationMs)));
       if (checks.some((c) => !c.pass && c.hard)) {

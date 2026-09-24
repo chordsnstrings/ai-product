@@ -8,9 +8,9 @@ import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
-import { classifyClaim, type LineMapping } from './compliance';
+import { classifyClaim, showsSyntheticPeople, syntheticTestimonials, type LineMapping } from './compliance';
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
-import { diffCompositions, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
+import { diffCompositions, disclosureMetadata, type AiDisclosure, type CompositionManifest, type ManifestScene, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
 import { authorize, holdAuthorization, reissueToken, settle, type Purpose } from './cost-governor';
 import { allowedClaimTexts } from './creative-director';
@@ -63,6 +63,16 @@ export async function claimsQaForExports(tx: Tx, skuId: string, lines: string[],
     detail: failing.map((f) => `${PLATFORM_LABEL[f.platform]}: ${f.check.detail}`).join(' | '),
     data: { platforms: failing.map((f) => ({ platform: f.platform, ...(f.check.data as object) })), mapping: (results[0]!.check.data as { mapping?: LineMapping[] })?.mapping ?? [] },
   };
+}
+
+/**
+ * Standard §40 as a QA check: a scene with an AI-generated person never carries a first-person customer line. It
+ * blocks like a claims failure (the merchant changes the line), and lists the lines as violations.
+ */
+export function testimonialCheck(scenes: Parameters<typeof syntheticTestimonials>[0]): CheckResult | null {
+  const found = syntheticTestimonials(scenes);
+  if (!found.length) return null;
+  return { check: 'claims', pass: false, hard: true, detail: found.map((f) => `“${f.text}”: ${f.reason}`).join('; '), data: { violations: found, unmapped: [] } };
 }
 
 /** Claim IDs a scene's own lines use, from a claims-QA mapping (§24: a scene stores the claims it uses). */
@@ -422,6 +432,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   const voice: LogicalVoice = brand?.brain.voice ?? DEFAULT_VOICE;
   const names = [sku.name as string, brand?.name ?? null];
   const reusable = reusableRenders(scenes, versions);
+  /** Strict scenes shown on a generated (AI) setting: part of the ad's AI-content disclosure (§40). */
+  const platedScenes = new Set<string>();
   const hashes = new Map(scenes.map((s) => [s.id, renderInputHash(s)]));
   const sameInputs = (v: VersionRow, s: SceneRow) => v.input_hash == null || v.input_hash === hashes.get(s.id);
   const ownFrames = versions.filter((v) => v.kind === 'frame' && v.lineage?.projectId === projectId && v.status === 'accepted');
@@ -707,7 +719,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const approved = await frameOf(s, n);
         if (!imagery.cutout?.keyed || !routes.plate) return still(s, n, approved);
         const prior = plateFrame(s.id);
-        if (prior?.asset_id) return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
+        if (prior?.asset_id) {
+          platedScenes.add(s.id);
+          return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
+        }
         try {
           const img = await generateImage({ ctx, token: auth.token, task: PLATE_TASK, subject: { type: 'scene', id: s.id }, prompt: platePrompt(s), references: [], width: 1080, height: 1920, mockLabel: '' });
           const plate = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: img.bytes, mime: img.mime, kind: 'storyboard_frame', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, projectId, plate: true, providerJobId: img.jobId, promptVersion: img.promptVersion } }));
@@ -718,6 +733,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             return still(s, n, approved);
           }
           checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: exact product on a generated setting — ${c.detail}` })));
+          platedScenes.add(s.id);
           const saved = await saveFrame(s, fb.bytes, fb.technique, fb.lineage, res);
           return still(s, n, { bytes: fb.bytes, ...saved, technique: fb.technique });
         } catch (e) {
@@ -754,17 +770,20 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb.hook_text, sb.cta_text].filter(Boolean) as string[];
       const claimCheck = await withTenant(ws, (tx) => claimsQaForExports(tx, sku.id as string, lines, ASPECTS, { names }));
       checks.push(claimCheck);
+      // §40: AI-generated people never speak as customers (checked on the scenes as produced).
+      const testimonials = testimonialCheck(scenes);
+      if (testimonials) checks.push(testimonials);
       const mapping = ((claimCheck.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? []) as LineMapping[];
       const claimIds = new Map(scenes.map((s) => [s.id, sceneClaimIds([s.spoken_line as string | null, s.overlay_text as string | null], mapping)]));
       await withTenant(ws, async (tx) => {
         for (const s of scenes) await tx`update scenes set claim_ids = ${claimIds.get(s.id)!}::uuid[] where id = ${s.id}`;
       });
       for (const slot of slots) slot.entry.claimIds = claimIds.get(slot.entry.sceneId) ?? [];
-      if (!claimCheck.pass) {
+      if (!claimCheck.pass || testimonials) {
         await withTenant(ws, async (tx) => {
           await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
           // The lines and why are in the QA report (shown with a compliant alternative); the reason is customer copy.
-          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: claimCheck.detail, code: 'claims_blocked' });
+          await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: [claimCheck.pass ? null : claimCheck.detail, testimonials?.detail].filter(Boolean).join(' | '), code: 'claims_blocked' });
           await tx`update projects set qa_report = ${tx.json(summarize(checks) as never)} where id = ${projectId}`;
           await settle(tx, ctx, auth.authorizationId, 'released');
         });
@@ -837,7 +856,16 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await step(tx, ws, projectId, 'platforms', 'active');
       });
       const endCard = { productName: sku.name as string, cta: (sb.cta_text as string) ?? 'Shop now', index: `NO. ${String(sku.catalogue_no).padStart(3, '0')}`, durationMs: endCardMs };
-      const outs = await composeAd({ scenes: slots.map((s) => s.input), voiceover: voPath, captions, endCard, aspects: ASPECTS }, dir);
+      // §40: what in this ad is AI-generated — written into every export's metadata, the manifest and the creative,
+      // and shown with each platform's disclosure steps on delivery.
+      const generatedScenes = slots.filter((sl) => sl.entry.technique === 'generative' || sl.entry.technique.startsWith('generated') || platedScenes.has(sl.entry.sceneId)).map((sl) => sl.entry.sceneId);
+      const disclosure: AiDisclosure = {
+        aiGenerated: generatedScenes.length > 0 || segments.length > 0,
+        syntheticPeople: scenes.some((s) => showsSyntheticPeople(s) && generatedScenes.includes(s.id) && !platedScenes.has(s.id)),
+        syntheticVoice: segments.length > 0,
+        generatedScenes,
+      };
+      const outs = await composeAd({ scenes: slots.map((s) => s.input), voiceover: voPath, captions, endCard, aspects: ASPECTS, metadata: disclosureMetadata(disclosure) }, dir);
       const [concept] = await withTenant(ws, (tx) => tx`select proposal from concepts where id = ${p.selected_concept_id}`);
       const proposal = (concept?.proposal ?? {}) as Record<string, unknown>;
       const manifest: CompositionManifest = {
@@ -851,6 +879,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         durationMs: totalMs,
         aspects: ASPECTS,
         genes: { angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment },
+        disclosure,
       };
 
       // Final QA: platform/audio per export + asset integrity + experiment integrity.
@@ -861,7 +890,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         checks.push(...(await qaExport(o.file, o.aspect, totalMs)));
         const bytes = await readFile(o.file);
         const a = await withTenant(ws, (tx) =>
-          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, storyboardId: sb.id } }),
+          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, storyboardId: sb.id, disclosure } }),
         );
         exportAssets.push({ aspect: o.aspect, assetId: a.id });
       }
@@ -877,10 +906,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, async (tx) => {
         const [cr] = await tx`
-          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition)
+          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0 } as never)},
-            1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)})
+            1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
@@ -1100,8 +1129,9 @@ export async function finishAfterEdit(tx: Tx, ctx: TenantContext, projectId: str
   if (!unit || !(await resumableAfterEdit(tx, ctx.workspaceId, projectId))) throw new DomainError('CONFLICT', 'This storyboard hasn’t been paid for yet.');
   const [sku] = await tx`select name from skus where id = ${p.sku_id}`;
   const check = await claimsQaForExports(tx, p.sku_id as string, await adLines(tx, p.storyboard_id as string), ASPECTS, { names: [sku?.name as string, (await brandBrainFor(tx, p.sku_id as string))?.name ?? null] });
-  if (!check.pass) {
-    const lines = blockedLines({ checks: [check] });
+  const testimonials = testimonialCheck(await tx`select production_mode, shows_human_skin, spoken_line, overlay_text from scenes where storyboard_id = ${p.storyboard_id}`);
+  if (!check.pass || testimonials) {
+    const lines = blockedLines({ checks: [check, ...(testimonials ? [testimonials] : [])] });
     throw new DomainError('GATE_BLOCKED', `“${lines[0]?.line ?? 'A line'}” still can’t be used: ${lines[0]?.reason ?? check.detail}`, { lines });
   }
   await approveForProduction(tx, ctx, projectId, unit);

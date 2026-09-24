@@ -53,12 +53,14 @@ export interface ProbeResult {
   audioCodec: string | null;
   hasAudio: boolean;
   formatName: string;
+  /** Container tags (lower-cased keys), e.g. comment/description. */
+  tags: Record<string, string>;
 }
 
 export async function probe(file: string): Promise<ProbeResult> {
   const { stdout } = await run(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file], 30_000);
   const j = JSON.parse(stdout) as {
-    format: { duration?: string; format_name: string };
+    format: { duration?: string; format_name: string; tags?: Record<string, string> };
     streams: { codec_type: string; codec_name: string; width?: number; height?: number }[];
   };
   const v = j.streams.find((s) => s.codec_type === 'video');
@@ -71,6 +73,7 @@ export async function probe(file: string): Promise<ProbeResult> {
     audioCodec: a?.codec_name ?? null,
     hasAudio: !!a,
     formatName: j.format.format_name,
+    tags: Object.fromEntries(Object.entries(j.format.tags ?? {}).map(([k, v]) => [k.toLowerCase(), String(v)])),
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyClaim, excludedProductReason, nonSkincareCategory, scanCreativeText, scanPasses, type LineMapping } from './compliance';
+import { classifyClaim, excludedProductReason, isFirstPersonTestimonial, nonSkincareCategory, scanCreativeText, scanPasses, syntheticTestimonials, type LineMapping } from './compliance';
 import { qaClaims } from './qa';
 
 /** Claims regression set (standard §51: allowed, ambiguous and blocked claims, express and implied). */
@@ -29,6 +29,29 @@ describe('claims regression', () => {
 
   it('never auto-verifies anything', () => {
     for (const [t] of cases) expect(classifyClaim(t).status).not.toBe('VERIFIED');
+  });
+});
+
+describe('AI-generated people never give testimonials (standard §40)', () => {
+  it.each([
+    ['I’ve been using it for two weeks', true],
+    ['My skin has never looked better', true],
+    ["I'm obsessed with this serum", true],
+    ['I swear by it every morning', true],
+    ['Two drops, morning and night', false],
+    ['Your skin, only softer', false],
+    ['Tap to try it', false],
+    ['Made by a small team', false],
+  ])('%s → testimonial: %s', (line, expected) => {
+    expect(isFirstPersonTestimonial(line)).toBe(expected);
+  });
+
+  it('only matters on scenes that show AI-generated people', () => {
+    const line = 'I’ve been using it for two weeks';
+    expect(syntheticTestimonials([{ productionMode: 'GENERATIVE_INTERACTION', showsHumanSkin: true, spokenLine: line }])).toEqual([{ text: line, reason: expect.stringMatching(/AI-generated person/) }]);
+    expect(syntheticTestimonials([{ production_mode: 'HYBRID', shows_human_skin: true, overlay_text: line }])).toHaveLength(1);
+    expect(syntheticTestimonials([{ productionMode: 'GENERATIVE_INTERACTION', showsHumanSkin: false, spokenLine: line }])).toEqual([]);
+    expect(syntheticTestimonials([{ productionMode: 'STRICT_COMPOSITE', showsHumanSkin: true, spokenLine: line }])).toEqual([]);
   });
 });
 

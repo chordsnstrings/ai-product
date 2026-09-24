@@ -198,3 +198,36 @@ export function detectSkincareCategory(text: string): string {
   for (const [re, c] of table) if (re.test(t)) return c;
   return 'skincare';
 }
+
+// ───────────── Synthetic people never give testimonials (standard §40) ─────────────
+
+/**
+ * Does this line speak as a customer about their own use or results ("I've used it for two weeks", "my skin has
+ * never looked better", "I'm obsessed")? A narrator's instruction or a second-person line is not a testimonial.
+ */
+export function isFirstPersonTestimonial(text: string): boolean {
+  const t = text.toLowerCase().replace(/[’‘]/g, "'");
+  if (!/\b(i|i'm|i've|i'd|i'll|me|my|mine|myself)\b/.test(t)) return false;
+  return /\b(i|i've|i'm|i have|i am|i've been|i was|my)\b[^.?!]{0,60}\b(skin|face|complexion|pores?|use[ds]?|using|tried|trying|love[ds]?|obsessed|swear|results?|routine|noticed|changed|cleared|glow(s|ing)?|recommend|bought|order(ed)?|week|weeks|days?|months?|never|finally|holy grail|game[- ]?changer)\b/.test(t);
+}
+
+export const SYNTHETIC_TESTIMONIAL_REASON =
+  'This scene shows an AI-generated person, so it can’t speak as a customer (“I”, “my skin”). Describe the product or speak to the viewer instead.';
+
+/** Scenes that show AI-generated people: generated interaction or hybrid shots with visible skin (hands, faces). */
+export const showsSyntheticPeople = (s: { productionMode?: string | null; production_mode?: string | null; showsHumanSkin?: boolean | null; shows_human_skin?: boolean | null }) =>
+  !!(s.showsHumanSkin ?? s.shows_human_skin) && ['GENERATIVE_INTERACTION', 'HYBRID'].includes((s.productionMode ?? s.production_mode) as string);
+
+/**
+ * Standard §40: "do not misrepresent a real person or customer endorsement." A scene with a synthetic person never
+ * carries a first-person customer line (spoken or on screen). Returns the offending lines.
+ */
+export function syntheticTestimonials(
+  scenes: { productionMode?: string | null; production_mode?: string | null; showsHumanSkin?: boolean | null; shows_human_skin?: boolean | null; spokenLine?: string | null; spoken_line?: string | null; overlayText?: string | null; overlay_text?: string | null }[],
+): { text: string; reason: string }[] {
+  return scenes
+    .filter(showsSyntheticPeople)
+    .flatMap((s) => [s.spokenLine ?? s.spoken_line, s.overlayText ?? s.overlay_text])
+    .filter((l): l is string => !!l && isFirstPersonTestimonial(l))
+    .map((text) => ({ text, reason: SYNTHETIC_TESTIMONIAL_REASON }));
+}

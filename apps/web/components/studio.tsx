@@ -6,11 +6,11 @@ import { Banner, Button, Ledger } from '@arkiv/ui';
 import { api, Sheet, usePoll } from '@arkiv/ui/client';
 import type { ProjectView } from '@/lib/views';
 import { ActionButton, ActionForm, SheetButton } from './actions';
-import { CancelProduction, Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
+import { AiDisclosureSteps, CancelProduction, Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
 
 type V = { id: string; code: string; label: string; role: string; projectId: string | null; projectState: string | null; files: { aspect: string; url: string }[] };
 
-export function StudioClient({ slug, experimentId, state, masterProjectId, variants, testsLeft, canApprove }: { slug: string; experimentId: string; state: string; masterProjectId: string | null; variants: V[]; testsLeft: number; canApprove: boolean }) {
+export function StudioClient({ slug, experimentId, state, masterProjectId, variants, testsLeft, canApprove, disclosure = null }: { slug: string; experimentId: string; state: string; masterProjectId: string | null; variants: V[]; testsLeft: number; canApprove: boolean; disclosure?: ProjectView['disclosure'] }) {
   const router = useRouter();
   const producing = state === 'PRODUCING';
   const pre = state === 'APPROVED' || state === 'DRAFT' || state === 'RECOMMENDED';
@@ -115,6 +115,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
               ))}
             </tbody>
           </table>
+          <AiDisclosureSteps disclosure={disclosure} />
           <div className="ak-row" style={{ marginTop: 16 }}>
             {state === 'READY_TO_RUN' ? <ActionButton slug={slug} action="experiment-live" body={{ experimentId }} variant="primary">I’ve launched these ads</ActionButton> : null}
             <a className="ak-btn ak-btn--secondary" href={`/w/${slug}/results/${experimentId}`}>See results</a>

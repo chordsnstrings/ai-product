@@ -28,3 +28,13 @@ create index provider_jobs_dispatched on provider_jobs (created_at) where status
 -- here; the run stops at its next checkpoint and settles it. Who asked and why stay with the request.
 alter table projects add column cancel_requested_at timestamptz;
 alter table projects add column cancel_request jsonb;
+
+-- ───────────── AI-generated media disclosure (standard §40) ─────────────
+-- Whether a scene shows people (hands, skin, faces): those people are AI-generated in generated scenes, which may
+-- never speak as customers. A creative records whether it contains AI-generated media and AI-generated people, so
+-- delivery shows each platform's disclosure steps and exports carry it in their metadata.
+alter table scenes add column shows_human_skin boolean not null default false;
+alter table creatives add column ai_generated boolean not null default false;
+alter table creatives add column synthetic_people boolean not null default false;
+-- The storyboard prompt now tells the Creative Director that generated people never speak as customers.
+update model_routes set prompt_version = 'storyboard@1.1.0' where task = 'creative_director.storyboard' and prompt_version = 'storyboard@1.0.0';

@@ -23,9 +23,11 @@ export interface CreativeVersion {
  * written with the row and can be rebuilt from events alone (§36). Runs in the caller's transaction.
  */
 export async function versionCreative(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, v: CreativeVersion): Promise<string> {
-  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition)
+  // A version keeps its parent's AI-content flags (standard §40): it reuses the parent's media.
+  const [parent] = await tx`select ai_generated, synthetic_people from creatives where id = ${v.parentCreativeId} and workspace_id = ${ctx.workspaceId}`;
+  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
                         values (${ctx.workspaceId}, ${v.skuId}, 'generated', ${v.parentCreativeId}, ${v.projectId}, ${tx.json(v.genome as never)}, 1,
-                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)})
+                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)}, ${!!parent?.ai_generated}, ${!!parent?.synthetic_people})
                         returning id`;
   const id = cr!.id as string;
   await emit(

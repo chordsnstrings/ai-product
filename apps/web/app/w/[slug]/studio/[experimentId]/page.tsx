@@ -30,7 +30,14 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
         return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files };
       }),
     );
-    return { e: v.experiment, sku, variants, results: v.results, bal: await balances(tx) };
+    // AI-content disclosure of the experiment's ads (the variants reuse the master's media, standard §40).
+    const masterProject = variants.find((x) => x.projectId)?.projectId ?? null;
+    const [dc] = masterProject
+      ? await tx`select c.ai_generated, c.synthetic_people, c.composition->'disclosure'->>'syntheticVoice' as synthetic_voice
+                 from projects p join creatives c on c.id = p.final_creative_id where p.id = ${masterProject}`
+      : [];
+    const disclosure = dc ? { aiGenerated: !!dc.ai_generated, syntheticPeople: !!dc.synthetic_people, syntheticVoice: dc.synthetic_voice === 'true' } : null;
+    return { e: v.experiment, sku, variants, results: v.results, bal: await balances(tx), disclosure };
   });
   if (!d) notFound();
   const master = d.variants.find((v) => v.projectId);
@@ -56,6 +63,7 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
         variants={d.variants}
         testsLeft={d.bal.creativeTests}
         canApprove={['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role)}
+        disclosure={d.disclosure}
       />
     </>
   );
