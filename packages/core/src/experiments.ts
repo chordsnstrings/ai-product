@@ -155,9 +155,11 @@ const PRODUCTION_OR_DONE = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING
  */
 export async function produceWithCreativeTest(tx: Tx, ctx: TenantContext, projectId: string): Promise<{ experimentId: string; projectId: string; replayed: boolean }> {
   assertCan(ctx, 'spend.creative_test');
-  const [p] = await tx`select id, state, kind, sku_id, experiment_id, storyboard_id, selected_concept_id, entitlement_unit from projects
+  const [p] = await tx`select id, state, kind, sku_id, experiment_id, storyboard_id, selected_concept_id, entitlement_unit, revision_free from projects
                        where id = ${projectId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  // A free re-plan ("Not right?", §48) is made at no cost; it never spends one of the plan's Creative Tests.
+  if (p.revision_free && !PRODUCTION_OR_DONE.includes(p.state as string)) throw new DomainError('CONFLICT', 'This re-plan is free — no Creative Test needed. Go back to the storyboard to make it.');
   if (PRODUCTION_OR_DONE.includes(p.state as string)) {
     if (p.entitlement_unit === 'creative_test' && p.experiment_id) return { experimentId: p.experiment_id as string, projectId, replayed: true };
     throw new DomainError('CONFLICT', 'This ad is already in production.');
