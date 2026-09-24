@@ -1,25 +1,35 @@
 import { NextResponse } from 'next/server';
 import { finishOAuth } from '@arkiv/auth';
-import { env, geoFromHeaders } from '@arkiv/shared';
+import { DomainError, env, geoFromHeaders } from '@arkiv/shared';
 import { afterLogin } from '@/lib/after-login';
 import { clientIp } from '@/lib/http';
-import { clearProvisionalCookie, setSessionCookie } from '@/lib/session';
+import { clearProvisionalCookie, setSessionCookie, takeOAuthBindingCookie } from '@/lib/session';
 
-/** Google returns via GET; Apple posts the form (response_mode=form_post), so both verbs land here. */
+/**
+ * Google returns via GET; Apple posts the form (response_mode=form_post), so both verbs land here. The flow must
+ * come back to the browser that started it (the binding cookie set by /start), or it is refused.
+ */
 async function handle(req: Request, provider: string, params: URLSearchParams) {
   if (provider !== 'google' && provider !== 'apple') return new NextResponse('Not found', { status: 404 });
   const base = env().APP_URL;
+  const binding = await takeOAuthBindingCookie();
   const code = params.get('code');
   const state = params.get('state');
-  if (!code || !state) return NextResponse.redirect(`${base}/login?error=${encodeURIComponent(params.get('error') ?? 'cancelled')}`, 303);
+  if (!code || !state) return NextResponse.redirect(`${base}/login?error=${encodeURIComponent(params.get('error') === 'access_denied' || !params.get('error') ? 'Sign-in was cancelled.' : 'Sign-in failed. Please try again.')}`, 303);
   try {
-    const r = await finishOAuth(provider, { code, state, user: params.get('user') }, { ip: clientIp(req), userAgent: req.headers.get('user-agent'), geo: geoFromHeaders(req.headers) });
+    const r = await finishOAuth(provider, { code, state, user: params.get('user') }, { ip: clientIp(req), userAgent: req.headers.get('user-agent'), geo: geoFromHeaders(req.headers) }, binding);
+    if (r.kind === 'linked') {
+      const to = r.redirectTo ?? '/app';
+      return NextResponse.redirect(`${base}${to}${to.includes('?') ? '&' : '?'}linked=${provider}`, 303);
+    }
     await setSessionCookie(r.token);
-    const next = await afterLogin({ userId: r.userId }, r.provisionalWorkspaceId, r.redirectTo);
-    if (r.provisionalWorkspaceId) await clearProvisionalCookie();
+    const next = await afterLogin({ userId: r.userId }, r.provisionalWorkspaceId, r.redirectTo, provider);
+    if (r.provisionalWorkspaceId && !next.startsWith('/start/claim?c=')) await clearProvisionalCookie();
     return NextResponse.redirect(`${base}${next}`, 303);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : 'Sign-in failed';
+    const msg = e instanceof DomainError ? e.message : 'Sign-in failed. Please try again.';
+    const linkBack = e instanceof DomainError ? (e.details as { linkRedirect?: string | null } | undefined)?.linkRedirect : undefined;
+    if (linkBack) return NextResponse.redirect(`${base}${linkBack}${linkBack.includes('?') ? '&' : '?'}error=${encodeURIComponent(msg)}`, 303);
     return NextResponse.redirect(`${base}/login?error=${encodeURIComponent(msg)}`, 303);
   }
 }

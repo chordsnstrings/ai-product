@@ -31,6 +31,7 @@ import {
   sweepPreviewCogsOutliers,
   verifyShopifyWebhooks,
   sweepRateLimits,
+  sweepSignInRecords,
   sweepHeartbeats,
   sweepExpiringTokens,
   sweepStaleIntegrations,
@@ -206,6 +207,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       }),
   },
   'sweep-rate-limits': { cron: '17 * * * *', run: () => withSystem((tx) => sweepRateLimits(tx)) },
+  'sweep-sign-in-records': { cron: '43 3 * * *', run: () => withSystem((tx) => sweepSignInRecords(tx)) },
   // A scheduled rate-table version replaces its predecessor at its effective time (plan 05 §9); pricing already
   // uses the newest version in effect, this keeps the table's statuses truthful.
   'retire-superseded-rates': { cron: '*/5 * * * *', run: () => withSystem((tx) => retireSupersededRates(tx)) },

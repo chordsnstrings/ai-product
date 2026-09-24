@@ -1,3 +1,4 @@
+import { passkeyPromptEligible } from '@arkiv/auth';
 import { errorResponse } from '@/lib/http';
 import { projectAccess } from '@/lib/tenant';
 import { projectVersion, projectView } from '@/lib/views';
@@ -27,7 +28,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     return errorResponse(e);
   }
   const ws = a.ctx.workspaceId;
-  const access = { provisional: a.provisional, signedIn: !!a.user, role: a.ctx.role, workspaceSlug: a.slug || null };
+  // The post-purchase passkey suggestion (plan 06 Phase 3 #8); the client shows it only once the purchase is paid.
+  const passkeyPrompt = !!a.user && !a.provisional && (await passkeyPromptEligible(a.user.id).catch(() => false));
+  const access = { provisional: a.provisional, signedIn: !!a.user, role: a.ctx.role, workspaceSlug: a.slug || null, passkeyPrompt };
   const enc = new TextEncoder();
   let closed = false;
   req.signal.addEventListener('abort', () => {

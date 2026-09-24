@@ -7,18 +7,47 @@ import { landingTable } from './lib/landing-table';
 /** Kept in step with lib/session.ts (the proxy can't import next/headers helpers). */
 const VISITOR_COOKIE = 'arkiv_v';
 
+/** Kept in step with @arkiv/auth (sessions.ts); the proxy stays free of database code. */
+const SESSION_COOKIE = 'arkiv_session';
+const SESSION_DAYS = 30;
+/** Set alongside a refreshed session cookie; while present, the cookie is not re-issued (at most once a day). */
+const REFRESH_MARKER = 'arkiv_sr';
+
+/** `/` and `/for/<slug>`: the campaign landing paths. */
+function isLandingPath(pathname: string): boolean {
+  return pathname === '/' || /^\/for\/[^/]+\/?$/.test(pathname);
+}
+
 /**
- * Campaign landing pages (plan 04 L6): `/` and `/for/<slug>` are served from a prerendered, cached page per
- * (page, copy variant) — rewritten to /lp/<slug>/<variant> — so the hero needs no database round-trip or client JS.
- * The visitor cookie is set here, before the page, so the sticky variant assignment and the funnel's visitor id
- * are stable from the very first view (a server component render can't set cookies). Deployed, the proxy runs in
- * front of the CDN cache (Next's CDN guidance): the cache key is the rewritten /lp path, never `/` itself.
- *
- * Draft previews (plan 05 §5) stay dynamic: the staff console frames `/for/<slug>?preview=<token>`, only the
- * console's own origin may frame it (CSP frame-ancestors), and the page verifies the signed token.
+ * 1. Rolling sessions (plan 03 Part C "Sessions: 30-day rolling"): the database extends a session on use, and the
+ *    cookie follows — re-issued with a fresh 30-day lifetime at most once a day, so an active user is never logged
+ *    out by the browser 30 days after signing in. The database stays authoritative (a revoked or expired session
+ *    is refused whatever the cookie says).
+ * 2. Campaign landing pages (plan 04 L6): `/` and `/for/<slug>` are served from a prerendered, cached page per
+ *    (page, copy variant) — rewritten to /lp/<slug>/<variant> — so the hero needs no database round-trip or client
+ *    JS. The visitor cookie is set here, before the page, so the sticky variant assignment and the funnel's visitor
+ *    id are stable from the very first view (a server component render can't set cookies). Deployed, the proxy runs
+ *    in front of the CDN cache (Next's CDN guidance): the cache key is the rewritten /lp path, never `/` itself.
+ * 3. Draft previews (plan 05 §5) stay dynamic: the staff console frames `/for/<slug>?preview=<token>`, only the
+ *    console's own origin may frame it (CSP frame-ancestors), and the page verifies the signed token. Every other
+ *    response keeps X-Frame-Options.
  */
 export async function proxy(request: NextRequest) {
   const url = request.nextUrl;
+  const res = await route(request);
+  const session = request.cookies.get(SESSION_COOKIE)?.value;
+  // Page loads only: API routes may set or clear the session cookie themselves (sign-in, rotation, sign-out).
+  if (session && request.method === 'GET' && !request.cookies.has(REFRESH_MARKER) && !url.pathname.startsWith('/api/')) {
+    const secure = env().NODE_ENV === 'production';
+    res.cookies.set(SESSION_COOKIE, session, { httpOnly: true, secure, sameSite: 'lax', path: '/', maxAge: SESSION_DAYS * 86400 });
+    res.cookies.set(REFRESH_MARKER, '1', { httpOnly: true, secure, sameSite: 'lax', path: '/', maxAge: 86400 });
+  }
+  return res;
+}
+
+async function route(request: NextRequest): Promise<NextResponse> {
+  const url = request.nextUrl;
+  if (!isLandingPath(url.pathname)) return NextResponse.next();
   if (url.searchParams.has('preview')) {
     const res = NextResponse.next();
     let admin = '';
@@ -56,4 +85,5 @@ export async function proxy(request: NextRequest) {
   return res;
 }
 
-export const config = { matcher: ['/', '/for/:slug'] };
+// Pages and API routes; not static assets.
+export const config = { matcher: ['/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml|.*\\.(?:png|jpg|jpeg|svg|webp|ico|css|js|woff2?)$).*)'] };

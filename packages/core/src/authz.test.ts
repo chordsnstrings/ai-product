@@ -157,6 +157,9 @@ describe('member management matrix (plan 02 §1.1: Admin ✓ except Owners)', ()
       [m1, { from: 'MEMBER', to: 'OWNER', transfer: true }],
       [t.userId, { from: 'OWNER', to: 'ADMIN', transfer: true }],
     ]);
+    // Both the new and the previous Owner get the security email (plan 03 A10), via the outbox after commit.
+    const mail = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and queue = 'send-email' and payload->>'template' = 'ownership_transferred'`;
+    expect(mail.map((r) => (r.payload as { userIds: string[] }).userIds)).toEqual([[m1, t.userId]]);
     // emit() refuses the shapes older staff paths wrote for the same event type.
     await expect(withTenant(t.workspaceId, (tx) => emit(tx, ctxOf(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), 'MEMBER_ROLE_CHANGED', { type: 'user', id: m1 }, { to: 'OWNER', from: [t.userId] }))).rejects.toThrow(/MEMBER_ROLE_CHANGED payload does not match/);
     await expect(withTenant(t.workspaceId, (tx) => emit(tx, ctxOf(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), 'CLAIM_RESTRICTED', null, { unblocked: true, reason: 'x' }))).rejects.toThrow(/CLAIM_RESTRICTED payload/);

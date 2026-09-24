@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { cookies } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { getSession, SESSION_COOKIE, SESSION_DAYS, type SessionUser } from '@arkiv/auth';
+import { getSession, OAUTH_BINDING_COOKIE, OAUTH_TTL_SECONDS, SESSION_COOKIE, SESSION_DAYS, type SessionUser } from '@arkiv/auth';
 import { env } from '@arkiv/shared';
 
 export const PROVISIONAL_COOKIE = 'arkiv_preview';
@@ -26,6 +26,24 @@ export async function setSessionCookie(token: string) {
 
 export async function clearSessionCookie() {
   (await cookies()).delete(SESSION_COOKIE);
+}
+
+/**
+ * The browser binding of an OAuth flow (login-CSRF defence, see @arkiv/auth oauth.ts). Scoped to the auth routes.
+ * Apple returns with a cross-site form POST (response_mode=form_post), which carries only SameSite=None cookies;
+ * Google returns with a top-level GET, which Lax cookies survive.
+ */
+export async function setOAuthBindingCookie(provider: 'google' | 'apple', binding: string) {
+  const sameSite = provider === 'apple' ? 'none' : 'lax';
+  // SameSite=None requires Secure; browsers treat http://localhost as secure for this purpose.
+  (await cookies()).set(OAUTH_BINDING_COOKIE, binding, { httpOnly: true, secure: provider === 'apple' ? true : secure(), sameSite, path: '/api/auth', maxAge: OAUTH_TTL_SECONDS });
+}
+
+export async function takeOAuthBindingCookie(): Promise<string | null> {
+  const c = await cookies();
+  const v = c.get(OAUTH_BINDING_COOKIE)?.value ?? null;
+  c.set(OAUTH_BINDING_COOKIE, '', { httpOnly: true, secure: secure(), path: '/api/auth', maxAge: 0 });
+  return v;
 }
 
 export async function provisionalToken(): Promise<string | null> {

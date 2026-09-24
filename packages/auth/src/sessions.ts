@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { globalTx, type Tx } from '@arkiv/db';
-import { DomainError } from '@arkiv/shared';
+import { DomainError, PRIVACY_VERSION, TERMS_VERSION, type SignInMethod } from '@arkiv/shared';
 import type { LoginMeta } from './login-attempts';
 
 /**
@@ -20,15 +20,57 @@ export interface SessionUser {
   createdAt: string;
 }
 
-export async function createSession(userId: string, meta: LoginMeta = {}, tx?: Tx): Promise<{ token: string; expiresAt: Date }> {
+/**
+ * A new session for an active user. Every sign-in path ends here, so a locked or deleted account can never get a
+ * session, whichever way it signs in (plan 05 §3 "lock account"). `method` is kept as sign-in history.
+ */
+export async function createSession(
+  userId: string,
+  meta: LoginMeta = {},
+  tx?: Tx,
+  method: SignInMethod | null = null,
+): Promise<{ token: string; expiresAt: Date; sessionId: string }> {
   const token = randomBytes(32).toString('base64url');
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400_000);
-  // The edge's city/region/country, shown to staff next to the IP (plan 05 §3 "sessions (device, IP city…)").
-  const run = (t: Tx) => t`insert into sessions (user_id, token_hash, expires_at, ip, user_agent, geo)
-                            values (${userId}, ${hash(token)}, ${expiresAt}, ${meta.ip ?? null}, ${meta.userAgent?.slice(0, 300) ?? null}, ${meta.geo ? t.json(meta.geo as never) : null})`;
-  if (tx) await run(tx);
-  else await globalTx(run);
-  return { token, expiresAt };
+  const run = async (t: Tx) => {
+    await assertUserActive(t, userId);
+    // The edge's city/region/country, shown to staff next to the IP (plan 05 §3 "sessions (device, IP city…)").
+    const [r] = await t`insert into sessions (user_id, token_hash, expires_at, ip, user_agent, geo, method)
+                        values (${userId}, ${hash(token)}, ${expiresAt}, ${meta.ip ?? null}, ${meta.userAgent?.slice(0, 300) ?? null},
+                                ${meta.geo ? t.json(meta.geo as never) : null}, ${method}) returning id`;
+    return r!.id as string;
+  };
+  const sessionId = tx ? await run(tx) : await globalTx(run);
+  return { token, expiresAt, sessionId };
+}
+
+/** Refuse a locked or deleted account (FORBIDDEN, customer-safe wording). */
+export async function assertUserActive(tx: Tx, userId: string): Promise<void> {
+  const [u] = await tx`select locked_at, deleted_at from users where id = ${userId}`;
+  if (u?.locked_at) throw new DomainError('FORBIDDEN', 'This account is locked. Contact support.');
+  if (!u || u.deleted_at) throw new DomainError('FORBIDDEN', 'This account was deleted.');
+}
+
+/**
+ * Rotate a session on a privilege change (plan 03 Part C "rotated on privilege change"): a new token replaces the
+ * old one, which is revoked in the same transaction, so a token captured before the change stops working. The
+ * caller sets the new cookie.
+ */
+export async function rotateSession(oldSessionId: string, userId: string): Promise<{ token: string; expiresAt: Date; sessionId: string }> {
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400_000);
+  return globalTx(async (tx) => {
+    const [old] = await tx`update sessions set revoked_at = now()
+                           where id = ${oldSessionId} and user_id = ${userId} and revoked_at is null and expires_at > now()
+                           returning ip, user_agent, geo, last_workspace_id, method, created_at`;
+    if (!old) throw new DomainError('UNAUTHENTICATED', 'Please sign in again.');
+    await assertUserActive(tx, userId);
+    // The sign-in time carries over: rotation is not a fresh sign-in, so it doesn't satisfy a step-up check.
+    const [r] = await tx`insert into sessions (user_id, token_hash, expires_at, ip, user_agent, geo, last_workspace_id, method, created_at)
+                         values (${userId}, ${hash(token)}, ${expiresAt}, ${old.ip}, ${old.user_agent}, ${old.geo ? tx.json(old.geo as never) : null},
+                                 ${old.last_workspace_id}, ${old.method}, ${old.created_at}) returning id`;
+    return { token, expiresAt, sessionId: r!.id as string };
+  });
 }
 
 export async function getSession(token: string | undefined | null): Promise<SessionUser | null> {
@@ -72,10 +114,15 @@ export function assertRecentLogin(s: SessionUser, minutes = 10) {
   }
 }
 
-export async function findOrCreateUser(tx: Tx, email: string, opts: { name?: string | null; verified: boolean }) {
+/**
+ * The user for a verified email, created on first sign-in. A new account records its acceptance of the Terms and
+ * Privacy Policy with the sign-in method and time (plan 03 P6: "acceptance logged by the action and timestamp").
+ */
+export async function findOrCreateUser(tx: Tx, email: string, opts: { name?: string | null; verified: boolean; method?: SignInMethod | null }) {
   const normalized = email.trim().toLowerCase();
   const [u] = await tx`
-    insert into users (email, name, email_verified_at) values (${normalized}, ${opts.name ?? null}, ${opts.verified ? new Date() : null})
+    insert into users (email, name, email_verified_at, terms_accepted_at, terms_version, privacy_version, terms_method)
+    values (${normalized}, ${opts.name ?? null}, ${opts.verified ? new Date() : null}, now(), ${TERMS_VERSION}, ${PRIVACY_VERSION}, ${opts.method ?? null})
     on conflict (email) do update set
       name = coalesce(users.name, excluded.name),
       email_verified_at = coalesce(users.email_verified_at, excluded.email_verified_at)

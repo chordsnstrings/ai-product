@@ -10,7 +10,8 @@ import {
 import { globalTx } from '@arkiv/db';
 import { DomainError, env } from '@arkiv/shared';
 import { recordLoginFailure, type LoginMeta } from './login-attempts';
-import { createSession } from './sessions';
+import { assertUserActive, createSession } from './sessions';
+import { notifyIfNewDevice } from './signals';
 
 /** Passkeys (WebAuthn), offered after the first purchase (plan 04 L5). Challenges live in oauth_states. */
 const rp = () => {
@@ -37,7 +38,8 @@ export async function passkeyRegistrationOptions(user: { userId: string; email: 
     userID: new TextEncoder().encode(user.userId),
     attestationType: 'none',
     excludeCredentials: existing.map((c) => ({ id: c.credential_id as string, transports: (c.transports as never) ?? undefined })),
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
+    // Discoverable credentials only: sign-in asks for no username (conditional UI), so it can't use any other kind.
+    authenticatorSelection: { residentKey: 'required', requireResidentKey: true, userVerification: 'preferred' },
   });
   await saveChallenge(`reg:${user.userId}`, opts.challenge);
   return opts;
@@ -53,6 +55,16 @@ export async function verifyPasskeyRegistration(user: { userId: string }, respon
   return true;
 }
 
+/**
+ * Whether to suggest adding a passkey (plan 06 Phase 3 #8 "Passkeys (offered after first purchase)"; the caller
+ * checks the purchase): the user has none yet and hasn't dismissed the suggestion.
+ */
+export async function passkeyPromptEligible(userId: string): Promise<boolean> {
+  const [r] = await globalTx((tx) => tx`select u.passkey_prompt_dismissed_at is null and not exists (select 1 from passkeys p where p.user_id = u.id) as ok
+                                        from users u where u.id = ${userId}`);
+  return !!r?.ok;
+}
+
 export async function passkeyLoginOptions() {
   const flow = randomBytes(16).toString('base64url');
   const opts = await generateAuthenticationOptions({ rpID: rp().rpID, userVerification: 'preferred' });
@@ -64,7 +76,9 @@ export async function passkeyLoginOptions() {
 export async function verifyPasskeyLogin(flow: string, response: AuthenticationResponseJSON, meta: LoginMeta) {
   let userId: string | null = null;
   try {
-    return await verifyPasskey(flow, response, meta, (u) => (userId = u));
+    const r = await verifyPasskey(flow, response, meta, (u) => (userId = u));
+    await notifyIfNewDevice(r.userId, r.sessionId, meta);
+    return r;
   } catch (e) {
     const reason = e instanceof DomainError ? e.message : 'Passkey could not be verified.';
     await recordLoginFailure('passkey', { userId }, reason, meta, /locked/i.test(reason) ? 'locked' : 'failed');
@@ -86,10 +100,10 @@ async function verifyPasskey(flow: string, response: AuthenticationResponseJSON,
   }).catch(() => ({ verified: false }) as Awaited<ReturnType<typeof verifyAuthenticationResponse>>);
   if (!v.verified) throw new DomainError('INVALID', 'Passkey could not be verified.');
   // A locked account can't sign in with a passkey either.
-  const [u] = await globalTx((tx) => tx`select locked_at, deleted_at from users where id = ${pk.user_id as string}`);
-  if (u?.locked_at) throw new DomainError('FORBIDDEN', 'This account is locked. Contact support.');
-  if (!u || u.deleted_at) throw new DomainError('FORBIDDEN', 'This account was deleted.');
-  await globalTx((tx) => tx`update passkeys set counter = ${v.authenticationInfo.newCounter}, last_used_at = now() where id = ${pk.id}`);
-  const s = await createSession(pk.user_id as string, meta);
-  return { ...s, userId: pk.user_id as string };
+  return globalTx(async (tx) => {
+    await assertUserActive(tx, pk.user_id as string);
+    await tx`update passkeys set counter = ${v.authenticationInfo.newCounter}, last_used_at = now() where id = ${pk.id}`;
+    const s = await createSession(pk.user_id as string, meta, tx, 'passkey');
+    return { ...s, userId: pk.user_id as string };
+  });
 }

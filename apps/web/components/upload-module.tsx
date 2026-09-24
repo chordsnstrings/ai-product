@@ -2,31 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@arkiv/ui/client';
-import { TURNSTILE_SCRIPT } from '@/lib/turnstile';
+import { loadTurnstile } from './turnstile';
 import { usePhotoUploads } from './photo-uploads';
-
-interface TurnstileApi {
-  render(el: HTMLElement, opts: Record<string, unknown>): string;
-  execute(id: string): void;
-  reset(id: string): void;
-  remove(id: string): void;
-}
-declare global {
-  interface Window {
-    turnstile?: TurnstileApi;
-  }
-}
-
-function loadScript(src: string): Promise<void> {
-  const existing = document.querySelector<HTMLScriptElement>(`script[src="${src}"]`);
-  if (existing && window.turnstile) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const s = existing ?? Object.assign(document.createElement('script'), { src, async: true, defer: true });
-    s.addEventListener('load', () => resolve());
-    s.addEventListener('error', () => reject(new Error('turnstile script failed to load')));
-    if (!existing) document.head.appendChild(s);
-  });
-}
 
 /**
  * Invisible Turnstile challenge run on submit only (plan 03 P1). Renders nothing visible unless Cloudflare
@@ -39,7 +16,7 @@ function useTurnstile(siteKey: string | null | undefined) {
   useEffect(() => {
     if (!siteKey || !box.current) return;
     let cancelled = false;
-    loadScript(TURNSTILE_SCRIPT)
+    loadTurnstile()
       .then(() => {
         if (cancelled || !window.turnstile || !box.current) return;
         widget.current = window.turnstile.render(box.current, {

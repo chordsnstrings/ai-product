@@ -56,6 +56,9 @@ test('anonymous visitor to delivered ad', async ({ page }) => {
   await expect(page.getByRole('dialog').getByText(email)).toBeVisible();
   const link = await magicLinkFor(email);
   await page.goto(link);
+  // Scanner-safe (plan 03 Part C): loading the link consumes nothing; pressing Continue does.
+  await expect(page.getByRole('heading', { name: 'Sign in to Arkiv' })).toBeVisible();
+  await page.getByRole('button', { name: 'Continue' }).click();
   await page.waitForURL(`**/concepts/${projectId}`);
 
   // Signed in: build the storyboard.

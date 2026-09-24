@@ -1,5 +1,5 @@
 import { notFound } from 'next/navigation';
-import { globalTx } from '@arkiv/db';
+import { globalTx, withTenant } from '@arkiv/db';
 import { resolveProvisional, type TenantContext } from '@arkiv/core';
 import { DomainError, type Role, type WorkspaceState } from '@arkiv/shared';
 import { currentRequestId } from '@arkiv/shared/log';
@@ -62,7 +62,8 @@ export async function projectAccess(projectId: string): Promise<WorkspaceInfo & 
       };
     }
   }
-  const prov = await resolveProvisional(await provisionalToken());
+  const cookie = await provisionalToken();
+  const prov = await resolveProvisional(cookie);
   if (prov === ws) {
     return {
       ctx: { workspaceId: ws, workspaceState: 'PROVISIONAL', role: 'OWNER', actor: { kind: 'provisional', id: ws }, requestId: currentRequestId() ?? crypto.randomUUID() },
@@ -71,6 +72,12 @@ export async function projectAccess(projectId: string): Promise<WorkspaceInfo & 
       user: user ? { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId } : null,
       provisional: true,
     };
+  }
+  // A signed-out visitor whose preview cookie no longer opens anything: the preview they were looking at was saved
+  // to an account (the link was opened on another device, plan 03 P6). Say so, instead of a bare 404.
+  if (!user && cookie && !prov) {
+    const [w] = await withTenant(ws, (tx) => tx`select state from workspaces where id = ${ws}`);
+    if (w && w.state !== 'PROVISIONAL') throw new DomainError('UNAUTHENTICATED', 'This preview was saved to an account. Log in to keep going.', { savedToAccount: true });
   }
   throw new DomainError('NOT_FOUND', 'Not found');
 }

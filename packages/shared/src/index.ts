@@ -8,3 +8,4 @@ export * from './subprocessors';
 export * from './geo';
 export * from './landing';
 export * from './format';
+export * from './auth';

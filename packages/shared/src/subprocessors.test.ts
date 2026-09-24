@@ -11,6 +11,7 @@ const SOURCES = ['packages', 'apps'];
 const NOT_RECIPIENTS: Record<string, string> = {
   'schema.org': 'JSON-LD vocabulary identifier; never fetched',
   'yourstore.com': 'placeholder text in the upload form',
+  'mock-idp.arkiv.invalid': 'issuer name of the built-in mock sign-in provider (mock mode only); never contacted',
 };
 
 function sourceFiles(dir: string): string[] {

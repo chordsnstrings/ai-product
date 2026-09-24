@@ -7,7 +7,8 @@
     ".": "./src/index.ts",
     "./log": "./src/log.ts",
     "./format": "./src/format.ts",
-    "./variants": "./src/variants.ts"
+    "./variants": "./src/variants.ts",
+    "./auth": "./src/auth.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
