@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
 import { DataRequestKind } from '@arkiv/shared';
 import { auditView } from '@arkiv/core';
-import { ActForm } from '@/components/act';
+import { ActButton, ActForm } from '@/components/act';
 import { dt, Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
 
@@ -25,6 +25,13 @@ export default async function Privacy() {
             <div key="u" className="ak-stack">
               <ActForm inline action="privacy.update" extra={{ id: r.id }} submit="Update" fields={[{ name: 'status', label: 'Status', type: 'select', options: ['in_progress', 'completed', 'rejected'] }, { name: 'notes', label: 'Notes' }]} />
               {r.kind === 'delete_user' ? <ActForm inline action="privacy.delete_user" extra={{ id: r.id }} submit="🔐 Delete account" fields={[{ name: 'reason', label: 'Verification reference', required: true }]} /> : null}
+              {(r.kind === 'access' || r.kind === 'export') && r.workspace_id ? <ActButton small action="privacy.run_export" payload={{ id: r.id }}>🔐 Run workspace export</ActButton> : null}
+              {r.kind === 'delete_workspace' && r.workspace_id ? <ActForm inline action="privacy.schedule_purge" extra={{ id: r.id }} submit="🔐 Schedule purge" fields={[{ name: 'reason', label: 'Verification reference', required: true }]} /> : null}
+              {r.kind === 'delete_person_in_reviews' && r.workspace_id ? (
+                <ActForm inline action="privacy.erase_reviews" extra={{ requestId: r.id, workspaceId: r.workspace_id }} submit="🔐 Erase (break-glass)" fields={[{ name: 'phrase', label: 'Distinctive phrase / name', required: true }, { name: 'reason', label: 'Verification reference', required: true }]} />
+              ) : null}
+              {r.kind !== 'delete_user' && !r.workspace_id ? <span className="ak-small ak-muted">Log the workspace on this request to run its tool.</span> : null}
+              {r.notes ? <span className="ak-small ak-muted">{r.notes as string}</span> : null}
             </div>
           ) : ((r.notes as string) ?? '')];
       })} empty="No requests." />

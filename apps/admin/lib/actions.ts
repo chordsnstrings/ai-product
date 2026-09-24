@@ -169,6 +169,20 @@ async function sendStaffInvite(s: StaffUser, email: string, name: string, token:
   await sendEmail('staff_invite', email, { name, inviterName: s.name, url: `${env().ADMIN_URL}/invite/${token}`, expiresIn: `${STAFF_INVITE_HOURS} hours` }, { idempotencyKey: `staff-invite:${inviteId}` });
 }
 
+/** An open data request of the given kinds, with the workspace it concerns (plan 05 §21 per-request tools). */
+async function openDataRequest(tx: Parameters<Parameters<typeof withAdmin>[0]>[0], id: string, kinds: DataRequestKind[], workspaceId?: string) {
+  const [r] = await tx`select kind, status, workspace_id from data_requests where id = ${id} for update`;
+  if (!r) throw new DomainError('NOT_FOUND', 'Request not found');
+  if (!['open', 'in_progress'].includes(r.status as string)) throw new DomainError('CONFLICT', 'This request is already closed.');
+  if (!kinds.includes(r.kind as DataRequestKind)) throw new DomainError('CONFLICT', `This tool answers ${kinds.join(' / ')} requests, not ${r.kind as string}.`);
+  if (!r.workspace_id) throw new DomainError('INVALID', 'Set the workspace on the request first.');
+  if (workspaceId && r.workspace_id !== workspaceId) throw new DomainError('INVALID', 'That request is about a different workspace.');
+  return { kind: r.kind as DataRequestKind, workspaceId: r.workspace_id as string };
+}
+async function noteDataRequest(tx: Parameters<Parameters<typeof withAdmin>[0]>[0], id: string, note: string) {
+  await tx`update data_requests set status = 'in_progress', notes = concat_ws(' · ', notes, ${note}::text) where id = ${id}`;
+}
+
 /** Customer-app link inside the workspace (plan 02 M11): email buttons land on the page they name. */
 export const appUrl = (slug: string, path: string) => `${env().APP_URL}/w/${slug}${path}`;
 async function workspaceSlug(workspaceId: string) {
@@ -1242,24 +1256,66 @@ export const ACTIONS = {
       const done = u ? await deleteUser(u.id as string, { by: 'staff' }) : { workspaces: 0 };
       await withAdmin(async (tx) => {
         const note = u ? `Account deleted (${done.workspaces} workspace memberships removed).` : 'No account with this email.';
-        await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${note}) where id = ${i.id}`;
+        await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${note}::text) where id = ${i.id}`;
         await audit(tx, s, 'privacy.delete_user', { type: 'data_request', id: i.id }, { reason: i.reason, after: { userId: (u?.id as string) ?? null, ...done } });
       });
       return { message: u ? 'Account deleted.' : 'No account with this email — request completed.' };
     },
   }),
   'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status, notes, workspace_id from data_requests where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Request not found'); await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, before: { status: b.status, notes: b.notes }, after: { status: i.status, notes: i.notes ?? b.notes } }); }) }),
+  // Plan 05 §21 tools, run from the request they answer: each one moves the request along and notes what was done.
+  'privacy.run_export': a({
+    perm: 'privacy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, reason: z.string().trim().max(500).optional() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const r = await openDataRequest(tx, i.id, ['access', 'export']);
+        await enqueue(tx, r.workspaceId, Queues.exportWorkspace, { requestedBy: { kind: 'staff', id: s.staffId }, requestedAt: new Date().toISOString(), dataRequestId: i.id }, { singletonKey: `export:${r.workspaceId}` });
+        await noteDataRequest(tx, i.id, `Workspace export queued by ${s.name}; the download link goes to the workspace owners.`);
+        await audit(tx, s, 'privacy.run_export', { type: 'data_request', id: i.id }, { workspaceId: r.workspaceId, reason: i.reason ?? null });
+        return { message: 'Export queued; the request is now in progress.' };
+      }),
+  }),
+  'privacy.schedule_purge': a({
+    perm: 'privacy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, reason }),
+    run: async (s, i) => {
+      const r = await withAdmin((tx) => openDataRequest(tx, i.id, ['delete_workspace']));
+      await scheduleTenantPurge(s, r.workspaceId, `data request ${i.id.slice(0, 8)}: ${i.reason}`);
+      await withAdmin(async (tx) => {
+        await noteDataRequest(tx, i.id, `Purge scheduled by ${s.name}; the purge certificate completes this request.`);
+        await audit(tx, s, 'privacy.schedule_purge', { type: 'data_request', id: i.id }, { workspaceId: r.workspaceId, reason: i.reason });
+      });
+      return { message: 'Purge scheduled (grace period first); the request is now in progress.' };
+    },
+  }),
+  // §21 "find and delete a specific person's review text across a tenant (break-glass + tenant notice)".
   'privacy.erase_reviews': a({
     perm: 'privacy.manage',
     reauth: true,
-    schema: z.object({ workspaceId: uuid, phrase: z.string().min(4).max(200), reason }),
-    run: (s, i) =>
-      withAdmin(async (tx) => {
+    schema: z.object({ workspaceId: uuid, phrase: z.string().min(4).max(200), requestId: uuid.optional(), reason }),
+    run: async (s, i) => {
+      const deleted = await withAdmin(async (tx) => {
         await assertBreakGlass(tx, s, i.workspaceId, 'erase a person’s review text', true);
-        const del = await tx`delete from customer_signals where workspace_id = ${i.workspaceId} and text ilike ${'%' + i.phrase.replace(/[%_]/g, '') + '%'} returning id`;
-        await audit(tx, s, 'privacy.erase_reviews', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { deleted: del.length } });
-        return { message: `Deleted ${del.length} review snippets. Themes refresh on the next clustering run.` };
-      }),
+        if (i.requestId) await openDataRequest(tx, i.requestId, ['delete_person_in_reviews'], i.workspaceId);
+        const del = await tx`delete from customer_signals where workspace_id = ${i.workspaceId} and text ilike ${'%' + i.phrase.replace(/[%_\\]/g, '') + '%'} returning id`;
+        await audit(tx, s, 'privacy.erase_reviews', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { deleted: del.length, requestId: i.requestId ?? null } });
+        if (i.requestId) {
+          await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${`Deleted ${del.length} review snippets (${s.name}); owners notified.`}::text) where id = ${i.requestId}`;
+        }
+        return del.length;
+      });
+      // The tenant is told what was removed from their workspace and why (never whose text it was).
+      const [w] = await withAdmin((tx) => tx`select name from workspaces where id = ${i.workspaceId}`);
+      const url = appUrl(await workspaceSlug(i.workspaceId), '/settings/access-log');
+      const reference = i.requestId ? `Privacy request ${i.requestId.slice(0, 8)}` : i.reason.slice(0, 80);
+      for (const to of await ownerEmails(i.workspaceId)) {
+        await sendEmail('review_text_erased', to, { workspaceName: (w?.name as string) ?? 'your workspace', deleted, reference, url }, { idempotencyKey: `review-erase:${i.workspaceId}:${i.requestId ?? i.phrase}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      }
+      return { message: `Deleted ${deleted} review snippets; the workspace owners were notified. Themes refresh on the next clustering run.` };
+    },
   }),
 
   /* ── Taxonomy ── */

@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
-import { assertStaff, decideApproval, decideOwnershipTransfer, lookupInvite, startBreakGlass } from '@arkiv/core';
+import { assertStaff, decideApproval, decideOwnershipTransfer, lookupInvite, Queues, startBreakGlass } from '@arkiv/core';
 import { MockStripe, setBillingGateway } from '@arkiv/billing';
 import { acceptStaffInvite, staffLogin, totp, viewStaffInvite } from '@arkiv/auth';
 import { devOutbox, REDACTED_LINK, sendEmail } from '@arkiv/email';
@@ -222,6 +222,44 @@ describe('privacy.create (plan 05 §21)', () => {
     for (const kind of DataRequestKind) await act(c, 'privacy.create', { kind, requesterEmail: 'person@example.com', workspaceId: t.workspaceId });
     const rows = await ownerPool()`select kind from data_requests order by kind`;
     expect(rows.map((r) => r.kind)).toEqual([...DataRequestKind].sort());
+  });
+
+  it('runs each tool from the request it answers, and tells the tenant when review text is erased', async () => {
+    const c = await staff(['COMPLIANCE']);
+    const sa = await staff(['SUPER_ADMIN']);
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const req = async (kind: string, workspaceId: string | null = t.workspaceId) =>
+      (await ownerPool()`insert into data_requests (kind, requester_email, workspace_id, due_at) values (${kind}, 'person@example.com', ${workspaceId}, now() + interval '45 days') returning id`)[0]!.id as string;
+
+    // Export for an access request: queued, request in progress with a note.
+    const exp = await req('export');
+    await expect(act(c, 'privacy.run_export', { id: await req('delete_user') })).rejects.toThrow(/answers access \/ export/);
+    await expect(act(c, 'privacy.run_export', { id: await req('access', null) })).rejects.toThrow(/Set the workspace/);
+    await act(c, 'privacy.run_export', { id: exp });
+    const [o] = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and queue = ${Queues.exportWorkspace}`;
+    expect(o!.payload).toMatchObject({ dataRequestId: exp });
+    expect(await ownerPool()`select status, notes from data_requests where id = ${exp}`).toMatchObject([{ status: 'in_progress', notes: expect.stringMatching(/export queued/) }]);
+
+    // Purge for a workspace deletion request.
+    const del = await req('delete_workspace');
+    await act(sa, 'privacy.schedule_purge', { id: del, reason: 'verified owner by email' });
+    expect(await ownerPool()`select state from workspaces where id = ${t.workspaceId}`).toEqual([{ state: 'PURGE_SCHEDULED' }]);
+    expect(await ownerPool()`select status from data_requests where id = ${del}`).toEqual([{ status: 'in_progress' }]);
+
+    // Erasing review text: break-glass write, the request completes, and the owners get a notice.
+    await ownerPool()`insert into customer_signals (workspace_id, sku_id, source, text) values (${t.workspaceId}, ${sku}, 'review', 'Jo Bloggs from Leeds loves it'), (${t.workspaceId}, ${sku}, 'review', 'Great serum')`;
+    const erase = await req('delete_person_in_reviews');
+    await expect(act(sa, 'privacy.erase_reviews', { workspaceId: t.workspaceId, phrase: 'Jo Bloggs', requestId: erase, reason: 'verified by email' })).rejects.toThrow(/break-glass/i);
+    await startBreakGlass(sa, t.workspaceId, { reasonKind: 'compliance_review', reason: 'privacy request: erase review text', write: true, writeReason: 'delete a person’s review text' });
+    devOutbox.length = 0;
+    const r = await act(sa, 'privacy.erase_reviews', { workspaceId: t.workspaceId, phrase: 'Jo Bloggs', requestId: erase, reason: 'verified by email' });
+    expect(r.message).toMatch(/Deleted 1 review snippets/);
+    expect(await ownerPool()`select text from customer_signals where workspace_id = ${t.workspaceId}`).toEqual([{ text: 'Great serum' }]);
+    expect(await ownerPool()`select status from data_requests where id = ${erase}`).toEqual([{ status: 'completed' }]);
+    const notice = devOutbox.find((m) => m.template === 'review_text_erased');
+    expect(notice).toBeTruthy();
+    expect(notice!.html).not.toContain('Jo Bloggs');
   });
 });
 
