@@ -616,7 +616,7 @@ describe('prompts, evals and golden sets (plan 05 §11)', () => {
     const eng = await staff(['ENGINEERING']);
     await act(eng, 'eval.run', { dataset: 'extract.packaging' });
     const [run] = await ownerPool()`select task, model, prompt_version, dataset from eval_runs order by created_at desc limit 1`;
-    expect(run).toMatchObject({ task: 'extract.product_facts', dataset: 'extract.packaging', prompt_version: 'extract-product@1.1.0' });
+    expect(run).toMatchObject({ task: 'extract.product_facts', dataset: 'extract.packaging', prompt_version: 'extract-product@1.2.0' });
     await expect(act(eng, 'eval.run', { task: 'extract.product_facts', promptVersion: 'extract-product@7.0.0' })).rejects.toThrow(/registered version/);
     await expect(act(eng, 'eval.run', { task: 'extract.product_facts', model: 'unpriced-model' })).rejects.toThrow(/No published rate/);
     await expect(act(eng, 'route.update', { task: 'creative_director.storyboard', rolloutPct: '5', promptVersion: 'storyboard@3.0.0', reason: 'typo' })).rejects.toThrow(/registered version/);
