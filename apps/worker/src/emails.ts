@@ -1,5 +1,5 @@
 import { withTenant } from '@arkiv/db';
-import { env, formatUsd, PLANS, PRICES, type PlanCode, type RiskIndicator } from '@arkiv/shared';
+import { env, formatTime, formatUsd, PLANS, PRICES, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { isTemplateName, quietHoursDelay, sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
 import { assetUrl, enqueue, Queues, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
@@ -95,7 +95,7 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       const [o] = await withTenant(ws, (tx) => tx`select o.price_micros, o.reference_price_micros, o.expires_at, o.status, s.name, p.id as project_id
                                                    from offers o join projects p on p.id = o.project_id join skus s on s.id = p.sku_id where o.id = ${data.offerId as string}`);
       if (o && o.status === 'active') {
-        const endsAt = new Date(o.expires_at as string).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' }) + ' ET';
+        const endsAt = formatTime(o.expires_at as string);
         await sendRecovery('offer_ending', o.project_id as string, { productName: o.name, url: recoveryUrl(app, o.project_id as string, 'offer_ending'), endsAt, price: formatUsd(Number(o.price_micros), 0), regular: formatUsd(Number(o.reference_price_micros ?? 29_000_000), 0) });
       }
       return;

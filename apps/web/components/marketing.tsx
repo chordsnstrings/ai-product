@@ -2,6 +2,7 @@ import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { globalTx } from '@arkiv/db';
 import { setting } from '@arkiv/core';
+import { ThemeScope } from '@arkiv/ui/client';
 
 /** Support address and legal links are platform settings (plan 05 §20), editable in the staff console. */
 async function footerSettings() {
@@ -12,7 +13,7 @@ async function footerSettings() {
 export async function MarketingShell({ children, loggedIn }: { children: ReactNode; loggedIn: boolean }) {
   const f = await footerSettings();
   return (
-    <div data-theme="light" style={{ background: 'var(--paper)', minHeight: '100vh' }}>
+    <ThemeScope theme="light">
       <header className="ak-wrap ak-between" style={{ paddingTop: 20, paddingBottom: 20 }}>
         <Link href="/" className="ak-wordmark">Arkiv</Link>
         {loggedIn ? <Link className="ak-textbtn" href="/app">Your archive</Link> : <Link className="ak-textbtn" href="/login">Log in</Link>}
@@ -32,6 +33,6 @@ export async function MarketingShell({ children, loggedIn }: { children: ReactNo
           </span>
         </div>
       </footer>
-    </div>
+    </ThemeScope>
   );
 }

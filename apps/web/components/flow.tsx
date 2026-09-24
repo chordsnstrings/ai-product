@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Banner, Button, ClaimChip, Ledger, LinkButton, MetadataTable, ProvenanceChip, Rail } from '@arkiv/ui';
-import { api, OfferExpiry, Sheet, StickyCta, usePoll } from '@arkiv/ui/client';
+import { Banner, Button, ClaimChip, Field, Input, LinkButton, LockButton, MetadataTable, Rail, SpecimenCard } from '@arkiv/ui';
+import { api, LiveLedger, OfferExpiry, ProvenanceChip, Sheet, StickyCta, usePoll } from '@arkiv/ui/client';
+import { formatDate, formatTime } from '@arkiv/shared/format';
 import type { ProjectView } from '@/lib/views';
 
 type View = ProjectView & { access: { provisional: boolean; signedIn: boolean; role: string; workspaceSlug: string | null } };
@@ -245,12 +246,40 @@ function WaitlistForm({ projectId }: { projectId: string }) {
   );
 }
 
+/**
+ * M2: which catalogued facts just arrived. Driven by the real server updates (each stream/poll result), not a
+ * timer — the facts already on screen when the page opens are not replayed, and each new batch animates once.
+ */
+function useNewFactKeys(keys: string[] | null): ReadonlySet<string> {
+  const seen = useRef<Set<string> | null>(null);
+  const [fresh, setFresh] = useState<ReadonlySet<string>>(() => new Set());
+  const sig = keys ? keys.join('\n') : null;
+  useEffect(() => {
+    if (sig === null) return;
+    const now = sig ? sig.split('\n') : [];
+    if (!seen.current) {
+      seen.current = new Set(now);
+      return;
+    }
+    const added = now.filter((k) => !seen.current!.has(k));
+    if (!added.length) return;
+    for (const k of added) seen.current.add(k);
+    setFresh(new Set(added));
+  }, [sig]);
+  // Rows rendered before the effect records them are new already (so they never flash in unanimated).
+  if (!keys || !seen.current) return fresh;
+  const unseen = keys.filter((k) => !seen.current!.has(k));
+  return unseen.length ? new Set([...fresh, ...unseen]) : fresh;
+}
+
 export function AnalysisFlow({ projectId }: { projectId: string }) {
   const active = useCallback((v: View | null) => !v || v.sku.status === 'analyzing' || (v.sku.status === 'active' && v.concepts.length === 0 && v.project.state !== 'NEEDS_USER_ACTION'), []);
   const { data: v, error, refresh, resume } = useProject(projectId, active);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [err, setErr] = useState<string | null>(null);
+  const newKeys = useNewFactKeys(v ? v.facts.filter((f) => FACT_LABELS[f.key]).map((f) => f.key) : null);
+  const [cutoutShown, setCutoutShown] = useState(false);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
 
   if (v.sku.status === 'rejected') {
@@ -314,57 +343,64 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
       sub={analyzing ? 'This is real work, happening now — usually under a minute. You can leave this tab; we’ll keep going.' : failed ? 'Here’s what we found. Add anything that’s missing and try again — nothing has been charged.' : `No. ${String(v.sku.catalogueNo).padStart(3, '0')} · Check the details below. Anything you correct is used exactly as you write it.`}
     >
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-        <div className="ak-specimen" data-ready={!!v.sku.cutoutUrl}>
-          {v.sku.cutoutUrl ? <img src={v.sku.cutoutUrl} alt={`${v.sku.name} product photo`} className="ak-draw" /> : <div className="ak-stone" style={{ aspectRatio: '4/5' }} aria-hidden />}
-          <p className="ak-specimen-caption ak-index">No. {String(v.sku.catalogueNo).padStart(3, '0')}{v.sku.packaging?.type ? ` · ${String(v.sku.packaging.type)}` : ''}</p>
-        </div>
+        {/* M3: the cut-out is placed onto the paper well with a clip reveal from the bottom, once it has loaded. */}
+        <SpecimenCard
+          index={`No. ${String(v.sku.catalogueNo).padStart(3, '0')}`}
+          title={analyzing ? undefined : v.sku.name}
+          meta={v.sku.packaging?.type ? [['Packaging', String(v.sku.packaging.type)]] : []}
+          image={v.sku.cutoutUrl ? { src: v.sku.cutoutUrl, alt: `${v.sku.name} product photo` } : null}
+          imageClassName={cutoutShown ? 'ak-reveal-up' : 'ak-reveal-wait'}
+          onImageLoad={() => setCutoutShown(true)}
+        />
         <div className="ak-stack">
-          <Ledger steps={v.steps} />
-          {!analyzing ? (
-            <>
-              {disputed.length ? <Banner tone="warn">Your page and photos disagree on {disputed.map((d) => FACT_LABELS[d.key] ?? d.key).join(', ')}. Tell us which is right.</Banner> : null}
-              {v.facts.some((f) => f.sourceConflict?.newer) ? <Banner tone="warn">Your store changed {v.facts.filter((f) => f.sourceConflict?.newer).map((d) => FACT_LABELS[d.key] ?? d.key).join(', ')} since you corrected it. Keep yours, or use the store’s value.</Banner> : null}
-              <MetadataTable
-                animate
-                rows={v.facts
-                  .filter((f) => FACT_LABELS[f.key])
-                  .map((f) => ({
-                    key: f.key,
-                    label: FACT_LABELS[f.key]!,
-                    value:
-                      editing === f.key ? (
-                        <form onSubmit={(e) => { e.preventDefault(); void save(f.key); }} className="ak-row">
-                          <input className="ak-input" autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} aria-label={FACT_LABELS[f.key]} />
-                          <Button size="sm" type="submit">Save</Button>
-                          <button type="button" className="ak-textbtn" onClick={() => setEditing(null)}>Cancel</button>
-                        </form>
-                      ) : (
-                        <span>
-                          {f.key === 'ingredients' && f.value.length > 120 ? `${f.value.slice(0, 120)}…` : f.value}
-                          {EDITABLE.has(f.key) ? <button className="ak-textbtn" style={{ marginLeft: 8 }} onClick={() => { setEditing(f.key); setDraft(f.value); }}>Fix</button> : null}
-                          {f.sourceConflict ? (
-                            <span className="ak-small ak-muted" style={{ display: 'block' }}>
-                              {SOURCE_WORDS[f.sourceConflict.source] ?? 'Another source'} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.value}”
-                              {f.sourceConflict.newer ? ` (since ${new Date(f.sourceConflict.observedAt).toLocaleDateString()})` : ''}.
-                              {f.sourceConflict.newer && EDITABLE.has(f.key) ? (
-                                <>
-                                  {' '}<button className="ak-textbtn" onClick={() => void resolveSource(f.key, { value: f.value })}>Keep yours</button>
-                                  {' · '}<button className="ak-textbtn" onClick={() => void resolveSource(f.key, { factId: f.sourceConflict!.factId })}>Use store value</button>
-                                </>
-                              ) : null}
-                            </span>
+          <LiveLedger steps={v.steps} />
+          {!analyzing && disputed.length ? <Banner tone="warn">Your page and photos disagree on {disputed.map((d) => FACT_LABELS[d.key] ?? d.key).join(', ')}. Tell us which is right.</Banner> : null}
+          {!analyzing && v.facts.some((f) => f.sourceConflict?.newer) ? <Banner tone="warn">Your store changed {v.facts.filter((f) => f.sourceConflict?.newer).map((d) => FACT_LABELS[d.key] ?? d.key).join(', ')} since you corrected it. Keep yours, or use the store’s value.</Banner> : null}
+          {/* M2: facts appear as each one is extracted (real server updates), numbered, while the analysis runs. */}
+          <MetadataTable
+            indexed
+            newKeys={newKeys}
+            rows={v.facts
+              .filter((f) => FACT_LABELS[f.key])
+              .map((f) => ({
+                key: f.key,
+                label: FACT_LABELS[f.key]!,
+                value:
+                  editing === f.key ? (
+                    <form onSubmit={(e) => { e.preventDefault(); void save(f.key); }} className="ak-row">
+                      <input className="ak-input" autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} aria-label={FACT_LABELS[f.key]} aria-invalid={err ? true : undefined} aria-describedby={err ? 'fact-error' : undefined} />
+                      <Button size="sm" type="submit">Save</Button>
+                      <button type="button" className="ak-textbtn" onClick={() => setEditing(null)}>Cancel</button>
+                    </form>
+                  ) : (
+                    <span>
+                      {f.key === 'ingredients' && f.value.length > 120 ? `${f.value.slice(0, 120)}…` : f.value}
+                      {EDITABLE.has(f.key) && !analyzing ? <button className="ak-textbtn" style={{ marginLeft: 8 }} onClick={() => { setEditing(f.key); setDraft(f.value); }}>Fix</button> : null}
+                      {f.sourceConflict && !analyzing ? (
+                        <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                          {SOURCE_WORDS[f.sourceConflict.source] ?? 'Another source'} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.value}”
+                          {f.sourceConflict.newer ? ` (since ${formatDate(f.sourceConflict.observedAt)})` : ''}.
+                          {f.sourceConflict.newer && EDITABLE.has(f.key) ? (
+                            <>
+                              {' '}<button className="ak-textbtn" onClick={() => void resolveSource(f.key, { value: f.value })}>Keep yours</button>
+                              {' · '}<button className="ak-textbtn" onClick={() => void resolveSource(f.key, { factId: f.sourceConflict!.factId })}>Use store value</button>
+                            </>
                           ) : null}
                         </span>
-                      ),
-                    chip: (
-                      <span className="ak-row" style={{ gap: 6 }}>
-                        <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} />
-                        {f.confirmed && f.state !== 'DECIDED' ? <span className="ak-small ak-muted" title="You confirmed this">✓ confirmed</span> : null}
-                      </span>
-                    ),
-                  }))}
-              />
-              {err ? <p className="ak-error" role="alert">{err}</p> : null}
+                      ) : null}
+                    </span>
+                  ),
+                chip: (
+                  <span className="ak-row" style={{ gap: 6 }}>
+                    <ProvenanceChip state={f.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.source} at={f.observedAt} />
+                    {f.confirmed && f.state !== 'DECIDED' ? <span className="ak-small ak-muted" title="You confirmed this">✓ confirmed</span> : null}
+                  </span>
+                ),
+              }))}
+          />
+          {!analyzing ? (
+            <>
+              {err ? <p className="ak-error" role="alert" id="fact-error">{err}</p> : null}
               {failed ? (
                 <div className="ak-stack">
                   <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
@@ -548,11 +584,9 @@ export function SaveGate({ open, onOpenChange, next, productName }: { open: bool
         </div>
       ) : (
         <form onSubmit={send} className="ak-stack">
-          <label className="ak-field">
-            <span className="ak-label">Work email</span>
-            <input className="ak-input" type="email" inputMode="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
-          </label>
-          {err ? <p className="ak-error" role="alert">{err}{suggestion ? <> — did you mean <button type="button" className="ak-textbtn" onClick={() => setEmail(suggestion)}>{suggestion}</button>?</> : null}</p> : null}
+          <Field label="Work email" error={err ? <>{err}{suggestion ? <> — did you mean <button type="button" className="ak-textbtn" onClick={() => setEmail(suggestion)}>{suggestion}</button>?</> : null}</> : undefined}>
+            <Input type="email" inputMode="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+          </Field>
           <Button type="submit" block>Email me a sign-in link</Button>
           <div className="ak-row" style={{ justifyContent: 'center' }}>
             <a className="ak-btn ak-btn--secondary" href={`/api/auth/google/start?next=${encodeURIComponent(next)}`}>Continue with Google</a>
@@ -619,15 +653,15 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           ))}
         </Banner>
       ) : null}
-      {!sb || sb.status === 'generating' ? <Ledger steps={sb?.steps ?? []} /> : null}
+      {!sb || sb.status === 'generating' ? <LiveLedger steps={sb?.steps ?? []} /> : null}
       {sb && sb.scenes.length ? (
         <div className="ak-scroll-row" role="list">
           {sb.scenes.map((s) => (
             <figure key={s.id} className="ak-frame" role="listitem" data-locked={s.locked}>
-              <div className="ak-well ak-well--916">{s.frameUrl ? <img src={s.frameUrl} alt={`Scene ${s.position + 1}: ${s.visualPlan}`} /> : <div className="ak-stone" style={{ height: '100%' }} aria-hidden />}</div>
+              <div className="ak-well ak-well--916">{s.frameUrl ? <img src={s.frameUrl} alt={`Scene ${s.position + 1}: ${s.visualPlan}`} /> : <span className="ak-index" aria-hidden>{String(s.position + 1).padStart(2, '0')}</span>}</div>
               <figcaption className="ak-small">
                 <div className="ak-between"><span className="ak-index">{String(s.position + 1).padStart(2, '0')} · {PURPOSE[s.purpose] ?? s.purpose}</span><span className="ak-index">{(s.durationMs / 1000).toFixed(1)}s</span></div>
-                {s.overlayText ? <p style={{ fontWeight: 600 }}>{s.overlayText}</p> : null}
+                {s.overlayText ? <p style={{ fontWeight: 500 }}>{s.overlayText}</p> : null}
                 {s.spokenLine ? <p className="ak-muted">“{s.spokenLine}”</p> : null}
                 {s.plannerReason ? <p className="ak-small ak-muted">{MODE_LABEL[s.productionMode] ?? 'Scene'} · {s.plannerReason}</p> : null}
                 {s.regeneration?.status === 'pending' || s.regeneration?.status === 'active' ? <p className="ak-small ak-muted" role="status">Redrawing this frame…</p> : null}
@@ -635,7 +669,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
                 <div className="ak-row">
                   <button className="ak-textbtn" disabled={s.locked} onClick={() => setEdit({ id: s.id, spokenLine: s.spokenLine ?? '', overlayText: s.overlayText ?? '' })}>Edit words</button>
                   <button className="ak-textbtn" disabled={s.locked || s.regeneration?.status === 'pending' || s.regeneration?.status === 'active'} onClick={() => setRegen({ id: s.id, text: '' })}>Change picture</button>
-                  <button className="ak-textbtn" onClick={() => call(`/api/scenes/${s.id}/lock`, { projectId, locked: !s.locked })}>{s.locked ? 'Unlock' : 'Lock'}</button>
+                  <LockButton locked={s.locked} scene={String(s.position + 1)} onClick={() => void call(`/api/scenes/${s.id}/lock`, { projectId, locked: !s.locked })} />
                 </div>
               </figcaption>
             </figure>
@@ -781,7 +815,7 @@ export function ProduceFlow({ projectId }: { projectId: string }) {
         <ProductionIssue projectId={projectId} v={v} onChange={resume} />
       ) : v.project.resumable || waitingPayment ? null : (
         <>
-          <Ledger steps={v.productionSteps} />
+          <LiveLedger steps={v.productionSteps} />
           <Liveness live={v.project.liveness} />
         </>
       )}
@@ -839,7 +873,7 @@ const STOPPED = ['PROVIDER_FAILED', 'REFUNDED', 'BLOCKED_COMPLIANCE', 'NEEDS_USE
 /** Has this production stopped (not merely queued behind a busy partner)? */
 export const productionStopped = (v: Pick<ProjectView, 'project'>) => !v.project.paused && STOPPED.includes(v.project.state);
 
-const clock = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+const clock = (iso: string) => formatTime(iso);
 
 /** Plan 03 P9: "Queued: our video partner is busy. Your place is held." plus an ETA if known. */
 export function QueuedBanner({ v }: { v: Pick<ProjectView, 'project'> }) {
@@ -951,8 +985,14 @@ export function AiDisclosureSteps({ disclosure }: { disclosure: ProjectView['dis
 }
 
 /** P10 "Watch" (standard §7): the finished ad counts as watched once it has played for 3 seconds or to the end. */
-function WatchedVideo({ projectId, assetId, src }: { projectId: string; assetId: string; src: string }) {
+function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked }: { projectId: string; assetId: string; src: string; onPlaying?: () => void; onBlocked?: () => void }) {
   const sent = useRef(false);
+  const el = useRef<HTMLVideoElement>(null);
+  // M12: plays inline at once, muted (captions are burned in). A browser that refuses autoplay gets the controls.
+  useEffect(() => {
+    const p = el.current?.play();
+    if (p) p.catch(() => onBlocked?.());
+  }, [src, onBlocked]);
   const report = (seconds: number) => {
     if (sent.current) return;
     sent.current = true;
@@ -960,10 +1000,14 @@ function WatchedVideo({ projectId, assetId, src }: { projectId: string; assetId:
   };
   return (
     <video
+      ref={el}
       src={src}
+      autoPlay
+      muted
       controls
       playsInline
-      preload="metadata"
+      preload="auto"
+      onPlaying={onPlaying}
       style={{ width: '100%', height: '100%', objectFit: 'contain' }}
       onTimeUpdate={(e) => {
         if (e.currentTarget.currentTime >= 3) report(e.currentTarget.currentTime);
@@ -1004,8 +1048,28 @@ function FactUpdate({ projectId, update }: { projectId: string; update: { shown:
   );
 }
 
+/** M12: the export CTA fades in 1.2s after playback starts (at once under reduced motion; 4s at most). */
+function useShowAfterPlay() {
+  const [show, setShow] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const reveal = useCallback(() => setShow(true), []);
+  useEffect(() => {
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return reveal();
+    const fallback = setTimeout(reveal, 4000);
+    return () => {
+      clearTimeout(fallback);
+      clearTimeout(timer.current);
+    };
+  }, [reveal]);
+  const onPlaying = useCallback(() => {
+    if (timer.current === undefined) timer.current = setTimeout(reveal, 1200);
+  }, [reveal]);
+  return { show, onPlaying, reveal };
+}
+
 export function DeliverFlow({ projectId }: { projectId: string }) {
   const { data: v, error } = useProject(projectId, useCallback(() => false, []));
+  const after = useShowAfterPlay();
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
   if (v.project.state !== 'COMPLETE') {
     if (typeof window !== 'undefined') window.location.replace(`/produce/${projectId}`);
@@ -1017,32 +1081,41 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
   return (
     <Shell step={4} title="Your ad is ready" sub={`${v.sku.name} · 15 seconds · checked for product accuracy and claims.`}>
       <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-        <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} /> : null}</div>
+        <div className="ak-well ak-well--916">{primary ? <WatchedVideo projectId={projectId} assetId={primary.assetId} src={primary.url} onPlaying={after.onPlaying} onBlocked={after.reveal} /> : null}</div>
         <div className="ak-stack">
           <FactUpdate projectId={projectId} update={v.project.factUpdate} />
-          <h2 className="ak-label">Download</h2>
-          {v.exports.map((e) => (
-            <a key={e.assetId} className="ak-index-row" href={e.download} download>
-              <span>{ASPECT[e.aspect] ?? e.aspect}</span>
-              <span className="ak-index">MP4 ↓</span>
-            </a>
-          ))}
-          {qa.length ? (
-            <details>
-              <summary className="ak-small">What we checked</summary>
-              <ul className="ak-small">{qa.map((c) => <li key={c.label}>{c.label} {c.ok ? '✓' : '•'}</li>)}</ul>
-            </details>
-          ) : null}
-          <AiDisclosureSteps disclosure={v.disclosure} />
-          <hr className="ak-rule" />
-          <h2 className="ak-label">What to do next</h2>
-          <ol className="ak-small">
-            <li>Upload the 9:16 file to TikTok or Reels as a new ad.</li>
-            <li>Run it for 5–7 days alongside your current best ad.</li>
-            <li>Connect your ad account and we’ll tell you what it taught you.</li>
-          </ol>
-          {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
-          <LinkButton href="/app/plan">Test 3 ideas a month · see plans</LinkButton>
+          <div className="ak-stack ak-after-play" data-show={after.show || !primary}>
+            <h2 className="ak-label">Download</h2>
+            {v.exports.map((e) => (
+              <a key={e.assetId} className="ak-index-row" href={e.download} download>
+                <span>{ASPECT[e.aspect] ?? e.aspect}</span>
+                <span className="ak-index">MP4 ↓</span>
+              </a>
+            ))}
+            {qa.length ? (
+              <details>
+                <summary className="ak-small">What we checked</summary>
+                <ul className="ak-small">
+                  {qa.map((c) => (
+                    <li key={c.label}>
+                      {/* The state is said in words, not only by the mark (a flagged check was reviewed before delivery). */}
+                      {c.label} <span aria-hidden>{c.ok ? '✓' : '•'}</span> <span className={c.ok ? 'ak-sr' : 'ak-muted'}>{c.ok ? 'Passed' : 'Flagged and reviewed'}</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            ) : null}
+            <AiDisclosureSteps disclosure={v.disclosure} />
+            <hr className="ak-rule" />
+            <h2 className="ak-label">What to do next</h2>
+            <ol className="ak-small">
+              <li>Upload the 9:16 file to TikTok or Reels as a new ad.</li>
+              <li>Run it for 5–7 days alongside your current best ad.</li>
+              <li>Connect your ad account and we’ll tell you what it taught you.</li>
+            </ol>
+            {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
+            <LinkButton href="/app/plan">Test 3 ideas a month · see plans</LinkButton>
+          </div>
         </div>
       </div>
     </Shell>

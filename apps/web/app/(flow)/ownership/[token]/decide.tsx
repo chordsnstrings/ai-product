@@ -2,14 +2,14 @@
 
 import { useState } from 'react';
 import { Banner, Button } from '@arkiv/ui';
-import { api } from '@arkiv/ui/client';
+import { api, confirmSheet } from '@arkiv/ui/client';
 
 export function DecideOwnership({ token }: { token: string }) {
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   async function decide(confirm: boolean) {
-    if (confirm && !window.confirm('Transfer ownership now? You will become an admin.')) return;
+    if (confirm && !(await confirmSheet({ title: 'Transfer ownership now?', body: 'You will become an admin.', confirmLabel: 'Confirm new owner' })).ok) return;
     setBusy(true);
     setErr(null);
     try {

@@ -3,6 +3,7 @@ import { globalTx } from '@arkiv/db';
 import { openCreatorPack } from '@arkiv/core';
 import { MarketingShell } from '@/components/marketing';
 import { CreatorUpload } from '@/components/creator-upload';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Creator brief', robots: { index: false, follow: false } };
 
@@ -71,7 +72,7 @@ export default async function CreatorPackPage({ params }: { params: Promise<{ to
         <hr className="ak-rule" />
         <h2 className="ak-label">Send your footage</h2>
         <CreatorUpload token={token} brand={c.brandName ?? c.productName} />
-        <p className="ak-small ak-muted">This link works until {new Date(pack.expiresAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}.</p>
+        <p className="ak-small ak-muted">This link works until {formatDate(pack.expiresAt)}.</p>
       </article>
     </MarketingShell>
   );

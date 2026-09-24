@@ -3,7 +3,9 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import { assetUrl, currentFacts, verifiedIngredients } from '@arkiv/core';
-import { MetadataTable, ProvenanceChip } from '@arkiv/ui';
+import { MetadataTable, SpecimenCard } from '@arkiv/ui';
+import { ProvenanceChip } from '@arkiv/ui/client';
+import { formatDate } from '@arkiv/shared/format';
 import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 
@@ -78,7 +80,7 @@ export default async function Product({ params, searchParams }: { params: Promis
                   {f.sourceConflict ? (
                     <span className="ak-small ak-muted" style={{ display: 'block' }}>
                       {SOURCE_WORDS[f.sourceConflict.fact.sourceType] ?? f.sourceConflict.fact.sourceType} {f.sourceConflict.newer ? 'now says' : 'says'} “{f.sourceConflict.fact.valueText ?? f.sourceConflict.fact.valueNumber}”
-                      {' '}({new Date(f.sourceConflict.fact.observedAt).toLocaleDateString()}).
+                      {' '}({formatDate(f.sourceConflict.fact.observedAt)}).
                       {canEdit ? (
                         <span className="ak-row" style={{ gap: 8, marginTop: 4 }}>
                           {f.sourceConflict.newer ? (
@@ -91,7 +93,7 @@ export default async function Product({ params, searchParams }: { params: Promis
                   ) : null}
                 </span>
               ),
-              chip: <ProvenanceChip state={f.value.state as 'OBSERVED'} source={f.value.sourceType} />,
+              chip: <ProvenanceChip state={f.value.state as 'OBSERVED' | 'INFERRED' | 'DECIDED'} source={f.value.sourceType} at={f.value.observedAt} />,
             }))}
           />
           {canEdit ? (
@@ -122,13 +124,18 @@ export default async function Product({ params, searchParams }: { params: Promis
       {tab === 'look' ? (
         d.fp ? (
           <div className="ak-grid-2" style={{ alignItems: 'start' }}>
-            <div className="ak-specimen">{d.cutout ? <img src={d.cutout} alt="Product cutout" /> : null}<p className="ak-specimen-caption ak-index">Fingerprint v{d.fp.version as number}</p></div>
+            <SpecimenCard
+              index={`No. ${String(d.sku.catalogue_no).padStart(3, '0')}`}
+              title={d.sku.name as string}
+              meta={[['Fingerprint', `v${d.fp.version as number}`], ['Package', String(d.fp.package_type ?? '—')]]}
+              image={d.cutout ? { src: d.cutout, alt: `${d.sku.name as string} product cutout` } : null}
+            />
             <MetadataTable rows={[
               { label: 'Package', value: String(d.fp.package_type ?? '—') },
               { label: 'Closure', value: String(d.fp.closure ?? '—') },
               { label: 'Label text', value: String(d.fp.label_text ?? '—') },
               { label: 'Colours', value: <span className="ak-row">{(d.fp.dominant_colors as string[]).map((c) => <span key={c} title={c} style={{ width: 18, height: 18, background: c, border: '1px solid var(--rule)', display: 'inline-block' }} />)}</span> },
-              { label: 'Versions', value: d.fps.map((f) => `v${f.version} · ${new Date(f.created_at as string).toLocaleDateString()}`).join(', ') },
+              { label: 'Versions', value: d.fps.map((f) => `v${f.version} · ${formatDate(f.created_at as string)}`).join(', ') },
             ]} />
           </div>
         ) : <p className="ak-muted">No packaging fingerprint yet — add a clear product photo.</p>
@@ -161,11 +168,11 @@ export default async function Product({ params, searchParams }: { params: Promis
       {tab === 'assets' ? (
         <div className="ak-grid-3">
           {d.assets.map((a) => (
-            <figure key={a.id as string} className="ak-frame">
+            <figure key={a.id as string} className="ak-frame" style={{ margin: 0 }}>
               <div className="ak-well" style={{ aspectRatio: '1' }}>{a.url ? <img src={a.url} alt={String(a.kind)} style={{ objectFit: 'contain', width: '100%', height: '100%' }} /> : <span className="ak-index">{String(a.mime)}</span>}</div>
-              <figcaption className="ak-index">{String(a.kind).replace(/_/g, ' ')} · {new Date(a.created_at as string).toLocaleDateString()}</figcaption>
+              <figcaption className="ak-index">{String(a.kind).replace(/_/g, ' ')} · {formatDate(a.created_at as string)}</figcaption>
               {canEdit && DELETABLE_KINDS.has(a.kind) ? (
-                <ActionButton slug={slug} action="asset-delete" variant="text" body={{ assetId: a.id }} confirm="Delete this file? It disappears from Arkiv. Evidence behind an approved claim and delivered ads are kept for our records.">Delete</ActionButton>
+                <ActionButton slug={slug} action="asset-delete" variant="text" danger body={{ assetId: a.id }} confirm="Delete this file? It disappears from Arkiv. Evidence behind an approved claim and delivered ads are kept for our records.">Delete</ActionButton>
               ) : null}
             </figure>
           ))}

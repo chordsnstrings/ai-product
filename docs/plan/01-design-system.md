@@ -41,20 +41,25 @@ They are plain CSS custom properties in `packages/ui/src/styles.css`; components
 | `--paper-sunk` | `#ECE8E0` | Image wells, code, disabled |
 | `--ink` | `#1A1917` | Primary text, primary button fill |
 | `--ink-2` | `#4A4742` | Secondary text |
-| `--stone` | `#8A857D` | Tertiary text, index numbers, placeholders |
+| `--stone` | `#8A857D` | Non-text tertiary marks: placeholder wells, dots, the gathering tint |
+| `--stone-text` | `#6B6761` | Tertiary text: labels, index numbers, table headers (stone darkened to pass AA on `--paper-sunk`) |
 | `--rule` | `#D6D1C7` | Hairlines (1px; 0.5px on 2× screens) |
-| `--rule-strong` | `#BDB7AB` | Input borders, table header rules |
+| `--rule-strong` | `#BDB7AB` | Table header rules |
+| `--rule-input` | `#959087` | Input borders (≥ 3:1 on `--paper-raised`, WCAG 1.4.11) |
 | `--accent` | `#7A4A32` (clay) | **Only**: the single primary conversion CTA on marketing pages, focus ring, offer timer |
 | `--accent-ink` | `#FBFAF7` | Text on accent |
 | `--signal-gathering` | `#8A857D` | Gathering signal (stone: deliberately neutral) |
-| `--signal-directional` | `#8C7A3E` (ochre) | Directional |
+| `--signal-directional` | `#776734` (ochre) | Directional |
 | `--signal-actionable` | `#3F5B45` (moss) | Actionable, QA passed, verified claim |
 | `--risk` | `#9B3B2F` (oxide) | Blocked claim, hard QA fail, destructive |
 | `--risk-soft` | `#F1E3DE` | Risk backgrounds |
 
 Dark ("Ink") mode inverts: `--paper #141312`, `--paper-raised #1C1B19`,
-`--ink #EEEAE2`, `--rule #2E2C29`, and the accent lightens to `#C08A6A`. Pairs
-are checked for WCAG AA contrast in CI (text ≥ 4.5:1, large ≥ 3:1). The
+`--ink #EEEAE2`, `--rule #2E2C29`, and the accent lightens to `#C08A6A`. The
+state colours lighten with it: `--stone-text #9A948A`, `--rule-input #716C64`,
+`--signal-directional #9C8C55`, `--signal-actionable #7F9383`, `--risk #C27F76`
+on `--risk-soft #2E1A16`. Pairs are checked for WCAG AA contrast in CI
+(`packages/ui/src/tokens.test.ts`: text ≥ 4.5:1, input borders ≥ 3:1). The
 marketing site is light-only; the app follows the system setting with a manual
 toggle.
 
@@ -112,7 +117,7 @@ italics except serif pull-quotes. Mobile inputs are ≥ 16px so iOS doesn't zoom
 | **Primary button** | Ink fill, paper text, 2px radius, 48px tall on mobile (thumb target), 44px desktop. On marketing CTAs: `--accent` fill. One per viewport. |
 | **Secondary button** | 1px ink outline, transparent. |
 | **Text button** | Underline offset 4px, thickness 1px; the underline animates in from the left on hover. |
-| **Input** | `--paper-raised`, 1px `--rule-strong`, label above in mono uppercase. Focus: 2px accent ring offset 2px. Errors: oxide text below, never red borders alone (colour-blind safe). |
+| **Input** | `--paper-raised`, 1px `--rule-input`, label above in mono uppercase. Focus: 2px accent ring offset 2px. Errors: oxide text below, never red borders alone (colour-blind safe). |
 | **Upload well** | Dashed 1px `--rule-strong` box with a large serif prompt "Your product, catalogued." On mobile the whole well is a single tap target opening camera/library. |
 | **Progress ledger** | Vertical list of work steps with mono timestamps (see §5, labor illusion). |
 | **Sheet / dialog** | Bottom sheet on mobile, centred panel on desktop. |

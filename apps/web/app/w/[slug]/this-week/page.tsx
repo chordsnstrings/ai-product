@@ -6,6 +6,7 @@ import { Banner, Empty, LinkButton, SignalChip } from '@arkiv/ui';
 import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
 import { ConnectAdsCard } from '@/components/connect-ads-card';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'This Week · Arkiv' };
 
@@ -54,8 +55,8 @@ function weekLine(d = new Date()) {
   const end = new Date(start.getTime() + 6 * 86400_000);
   const jan1 = new Date(Date.UTC(start.getUTCFullYear(), 0, 1));
   const wk = Math.ceil(((start.getTime() - jan1.getTime()) / 86400_000 + jan1.getUTCDay() + 1) / 7);
-  const f = (x: Date) => x.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
-  return `Week ${wk} · ${f(start)} – ${f(end)}`;
+  const f = (x: Date) => formatDate(x, { timeZone: 'UTC', year: false });
+  return `Week ${wk} · ${f(start)} – ${formatDate(end, { timeZone: 'UTC' })}`;
 }
 
 export default async function ThisWeek({ params, searchParams }: { params: Promise<{ slug: string }>; searchParams: Promise<{ subscribed?: string }> }) {
@@ -178,7 +179,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
           data.changes.map((c, i) => (
             <div key={i} className="ak-index-row">
               <span>{EVENT_TEXT[c.type as string] ?? c.type}{(c.payload as { to?: string }).to ? <> · <SignalChip state={String((c.payload as { to: string }).to)} /></> : null}</span>
-              <span className="ak-index">{new Date(c.at as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+              <span className="ak-index">{formatDate(c.at as string)}</span>
             </div>
           ))
         )}

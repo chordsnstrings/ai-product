@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Banner, Button } from '@arkiv/ui';
 import { api } from '@arkiv/ui/client';
+import { formatDate } from '@arkiv/shared/format';
 
 const REASONS = [
   ['too_expensive', 'Too expensive'],
@@ -85,7 +86,7 @@ export function CancelFlow({ slug, endsOn, planCode, archiveDays, pastDue = fals
             setErr(null);
             try {
               const r = await api<{ endsAt: string; immediate?: boolean }>(`/api/w/${slug}/cancel`, { reason: reason || null, detail: detail || null });
-              if (r.endsAt) setEnds(new Date(r.endsAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }));
+              if (r.endsAt) setEnds(formatDate(r.endsAt));
               setImmediate(!!r.immediate);
               setStep(2);
             } catch (e) {

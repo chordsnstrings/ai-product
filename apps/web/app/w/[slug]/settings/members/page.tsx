@@ -4,6 +4,7 @@ import { listMembers, planQuota } from '@arkiv/core';
 import type { PlanCode } from '@arkiv/shared';
 import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Members · Arkiv' };
 
@@ -38,13 +39,13 @@ export default async function Members({ params }: { params: Promise<{ slug: stri
                           {(['ADMIN', 'MEMBER', 'VIEWER'] as const).filter((r) => r !== m.role).map((r) => (
                             <ActionButton key={r} slug={slug} action="member-role" body={{ userId: m.user_id, role: r }} variant="text">Make {r.toLowerCase()}</ActionButton>
                           ))}
-                          <ActionButton slug={slug} action="member-remove" body={{ userId: m.user_id }} variant="text" confirm={`Remove ${m.email}? They lose access immediately.`}>Remove</ActionButton>
+                          <ActionButton slug={slug} action="member-remove" body={{ userId: m.user_id }} variant="text" danger confirm={`Remove ${m.email}? They lose access immediately.`}>Remove</ActionButton>
                         </>
                       ) : null}
                       {isOwner && !self && m.role === 'ADMIN' ? (
                         <ActionButton slug={slug} action="transfer" body={{ userId: m.user_id }} variant="text" confirm={`Make ${m.email} the owner? You'll become an admin.`}>Transfer ownership</ActionButton>
                       ) : null}
-                      {self && m.role !== 'OWNER' ? <ActionButton slug={slug} action="member-remove" body={{ userId: m.user_id }} variant="text" confirm="Leave this workspace?">Leave</ActionButton> : null}
+                      {self && m.role !== 'OWNER' ? <ActionButton slug={slug} action="member-remove" body={{ userId: m.user_id }} variant="text" danger confirm="Leave this workspace?">Leave</ActionButton> : null}
                     </div>
                   </td>
                 </tr>
@@ -52,7 +53,7 @@ export default async function Members({ params }: { params: Promise<{ slug: stri
             })}
             {d.invites.map((i) => (
               <tr key={i.id as string}>
-                <td>{i.email as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>invited · expires {new Date(i.expires_at as string).toLocaleDateString()}</span></td>
+                <td>{i.email as string}<span className="ak-small ak-muted" style={{ display: 'block' }}>invited · expires {formatDate(i.expires_at as string)}</span></td>
                 <td className="ak-mono">{String(i.role).toLowerCase()}</td>
                 <td>{isAdmin ? <ActionButton slug={slug} action="invite-revoke" body={{ id: i.id }} variant="text">Revoke</ActionButton> : null}</td>
               </tr>

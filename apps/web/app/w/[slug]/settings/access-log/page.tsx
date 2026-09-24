@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { withTenant } from '@arkiv/db';
 import { workspacePage } from '@/lib/tenant';
+import { formatDateTime } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Access log · Arkiv' };
 
@@ -30,7 +31,7 @@ export default async function AccessLog({ params }: { params: Promise<{ slug: st
             <tbody>
               {d.staff.map((s, i) => (
                 <tr key={i}>
-                  <td className="ak-mono">{new Date(s.started_at as string).toLocaleString()}</td>
+                  <td className="ak-mono">{formatDateTime(s.started_at as string)}</td>
                   <td>{s.staff_name as string}</td>
                   <td>{why(s.reason_kind, s.ticket) ? <strong>{why(s.reason_kind, s.ticket)}: </strong> : null}{s.reason as string}</td>
                   <td>{s.write_access ? 'read + write' : 'read only'} · {s.ended_at ? 'ended' : new Date(s.expires_at as string) > new Date() ? 'active' : 'expired'}</td>
@@ -47,7 +48,7 @@ export default async function AccessLog({ params }: { params: Promise<{ slug: st
           <tbody>
             {d.events.map((e, i) => (
               <tr key={i}>
-                <td className="ak-mono">{new Date(e.at as string).toLocaleString()}</td>
+                <td className="ak-mono">{formatDateTime(e.at as string)}</td>
                 <td>{String(e.type).replace(/_/g, ' ').toLowerCase()}</td>
                 <td className="ak-mono ak-small">{String(e.actor).split(':')[0]}</td>
               </tr>

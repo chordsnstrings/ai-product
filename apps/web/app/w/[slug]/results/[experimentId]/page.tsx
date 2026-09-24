@@ -4,9 +4,11 @@ import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import { experimentView } from '@arkiv/core';
 import { MeasurementContextCaveat, measurementContextLabel, type MeasurementContext } from '@arkiv/shared';
-import { Banner, SignalChip } from '@arkiv/ui';
+import { Banner, SignalChip, VideoThumb } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
+import { variantPreviewUrl } from '@/lib/variant-preview';
 
 export const metadata: Metadata = { title: 'Test results · Arkiv' };
 
@@ -24,7 +26,11 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     const conf = await tx`select id, kind, source, status, starts_at, ends_at, note from confounders where (sku_id is null or sku_id = ${v.experiment.sku_id})
                           and status <> 'dismissed' and coalesce(ends_at, now()) > now() - interval '120 days' order by starts_at desc`;
     const revised = await tx`select max(superseded_at) as at from performance_observations where variant_id in ${tx(v.variants.length ? v.variants.map((x) => x.id as string) : ['00000000-0000-0000-0000-000000000000'])}`;
-    return { ...v, conf, revisedAt: revised[0]?.at as string | null };
+    // The variants being compared, as 9:16 thumbnails (design §2.4).
+    const thumbs = (
+      await Promise.all(v.variants.map(async (x) => ({ id: x.id as string, code: x.code as string, label: x.label as string, src: await variantPreviewUrl(tx, x) })))
+    ).filter((t) => t.src);
+    return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs };
   });
   if (!d) notFound();
   // One table per measurement context and attribution window: different windows are different measurements (§30).
@@ -34,7 +40,7 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
   // Confounder windows that overlapped this test's observed dates (§45), as of the last computation.
   const overlapping = new Set(d.results.flatMap((r) => ((r.confounder_windows as { id: string }[] | null) ?? []).map((c) => c.id)));
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
-  const day = (x: unknown) => new Date(x as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const day = (x: unknown) => formatDate(x as string);
   const scopeOf = (ctx: string, window: string) => {
     const r = d.results.find((x) => x.measurement_context === ctx && String(x.attribution_window ?? 'default') === window);
     return (r?.scope ?? {}) as { optimizationEvent?: string; campaignType?: string; excludedImpressions?: number };
@@ -46,7 +52,16 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
         <h1 className="ak-h1" style={{ margin: 0 }}>{d.experiment.hypothesis as string}</h1>
         <SignalChip state={String(d.experiment.state)} />
       </div>
-      {d.revisedAt ? <Banner>Updated: numbers were revised on {new Date(d.revisedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} as late conversions arrived.</Banner> : null}
+      {d.thumbs.length ? (
+        <div className="ak-scroll-row" role="list" aria-label="Variants" style={{ marginTop: 24 }}>
+          {d.thumbs.map((t) => (
+            <div key={t.id} role="listitem">
+              <VideoThumb src={t.src} caption={[t.code, t.label, '9:16'].join(' · ')} label={`Variant ${t.code}: ${t.label}`} />
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {d.revisedAt ? <Banner>Updated: numbers were revised on {formatDate(d.revisedAt)} as late conversions arrived.</Banner> : null}
       {d.freshness?.stale ? <Banner tone="warn">{d.freshness.degraded ? 'A connected ad account needs attention' : 'Your ad data hasn’t synced for over a week'} — these numbers may be incomplete.</Banner> : null}
       {groups.length === 0 ? (
         <p className="ak-muted" style={{ marginTop: 24 }}>No performance data yet. Launch the ads with the variant codes in their names, or upload a CSV from Results. Signals appear after roughly 1,000 impressions per variant.</p>

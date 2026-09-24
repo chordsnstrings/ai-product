@@ -5,6 +5,7 @@ import { PROVISIONAL } from '@arkiv/shared';
 import { Banner } from '@arkiv/ui';
 import { ActionButton, ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
+import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'Data · Arkiv' };
 
@@ -33,11 +34,11 @@ export default async function Data({ params }: { params: Promise<{ slug: string 
         <h2 className="ak-label">Delete workspace</h2>
         {ws?.state === 'PURGE_SCHEDULED' ? (
           <>
-            <Banner tone="risk">Scheduled for deletion on {new Date(ws.purge_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}.</Banner>
+            <Banner tone="risk">Scheduled for deletion on {formatDate(ws.purge_at as string)}.</Banner>
             {isOwner ? <ActionButton slug={slug} action="undelete" variant="primary">Cancel deletion</ActionButton> : null}
           </>
         ) : isOwner ? (
-          <ActionForm slug={slug} action="delete" submit="Delete workspace" fields={[{ name: 'confirm', label: `Type ${slug} to confirm`, required: true, hint: 'Cancel your plan first. You can undo this during the grace period.' }]} />
+          <ActionForm slug={slug} action="delete" danger submit="Delete workspace" fields={[{ name: 'confirm', label: `Type ${slug} to confirm`, required: true, hint: 'Cancel your plan first. You can undo this during the grace period.' }]} />
         ) : (
           <p className="ak-small ak-muted">Only the owner can delete the workspace.</p>
         )}

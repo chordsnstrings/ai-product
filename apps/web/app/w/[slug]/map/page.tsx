@@ -9,6 +9,15 @@ export const metadata: Metadata = { title: 'Creative Map · Arkiv' };
 
 const t = (s: string) => s.replace(/_/g, ' ');
 
+/** Each signal state has a glyph and a word as well as its tint, so colour is never the only cue (WCAG 1.4.1). */
+const STATES: Record<string, { glyph: string; word: string }> = {
+  actionable: { glyph: '●', word: 'Actionable' },
+  directional: { glyph: '◐', word: 'Directional' },
+  gathering: { glyph: '○', word: 'Gathering signal' },
+  inconclusive: { glyph: '?', word: 'Inconclusive' },
+  untested: { glyph: '–', word: 'No test result yet' },
+};
+
 /** A2: what's been tested per SKU — angles × treatments, count and best signal per cell. */
 export default async function MapPage({ params, searchParams }: { params: Promise<{ slug: string }>; searchParams: Promise<{ sku?: string }> }) {
   const { slug } = await params;
@@ -28,20 +37,47 @@ export default async function MapPage({ params, searchParams }: { params: Promis
       <h1 className="ak-h1">Creative Map</h1>
       <div className="ak-row" style={{ flexWrap: 'wrap' }}>
         {d.skus.map((s) => (
-          <Link key={s.id as string} href={`/w/${slug}/map?sku=${s.id}`} className={`ak-chip${s.id === d.sku!.id ? ' ak-chip--dec' : ''}`}>No. {String(s.catalogue_no).padStart(3, '0')} {s.name as string}</Link>
+          <Link key={s.id as string} href={`/w/${slug}/map?sku=${s.id}`} className={`ak-chip${s.id === d.sku!.id ? ' ak-chip--dec' : ''}`} aria-current={s.id === d.sku!.id ? 'page' : undefined}>
+            {s.id === d.sku!.id ? <span aria-hidden>✓ </span> : null}No. {String(s.catalogue_no).padStart(3, '0')} {s.name as string}
+          </Link>
         ))}
       </div>
-      <p className="ak-small ak-muted">Rows are angles, columns are production treatments. Numbers count tests and imported ads; colour is the strongest signal reached. Empty rows are under-tested territory.</p>
+      <p className="ak-small ak-muted">Rows are angles, columns are production treatments. Numbers count tests and imported ads; the mark shows the strongest signal reached. Empty rows are under-tested territory.</p>
+      <ul className="ak-legend" aria-label="Key">
+        {Object.entries(STATES).map(([k, s]) => (
+          <li key={k}><span className="ak-swatch ak-cell" data-signal={k} aria-hidden>{s.glyph}</span>{s.word}</li>
+        ))}
+        <li><span className="ak-swatch" aria-hidden>·</span>Not tried</li>
+      </ul>
       <div className="ak-scroll-x">
         <table className="ak-table">
-          <thead><tr><th>Angle</th>{cols.map((c) => <th key={c}>{t(c)}</th>)}</tr></thead>
+          <caption className="ak-sr">Tests by angle and treatment for No. {String(d.sku.catalogue_no).padStart(3, '0')} {d.sku.name as string}</caption>
+          <thead><tr><th scope="col">Angle</th>{cols.map((c) => <th key={c} scope="col">{t(c)}</th>)}</tr></thead>
           <tbody>
             {d.map.angles.map((a) => (
               <tr key={a}>
-                <td>{t(a)}</td>
+                <th scope="row">{t(a)}</th>
                 {cols.map((c) => {
                   const cell = byKey.get(`${a}|${c}`);
-                  return <td key={c}><div className="ak-cell" data-signal={cell?.state ?? 'untested'} title={cell ? `${cell.count} · ${cell.state}` : 'untested'}>{cell?.count ?? '·'}</div></td>;
+                  const st = cell ? (STATES[cell.state] ?? { glyph: '', word: cell.state }) : null;
+                  return (
+                    <td key={c}>
+                      <div className="ak-cell" data-signal={cell?.state ?? 'untested'}>
+                        {cell ? (
+                          <>
+                            {cell.count}
+                            <span className="ak-cell-glyph" aria-hidden>{st!.glyph}</span>
+                            <span className="ak-sr">{cell.count === 1 ? ' test' : ' tests'}, {st!.word}</span>
+                          </>
+                        ) : (
+                          <>
+                            <span aria-hidden>·</span>
+                            <span className="ak-sr">Not tried</span>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  );
                 })}
               </tr>
             ))}

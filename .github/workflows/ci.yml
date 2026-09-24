@@ -60,6 +60,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @arkiv/web build
       - run: pnpm --filter @arkiv/admin build
+      - name: Font budget — at most 2 preloaded font files per route (design §5)
+        run: pnpm exec tsx scripts/check-fonts.ts apps/web apps/admin
 
   e2e:
     name: E2E (browser + HTTP smoke)

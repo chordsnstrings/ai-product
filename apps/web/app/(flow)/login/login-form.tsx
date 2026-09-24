@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { startAuthentication } from '@simplewebauthn/browser';
-import { Banner, Button } from '@arkiv/ui';
+import { Banner, Button, Field, Input } from '@arkiv/ui';
 import { api } from '@arkiv/ui/client';
 
 export function LoginForm({ next, error, google, apple, ttlMinutes }: { next: string | null; error: string | null; google: boolean; apple: boolean; ttlMinutes: number }) {
@@ -50,10 +50,9 @@ export function LoginForm({ next, error, google, apple, ttlMinutes }: { next: st
   return (
     <form className="ak-stack" onSubmit={send} style={{ marginTop: 24 }}>
       {err ? <Banner tone="risk">{err}</Banner> : null}
-      <label className="ak-field">
-        <span className="ak-label">Email</span>
-        <input className="ak-input" type="email" inputMode="email" autoComplete="email webauthn" required value={email} onChange={(e) => setEmail(e.target.value)} />
-      </label>
+      <Field label="Email">
+        <Input type="email" inputMode="email" autoComplete="email webauthn" required value={email} onChange={(e) => setEmail(e.target.value)} />
+      </Field>
       {suggestion && err ? <button type="button" className="ak-textbtn" onClick={() => setEmail(suggestion)}>Use {suggestion}</button> : null}
       <Button type="submit" block disabled={busy}>{busy ? 'Sending…' : 'Email me a link'}</Button>
       <hr className="ak-rule" />

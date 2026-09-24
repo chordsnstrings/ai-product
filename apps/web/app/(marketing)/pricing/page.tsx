@@ -42,7 +42,7 @@ export default async function Pricing() {
                       <tr><th>Team</th><td>{p.members} people</td></tr>
                     </tbody>
                   </table>
-                  <Link className={`ak-btn${pick ? '' : ' ak-btn--secondary'} ak-btn--block`} href={user ? `/app/plan?plan=${code}` : `/login?next=${encodeURIComponent(`/app/plan?plan=${code}`)}`}>
+                  <Link className={`ak-btn${pick ? ' ak-btn--accent' : ' ak-btn--secondary'} ak-btn--block`} href={user ? `/app/plan?plan=${code}` : `/login?next=${encodeURIComponent(`/app/plan?plan=${code}`)}`}>
                     Choose {p.name}
                   </Link>
                 </div>

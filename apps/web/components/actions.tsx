@@ -2,25 +2,34 @@
 
 import { useRouter } from 'next/navigation';
 import { useState, type ReactNode } from 'react';
-import { Banner, Button } from '@arkiv/ui';
-import { api, Sheet } from '@arkiv/ui/client';
+import { Banner, Button, Field as FormField, Input, Select, splitConfirm, Textarea } from '@arkiv/ui';
+import { api, confirmSheet, Sheet, toast } from '@arkiv/ui/client';
 
 type Variant = 'primary' | 'secondary' | 'accent' | 'text';
 
-/** POSTs a workspace action and refreshes server data. Errors are shown inline, never swallowed. */
-export function ActionButton({ slug, action, body, children, variant = 'secondary', confirm, next, size }: { slug: string; action: string; body?: unknown; children: ReactNode; variant?: Variant; confirm?: string; next?: string; size?: 'sm' }) {
+/**
+ * POSTs a workspace action and refreshes server data. Errors are shown inline, never swallowed. A `confirm`
+ * question opens the confirmation sheet first (with an oxide confirm button when `danger`); `success` is toasted.
+ */
+export function ActionButton({ slug, action, body, children, variant = 'secondary', confirm, danger, next, size, success }: { slug: string; action: string; body?: unknown; children: ReactNode; variant?: Variant; confirm?: string; danger?: boolean; next?: string; size?: 'sm'; success?: string }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   async function run() {
-    if (confirm && !window.confirm(confirm)) return;
+    if (confirm) {
+      const ok = await confirmSheet({ ...splitConfirm(confirm), danger, confirmLabel: typeof children === 'string' ? children : 'Confirm' });
+      if (!ok.ok) return;
+    }
     setBusy(true);
     setErr(null);
     try {
       const r = await api<{ next?: string | null; url?: string }>(`/api/w/${slug}/${action}`, body ?? {});
       if (r.url) window.location.assign(r.url);
       else if (r.next ?? next) router.push((r.next ?? next)!);
-      else router.refresh();
+      else {
+        router.refresh();
+        if (success) toast(success);
+      }
     } catch (e) {
       setErr((e as Error).message);
     }
@@ -53,18 +62,16 @@ export interface Field {
   checked?: string[];
 }
 
-/** Small declarative form → workspace action (JSON, or multipart when a file field is present). */
-export function ActionForm({ slug, action, fields, submit, extra, onDone, multipart }: { slug: string; action: string; fields: Field[]; submit: string; extra?: Record<string, unknown>; onDone?: (r: unknown) => void; multipart?: boolean }) {
+/** Small declarative form → workspace action (JSON, or multipart when a file field is present). Success is a toast. */
+export function ActionForm({ slug, action, fields, submit, extra, onDone, multipart, danger }: { slug: string; action: string; fields: Field[]; submit: string; extra?: Record<string, unknown>; onDone?: (r: unknown) => void; multipart?: boolean; danger?: boolean }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [ok, setOk] = useState<string | null>(null);
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
     setBusy(true);
     setErr(null);
-    setOk(null);
     try {
       let payload: unknown;
       if (multipart) {
@@ -83,7 +90,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
       }
       const r = await api<{ next?: string }>(`/api/w/${slug}/${action}`, payload);
       (e.target as HTMLFormElement).reset();
-      setOk('Saved');
+      toast('Saved');
       onDone?.(r);
       if (r?.next) router.push(r.next);
       else router.refresh();
@@ -94,30 +101,33 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
   }
   return (
     <form className="ak-stack" onSubmit={onSubmit}>
-      {fields.map((f) => (
-        <label key={f.name} className="ak-field">
-          <span className="ak-label">{f.label}</span>
-          {f.type === 'textarea' ? (
-            <textarea className="ak-textarea" name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} />
-          ) : f.type === 'select' ? (
-            <select className="ak-input" name={f.name} required={f.required} defaultValue={f.defaultValue}>
-              {f.options?.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-          ) : f.type === 'checkboxes' ? (
+      {fields.map((f) =>
+        f.type === 'checkboxes' ? (
+          <fieldset key={f.name} className="ak-field" style={{ border: 0, padding: 0, margin: 0 }}>
+            <legend className="ak-label">{f.label}</legend>
             <span className="ak-row">
               {f.options?.map((o) => (
                 <label key={o.value} className="ak-check"><input type="checkbox" name={f.name} value={o.value} defaultChecked={f.checked ? f.checked.includes(o.value) : true} /> {o.label}</label>
               ))}
             </span>
-          ) : (
-            <input className="ak-input" type={f.type ?? 'text'} name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} accept={f.accept} />
-          )}
-          {f.hint ? <span className="ak-small ak-muted">{f.hint}</span> : null}
-        </label>
-      ))}
+            {f.hint ? <span className="ak-hint">{f.hint}</span> : null}
+          </fieldset>
+        ) : (
+          <FormField key={f.name} label={f.label} hint={f.hint}>
+            {f.type === 'textarea' ? (
+              <Textarea name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} />
+            ) : f.type === 'select' ? (
+              <Select name={f.name} required={f.required} defaultValue={f.defaultValue}>
+                {f.options?.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </Select>
+            ) : (
+              <Input type={f.type ?? 'text'} name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} accept={f.accept} />
+            )}
+          </FormField>
+        ),
+      )}
       {err ? <Banner tone="risk">{err}</Banner> : null}
-      {ok ? <p className="ak-small ak-muted" role="status">{ok}</p> : null}
-      <div><Button type="submit" disabled={busy}>{busy ? 'Saving…' : submit}</Button></div>
+      <div><Button type="submit" variant={danger ? 'danger' : 'primary'} disabled={busy}>{busy ? 'Saving…' : submit}</Button></div>
     </form>
   );
 }

@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Banner, Button } from '@arkiv/ui';
 import { api } from '@arkiv/ui/client';
+import { formatDate } from '@arkiv/shared/format';
 
 type Pack = { id: string; expiresAt: string; revokedAt: string | null; views: number; uploads: number; createdAt: string };
 
@@ -49,8 +50,8 @@ export function CreatorPacks({ slug, experimentId, packs, canEdit }: { slug: str
               const expired = new Date(p.expiresAt) <= new Date();
               return (
                 <tr key={p.id}>
-                  <td>{new Date(p.createdAt).toLocaleDateString()}</td>
-                  <td>{p.revokedAt ? 'Turned off' : expired ? 'Expired' : `Live until ${new Date(p.expiresAt).toLocaleDateString()}`}</td>
+                  <td>{formatDate(p.createdAt)}</td>
+                  <td>{p.revokedAt ? 'Turned off' : expired ? 'Expired' : `Live until ${formatDate(p.expiresAt)}`}</td>
                   <td className="ak-mono">{p.views}</td>
                   <td className="ak-mono">{p.uploads}</td>
                   <td>{canEdit && !p.revokedAt && !expired ? <button className="ak-textbtn" disabled={busy} onClick={() => act('creator-pack-revoke', { id: p.id })}>Turn off link</button> : null}</td>

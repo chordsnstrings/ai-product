@@ -1,12 +1,14 @@
 import Link from 'next/link';
 import type { ReactNode } from 'react';
+import { formatDate, formatDateTime, formatTime } from '@arkiv/shared/format';
 import { requestTz } from '@/lib/prefs';
 
 export const money = (micros: number | string | null | undefined, d = 2) => `$${(Number(micros ?? 0) / 1e6).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
 /** Dates are stored in UTC and shown in the console timezone (plan 05 §1), or an explicit one. */
-export const dt = (v: unknown, tz = requestTz().tz) => (v ? new Date(v as string).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: tz }) : '—');
-export const d = (v: unknown, tz = requestTz().tz) => (v ? new Date(v as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: tz }) : '—');
-export const tm = (v: unknown, tz = requestTz().tz) => (v ? new Date(v as string).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: tz, timeZoneName: 'short' }) : '—');
+/** House format (design §6): `23 Sep 2026`, `14:02 ET` — in the console timezone. */
+export const dt = (v: unknown, tz = requestTz().tz) => (v ? formatDateTime(v as string, { timeZone: tz }) || '—' : '—');
+export const d = (v: unknown, tz = requestTz().tz) => (v ? formatDate(v as string, { timeZone: tz }) || '—' : '—');
+export const tm = (v: unknown, tz = requestTz().tz) => (v ? formatTime(v as string, { timeZone: tz }) || '—' : '—');
 export const ago = (v: unknown) => {
   if (!v) return '—';
   const s = (Date.now() - new Date(v as string).getTime()) / 1000;

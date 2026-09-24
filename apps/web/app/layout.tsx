@@ -4,7 +4,8 @@ import '@arkiv/ui/styles.css';
 
 const sans = Inter_Tight({ subsets: ['latin'], variable: '--font-sans-loaded', display: 'swap' });
 const serif = Instrument_Serif({ subsets: ['latin'], weight: '400', variable: '--font-serif-loaded', display: 'swap' });
-const mono = IBM_Plex_Mono({ subsets: ['latin'], weight: ['400', '500'], variable: '--font-mono-loaded', display: 'swap' });
+// Design §5: preload only the two above-the-fold files (sans + serif); mono loads on use with font-display: swap.
+const mono = IBM_Plex_Mono({ subsets: ['latin'], weight: ['400', '500'], variable: '--font-mono-loaded', display: 'swap', preload: false });
 
 export const metadata: Metadata = {
   title: { default: 'Arkiv — Know what skincare ad to make next', template: '%s · Arkiv' },

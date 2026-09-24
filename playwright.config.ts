@@ -14,7 +14,9 @@ export default defineConfig({
   testDir: './tests/e2e',
   globalSetup: './tests/e2e/global-setup.ts',
   timeout: 12 * 60_000,
-  expect: { timeout: 30_000 },
+  expect: { timeout: 30_000, toHaveScreenshot: { maxDiffPixelRatio: 0.01 } },
+  // Catalogue baselines (design §8), committed from Linux Chromium; one set per project.
+  snapshotPathTemplate: '{testDir}/__screenshots__/{testFilePath}/{projectName}/{arg}{ext}',
   fullyParallel: false,
   workers: 1,
   retries: process.env.CI ? 1 : 0,

@@ -3,8 +3,8 @@
 import { useRouter } from 'next/navigation';
 import { useState, type ReactNode } from 'react';
 import { startRegistration } from '@simplewebauthn/browser';
-import { Button } from '@arkiv/ui';
-import { api } from '@arkiv/ui/client';
+import { Button, splitConfirm } from '@arkiv/ui';
+import { api, confirmSheet } from '@arkiv/ui/client';
 
 export function MeButton({ action, body, children, confirm }: { action: string; body?: unknown; children: ReactNode; confirm?: string }) {
   const router = useRouter();
@@ -14,7 +14,7 @@ export function MeButton({ action, body, children, confirm }: { action: string; 
       <button
         className="ak-textbtn"
         onClick={async () => {
-          if (confirm && !window.confirm(confirm)) return;
+          if (confirm && !(await confirmSheet({ ...splitConfirm(confirm), danger: true, confirmLabel: typeof children === 'string' ? children : 'Confirm' })).ok) return;
           try {
             const r = await api<{ next?: string | null }>(`/api/me/${action}`, body ?? {});
             if (r.next) window.location.assign(r.next);
@@ -99,7 +99,7 @@ export function DeleteAccount({ email }: { email: string }) {
         <input className="ak-input" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="off" />
       </label>
       {err ? <p className="ak-error ak-small" role="alert">{err}</p> : null}
-      <div><Button type="submit" variant="secondary" size="sm" disabled={busy || confirm.trim().toLowerCase() !== email.toLowerCase()}>Delete my account</Button></div>
+      <div><Button type="submit" variant="danger" size="sm" disabled={busy || confirm.trim().toLowerCase() !== email.toLowerCase()}>Delete my account</Button></div>
     </form>
   );
 }
