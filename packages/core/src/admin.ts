@@ -952,10 +952,14 @@ export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
   const switched = tx`exists (select 1 from jsonb_array_elements(case when jsonb_typeof(p.qa_report->'checks') = 'array' then p.qa_report->'checks' else '[]'::jsonb end) c
                               where c->'data' ? 'techniqueSwitch')`;
   const sample = tx`(p.state = 'COMPLETE' and abs(hashtext(p.id::text)) % 50 = 0)`;
+  // The customer said the delivered ad was "Not right?" (plan 03 P10, standard §48): a human looks at it.
+  const rejected = tx`exists (select 1 from project_feedback f where f.workspace_id = p.workspace_id and f.project_id = p.id)`;
+  const rejectedAs = tx`(select f.diagnosis from project_feedback f where f.workspace_id = p.workspace_id and f.project_id = p.id order by f.created_at desc limit 1)`;
   return tx`
     select p.id, p.workspace_id, p.state, p.qa_report, p.updated_at,
            -- A switch explains the earlier hard fails in the same report, so it is named first.
-           case when ${failedTwice} and ${switched} then 'failed QA twice (technique switched)'
+           case when ${rejected} then 'customer: not right (' || ${rejectedAs} || ')'
+                when ${failedTwice} and ${switched} then 'failed QA twice (technique switched)'
                 when ${switched} then 'technique switched'
                 when ${hard} then 'hard fidelity fail'
                 when ${failedTwice} then 'failed QA twice'
@@ -963,5 +967,5 @@ export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
     from projects p
     where not exists (select 1 from qa_reviews r where r.project_id = p.id)
       and (${!!opts.includeTest} or p.workspace_id not in (select id from workspaces where is_test))
-      and (${hard} or ${failedTwice} or ${switched} or ${sample})`;
+      and (${rejected} or ${hard} or ${failedTwice} or ${switched} or ${sample})`;
 }

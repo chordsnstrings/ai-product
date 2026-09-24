@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, retryAnalysis, retryProduction, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { CreativeGoal, DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -22,6 +22,8 @@ import { projectAccess } from '@/lib/tenant';
  *   confirm   – "Looks right" on the confirmation screen (P4): the shown facts become merchant-confirmed
  *   fact-accept-source – use the store's newer value instead of the merchant's earlier correction (§28, §42)
  *   variant   – which size/shade this ad is for (§42), before an idea is chosen
+ *   not-right – "Not right?" on a delivered ad: diagnosis + re-plan (free once for product accuracy, §48)
+ *   produce-free – produce a free re-plan's storyboard (no checkout)
  *   watched   – the finished ad was played (P10 "Watch", standard §7); recorded once per project
  */
 export const POST = route(async (req, { params }: { params: Promise<{ id: string; action: string }> }) => {
@@ -107,6 +109,19 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const { variantId } = await body(req, z.object({ variantId: z.string().uuid().nullable() }));
       const v = await withTenant(a.ctx.workspaceId, (tx) => selectVariant(tx, a.ctx, id, variantId));
       return json({ ok: true, variant: v });
+    }
+    case 'not-right': {
+      // P10 "Not right?": the diagnosis, and a re-plan (free once for product accuracy) as a new project.
+      if (!a.user || a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const i = await body(req, z.object({ reason: z.enum(['strategy', 'accuracy', 'style']), note: z.string().trim().max(500).optional() }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => reportNotRight(tx, a.ctx, id, { reason: i.reason, note: i.note ?? null }));
+      return json({ ok: true, ...r });
+    }
+    case 'produce-free': {
+      // A free re-plan's storyboard goes into production without a checkout (the credit was granted for it).
+      if (!a.user || a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const r = await withTenant(a.ctx.workspaceId, (tx) => produceFreeRevision(tx, a.ctx, id));
+      return json({ ok: true, ...r });
     }
     case 'watched': {
       const { assetId, seconds } = await body(req, z.object({ assetId: z.string().uuid(), seconds: z.number().min(0).max(3600) }));

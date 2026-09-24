@@ -771,7 +771,14 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
-      {sb && sb.status !== 'generating' && resumable ? (
+      {sb && sb.status !== 'generating' && v.project.revisionFree ? (
+        <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
+          <h2 className="ak-label">Make it again — free</h2>
+          <p className="ak-small ak-muted">This re-plan is on us, because your first ad didn’t show your product accurately. Check the scenes, then we’ll make it — nothing to pay.</p>
+          <Button block id="cta" disabled={busy} onClick={async () => { if (await call(`/api/projects/${projectId}/produce-free`, {})) window.location.assign(`/produce/${projectId}`); }}>Make my ad</Button>
+        </section>
+      ) : null}
+      {sb && sb.status !== 'generating' && resumable && !v.project.revisionFree ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="finish">
           <h2 className="ak-label">Finish your ad</h2>
           <p className="ak-small ak-muted">You’ve already paid for this ad, so there’s nothing more to pay. We check your changes, then produce it — scenes that were already made are reused.</p>
@@ -779,7 +786,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           <div style={{ marginTop: 12 }}><CancelProduction projectId={projectId} v={v} onChange={() => window.location.assign(`/produce/${projectId}`)} /></div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && !resumable ? (
+      {sb && sb.status !== 'generating' && !resumable && !v.project.revisionFree ? (
         <section className="ak-panel" style={{ marginTop: 40 }} id="offer">
           <div className="ak-between" style={{ alignItems: 'start', flexWrap: 'wrap', gap: 24 }}>
             <div>
@@ -806,7 +813,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
           </div>
         </section>
       ) : null}
-      {sb && sb.status !== 'generating' && !resumable ? (
+      {sb && sb.status !== 'generating' && !resumable && !v.project.revisionFree ? (
         <StickyCta watchId="cta" mobileOnly>
           <LinkButton href={`/checkout/${projectId}`} block>Make my ad · {usd(q.priceMicros)}</LinkButton>
         </StickyCta>
@@ -1353,6 +1360,67 @@ function useShowAfterPlay() {
 }
 
 /**
+ * "Not right?" (plan 03 P10, standard §48): the merchant says what missed — the strategy, the product's accuracy or
+ * the style — and gets a re-plan: free once when the product wasn't shown accurately (our QA should have caught
+ * it), otherwise at the one-off price. The delivered ad is kept either way.
+ */
+function NotRight({ projectId, v }: { projectId: string; v: View }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState<'strategy' | 'accuracy' | 'style' | null>(null);
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (v.project.kind !== 'taste' && v.project.kind !== 'standalone') return null;
+  const price = usd(v.quote.priceMicros);
+  const outcome = (r: typeof reason) =>
+    r === 'accuracy' && v.project.freeReplanAvailable ? 'We’ll re-plan the same idea and make it again, free.' : r === 'strategy' ? `Pick another direction for ${v.sku.name}; making it is ${price}.` : r ? `We’ll re-plan the same idea with a new storyboard; making it is ${price}.` : null;
+  return (
+    <>
+      <button type="button" className="ak-textbtn" onClick={() => setOpen(true)}>Not right?</button>
+      <Sheet open={open} onOpenChange={setOpen} title="What isn’t right?" description="Your ad stays in your archive either way.">
+        <form
+          className="ak-stack"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (!reason) return;
+            setBusy(true);
+            setErr(null);
+            try {
+              const r = await api<{ next: string }>(`/api/projects/${projectId}/not-right`, { reason, note: note.trim() || undefined });
+              window.location.assign(r.next);
+            } catch (x) {
+              setErr((x as Error).message);
+              setBusy(false);
+            }
+          }}
+        >
+          <fieldset className="ak-stack" style={{ border: 0, padding: 0, margin: 0, gap: 8 }}>
+            <legend className="ak-sr">What isn’t right?</legend>
+            {([
+              ['strategy', 'The idea — it’s the wrong angle for my customers'],
+              ['accuracy', 'My product — it doesn’t look like my real product'],
+              ['style', 'The look and feel — the idea is right, the execution isn’t'],
+            ] as const).map(([value, label]) => (
+              <label key={value} className="ak-row" style={{ gap: 8, alignItems: 'flex-start' }}>
+                <input type="radio" name="not-right" value={value} checked={reason === value} onChange={() => setReason(value)} />
+                <span>{label}</span>
+              </label>
+            ))}
+          </fieldset>
+          <label className="ak-field">
+            <span className="ak-label">Anything specific? (optional)</span>
+            <textarea className="ak-textarea" maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} />
+          </label>
+          {reason ? <p className="ak-small" role="status" style={{ margin: 0 }}>{outcome(reason)}</p> : null}
+          {err ? <p className="ak-error" role="alert">{err}</p> : null}
+          <Button type="submit" disabled={!reason || busy}>{busy ? 'Starting…' : 'Continue'}</Button>
+        </form>
+      </Sheet>
+    </>
+  );
+}
+
+/**
  * Plan 03 P10 #4 / plan 04 L17 / standard §8: the continuation card appears only once the finished ad has been
  * watched (10 seconds, or to the end) or exported — never before. It names the two strategic directions that are
  * still untested, and for a one-off buyer leads to the plans.
@@ -1492,6 +1560,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
               <li>{slug ? <a href={`/w/${slug}/settings/integrations`}>Connect your ad account</a> : 'Connect your ad account'} and we’ll tell you what it taught you.</li>
             </ol>
             {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
+            <NotRight projectId={projectId} v={v} />
             {earned || !primary ? <Continuation v={v} /> : null}
             {primary ? (
               <StickyCta watchId="cta" mobileOnly>

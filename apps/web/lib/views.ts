@@ -158,6 +158,11 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** The size/shade this ad is for (§42). */
         variantId: (p.sku_variant_id as string) ?? null,
         selectedConceptId: (p.selected_concept_id as string) ?? null,
+        /** A free re-plan ("Not right?", product accuracy): produced without a checkout. */
+        revisionFree: !!p.revision_free,
+        /** A delivered one-off ad can still get its one free re-plan for product accuracy. */
+        freeReplanAvailable:
+          p.state === 'COMPLETE' && (p.kind === 'taste' || p.kind === 'standalone') && !(await tx`select 1 from projects where workspace_id = ${workspaceId} and revision_of = ${projectId} and revision_free`).length,
         /** §8 creative goal the ideas are drafted for (performance by default). */
         goal: ((CreativeGoal as readonly string[]).includes(p.goal as string) ? p.goal : 'performance') as CreativeGoal,
         deliveryHeld,

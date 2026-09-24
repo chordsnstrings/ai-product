@@ -69,8 +69,10 @@ async function ensureCustomer(tx: Tx, ctx: TenantContext, email: string): Promis
 export async function startProductionCheckout(tx: Tx, ctx: TenantContext, projectId: string, user: { id: string; email: string }) {
   assertCan(ctx, 'storyboard.approve');
   if (await isFlagOn(tx, 'kill.checkout')) throw new DomainError('UNAVAILABLE', 'Checkout is paused for a few minutes for maintenance. Your storyboard is saved.');
-  const [p] = await tx`select p.state, p.storyboard_id, p.sku_id, s.name from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
+  const [p] = await tx`select p.state, p.storyboard_id, p.sku_id, p.revision_free, s.name from projects p join skus s on s.id = p.sku_id where p.id = ${projectId}`;
   if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  // A free re-plan ("Not right?", product accuracy) is produced without a payment.
+  if (p.revision_free) throw new DomainError('CONFLICT', 'This re-plan is free — no payment needed. Go back to the storyboard to make it.');
   if (p.state !== 'STORYBOARD_READY') throw new DomainError('CONFLICT', p.state === 'COMPLETE' || String(p.state).startsWith('REN') ? 'This ad is already in production.' : 'The storyboard isn’t ready yet.');
   // §42: nobody pays to produce an ad for a product they can't sell until they say it's for a waitlist or launch.
   await assertStockCleared(tx, p.sku_id as string);
