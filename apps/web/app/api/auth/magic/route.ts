@@ -11,7 +11,7 @@ export const POST = route(async (req) => {
   const provisionalWorkspaceId = await resolveProvisional(await provisionalToken());
   let productName: string | null = null;
   if (provisionalWorkspaceId) {
-    const [s] = await withTenant(provisionalWorkspaceId, (tx) => tx`select name from skus where status <> 'analyzing' order by created_at desc limit 1`);
+    const [s] = await withTenant(provisionalWorkspaceId, (tx) => tx`select name from skus where status not in ('analyzing', 'needs_input') order by created_at desc limit 1`);
     productName = (s?.name as string) ?? null;
   }
   const r = await requestMagicLink({ email: input.email, purpose: provisionalWorkspaceId ? 'claim' : input.purpose, provisionalWorkspaceId, redirectTo: input.next ?? null, ip: clientIp(req), productName });

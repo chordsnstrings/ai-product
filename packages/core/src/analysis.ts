@@ -92,7 +92,7 @@ function factsFromStructured(p: ExtractedProduct, url: string | null): FactInput
   return f;
 }
 
-export async function analyzeProduct(ctx: TenantContext, skuId: string, projectId: string): Promise<{ status: 'ready' | 'rejected' | 'needs_input'; reason?: string }> {
+export async function analyzeProduct(ctx: TenantContext, skuId: string, projectId: string): Promise<{ status: 'ready' | 'rejected' | 'needs_input' | 'skipped'; reason?: string }> {
   const ws = ctx.workspaceId;
   const sku = await withTenant(ws, async (tx) => {
     const [s] = await tx`select * from skus where id = ${skuId}`;
@@ -162,19 +162,33 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
     return { status: 'rejected', reason };
   }
 
-  // 4. Free preview authorization (extraction + concepts ≤ $0.20, standard §5).
-  const auth = await withTenant(ws, async (tx) =>
-    authorize(tx, ctx, {
-      purpose: 'free_preview',
-      skuId,
-      projectId,
-      lines: await routedLines(tx, ws, [
-        { task: 'extract.product_facts', kind: 'llm', inputTokens: 14_000, outputTokens: 2_000 },
-        { task: 'creative_director.concepts', kind: 'llm', inputTokens: 6_000, outputTokens: 3_500 },
-      ]),
-      idempotencyKey: `preview:${skuId}`,
-    }),
-  );
+  // 4. Free preview authorization (extraction + concepts ≤ $0.20, standard §5). A retried analysis (the job's own
+  //    retry, or the merchant's "Try again") takes over the settled attempt's key as a new attempt; the per-SKU
+  //    free-preview cap still bounds all attempts together. While an attempt is in flight, a duplicate delivery
+  //    stands down (CONFLICT) rather than failing or double-spending.
+  let auth: Awaited<ReturnType<typeof authorize>>;
+  try {
+    auth = await withTenant(ws, async (tx) =>
+      authorizeOrTakeOver(
+        tx,
+        ctx,
+        {
+          purpose: 'free_preview',
+          skuId,
+          projectId,
+          lines: await routedLines(tx, ws, [
+            { task: 'extract.product_facts', kind: 'llm', inputTokens: 14_000, outputTokens: 2_000 },
+            { task: 'creative_director.concepts', kind: 'llm', inputTokens: 6_000, outputTokens: 3_500 },
+          ]),
+          idempotencyKey: `preview:${skuId}`,
+        },
+        ANALYSIS_STALE_MINUTES,
+      ),
+    );
+  } catch (e) {
+    if (e instanceof DomainError && e.code === 'CONFLICT') return { status: 'skipped', reason: 'duplicate delivery' };
+    throw e;
+  }
 
   try {
     // 5. Vision + text extraction.
@@ -272,6 +286,72 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
     });
     throw e;
   }
+}
+
+// ───────────── A failed analysis (plan 03 P3 edge cases) ─────────────
+
+/** Facts a merchant is asked for when the analysis could not find them. */
+export const ANALYSIS_KEY_FACTS = [
+  { key: 'name', label: 'Product name' },
+  { key: 'category', label: 'Category (e.g. serum, moisturiser)' },
+  { key: 'size', label: 'Size (e.g. 30 ml)' },
+  { key: 'ingredients', label: 'Ingredient list' },
+] as const;
+
+/** An analysis attempt with no result after this long is presumed dead and may be taken over by a retry. */
+const ANALYSIS_STALE_MINUTES = 10;
+
+/** Customer-facing copy for a failed analysis (project failure_reason, shown in the funnel). */
+export const ANALYSIS_FAILED_COPY = 'We couldn’t finish reading this product. Here’s what we found — add what’s missing, or try again.';
+const ANALYSIS_FAILED_STEP = 'We couldn’t finish this step. Nothing was charged.';
+/** Project states of an analysis still under way (NEEDS_USER_ACTION already waits for the merchant). */
+export const ANALYSIS_STATES: readonly ProjectState[] = ['PRODUCT_UPLOADED', 'PRODUCT_ANALYZED', 'BRIEF_READY'];
+
+/** Key facts the SKU still lacks (any source), for the "show what we have and ask for the missing field" screen. */
+export async function missingAnalysisFacts(tx: Tx, skuId: string): Promise<string[]> {
+  const rows = await tx`select distinct normalized_key from product_facts where sku_id = ${skuId} and status <> 'SUPERSEDED'`;
+  const have = new Set(rows.map((r) => r.normalized_key as string));
+  return ANALYSIS_KEY_FACTS.filter((k) => !have.has(k.key) && !(k.key === 'ingredients' && have.has('key_ingredients'))).map((k) => k.key);
+}
+
+/**
+ * The analysis will not finish (its job ran out of retries, hit a final error, or stalled): the SKU waits for the
+ * merchant (needs_input) with what was found so far and the key facts still missing, the project asks for
+ * action, and the progress steps show a final state instead of "Retrying…". Idempotent; a SKU that already
+ * finished analysing, or was rejected, is left alone. Returns whether the analysis was failed now.
+ */
+export async function failAnalysis(ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, skuId: string, projectId: string, detail: string): Promise<boolean> {
+  return withTenant(ctx.workspaceId, async (tx) => {
+    const [p] = await tx`select p.state, s.status from projects p join skus s on s.id = p.sku_id
+                         where p.id = ${projectId} and p.sku_id = ${skuId} for update of p, s`;
+    // Only an analysis still under way can fail (the SKU turns active at the fingerprint step, before concepts).
+    if (!p || !ANALYSIS_STATES.includes(p.state as ProjectState) || !['analyzing', 'active'].includes(p.status as string)) return false;
+    const missing = await missingAnalysisFacts(tx, skuId);
+    await tx`update skus set status = 'needs_input',
+               analysis = analysis || ${tx.json({ failure: { at: new Date().toISOString(), detail: detail.slice(0, 300), missing } } as never)}
+             where id = ${skuId}`;
+    await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: ANALYSIS_FAILED_COPY, detail: detail.slice(0, 300) });
+    await tx`update progress_steps set status = case when status = 'pending' then 'skipped' else 'failed' end,
+               detail = case when status = 'pending' then detail else ${ANALYSIS_FAILED_STEP} end, completed_at = now()
+             where subject_id = ${skuId} and (status in ('active','pending') or (status = 'failed' and detail like '%Retrying%'))`;
+    return true;
+  });
+}
+
+/**
+ * "Try again" on a failed analysis: the SKU goes back to analysing, its steps restart and the analysis is queued
+ * again (a new attempt under the same free-preview cap). A double click finds it already analysing.
+ */
+export async function retryAnalysis(tx: Tx, ctx: TenantContext, projectId: string): Promise<{ skuId: string }> {
+  assertCan(ctx, 'sku.edit');
+  const [p] = await tx`select p.state, p.sku_id, s.status from projects p join skus s on s.id = p.sku_id where p.id = ${projectId} for update of p, s`;
+  if (!p) throw new DomainError('NOT_FOUND', 'Project not found');
+  if (p.status !== 'needs_input' || p.state !== 'NEEDS_USER_ACTION') throw new DomainError('CONFLICT', p.status === 'analyzing' ? 'We’re already reading this product.' : 'There’s nothing to retry.');
+  await tx`update skus set status = 'analyzing' where id = ${p.sku_id}`;
+  await transition(tx, ctx, projectId, 'PRODUCT_UPLOADED', { detail: 'analysis retried' });
+  await tx`update progress_steps set status = 'pending', detail = null, started_at = null, completed_at = null, expected_ms = null where subject_id = ${p.sku_id}`;
+  await enqueue(tx, ctx.workspaceId, queueFor(Queues.analyzeProduct, ctx), { skuId: p.sku_id, projectId, actor: ctx.actor, retry: true }, { priority: priorityFor(ctx) });
+  return { skuId: p.sku_id as string };
 }
 
 /** Progress key for one requested concept batch (subject: the project). */

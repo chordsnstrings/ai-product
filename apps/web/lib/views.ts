@@ -1,5 +1,22 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { assetUrl, currentFacts, currentQuote, customerQaSummary, DELIVERY_HOLD_STATES, IN_PRODUCTION, listClaims, listSteps, liveness, storyboardView, type Proposal, type QaReport } from '@arkiv/core';
+import {
+  ANALYSIS_KEY_FACTS,
+  assetUrl,
+  currentFacts,
+  currentQuote,
+  customerQaSummary,
+  DELIVERY_HOLD_STATES,
+  IN_PRODUCTION,
+  listClaims,
+  listSteps,
+  liveness,
+  SLOW_STEP_MS,
+  stepEta,
+  storyboardView,
+  verifiedIngredients,
+  type Proposal,
+  type QaReport,
+} from '@arkiv/core';
 import type { ProjectState } from '@arkiv/shared';
 import type { WorkspaceState } from '@arkiv/shared';
 
@@ -77,6 +94,12 @@ export async function projectView(workspaceId: string, projectId: string) {
         analysis: p.analysis ?? {},
         cutoutUrl: fp?.cutout_asset_id ? await assetUrl(tx, fp.cutout_asset_id as string) : null,
         packaging: fp ? { type: fp.package_type, closure: fp.closure, label: fp.label_text } : null,
+        /** What a good ad would still need (§42), from the analysis. */
+        missingEvidence: ((p.analysis as { missingEvidence?: string[] } | null)?.missingEvidence ?? []).slice(0, 6),
+        /** Ingredient-led tests need a sourced ingredient list (§42 "request source"). */
+        ingredientsVerified: verifiedIngredients(facts).verified,
+        /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
+        missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
       },
       steps: skuSteps.map(stepJson),
       facts: factRows,
@@ -93,7 +116,25 @@ export async function projectView(workspaceId: string, projectId: string) {
   });
 }
 
-const stepJson = (s: Record<string, unknown>) => ({ key: s.step_key as string, label: s.label as string, status: s.status as string, detail: (s.detail as string) ?? null, at: (s.completed_at ?? s.started_at ?? null) as string | null });
+/** Honest "still working" copy for a slow step, from the estimate recorded when it started (plan 03 P3). */
+function slowNote(key: string, eta: ReturnType<typeof stepEta>): string | null {
+  if (!eta || eta.elapsedMs < SLOW_STEP_MS) return null;
+  if (eta.remainingMs == null || eta.remainingMs < 5_000) return 'Taking longer than usual — still working. Nothing is lost if you leave this page.';
+  const sec = Math.ceil(eta.remainingMs / 5_000) * 5;
+  return `${key === 'read_page' || key === 'identify' ? 'Your page is detailed' : 'This one is detailed'} — about ${sec} more seconds.`;
+}
+
+const stepJson = (s: Record<string, unknown>) => {
+  const eta = stepEta(s as { status: string; started_at?: string | null; expected_ms?: number | null });
+  return {
+    key: s.step_key as string,
+    label: s.label as string,
+    status: s.status as string,
+    detail: (s.detail as string) ?? null,
+    at: (s.completed_at ?? s.started_at ?? null) as string | null,
+    note: slowNote(s.step_key as string, eta),
+  };
+};
 
 async function storyboardBlock(tx: Tx, storyboardId: string) {
   const v = await storyboardView(tx, storyboardId);

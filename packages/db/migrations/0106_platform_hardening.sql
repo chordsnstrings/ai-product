@@ -123,3 +123,23 @@ create trigger product_facts_guard before update on product_facts for each row e
 
 -- Customer signals are raw customer language: imported, read, deleted (privacy / purge), never edited.
 revoke update on customer_signals from app_rw, admin_rw, system_rw;
+
+-- ───────────── Analysis: truthful ETAs and a way out of a failed analysis (plan 03 P3) ─────────────
+-- A step's expected duration when it started (from recent provider latency for its task), so a slow extraction
+-- shows "about N more seconds" from a real estimate; and a SKU whose analysis failed waits for the merchant
+-- (needs_input) instead of staying "analyzing" forever.
+alter table progress_steps add column expected_ms int;
+alter table skus drop constraint skus_status_check;
+alter table skus add constraint skus_status_check check (status in ('analyzing','needs_input','active','out_of_stock','archived','rejected'));
+
+-- p75 latency of a provider task over its last 200 successful calls (at least 5), across tenants: a duration
+-- estimate carries no tenant data.
+create or replace function task_latency_p75(p_task text) returns integer
+language sql stable security definer set search_path = public as $$
+  select case when count(*) >= 5 then (percentile_cont(0.75) within group (order by latency_ms))::int end
+  from (select latency_ms from provider_jobs where task = p_task and status = 'succeeded' and latency_ms is not null
+        order by created_at desc limit 200) j
+$$;
+revoke all on function task_latency_p75 from public;
+grant execute on function task_latency_p75 to app_rw, admin_rw, system_rw;
+create index provider_jobs_task_recent on provider_jobs (task, created_at desc) where status = 'succeeded';

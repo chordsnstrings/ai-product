@@ -65,7 +65,7 @@ describe('rationale ids and confidence (§38)', () => {
 
   it('keeps only rationale ids from the context packet', () => {
     const [p] = mockConcepts(pc).concepts;
-    const g = gateProposal({ ...p!, rationaleIds: [F, 'made-up-id', F] }, [], [], new Set([F, T]));
+    const g = gateProposal({ ...p!, rationaleIds: [F, 'made-up-id', F] }, [], [], { packetIds: new Set([F, T]) });
     expect(g.cleaned.rationaleIds).toEqual([F]);
     expect(g.reasons.some((r) => r.startsWith('unknown rationale id dropped'))).toBe(true);
   });

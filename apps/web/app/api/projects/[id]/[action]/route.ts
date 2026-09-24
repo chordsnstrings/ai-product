@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { decideFact, requestConcepts, retryProduction, selectConcept } from '@arkiv/core';
+import { decideFact, requestConcepts, retryAnalysis, retryProduction, selectConcept } from '@arkiv/core';
 import { startProductionCheckout } from '@arkiv/billing';
 import { DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -12,6 +12,7 @@ import { projectAccess } from '@/lib/tenant';
  *   select    – choose a concept → storyboard (requires an account: the save gate, plan 03 P6)
  *   checkout  – one-time Taste/Standalone checkout at the live server quote (P8)
  *   retry     – retry a failed production (entitlement was returned on failure)
+ *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  */
 export const POST = route(async (req, { params }: { params: Promise<{ id: string; action: string }> }) => {
   const { id, action } = await params;
@@ -45,6 +46,10 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     case 'retry':
       await withTenant(a.ctx.workspaceId, (tx) => retryProduction(tx, a.ctx, id));
       return json({ ok: true });
+    case 'retry-analysis': {
+      const r = await withTenant(a.ctx.workspaceId, (tx) => retryAnalysis(tx, a.ctx, id));
+      return json({ ok: true, queued: true, ...r }, 202);
+    }
     default:
       throw new DomainError('NOT_FOUND', 'Unknown action');
   }

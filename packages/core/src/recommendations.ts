@@ -4,7 +4,7 @@ import { assertCan } from './authz';
 import { classifyClaim } from './compliance';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
-import { buildContext, gateProposal } from './creative-director';
+import { buildContext, gateProposal, isIngredientLed, UNVERIFIED_INGREDIENTS_REASON } from './creative-director';
 import { emit } from './events';
 import { ConceptSet, type Proposal } from './intel-schemas';
 import { mockConcepts } from './mock-intel';
@@ -48,6 +48,8 @@ export interface ScoringContext {
   hasRealAssets: boolean;
   /** Evidence basis of this week's plan (§31); sets the starting confidence. */
   basis?: 'performance' | 'context_limited' | 'cold_start';
+  /** False when the SKU has no sourced ingredient list: ingredient-led tests are gated (§42). */
+  ingredientsVerified?: boolean;
 }
 
 export interface Scored {
@@ -95,6 +97,7 @@ export function hardGates(p: Proposal, s: ScoringContext): { passed: boolean; re
   if (p.estimatedGenerationClass === 'premium') reasons.push('premium production exceeds the standard Creative Test cost ceiling');
   if (p.treatment === 'RAW_UGC' && !s.hasRealAssets) reasons.push('needs real footage/assets that are not in the library');
   if (p.proofMechanism === 'BEFORE_AFTER_RESTRICTED') reasons.push('before/after requires separate policy review');
+  if (s.ingredientsVerified === false && isIngredientLed(p)) reasons.push(UNVERIFIED_INGREDIENTS_REASON);
   return { passed: reasons.length === 0, reasons };
 }
 
@@ -206,8 +209,8 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
   const ws = ctx.workspaceId;
   const existing = await withTenant(ws, (tx) => tx`select id from recommendations where sku_id = ${skuId} and week_of = ${week}`);
   if (existing.length) return 0; // idempotent per week
-  const { productContext, packet, packetIds, names } = await withTenant(ws, (tx) => buildContext(tx, skuId));
-  const sc = await withTenant(ws, (tx) => scoringContext(tx, skuId));
+  const { productContext, packet, packetIds, ingredientsVerified, names } = await withTenant(ws, (tx) => buildContext(tx, skuId));
+  const sc = { ...(await withTenant(ws, (tx) => scoringContext(tx, skuId))), ingredientsVerified };
   const auth = await withTenant(ws, async (tx) =>
     authorize(tx, ctx, { purpose: 'storyboard', projectId: null, lines: await routedLines(tx, ws, [{ task: 'creative_director.recommendations', kind: 'llm', inputTokens: 12_000, outputTokens: 8_000 }]), idempotencyKey: `recs:${skuId}:${week}` }),
   );
@@ -230,7 +233,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
         effort: 'high',
         maxTokens: 6000,
       });
-      candidates.push(...r.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, packetIds).cleaned));
+      candidates.push(...r.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified }).cleaned));
     }
     const picked = composePortfolio(candidates.map((c) => scoreProposal(c, sc)), sc.maturity, 3);
     await withTenant(ws, async (tx) => {

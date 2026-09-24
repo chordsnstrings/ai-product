@@ -2,7 +2,7 @@ import { PgBoss } from 'pg-boss';
 import { closeAll, systemPool, withSystem } from '@arkiv/db';
 import { env } from '@arkiv/shared';
 import { processStripeEvent } from '@arkiv/billing';
-import { processPendingStripeEvents, runJob } from './handlers';
+import { onFinalFailure, processPendingStripeEvents, runJob } from './handlers';
 import { sweepQueue, sweeps } from './sweeps';
 import { grantQueueVisibility, processOpsCommands } from './ops';
 import { QUEUE_CONFIG } from './queues';
@@ -44,9 +44,17 @@ async function main() {
     await boss.createQueue(`${name}-dlq`).catch(() => {});
     await boss.createQueue(name, { retryLimit: cfg.retryLimit, retryDelay: 15, retryBackoff: true, expireInSeconds: cfg.expireInSeconds, deadLetter: `${name}-dlq` }).catch(() => {});
     for (let i = 0; i < cfg.concurrency; i++) {
-      await boss.work(name, { batchSize: 1, pollingIntervalSeconds: 1 }, async (jobs) => {
+      await boss.work(name, { batchSize: 1, pollingIntervalSeconds: 1, includeMetadata: true }, async (jobs) => {
         // runJob logs each job with its queue, job id, payload domain ids and originating request id.
-        for (const job of jobs) await runJob(name, job.data as Record<string, unknown>, job.id);
+        for (const job of jobs) {
+          try {
+            await runJob(name, job.data as Record<string, unknown>, job.id);
+          } catch (e) {
+            // Last attempt: leave an honest final state behind (the job itself goes to the dead-letter queue).
+            if (job.retryCount >= job.retryLimit) await onFinalFailure(name, job.data as Record<string, unknown>, job.id, e).catch((f) => log.error('final-failure handling failed', { jobId: job.id, queue: name, err: f }));
+            throw e;
+          }
+        }
       });
     }
   }

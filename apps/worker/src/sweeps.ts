@@ -2,6 +2,8 @@ import { withSystem, withTenant } from '@arkiv/db';
 import { sendEmail } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import {
+  ANALYSIS_STATES,
+  failAnalysis,
   OUTAGE_MAX_HOURS,
   RECOVERY_EMAIL_CAP,
   STUCK_DEADLINE_MINUTES,
@@ -129,6 +131,28 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
         else await withSystem((tx) => enqueueFor(tx, r.workspace_id as string, 'produce-project', { projectId: r.id, resume: true }, `produce:${r.id}:stuck:${Math.floor(Date.now() / 300_000)}`, 20));
       }
       return rows.length;
+    },
+  },
+  // Plan 03 P3: an analysis with no progress for 10 minutes (worker lost, job expired) is failed honestly: the
+  // SKU waits for the merchant with what was found, instead of "analyzing" forever. System role: every
+  // predicate is tied to the SKU's own workspace.
+  'sweep-stuck-analysis': {
+    cron: '*/5 * * * *',
+    run: async () => {
+      const rows = await withSystem((tx) => tx`
+        select s.id as sku_id, p.id as project_id, s.workspace_id from skus s
+        join projects p on p.sku_id = s.id and p.workspace_id = s.workspace_id
+        where s.status in ('analyzing', 'active') and p.state in ${tx([...ANALYSIS_STATES])}
+          and p.updated_at < now() - interval '10 minutes' and s.created_at < now() - interval '10 minutes'
+          and not exists (select 1 from progress_steps ps where ps.workspace_id = s.workspace_id and ps.subject_id = s.id
+                          and greatest(ps.started_at, ps.completed_at) > now() - interval '10 minutes')
+          and not exists (select 1 from outbox o where o.workspace_id = s.workspace_id and o.queue in ('analyze-product', 'analyze-product-free')
+                          and o.dispatched_at is null and o.payload->>'skuId' = s.id::text)
+          and not exists (select 1 from workspaces w where w.id = s.workspace_id and w.state = any(${[...JOB_HOLD_STATES]}))
+        limit 100`);
+      let n = 0;
+      for (const r of rows) if (await failAnalysis(sysCtx(r.workspace_id as string, 'analysis-sweep'), r.sku_id as string, r.project_id as string, 'analysis stalled (no progress for 10 minutes)')) n++;
+      return n;
     },
   },
   'sweep-provisional': { cron: '*/15 * * * *', run: () => withSystem((tx) => sweepProvisional(tx)) },

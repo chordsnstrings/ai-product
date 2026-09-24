@@ -12,6 +12,34 @@ import { llmJson } from './model-gateway';
 import { currentFacts, factText } from './product-truth';
 import { CONCEPTS_SYSTEM, STORYBOARD_SYSTEM } from './prompts';
 
+/** Sources that observe a real ingredient list (the page, structured data, the store, the label itself). */
+const INGREDIENT_SOURCES: ReadonlySet<string> = new Set(['product_page', 'json_ld', 'shopify', 'photo_ocr']);
+
+/**
+ * Ingredients creative may use (§42 "Missing ingredient list: do not infer ingredient claims from category;
+ * request source if ingredient creative is desired"): only an ingredient list observed at a real source, or one
+ * the merchant decided. Ingredients inferred from photos or category are never passed on.
+ */
+export function verifiedIngredients(facts: Awaited<ReturnType<typeof currentFacts>>): { list: string[]; verified: boolean } {
+  const usable = (key: string) => {
+    const f = facts[key];
+    if (!f || f.disputed) return null;
+    const v = f.value;
+    const ok = (v.state === 'OBSERVED' && INGREDIENT_SOURCES.has(v.sourceType)) || (v.state === 'DECIDED' && (v.sourceType === 'merchant' || v.sourceType === 'staff'));
+    return ok ? factText(facts, key) : null;
+  };
+  const split = (t: string, max: number) => t.split(/[,;\n]/).map((s) => s.trim()).filter((s) => s && s.length <= 60).slice(0, max);
+  const key = usable('key_ingredients');
+  if (key) return { list: split(key, 8), verified: true };
+  const full = usable('ingredients');
+  if (full) return { list: split(full, 6), verified: true };
+  return { list: [], verified: false };
+}
+
+/** Ingredient-led creative (education, explanation) needs a sourced ingredient list (§42). */
+export const isIngredientLed = (p: Pick<Proposal, 'angle' | 'proofMechanism'>) => p.angle === 'INGREDIENT_EDUCATION' || p.proofMechanism === 'INGREDIENT_EXPLANATION';
+export const UNVERIFIED_INGREDIENTS_REASON = 'ingredient creative needs your ingredient list (add it to unlock ingredient tests)';
+
 /**
  * ContextBuilder (§22, §33): a curated, bounded Context Packet — never raw DB access. Everything comes through
  * tenant-scoped reads, so a packet can only contain this workspace's rows (plan 02 §3 layer 6).
@@ -31,7 +59,7 @@ export async function buildContext(tx: Tx, skuId: string) {
                             group by 1, 2`;
   const learnings = await tx`select id, statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
                              and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') and not confounded order by confidence desc limit 6`;
-  const ingredients = (factText(facts, 'key_ingredients') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const { list: ingredients, verified: ingredientsVerified } = verifiedIngredients(facts);
   const brand = await brandBrainFor(tx, skuId);
   const approvedRows = claims.filter((c) => usable.has(c.id));
   // Stable ids for every packet item, so a proposal can cite what it rests on (rationale ids, §38).
@@ -57,6 +85,8 @@ export async function buildContext(tx: Tx, skuId: string) {
       texture: productContext.texture,
       format: factText(facts, 'format'),
       keyIngredients: ingredients,
+      // No sourced ingredient list: no ingredient-led concepts, and never ingredients guessed from the category.
+      ingredientsUnverified: !ingredientsVerified,
       factIds,
     },
     claims: {
@@ -78,15 +108,23 @@ export async function buildContext(tx: Tx, skuId: string) {
   const names = [sku.name as string, brand?.name ?? null];
   const r = productContext.rationaleIds!;
   const packetIds = new Set([...r.themes, ...r.claims, ...r.facts, ...r.learnings]);
-  return { sku, facts, productContext, packet, packetIds, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
+  return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, snippets: snippets.map((s) => s.text as string), brandBrainVersionId: brand?.versionId ?? null };
 }
 
 /**
  * Hard gates on a proposal before a merchant ever sees it (§20: gates happen before scoring). Rationale ids are
  * kept only when they name an item of the packet the proposal was drafted from (`packetIds`).
  */
-export function gateProposal(p: Proposal, approved: string[], names: (string | null | undefined)[] = [], packetIds?: ReadonlySet<string>): { ok: boolean; reasons: string[]; cleaned: Proposal } {
+export function gateProposal(
+  p: Proposal,
+  approved: string[],
+  names: (string | null | undefined)[] = [],
+  opts: { packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean } = {},
+): { ok: boolean; reasons: string[]; cleaned: Proposal } {
   const reasons: string[] = [];
+  const { packetIds } = opts;
+  const ingredientBlocked = opts.ingredientsVerified === false && isIngredientLed(p);
+  if (ingredientBlocked) reasons.push(UNVERIFIED_INGREDIENTS_REASON);
   const rationaleIds = [...new Set(p.rationaleIds ?? [])].filter((id) => {
     const known = !packetIds || packetIds.has(id);
     if (!known) reasons.push(`unknown rationale id dropped: ${id.slice(0, 40)}`);
@@ -109,7 +147,7 @@ export function gateProposal(p: Proposal, approved: string[], names: (string | n
     return ok;
   });
   while (cleanHooks.length < 3) cleanHooks.push(['A closer look at the texture', 'Where this fits in your routine', 'The finish, up close'][cleanHooks.length]!);
-  return { ok: !blockedStrategy, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds } };
+  return { ok: !blockedStrategy && !ingredientBlocked, reasons, cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds } };
 }
 
 /** Three concepts must differ in hypothesis (angle or primary variable), not just copy (§13). */
@@ -131,7 +169,7 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, packetIds, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
+  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId));
   const content: ContentPart[] = [
     { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
@@ -153,7 +191,7 @@ export async function generateConcepts(run: ConceptRun) {
       effort: 'high',
       maxTokens: CONCEPTS_MAX_TOKENS,
     });
-    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, packetIds));
+    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified }));
     const valid = gated.filter((g) => g.ok);
     if (valid.length === 3 && conceptsAreDistinct(valid.map((v) => v.cleaned))) break;
     content.push({ type: 'text', text: `Previous attempt was rejected by compliance/diversity gates: ${gated.flatMap((g) => g.reasons).join('; ') || 'concepts too similar'}. Fix and return three distinct compliant concepts.` });

@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
-import { assetUrl, currentFacts } from '@arkiv/core';
+import { assetUrl, currentFacts, verifiedIngredients } from '@arkiv/core';
 import { MetadataTable, ProvenanceChip } from '@arkiv/ui';
 import { ActionForm } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
@@ -76,10 +76,25 @@ export default async function Product({ params, searchParams }: { params: Promis
             }))}
           />
           {canEdit ? (
+            <div className="ak-stack">
+            {!verifiedIngredients(d.facts).verified ? (
+              <div className="ak-panel" id="ingredients">
+                <h2 className="ak-label">Add your ingredient list to unlock ingredient tests</h2>
+                <p className="ak-small ak-muted">We only use ingredients from your page, label or your own entry — never guessed from the category. Until then we won’t suggest ingredient-led ads.</p>
+                <ActionForm slug={slug} action="fact" extra={{ skuId, key: 'ingredients' }} submit="Save ingredients" fields={[{ name: 'value', label: 'Ingredients', type: 'textarea', required: true, max: 2000 }]} />
+              </div>
+            ) : null}
+            {((d.sku.analysis as { missingEvidence?: string[] } | null)?.missingEvidence ?? []).length ? (
+              <div className="ak-panel">
+                <h2 className="ak-label">What would make these ads stronger</h2>
+                <ul className="ak-small" style={{ margin: 0 }}>{((d.sku.analysis as { missingEvidence: string[] }).missingEvidence).slice(0, 6).map((m) => <li key={m}>{m}</li>)}</ul>
+              </div>
+            ) : null}
             <div className="ak-panel">
               <h2 className="ak-label">Correct a fact</h2>
               <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. Shopify values that disagree are kept and marked disputed.</p>
               <ActionForm slug={slug} action="fact" extra={{ skuId }} submit="Save" fields={[{ name: 'key', label: 'Field', type: 'select', options: Object.entries(LABEL).map(([value, label]) => ({ value, label })) }, { name: 'value', label: 'Value', type: 'textarea', required: true, max: 2000 }]} />
+            </div>
             </div>
           ) : null}
         </div>

@@ -21,6 +21,7 @@ import {
   syncIntegration,
   weekOf,
   enqueue,
+  failAnalysis,
   holdDecision,
   holdJob,
   exportSatisfied,
@@ -38,6 +39,24 @@ import { QUEUE_CONFIG } from './queues';
 import { logger, payloadBindings, withLogContext } from '@arkiv/shared/log';
 
 export type Handler = (ctx: TenantContext, data: Record<string, unknown>, jobId: string) => Promise<unknown>;
+
+/** Domain errors that end a job for good (no retry): the request itself cannot succeed. */
+export const FINAL_DOMAIN_CODES: readonly string[] = ['INVALID', 'NOT_FOUND', 'FORBIDDEN', 'GATE_BLOCKED', 'PAYMENT_REQUIRED', 'CONFLICT'];
+
+/**
+ * Product analysis (plan 03 P3). An analysis that ends for good — a final domain error here, or its last retry
+ * failing (onFinalFailure) — leaves the SKU waiting for the merchant with what was found, never "analyzing".
+ */
+const analyze: Handler = async (ctx, d) => {
+  try {
+    return await analyzeProduct(ctx, d.skuId as string, d.projectId as string);
+  } catch (e) {
+    if (e instanceof DomainError && FINAL_DOMAIN_CODES.includes(e.code) && e.code !== 'NOT_FOUND') {
+      await failAnalysis(ctx, d.skuId as string, d.projectId as string, `${e.code}: ${e.message}`);
+    }
+    throw e;
+  }
+};
 
 /** Per-workspace render concurrency (plan 02 §3 layer 5): lease or re-queue with a truthful delay. */
 async function withRenderLease<T>(ctx: TenantContext, jobId: string, fn: () => Promise<T>): Promise<T | 'requeued'> {
@@ -60,8 +79,8 @@ async function withRenderLease<T>(ctx: TenantContext, jobId: string, fn: () => P
 }
 
 export const handlers: Record<string, Handler> = {
-  [Queues.analyzeProduct]: (ctx, d) => analyzeProduct(ctx, d.skuId as string, d.projectId as string),
-  [Queues.analyzeProductFree]: (ctx, d) => analyzeProduct(ctx, d.skuId as string, d.projectId as string),
+  [Queues.analyzeProduct]: analyze,
+  [Queues.analyzeProductFree]: analyze,
   [Queues.generateStoryboard]: (ctx, d) => generateStoryboard(ctx, d.projectId as string, d.storyboardId as string, d.conceptId as string),
   [Queues.generateStoryboardFree]: (ctx, d) => generateStoryboard(ctx, d.projectId as string, d.storyboardId as string, d.conceptId as string),
   [Queues.generateConcepts]: (ctx, d) => generateConceptBatch(ctx, d.projectId as string, Number(d.batch)),
@@ -188,11 +207,26 @@ async function runJobInContext(queue: string, data: Record<string, unknown>, job
   try {
     return await h(ctx, data, jobId);
   } catch (e) {
-    if (e instanceof DomainError && ['INVALID', 'NOT_FOUND', 'FORBIDDEN', 'GATE_BLOCKED', 'PAYMENT_REQUIRED', 'CONFLICT'].includes(e.code)) {
+    if (e instanceof DomainError && FINAL_DOMAIN_CODES.includes(e.code)) {
       return { failed: e.code, message: e.message };
     }
     throw e;
   }
+}
+
+/**
+ * A job failed for the last time (its retries are spent; pg-boss moves it to the dead-letter queue, which stays
+ * visible to staff). Jobs whose subject would otherwise be stuck record an honest final state here.
+ */
+export async function onFinalFailure(queue: string, data: Record<string, unknown>, jobId: string, err: unknown): Promise<void> {
+  if (queue !== Queues.analyzeProduct && queue !== Queues.analyzeProductFree) return;
+  let ctx: TenantContext;
+  try {
+    ctx = await jobContext(data as never, jobId);
+  } catch {
+    return; // workspace gone
+  }
+  await failAnalysis(ctx, data.skuId as string, data.projectId as string, `analysis failed after retries: ${(err as Error)?.message ?? String(err)}`);
 }
 
 /**
