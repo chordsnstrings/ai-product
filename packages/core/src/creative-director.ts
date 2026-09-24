@@ -339,6 +339,7 @@ export async function generateConcepts(run: ConceptRun) {
       token: run.token,
       task: 'creative_director.concepts',
       subject: { type: 'project', id: run.projectId },
+      inputRefs: { skuId: run.skuId, projectId: run.projectId, batch: run.batch, attempt, brandBrainVersionId, packetIds: [...packetIds] },
       template: 'concepts',
       content,
       schema: ConceptSet,
@@ -440,6 +441,7 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       token: run.token,
       task: 'creative_director.storyboard',
       subject: { type: 'project', id: run.projectId },
+      inputRefs: { skuId: run.skuId, projectId: run.projectId, conceptId: run.conceptId, attempt, brandBrainVersionId, packetIds: productContext.rationaleIds ? Object.values(productContext.rationaleIds).flat() : [] },
       template: 'storyboard',
       content: [
         ...contextPacketParts(packet),

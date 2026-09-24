@@ -319,6 +319,19 @@ function unitsOf(line: CostLine): Record<string, unknown> {
   return units;
 }
 
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+/** The call's input refs plus what the gateway derives from its inputs (content hashes of images/references). */
+const withInputRefs = <M extends CallMeta>(call: M, derived: Record<string, unknown>): M => (Object.keys(derived).length ? { ...call, inputRefs: { ...(call.inputRefs ?? {}), ...derived } } : call);
+
+/**
+ * A provider job's output was saved as an asset (standard §41 "output ID"): link it, and return what the call
+ * actually cost so the scene version / asset that used it can carry it. Tenant role, explicit workspace filter.
+ */
+export async function linkJobOutput(tx: Tx, workspaceId: string, jobId: string, assetId: string): Promise<{ costMicros: number }> {
+  const [j] = await tx`update provider_jobs set output_asset_id = ${assetId} where id = ${jobId} and workspace_id = ${workspaceId} returning actual_micros`;
+  return { costMicros: Number(j?.actual_micros ?? 0) };
+}
+
 const gatewayLog = logger('gateway');
 
 /** What kind of failure closed a job (ProviderError kind, DomainError code), for events and reconciliation. */
@@ -393,6 +406,9 @@ async function closeJob(
     // The failure class is kept on the job: the circuit breaker counts outage-class failures per route (plan 05 §10).
     const extra = { ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}), ...(outcome.ok ? {} : { errorKind: outcome.errorKind }), ...(billed.length ? { billedOnFailure: billed.map(unitsOf) } : {}) };
     const raw = outcome.rawMeta || Object.keys(extra).length ? { ...(outcome.rawMeta ?? {}), ...extra } : null;
+    // §41 token/compute usage: the units the provider reported (tokens incl. cached, seconds, characters, images),
+    // plus what failed attempts were billed for.
+    const usage = line || billed.length ? { ...(line ? unitsOf(line) : {}), ...(billed.length ? { billedOnFailure: billed.map(unitsOf) } : {}) } : null;
     const [closed] = await tx`
       update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual}, savings_micros = ${savingsMicros},
         latency_ms = ${outcome.latencyMs}, completed_at = now(),
@@ -401,6 +417,8 @@ async function closeJob(
         error = ${outcome.ok ? null : outcome.error},
         output = ${outcome.ok && outcome.output !== undefined ? tx.json(outcome.output as never) : null},
         output_asset_id = ${outcome.ok ? (outcome.outputAssetId ?? null) : null},
+        moderation_status = ${outcome.ok ? 'passed' : outcome.errorKind === 'moderation' ? 'rejected' : null},
+        usage = ${usage ? tx.json(usage as never) : null},
         raw_meta = coalesce(raw_meta, '{}'::jsonb) || coalesce(${raw ? tx.json(raw as never) : null}::jsonb, '{}'::jsonb)
       where id = ${started.jobId} and workspace_id = ${meta.ctx.workspaceId} and status = 'dispatched'
       returning provider_request_id`;
@@ -515,9 +533,11 @@ async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet, adapter: LlmProvider
   // Priced with the template the route actually sends (its version may be older or newer than the latest).
   const approxIn = (r: Route) => Math.ceil(((call.system?.length ?? routedPrompt(r, call.template!).length) + contentLen) / 4);
   const maxTokens = call.maxTokens ?? 8000;
-  const started = await begin(call, (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn(r), outputTokens: maxTokens }), {
+  // Images are identified by their content hash, in the fingerprint and on the job's input refs (§41).
+  const imageSha256 = call.content.filter((c) => c.type === 'image').map((c) => sha256((c as { base64: string }).base64));
+  const started = await begin(withInputRefs(call, imageSha256.length ? { imageSha256 } : {}), (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn(r), outputTokens: maxTokens }), {
     task: call.task,
-    content: call.content.map((c) => (c.type === 'image' ? { type: 'image', len: c.base64.length } : c)),
+    content: call.content.map((c) => (c.type === 'image' ? { type: 'image', sha256: sha256(c.base64) } : c)),
   });
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.
@@ -569,7 +589,8 @@ export async function generateImage(call: ImageCall): Promise<ImageResult & { jo
 }
 
 async function imageOnce(call: ImageCall, p: ProviderSet, adapter: ImageProvider = p.image): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
-  const started = await begin(call, (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: call.references.length });
+  const referenceSha256 = call.references.map(sha256);
+  const started = await begin(withInputRefs(call, { referenceSha256 }), (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: referenceSha256 });
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.
   const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
@@ -659,7 +680,8 @@ export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; j
 }
 
 async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider = p.video): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
-  const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false, ...(call.videoInputSeconds ? { videoInputSeconds: call.videoInputSeconds } : {}) }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
+  const referenceSha256 = call.references.map(sha256);
+  const started = await begin(withInputRefs(call, { referenceSha256 }), (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false, ...(call.videoInputSeconds ? { videoInputSeconds: call.videoInputSeconds } : {}) }), { prompt: call.prompt, seconds: call.seconds, refs: referenceSha256 });
   const line = started.line;
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.

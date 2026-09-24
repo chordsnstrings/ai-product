@@ -199,6 +199,7 @@ export async function clusterThemes(ctx: TenantContext, skuId: string) {
       token: auth.token,
       task: 'customer_language.themes',
       subject: { type: 'sku', id: skuId },
+      inputRefs: { skuId, signalIds: signals.map((x) => x.id as string) },
       template: 'themes',
       content: [{ type: 'untrusted', sourceId: 'reviews', text: texts.map((t, i) => `[${i}] ${t}`).join('\n').slice(0, 100_000) }],
       schema: ThemeSet,

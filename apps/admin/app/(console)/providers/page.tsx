@@ -16,7 +16,7 @@ export default async function Providers() {
     routes: await tx`select * from model_routes order by task`,
     health: await tx`select provider, count(*)::int as n, count(*) filter (where status = 'failed')::int as failed,
                             percentile_cont(0.5) within group (order by latency_ms)::int as p50, percentile_cont(0.95) within group (order by latency_ms)::int as p95,
-                            count(*) filter (where error ilike '%moderation%' or error ilike '%sensitive%')::int as moderated
+                            count(*) filter (where moderation_status = 'rejected')::int as moderated
                      from provider_jobs where created_at > now() - interval '24 hours' group by provider`,
     // §48 drift: what providers answered pinned routes with, when it isn't the pinned version (alerts go to Pulse);
     // for unpinned routes, the versions actually served (pin one of them to freeze behaviour).

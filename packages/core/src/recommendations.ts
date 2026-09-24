@@ -365,6 +365,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
         token: auth.token,
         task: 'creative_director.recommendations',
         subject: { type: 'sku', id: skuId },
+        inputRefs: { skuId, week, candidateSet: b, packetIds: [...packetIds] },
         template: 'recommendations',
         content: [
           ...contextPacketParts(packet),

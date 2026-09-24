@@ -153,6 +153,15 @@ describe('provider moderation (§44 "model moderation false positive": edge-44-0
     expect(m.scenes.find((s) => s.sceneId === sc!.id)).toMatchObject({ kind: 'still', technique: 'exact_product_composite' });
     const queue = await withAdmin((tx) => tx`${qaQueueSql(tx, { includeTest: true })}`);
     expect(queue.find((q) => q.id === r.projectId)?.why).toBe('provider moderation (alternative shot used)');
+
+    // §41: every accepted render carries its job (output linked, cost recorded), and the jobs whose output is in the
+    // delivered ad are marked finally accepted; the declined job is not.
+    const renders = await ownerPool()`select v.status, v.provider_job_id, v.cost_micros, j.output_asset_id = v.asset_id as linked, j.final_accepted_at is not null as final, j.moderation_status
+                                      from scene_versions v join provider_jobs j on j.id = v.provider_job_id where v.workspace_id = ${r.t.workspaceId} and v.kind = 'render'`;
+    expect(renders.filter((x) => x.status === 'accepted').length).toBeGreaterThan(0);
+    for (const x of renders.filter((y) => y.status === 'accepted')) expect(x).toMatchObject({ linked: true, final: true, moderation_status: 'passed' });
+    expect(renders.filter((x) => x.status === 'accepted').every((x) => Number(x.cost_micros) > 0)).toBe(true);
+    expect(renders.find((x) => x.status === 'failed')).toMatchObject({ final: false, moderation_status: 'rejected' });
   }, 300_000);
 });
 

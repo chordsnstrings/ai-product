@@ -18,7 +18,7 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, currentPeriodKey, type LedgerUnit } from './ledger';
 import { setting } from './settings';
-import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
+import { generateImage, generateVideo, lineFor, linkJobOutput, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
@@ -685,9 +685,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         withTenant(ws, async (tx) => {
           const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: sku.id as string, source: 'composed', lineage: { sceneId: s.id, projectId, technique, ...lineage } });
           const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'frame'`;
-          const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, qa, status, lineage)
+          // A generated plate's provider job (§41), with its cost, on the version it produced.
+          const jobId = (lineage.plateJobId as string | undefined) ?? null;
+          const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, qa, status, lineage, provider_job_id, cost_micros)
                                  values (${ws}, ${s.id}, ${v!.v}, 'frame', ${a.id}, ${technique}, ${tx.json(qa as never)}, 'accepted',
-                                         ${tx.json({ projectId, ...lineage } as never)})
+                                         ${tx.json({ projectId, ...lineage } as never)}, ${jobId},
+                                         coalesce((select actual_micros from provider_jobs where id = ${jobId} and workspace_id = ${ws}), 0))
                                  returning id`;
           return { assetId: a.id, versionId: row!.id as string };
         });
@@ -738,9 +741,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                                  order by created_at desc limit 1`;
           const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
           const qa = [{ check: 'visual', pass: false, hard: false, detail: `provider moderation: ${e.message.slice(0, 200)}`, data: { moderation: true } }];
-          await tx`insert into scene_versions (workspace_id, scene_id, version, kind, technique, qa, status, input_hash, lineage)
+          await tx`insert into scene_versions (workspace_id, scene_id, version, kind, technique, qa, status, input_hash, lineage, provider_job_id)
                    values (${ws}, ${s.id}, ${v!.v}, 'render', 'generative', ${tx.json(qa as never)}, 'failed', ${hashes.get(s.id)!},
-                           ${tx.json({ attempt, moderation: true, provider: e.provider, providerJobId: (job?.id as string) ?? null } as never)})`;
+                           ${tx.json({ attempt, moderation: true, provider: e.provider, providerJobId: (job?.id as string) ?? null } as never)}, ${(job?.id as string) ?? null})`;
           if (job) {
             await emit(tx, ctx, 'PROVIDER_MODERATION_REJECTED', { type: 'scene', id: s.id }, { projectId, provider: e.provider, attempt, error: e.message.slice(0, 200) }, {
               projectId, skuId: sku.id as string, storyboardId: sb!.id as string, providerJobId: job.id as string, authorizationId: auth.authorizationId,
@@ -831,7 +834,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
               const v0 = vid;
               assetId = await withTenant(ws, async (tx) => {
                 const a = await saveAsset(tx, ws, { bytes: v0.bytes, mime: 'video/mp4', kind: 'scene_render', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, attempt, providerJobId: v0.jobId, model: v0.modelVersion, promptVersion: v0.promptVersion, inputHash: hashes.get(s.id) } });
-                await tx`update provider_jobs set output_asset_id = ${a.id} where id = ${v0.jobId} and workspace_id = ${ws}`;
+                await linkJobOutput(tx, ws, v0.jobId, a.id);
                 return a.id;
               });
             }
@@ -840,10 +843,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             const saved = await withTenant(ws, async (tx) => {
               const a = { id: assetId };
               const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
-              const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage)
+              // §41: the render's job and cost on its version; a failed QA's first failing check is the repair reason.
+              const repairReason = ok ? null : (res.find((c) => !c.pass)?.detail ?? 'QA').slice(0, 200);
+              const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage, provider_job_id, cost_micros)
                                      values (${ws}, ${s.id}, ${v!.v}, 'render', ${a.id}, 'generative', ${vid.modelVersion ?? null}, ${vid.promptVersion},
                                              ${tx.json(res as never)}, ${ok ? 'accepted' : 'qa_failed'}, ${hashes.get(s.id)!},
-                                             ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null } as never)})
+                                             ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null, ...(repairReason ? { repairReason } : {}) } as never)},
+                                             ${vid.jobId}, coalesce((select actual_micros from provider_jobs where id = ${vid.jobId} and workspace_id = ${ws}), 0))
                                      returning id`;
               await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) }, {
                 projectId, skuId: sku.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null,
@@ -895,8 +901,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
         }
         try {
-          const img = await generateImage({ ctx, token: auth.token, task: PLATE_TASK, subject: { type: 'scene', id: s.id }, prompt: platePrompt(s), references: [], width: 1080, height: 1920, mockLabel: '' });
-          const plate = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: img.bytes, mime: img.mime, kind: 'storyboard_frame', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, projectId, plate: true, providerJobId: img.jobId, promptVersion: img.promptVersion } }));
+          const img = await generateImage({ ctx, token: auth.token, task: PLATE_TASK, subject: { type: 'scene', id: s.id }, inputRefs: { projectId, sceneId: s.id, skuId: sku.id }, prompt: platePrompt(s), references: [], width: 1080, height: 1920, mockLabel: '' });
+          const plate = await withTenant(ws, async (tx) => {
+            const a = await saveAsset(tx, ws, { bytes: img.bytes, mime: img.mime, kind: 'storyboard_frame', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, projectId, plate: true, providerJobId: img.jobId, promptVersion: img.promptVersion } });
+            await linkJobOutput(tx, ws, img.jobId, a.id);
+            return a;
+          });
           const fb = (await exactProductFrame(imagery, { purpose: s.purpose, plate: { assetId: plate.id, bytes: img.bytes } }))!;
           const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, frameBytes: fb.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt: 1 });
           if (!res.every((c) => c.pass)) {
@@ -905,7 +915,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           }
           checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: exact product on a generated setting — ${c.detail}` })));
           platedScenes.add(s.id);
-          const saved = await saveFrame(s, fb.bytes, fb.technique, fb.lineage, res);
+          const saved = await saveFrame(s, fb.bytes, fb.technique, { ...fb.lineage, plateJobId: img.jobId }, res);
           return still(s, n, { bytes: fb.bytes, ...saved, technique: fb.technique });
         } catch (e) {
           if (e instanceof LeaseLost || e instanceof ProductionCancelled) throw e;
@@ -1020,8 +1030,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         });
         if (!clip) {
           try {
-            const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'scene', id: s.id }, text, voice });
-            const a = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId: sku.id as string, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, sceneId: s.id, textHash } }));
+            const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'scene', id: s.id }, inputRefs: { projectId, sceneId: s.id, textHash }, text, voice });
+            const a = await withTenant(ws, async (tx) => {
+              const saved = await saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId: sku.id as string, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, sceneId: s.id, textHash } });
+              await linkJobOutput(tx, ws, vo.jobId, saved.id);
+              return saved;
+            });
             clip = { id: a.id, bytes: vo.bytes };
           } catch (e) {
             if (isProviderOutage(e)) throw new ProviderOutage('tts.voiceover', e);
@@ -1157,6 +1171,14 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
+        // §41 final acceptance: the provider jobs whose output is in the delivered creative (its scene versions and
+        // voice clips).
+        const versionIds = manifest.scenes.map((m) => m.versionId).filter((x): x is string => !!x);
+        const clipIds = segments.map((sg) => sg.clipAssetId).filter(Boolean);
+        await tx`update provider_jobs j set final_accepted_at = now()
+                 where j.workspace_id = ${ws} and j.final_accepted_at is null
+                   and (j.id in (select v.provider_job_id from scene_versions v where v.workspace_id = ${ws} and v.id = any(${versionIds}::uuid[]) and v.provider_job_id is not null)
+                        or j.output_asset_id = any(${clipIds}::uuid[]))`;
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');
         await settle(tx, ctx, auth.authorizationId, 'consumed');

@@ -84,5 +84,7 @@ insert into table_registry values ('price_change_notices', 'tenant');
 -- characters, images), so the console reads them instead of guessing from error text.
 alter table provider_jobs add column moderation_status text check (moderation_status in ('passed', 'rejected'));
 alter table provider_jobs add column usage jsonb;
+-- Final acceptance: the job's output went into the delivered creative (set when the creative is composed).
+alter table provider_jobs add column final_accepted_at timestamptz;
 -- Which provider job produced a scene version (render or frame), and what it cost.
 alter table scene_versions add column provider_job_id uuid;

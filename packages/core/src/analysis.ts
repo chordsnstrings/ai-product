@@ -327,6 +327,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       token: auth.token,
       task: 'extract.product_facts',
       subject: { type: 'sku', id: skuId },
+      inputRefs: { skuId, projectId, photoAssetIds: photoIds.slice(0, 3), productPage: !!extracted },
       template: 'extract-product',
       content: [
         ...images,

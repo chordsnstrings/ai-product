@@ -16,7 +16,7 @@ import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { setExperimentState } from './experiments';
 import { LEASE_BUSY, renewJobLease, withJobLease } from './leases';
-import { synthesizeVoice } from './model-gateway';
+import { linkJobOutput, synthesizeVoice } from './model-gateway';
 import { bonusHookDue } from './offers';
 import { enqueue, Queues } from './outbox';
 import { ASPECTS, productionRoutes, voiceLine } from './production';
@@ -346,9 +346,10 @@ async function hookClip(ctx: TenantContext, ref: { variantId?: string; bonusFor?
   );
   try {
     const subject = ref.variantId ? { type: 'variant', id: ref.variantId } : { type: 'project', id: refId };
-    const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject, text, voice: voice as never });
+    const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject, inputRefs: { projectId, [lineageKey]: refId, textHash }, text, voice: voice as never });
     return await withTenant(ws, async (tx) => {
       const a = await saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, [lineageKey]: refId, textHash } });
+      await linkJobOutput(tx, ws, vo.jobId, a.id);
       await settle(tx, ctx, auth.authorizationId, 'consumed');
       return { id: a.id, bytes: vo.bytes };
     });

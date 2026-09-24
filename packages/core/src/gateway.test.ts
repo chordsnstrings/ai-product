@@ -104,6 +104,32 @@ describe('partial provider billing (plan 06 Phase 3 tests; standard §37 all spe
   });
 });
 
+describe('provider job records (standard §41: arch-34)', () => {
+  it('keeps input refs with content hashes, usage and moderation outcome; the fingerprint covers the references', async () => {
+    const t = await makeTenant();
+    const call = async (refs: string[], prompt = 'hands') => {
+      const { ctx, token } = await tokenFor(t.workspaceId, t.userId, 'video.scene', 'video');
+      return generateVideo({ ctx, token, task: 'video.scene', subject: null, inputRefs: { sceneId: 'scene-1' }, prompt, references: refs, seconds: 5, resolution: '720p', ratio: '9:16' });
+    };
+    await call(['data:image/png;base64,AAAA']);
+    await call(['data:image/png;base64,BBBB']);
+    await call(['data:image/png;base64,AAAA'], 'hands [[fail:moderation]]').catch(() => null);
+    const jobs = await ownerPool()`select request_hash, input_refs, usage, moderation_status, status from provider_jobs where workspace_id = ${t.workspaceId} order by created_at`;
+    expect(jobs).toHaveLength(3);
+    // Same prompt, different reference image: a different request.
+    expect(jobs[0]!.request_hash).not.toBe(jobs[1]!.request_hash);
+    expect(jobs[0]!.input_refs).toMatchObject({ sceneId: 'scene-1', referenceSha256: [expect.stringMatching(/^[0-9a-f]{64}$/)] });
+    expect(jobs[0]!).toMatchObject({ status: 'succeeded', moderation_status: 'passed', usage: { kind: 'video', seconds: 5 } });
+    expect(jobs[2]!).toMatchObject({ status: 'failed', moderation_status: 'rejected' });
+
+    const { ctx: c2, token: t2 } = await tokenFor(t.workspaceId, t.userId);
+    const r = await llmJson({ ctx: c2, token: t2, task: 'qa.fidelity', subject: null, inputRefs: { sceneId: 'scene-2' }, system: 'x', content: [{ type: 'image', mediaType: 'image/jpeg', base64: 'Zm9v' }, { type: 'text', text: 'same?' }], schema: z.object({ ok: z.boolean() }), mock: () => ({ ok: true }), maxTokens: 400 });
+    const [j] = await ownerPool()`select input_refs, usage from provider_jobs where id = ${r.jobId}`;
+    expect(j!.input_refs).toMatchObject({ sceneId: 'scene-2', imageSha256: [expect.stringMatching(/^[0-9a-f]{64}$/)] });
+    expect(j!.usage).toMatchObject({ kind: 'llm', inputTokens: expect.any(Number), outputTokens: expect.any(Number) });
+  });
+});
+
 describe('promotional packages (standard §6: recorded as savings)', () => {
   it('realized cost is the discounted amount, the list-price difference is kept as savings, estimates stay at list', async () => {
     const t = await makeTenant();

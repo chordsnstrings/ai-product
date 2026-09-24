@@ -48,6 +48,7 @@ export async function extractGenome(ctx: TenantContext, creativeId: string) {
       token: auth.token,
       task: 'genome.extract',
       subject: { type: 'creative', id: creativeId },
+      inputRefs: { creativeId, taxonomyVersion: Taxonomy.version },
       template: 'genome',
       content: [{ type: 'untrusted', sourceId: 'ad_copy', text: copy.slice(0, 8000) }, { type: 'text', text: `Taxonomy v${Taxonomy.version}.` }],
       schema: Genome,
