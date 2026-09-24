@@ -217,3 +217,51 @@ describe('tenant isolation', () => {
     }
   });
 });
+
+describe('raw observations are never rewritten (standard §15, §18)', () => {
+  type T = Parameters<Parameters<typeof withTenant>[1]>[0];
+  async function factAndSignal(workspaceId: string, skuId: string) {
+    return withTenant(workspaceId, async (tx) => {
+      const [f] = await tx`insert into product_facts (workspace_id, sku_id, fact_type, normalized_key, value_text, source_type, state, created_by)
+                           values (${workspaceId}, ${skuId}, 'size', 'size', '30 ml', 'product_page', 'OBSERVED', 'test') returning id`;
+      const [s] = await tx`insert into customer_signals (workspace_id, sku_id, source, text) values (${workspaceId}, ${skuId}, 'review', 'Absorbs fast') returning id`;
+      return { factId: f!.id as string, signalId: s!.id as string };
+    });
+  }
+
+  it('a product fact keeps its value, source and state; only lifecycle columns move, along allowed edges', async () => {
+    const a = await makeTenant();
+    const sku = await makeSku(a.workspaceId);
+    const { factId } = await factAndSignal(a.workspaceId, sku);
+    const changes = [
+      (tx: T) => tx`update product_facts set value_text = '50 ml' where id = ${factId}`,
+      (tx: T) => tx`update product_facts set state = 'DECIDED' where id = ${factId}`,
+      (tx: T) => tx`update product_facts set source_type = 'merchant' where id = ${factId}`,
+    ];
+    for (const change of changes) await expect(withTenant(a.workspaceId, change)).rejects.toThrow(/observations are immutable/);
+    // Staff and system roles are bound by the same guard.
+    await expect(withAdmin((tx) => tx`update product_facts set value_text = '50 ml' where id = ${factId}`)).rejects.toThrow(/immutable/);
+    await expect(withSystem((tx) => tx`update product_facts set value_text = '50 ml' where id = ${factId}`)).rejects.toThrow(/immutable/);
+    await withTenant(a.workspaceId, (tx) => tx`update product_facts set merchant_confirmed = true, status = 'DISPUTED' where id = ${factId}`);
+    await withTenant(a.workspaceId, (tx) => tx`update product_facts set status = 'SUPERSEDED', valid_to = now() where id = ${factId}`);
+    await expect(withTenant(a.workspaceId, (tx) => tx`update product_facts set status = 'ACTIVE' where id = ${factId}`)).rejects.toThrow(/cannot move from SUPERSEDED to ACTIVE/);
+    const [f] = await ownerPool()`select value_text, state, status, merchant_confirmed from product_facts where id = ${factId}`;
+    expect(f).toMatchObject({ value_text: '30 ml', state: 'OBSERVED', status: 'SUPERSEDED', merchant_confirmed: true });
+  });
+
+  it('customer signals cannot be edited by any runtime role, but can be deleted and move with their SKU', async () => {
+    const a = await makeTenant();
+    const b = await makeTenant();
+    const sku = await makeSku(a.workspaceId);
+    const { factId, signalId } = await factAndSignal(a.workspaceId, sku);
+    await expect(withTenant(a.workspaceId, (tx) => tx`update customer_signals set text = 'Cured my acne' where id = ${signalId}`)).rejects.toThrow(/permission denied/);
+    await expect(withAdmin((tx) => tx`update customer_signals set text = 'x' where id = ${signalId}`)).rejects.toThrow(/permission denied/);
+    await expect(withSystem((tx) => tx`update customer_signals set text = 'x' where id = ${signalId}`)).rejects.toThrow(/permission denied/);
+    // Moving a SKU into another workspace (provisional → existing account) cascades through both guards.
+    await withSystem((tx) => tx`update skus set workspace_id = ${b.workspaceId}, catalogue_no = 900 where id = ${sku}`);
+    const [moved] = await ownerPool()`select (select workspace_id from product_facts where id = ${factId}) as f, (select workspace_id from customer_signals where id = ${signalId}) as s`;
+    expect(moved).toEqual({ f: b.workspaceId, s: b.workspaceId });
+    await withTenant(b.workspaceId, (tx) => tx`delete from customer_signals where id = ${signalId}`);
+    expect(await ownerPool()`select 1 from customer_signals where id = ${signalId}`).toHaveLength(0);
+  });
+});

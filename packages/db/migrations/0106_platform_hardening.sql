@@ -98,3 +98,28 @@ begin
 end $$;
 revoke all on function arkiv_platform_metrics from public;
 grant execute on function arkiv_platform_metrics to app_rw, admin_rw, system_rw;
+
+-- ───────────── Raw observations are never rewritten (standard §15, §18) ─────────────
+-- A product fact's value, source and state are immutable: corrections insert a DECIDED fact that supersedes.
+-- Only lifecycle columns move (status, valid_to, merchant_confirmed), along allowed status edges; workspace_id
+-- may change only through the SKU move cascade (moveProvisionalSkus).
+create or replace function arkiv_product_fact_guard() returns trigger language plpgsql as $$
+begin
+  if (new.id, new.sku_id, new.fact_type, new.normalized_key, new.value_text, new.value_number, new.value_json, new.source_type,
+      new.source_id, new.source_url, new.observed_at, new.confidence, new.valid_from, new.supersedes_fact_id, new.state, new.created_by)
+     is distinct from
+     (old.id, old.sku_id, old.fact_type, old.normalized_key, old.value_text, old.value_number, old.value_json, old.source_type,
+      old.source_id, old.source_url, old.observed_at, old.confidence, old.valid_from, old.supersedes_fact_id, old.state, old.created_by) then
+    raise exception 'product_facts: observations are immutable; record a new fact that supersedes this one' using errcode = 'restrict_violation';
+  end if;
+  if new.status is distinct from old.status and not (
+       (old.status = 'ACTIVE' and new.status in ('SUPERSEDED', 'DISPUTED'))
+    or (old.status = 'DISPUTED' and new.status in ('SUPERSEDED', 'ACTIVE'))) then
+    raise exception 'product_facts: status cannot move from % to %', old.status, new.status using errcode = 'restrict_violation';
+  end if;
+  return new;
+end $$;
+create trigger product_facts_guard before update on product_facts for each row execute function arkiv_product_fact_guard();
+
+-- Customer signals are raw customer language: imported, read, deleted (privacy / purge), never edited.
+revoke update on customer_signals from app_rw, admin_rw, system_rw;
