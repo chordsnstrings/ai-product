@@ -33,12 +33,13 @@ export default async function Claims() {
         <Table head={['Since', 'Workspace', 'SKU', 'Claim', 'Category', 'Evidence', 'Decision']} rows={d0.restricted.map((c) => [
           ago(c.created_at), <Link key="w" href={`/tenants/${c.workspace_id}`}>{c.name as string}</Link>, String(c.catalogue_no).padStart(3, '0'), `“${c.preferred_wording}”`, c.claim_category as string, c.evidence as number,
           <ActForm key="f" inline action="claim.decide" extra={{ workspaceId: c.workspace_id, claimId: c.id }} submit="Decide" fields={[
-            { name: 'decision', label: 'Decision', type: 'select', options: ['approve', 'block'] },
+            { name: 'decision', label: 'Decision', type: 'select', options: ['approve', 'block', 'approve_without_evidence'] },
             { name: 'wording', label: 'Exact wording', defaultValue: c.preferred_wording as string },
             { name: 'qualifier', label: 'Qualifier' },
             { name: 'platforms', label: 'Platforms (TIKTOK, META = Reels + Feed, YOUTUBE, ORGANIC)', defaultValue: 'TIKTOK,META' },
             { name: 'markets', label: 'Markets (blank = brand market)' },
-            { name: 'reason', label: 'Reason', required: true },
+            { name: 'evidenceIds', label: 'Evidence ids relied on (blank = every product-specific file on record)' },
+            { name: 'reason', label: 'Reason (approving without evidence goes to a second compliance reviewer)', required: true },
           ]} />,
         ])} empty="Nothing waiting for compliance review." />
       </Section>

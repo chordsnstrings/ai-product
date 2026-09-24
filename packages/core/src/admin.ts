@@ -1,5 +1,6 @@
 import { withAdmin, type Tx } from '@arkiv/db';
 import { DomainError, newId, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type StaffRole, type WorkspaceState } from '@arkiv/shared';
+import { approveClaim, claimMarket } from './claims';
 import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { emit } from './events';
@@ -215,6 +216,7 @@ export type ApprovalAction =
   | 'workspace.purge_now'
   | 'staff.roles'
   | 'claim.unblock'
+  | 'claim.approve_override'
   | 'stripe.assign';
 
 type Executor = (payload: Record<string, unknown>, ctx: { requester: Staff; approver: Staff }) => Promise<unknown>;
@@ -246,6 +248,7 @@ const APPROVER_ROLE: Record<ApprovalAction, StaffRole> = {
   'workspace.purge_now': 'OPS',
   'staff.roles': 'SUPER_ADMIN',
   'claim.unblock': 'COMPLIANCE',
+  'claim.approve_override': 'COMPLIANCE',
   'stripe.assign': 'FINANCE',
 };
 
@@ -367,6 +370,29 @@ registerExecutor('claim.unblock', async (p, { approver }) =>
     await emit(tx, staffCtx(approver, ws), 'CLAIM_UNBLOCKED', { type: 'claim', id: p.claimId as string }, { from: 'BLOCKED', to: 'MERCHANT_REVIEW_REQUIRED', reason: String(p.reason ?? '') });
     await audit(tx, approver, 'claim.unblocked', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string, before: { status: 'BLOCKED' }, after: { status: 'MERCHANT_REVIEW_REQUIRED' } });
     return { claimId: p.claimId };
+  }),
+);
+
+/**
+ * A high-risk or RESTRICTED claim approved without qualifying evidence on file (§43): only on a second compliance
+ * reviewer's approval, with the reason recorded on the claim's approval event.
+ */
+registerExecutor('claim.approve_override', async (p, { requester, approver }) =>
+  withAdmin(async (tx) => {
+    const ws = p.workspaceId as string;
+    const [cl] = await tx`select sku_id from claims where id = ${p.claimId as string} and workspace_id = ${ws}`;
+    if (!cl) throw new DomainError('NOT_FOUND', 'Claim not found');
+    const markets = typeof p.markets === 'string' && p.markets.trim() ? p.markets.split(',').map((m) => m.trim()).filter(Boolean) : [await claimMarket(tx, cl.sku_id as string)];
+    const ctx: TenantContext = { workspaceId: ws, workspaceState: 'ACTIVE_PAID', role: 'OWNER', actor: staffCtx(approver, ws).actor, requestId: newId() };
+    const claim = await approveClaim(tx, ctx, p.claimId as string, {
+      markets,
+      platforms: String(p.platforms ?? 'TIKTOK,META').split(',').map((x) => x.trim()).filter(Boolean),
+      qualifier: (p.qualifier as string | null) ?? null,
+      wording: (p.wording as string | null) ?? undefined,
+      overrideReason: `${String(p.reason ?? '')} (requested by ${requester.email}, approved by ${approver.email})`,
+    });
+    await audit(tx, approver, 'claim.approved_without_evidence', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string, after: { status: claim.status } });
+    return { claimId: p.claimId, status: claim.status };
   }),
 );
 

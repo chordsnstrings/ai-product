@@ -11,6 +11,7 @@ import {
   createExperiment,
   decideFact,
   disconnectIntegration,
+  EVIDENCE_APPLICABILITY,
   dismissNotice,
   dismissRecommendation,
   enqueue,
@@ -72,10 +73,17 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       case 'evidence': {
         const claimId = uuid.parse(form.get('claimId'));
         const type = z.enum(['clinical_study', 'consumer_perception', 'lab_test', 'certificate', 'ingredient_spec', 'other']).parse(form.get('type'));
+        // §43: evidence is a document (or a link to one) and says whether it is about this product.
+        const applicability = z.enum(EVIDENCE_APPLICABILITY).parse(form.get('applicability'));
+        const location = z.string().trim().max(500).optional().parse((form.get('location') as string | null) || undefined) || null;
+        const wording = z.string().trim().max(200).optional().parse((form.get('wording') as string | null) || undefined) || null;
+        const expiry = z.string().date().optional().parse((form.get('expiry') as string | null) || undefined) ?? null;
+        const hasFile = file instanceof File && file.size > 0;
+        if (!hasFile && !/^https?:\/\/\S+$/i.test(location ?? '')) throw new DomainError('INVALID', 'Attach the document, or paste a link to it. A description alone isn’t evidence.');
         assertCan(ctx, 'sku.edit');
         await t(async (tx) => {
-          const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'evidence_doc', null, { filename: file.name })).id : null;
-          await attachEvidence(tx, ctx, claimId, { type, assetId, location: (form.get('location') as string) || null, applicability: (form.get('applicability') as string) || null, expiry: (form.get('expiry') as string) || null });
+          const assetId = hasFile ? (await ingestBytes(tx, ctx, Buffer.from(await (file as File).arrayBuffer()), 'evidence_doc', null, { filename: (file as File).name })).id : null;
+          await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, expiry, wording });
         });
         return json({ ok: true });
       }

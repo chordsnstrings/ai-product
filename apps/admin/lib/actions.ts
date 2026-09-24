@@ -629,9 +629,25 @@ export const ACTIONS = {
   /* ── Claims (tenant routed these to our compliance team; views are audited as content access) ── */
   'claim.decide': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, claimId: uuid, decision: z.enum(['approve', 'block', 'unblock']), wording: z.string().max(200).optional(), qualifier: z.string().max(200).optional(), platforms: z.string().default('TIKTOK,META'), markets: z.string().optional(), reason }),
+    schema: z.object({
+      workspaceId: uuid,
+      claimId: uuid,
+      decision: z.enum(['approve', 'block', 'unblock', 'approve_without_evidence']),
+      wording: z.string().max(200).optional(),
+      qualifier: z.string().max(200).optional(),
+      platforms: z.string().default('TIKTOK,META'),
+      markets: z.string().optional(),
+      /** Comma-separated claim_evidence ids the approval rests on (default: every qualifying file). */
+      evidenceIds: z.string().optional(),
+      reason,
+    }),
     run: async (s, i) => {
       if (i.decision === 'unblock') return requestOrExecute(s, 'claim.unblock', { workspaceId: i.workspaceId, claimId: i.claimId }, i.reason);
+      const evidenceIds = (i.evidenceIds ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+      if (evidenceIds.some((x) => !uuid.safeParse(x).success)) throw new DomainError('INVALID', 'Evidence ids must be UUIDs.');
+      // A high-risk claim approved without qualifying evidence needs a second compliance reviewer (§43, four-eyes).
+      if (i.decision === 'approve_without_evidence')
+        return requestOrExecute(s, 'claim.approve_override', { workspaceId: i.workspaceId, claimId: i.claimId, wording: i.wording ?? null, qualifier: i.qualifier ?? null, platforms: i.platforms, markets: i.markets ?? null }, i.reason);
       return withAdmin(async (tx) => {
         const ctx = { workspaceId: i.workspaceId, workspaceState: 'ACTIVE_PAID' as const, role: 'OWNER' as const, actor: { kind: 'staff' as const, id: s.staffId }, requestId: newId() };
         if (i.decision === 'block') await blockClaim(tx, ctx, i.claimId, i.reason);
@@ -640,9 +656,9 @@ export const ACTIONS = {
           const [cl] = await tx`select sku_id from claims where id = ${i.claimId} and workspace_id = ${i.workspaceId}`;
           if (!cl) throw new DomainError('NOT_FOUND', 'Claim not found');
           const markets = i.markets?.trim() ? i.markets.split(',').map((m) => m.trim()).filter(Boolean) : [await claimMarket(tx, cl.sku_id as string)];
-          await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording });
+          await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording, evidenceIds: evidenceIds.length ? evidenceIds : null });
         }
-        await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier } });
+        await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier, evidenceIds } });
         const [c] = await tx`select c.preferred_wording, c.sku_id, w.slug from claims c join workspaces w on w.id = c.workspace_id where c.id = ${i.claimId} and c.workspace_id = ${i.workspaceId}`;
         // "Open Claims Vault" lands on this SKU's claims page.
         const url = c ? appUrl(c.slug as string, `/products/${c.sku_id as string}/claims`) : `${env().APP_URL}/app`;
