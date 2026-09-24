@@ -2,8 +2,12 @@ import { createHash } from 'node:crypto';
 import { withSystem, withTenant, type Tx } from '@arkiv/db';
 import { DomainError, providerVoiceId, sleep, SUBJECT_REF, type EventRefs, type EventSubjectType, type LogicalVoice, type Micros } from '@arkiv/shared';
 import {
+  adapterFor,
   providers,
   ProviderError,
+  type ImageProvider,
+  type LlmProvider,
+  type VideoProvider,
   type BilledUnits,
   type ContentPart,
   type ImageResult,
@@ -462,19 +466,21 @@ export function fallbackEligible(e: unknown): boolean {
  * prompt version (§41). A fallback that can't take the call (its own circuit is open, or the authorization can't
  * fund its price) leaves the primary's failure as the answer, so the caller pauses/queues as before.
  */
-async function withRouteFallback<T>(meta: CallMeta, adapter: { name: string }, call: (m: CallMeta) => Promise<T>): Promise<T> {
+async function withRouteFallback<A extends { name: string }, T>(meta: CallMeta, adapter: A, call: (m: CallMeta, adapter: A) => Promise<T>, fallbackAdapter: (provider: string) => A | null = (pr) => (pr === adapter.name ? adapter : null)): Promise<T> {
   try {
-    return await call(meta);
+    return await call(meta, adapter);
   } catch (primaryErr) {
     if (!fallbackEligible(primaryErr)) throw primaryErr;
     const fb = await withTenant(meta.ctx.workspaceId, async (tx) => {
       const r = await route(tx, meta.task, meta.ctx.workspaceId);
       return r.fallbackTask ? route(tx, r.fallbackTask, meta.ctx.workspaceId) : null;
     });
-    if (!fb || fb.provider !== adapter.name) throw primaryErr;
-    gatewayLog.warn('provider call failing over', { workspaceId: meta.ctx.workspaceId, task: meta.task, fallbackTask: fb.task, errorKind: errorKind(primaryErr) });
+    // The fallback may be another provider (§53 "fallback providers"): it needs an adapter registered for it.
+    const fbAdapter = fb ? fallbackAdapter(fb.provider) : null;
+    if (!fb || !fbAdapter) throw primaryErr;
+    gatewayLog.warn('provider call failing over', { workspaceId: meta.ctx.workspaceId, task: meta.task, fallbackTask: fb.task, fallbackProvider: fb.provider, errorKind: errorKind(primaryErr) });
     try {
-      return await call({ ...meta, task: fb.task });
+      return await call({ ...meta, task: fb.task }, fbAdapter);
     } catch (fallbackErr) {
       if (fallbackErr instanceof DomainError && (fallbackErr.code === 'UNAVAILABLE' || fallbackErr.code === 'FORBIDDEN')) throw primaryErr;
       throw fallbackErr;
@@ -496,10 +502,10 @@ export async function llmJson<T>(call: LlmCall<T>): Promise<LlmJsonResult<T> & {
   const p = await providers();
   // An eval of a candidate measures that candidate: it never fails over to another route.
   if (call.candidate) return llmOnce(call, p);
-  return withRouteFallback(call, p.llm, (m) => llmOnce({ ...call, task: m.task }, p));
+  return withRouteFallback(call, p.llm, (m, a) => llmOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'llm', pr));
 }
 
-async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string; task: string }> {
+async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet, adapter: LlmProvider = p.llm): Promise<LlmJsonResult<T> & { jobId: string; promptVersion: string; task: string }> {
   if (!call.system && !call.template) throw new Error('llmJson needs a system prompt or a prompt template family');
   const contentLen = call.content.reduce((n, c) => n + (c.type === 'image' ? 6000 : c.text.length), 0);
   // Priced with the template the route actually sends (its version may be older or newer than the latest).
@@ -515,7 +521,7 @@ async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet): Promise<LlmJsonResu
   const t0 = Date.now();
   try {
     const res = await request(started, () =>
-      p.llm.json({
+      adapter.json({
         task: call.task,
         model: wire,
         system: started.system ?? call.system!,
@@ -555,17 +561,17 @@ export interface ImageCall extends CallMeta {
 
 export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
   const p = await providers();
-  return withRouteFallback(call, p.image, (m) => imageOnce({ ...call, task: m.task }, p));
+  return withRouteFallback(call, p.image, (m, a) => imageOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'image', pr));
 }
 
-async function imageOnce(call: ImageCall, p: ProviderSet): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
+async function imageOnce(call: ImageCall, p: ProviderSet, adapter: ImageProvider = p.image): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
   const started = await begin(call, (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: call.references.length });
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.
   const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
   const t0 = Date.now();
   try {
-    const r = await request(started, () => p.image.generate({ model: wire, prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }));
+    const r = await request(started, () => adapter.generate({ model: wire, prompt: call.prompt, references: call.references, width: call.width, height: call.height, mockLabel: call.mockLabel }));
     await finish(call, started, { ok: true, actualLine: started.line, modelVersion: r.modelVersion, providerRequestId: r.providerRequestId, rawMeta: r.rawMeta, wireModel: wire, latencyMs: Date.now() - t0 });
     return { ...r, jobId: started.jobId, promptVersion: started.route.promptVersion, task: call.task };
   } catch (e) {
@@ -593,7 +599,7 @@ export async function removeBackground(call: CutoutCall): Promise<SegmentationRe
   const p = await providers();
   const adapter = p.segmentation;
   if (!adapter) throw new DomainError('UNAVAILABLE', 'Background removal isn’t available right now.', { notConfigured: 'segmentation' });
-  return withRouteFallback(call, adapter, (m) => cutoutOnce({ ...call, task: m.task }, p, adapter));
+  return withRouteFallback(call, adapter, (m, a) => cutoutOnce({ ...call, task: m.task }, p, a));
 }
 
 async function cutoutOnce(call: CutoutCall, p: ProviderSet, adapter: SegmentationProvider): Promise<SegmentationResult & { jobId: string; promptVersion: string; task: string }> {
@@ -643,10 +649,10 @@ export interface VideoCall extends CallMeta {
  */
 export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
   const p = await providers();
-  return withRouteFallback(call, p.video, (m) => videoOnce({ ...call, task: m.task }, p));
+  return withRouteFallback(call, p.video, (m, a) => videoOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'video', pr));
 }
 
-async function videoOnce(call: VideoCall, p: ProviderSet): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
+async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider = p.video): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
   const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
   const line = started.line;
   const wire = wireModelFor(started.route, p);
@@ -657,7 +663,7 @@ async function videoOnce(call: VideoCall, p: ProviderSet): Promise<{ bytes: Buff
   let lastMeta: RawMeta | undefined;
   try {
     ({ providerRequestId: requestId } = await request(started, () =>
-      p.video.submit({ model: wire, prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel }),
+      video.submit({ model: wire, prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel }),
     ));
     await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId} where id = ${started.jobId}`);
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
@@ -670,15 +676,15 @@ async function videoOnce(call: VideoCall, p: ProviderSet): Promise<{ bytes: Buff
           await call.heartbeat();
         } catch (e) {
           // The run stopped (lease lost or production cancelled): don't leave the provider rendering for nobody.
-          await p.video.cancel(requestId).catch(() => {});
+          await video.cancel(requestId).catch(() => {});
           throw e;
         }
       }
-      res = await request(started, () => p.video.poll(requestId!));
+      res = await request(started, () => video.poll(requestId!));
       lastMeta = res.rawMeta ?? lastMeta;
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
       if (Date.now() > deadline) {
-        await p.video.cancel(requestId).catch(() => {});
+        await video.cancel(requestId).catch(() => {});
         throw new ProviderError(started.route.provider, 'video generation timed out', true, 'timeout');
       }
       await sleep(call.pollMs ?? (process.env.NODE_ENV === 'test' ? 20 : 5000));
@@ -827,7 +833,12 @@ export async function reconcileProviderJobs(opts: { limit?: number } = {}): Prom
     }
     let res: VideoPoll | null = null;
     try {
-      res = await p.video.poll(j.provider_request_id as string);
+      const adapter = adapterFor(p, 'video', j.provider as string);
+      if (!adapter) {
+        out.pending++; // no adapter for this provider in this process (configuration): leave it for one that has
+        continue;
+      }
+      res = await adapter.poll(j.provider_request_id as string);
     } catch {
       out.pending++; // provider unreachable right now: try again next sweep
       continue;
@@ -856,7 +867,7 @@ export async function reconcileProviderJobs(opts: { limit?: number } = {}): Prom
       continue;
     }
     if (j.expired) {
-      await p.video.cancel(j.provider_request_id as string).catch(() => {});
+      await adapterFor(p, 'video', j.provider as string)?.cancel(j.provider_request_id as string).catch(() => {});
       if (await finish(meta, started, { ok: false, error: `still ${res.status} after ${RECONCILE_RENDER_GIVE_UP_HOURS}h; cancelled`, errorKind: 'timeout', latencyMs, rawMeta: res.rawMeta })) out.failed++;
       continue;
     }

@@ -34,7 +34,7 @@ function injected(prompt: string): string | null {
 }
 
 export class MockLlm implements LlmProvider {
-  readonly name = 'anthropic';
+  constructor(readonly name = 'anthropic') {}
   async json<T>(req: LlmJsonRequest<T>): Promise<LlmJsonResult<T>> {
     const text = req.content.map((c) => (c.type === 'image' ? '' : c.text)).join('\n');
     const fail = injected(text);
@@ -82,7 +82,7 @@ export class MockSegmentation implements SegmentationProvider {
 const aspectFor = (w: number, h: number): Aspect => (w === h ? '1x1' : w / h > 0.7 ? '4x5' : '9x16');
 
 export class MockImage implements ImageProvider {
-  readonly name = 'byteplus';
+  constructor(readonly name = 'byteplus') {}
   async generate(req: ImageRequest): Promise<ImageResult> {
     const fail = injected(req.prompt);
     if (fail === 'partial') throw new ProviderError(this.name, 'injected partial failure (billed)', false, 'server', { images: 1 });
@@ -102,12 +102,14 @@ interface MockTask {
 }
 
 export class MockVideo implements VideoProvider {
-  readonly name = 'byteplus';
   private tasks = new Map<string, MockTask>();
   /** The latest requests submitted, in order (tests inspect what a render was asked for). */
   readonly requests: VideoRequest[] = [];
   /** Simulated latency before a task completes. */
-  constructor(private readonly latencyMs = 50) {}
+  constructor(
+    private readonly latencyMs = 50,
+    readonly name = 'byteplus',
+  ) {}
 
   async submit(req: VideoRequest): Promise<{ providerRequestId: string }> {
     this.requests.push(req);

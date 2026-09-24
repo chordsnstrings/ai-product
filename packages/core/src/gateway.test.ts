@@ -185,6 +185,36 @@ describe('approved fallback routes on outage (standard §44; arch-24)', () => {
     expect(ok.task).toBe('video.scene_fallback');
   });
 
+  it('fails over to another provider when an adapter is registered for it, priced at that provider’s rates (§53)', async () => {
+    const backup = { llm: new MockLlm('mock-backup'), image: new MockImage('mock-backup'), video: new MockVideo(10, 'mock-backup') };
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), named: { llm: { 'mock-backup': backup.llm }, video: { 'mock-backup': backup.video } }, wireModel: (m) => m });
+    const [primary] = await ownerPool()`select model from model_routes where task = 'video.scene'`;
+    // The backup provider publishes its own (dearer) rate for the same model.
+    await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                      values ('mock-backup', ${primary!.model as string}, 1, 'per_second', ${ownerPool().json({ per_second_720p: 300_000, per_second_1080p: 600_000 })}, now() - interval '1 hour', 'published')`;
+    try {
+      await fallbackRoute('video.scene_fallback', 'video.scene', 'mock-backup');
+      await ownerPool()`update model_routes set circuit_open = true where task = 'video.scene'`;
+      const t = await makeTenant();
+      const { ctx, token } = await tokenFor(t.workspaceId, t.userId, 'video.scene', 'video');
+      const v = await generateVideo({ ctx, token, task: 'video.scene', subject: null, prompt: 'hands', references: [], seconds: 5, resolution: '720p', ratio: '9:16' });
+      expect(v.task).toBe('video.scene_fallback');
+      expect(backup.video.requests).toHaveLength(1);
+      const jobs = await ownerPool()`select task, provider, status, actual_micros from provider_jobs where workspace_id = ${t.workspaceId}`;
+      expect(jobs).toEqual([{ task: 'video.scene_fallback', provider: 'mock-backup', status: 'succeeded', actual_micros: 5 * 300_000 }]);
+      // An LLM route on a provider with no adapter still can't fail over (the next test), one with an adapter can.
+      await fallbackRoute('qa.fidelity_elsewhere', 'qa.fidelity', 'mock-backup');
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        select 'mock-backup', model, 1, unit, rates, effective_from, status from provider_rate_tables
+                        where provider = 'anthropic' and model = (select model from model_routes where task = 'qa.fidelity') and status = 'published' order by version desc limit 1`;
+      await ownerPool()`update model_routes set circuit_open = true where task = 'qa.fidelity'`;
+      const { token: t2 } = await tokenFor(t.workspaceId, t.userId);
+      expect((await ask(ctx, t2)).task).toBe('qa.fidelity_elsewhere');
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where provider = 'mock-backup'`;
+    }
+  });
+
   it('never fails over for content problems, to a provider no adapter serves, or to a route that is down too', async () => {
     const t = await makeTenant();
     const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
