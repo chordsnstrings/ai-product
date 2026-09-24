@@ -214,7 +214,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
           insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis)
           values (${ws}, ${skuId}, ${week}, ${p.slot}, ${tx.json(p.proposal as never)}, ${p.score}, ${tx.json(p.breakdown)}, ${tx.json(p.gates)}, ${sc.basis})
           returning id`;
-        await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: r!.id as string }, { slot: p.slot, score: p.score, basis: sc.basis });
+        await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: r!.id as string }, { slot: p.slot, score: p.score, basis: sc.basis }, { skuId });
       }
       await settle(tx, ctx, auth.authorizationId, 'consumed');
     });

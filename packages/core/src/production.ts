@@ -595,7 +595,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                                              ${tx.json(res as never)}, ${ok ? 'accepted' : 'qa_failed'}, ${hashes.get(s.id)!},
                                              ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null } as never)})
                                      returning id`;
-              await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) });
+              await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) }, {
+                projectId, skuId: sku.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null,
+                providerJobId: vid.jobId, authorizationId: auth.authorizationId, assetId: a.id,
+              });
               return { assetId: a.id, versionId: row!.id as string };
             });
             checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: ${c.detail}` })));
@@ -813,8 +816,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');
         await settle(tx, ctx, auth.authorizationId, 'consumed');
-        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets });
-        await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, {});
+        const refs = { projectId, skuId: sku.id as string, creativeId: cr!.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null, authorizationId: auth.authorizationId };
+        // An experiment's master is its control variant; a one-off ad has no variant (COMPOSITION_COMPLETED only).
+        if (p.variant_id) await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: p.variant_id as string }, { creativeId: cr!.id, exports: exportAssets, master: true }, refs);
+        await emit(tx, ctx, 'COMPOSITION_COMPLETED', { type: 'project', id: projectId }, { creativeId: cr!.id, exports: exportAssets }, refs);
         await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
         if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
       });

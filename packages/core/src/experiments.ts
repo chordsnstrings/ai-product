@@ -75,10 +75,11 @@ export async function createExperiment(
   await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: concept!.id, storyboard_id: sb!.id } });
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
   await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true }, { priority: priorityFor(ctx) });
-  await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: expId }, { mode, slot: input.slot, primaryVariable: p.primaryVariable });
+  const expRefs = { experimentId: expId, skuId: input.skuId, projectId, variantId: master!.id as string, storyboardId: sb!.id as string, recommendationId: input.recommendationId ?? null };
+  await emit(tx, ctx, 'EXPERIMENT_CREATED', { type: 'experiment', id: expId }, { mode, slot: input.slot, primaryVariable: p.primaryVariable }, expRefs);
   if (input.recommendationId) {
     await tx`update recommendations set status = 'accepted', experiment_id = ${expId} where id = ${input.recommendationId}`;
-    await emit(tx, ctx, 'RECOMMENDATION_ACCEPTED', { type: 'recommendation', id: input.recommendationId }, { experimentId: expId });
+    await emit(tx, ctx, 'RECOMMENDATION_ACCEPTED', { type: 'recommendation', id: input.recommendationId }, { experimentId: expId }, expRefs);
   }
   return { experimentId: expId, projectId, storyboardId: sb!.id as string };
 }
@@ -125,7 +126,8 @@ export async function linkAdToVariant(tx: Tx, ctx: TenantContext, platform: 'met
     await tx`update creatives set platform_refs = jsonb_set(coalesce(platform_refs, '{}'), ${`{${platform}_ad_ids}`},
                coalesce(platform_refs->${platform + '_ad_ids'}, '[]'::jsonb) || to_jsonb(${adId}::text)) where id = ${v.creative_id}`;
   }
-  await emit(tx, ctx, 'PERFORMANCE_INGESTED', { type: 'variant', id: variantId }, { linkedAd: adId, platform });
+  // Re-attribution of existing observations: no integration subject; the variant and creative are refs.
+  await emit(tx, ctx, 'PERFORMANCE_INGESTED', null, { linkedAd: adId, platform }, { variantId, creativeId: (v.creative_id as string | null) ?? null });
 }
 
 export async function autoLinkByCode(tx: Tx, platform: 'meta' | 'tiktok', adId: string, adName: string | null): Promise<string | null> {
@@ -212,7 +214,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   if (confounded!.n > 0 && expState === 'ACTIONABLE') expState = 'OPERATIONALLY_CONFOUNDED';
   const prev = e.state as string;
   if (agg.length) await setExperimentState(tx, ctx, experimentId, expState, 'results');
-  if (prev !== expState && agg.length) await emit(tx, ctx, 'CONFIDENCE_CHANGED', { type: 'experiment', id: experimentId }, { from: prev, to: expState });
+  if (prev !== expState && agg.length) await emit(tx, ctx, 'CONFIDENCE_CHANGED', { type: 'experiment', id: experimentId }, { from: prev, to: expState }, { skuId: e.sku_id as string });
 
   // Learnings (scoped to platform/measurement context; never generalized across platforms, §21). Learnings are
   // revised whenever results are recomputed — late conversions, backfills and corrections (§45, §48) — so they can
@@ -249,7 +251,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
             ${tx.json([{ at: now, to: s.state, experimentId, supports, reason: 'created' }] as never)})
           returning id`;
         revised.add(l!.id as string);
-        await emit(tx, ctx, 'LEARNING_CREATED', { type: 'learning', id: l!.id as string }, { state: s.state, experimentId, supports });
+        await emit(tx, ctx, 'LEARNING_CREATED', { type: 'learning', id: l!.id as string }, { state: s.state, experimentId, supports }, { experimentId, skuId: e.sku_id as string, variantId: s.leader });
       } else {
         await reviseLearning(tx, ctx, existing.id as string, supports, s.state === 'ACTIONABLE', { experimentId, reason: 'new evidence', leaderId: s.leader! });
         revised.add(existing.id as string);
@@ -266,7 +268,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
       if (!l.confounded) {
         await tx`update learnings set confounded = true, last_revalidated_at = now(),
                    history = history || ${tx.json([{ at: now, experimentId, reason: 'operationally confounded' }] as never)} where id = ${l.id}`;
-        await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { confounded: true, experimentId });
+        await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { confounded: true, experimentId }, { experimentId, skuId: e.sku_id as string });
       }
       continue;
     }
@@ -298,7 +300,7 @@ async function reviseLearning(
   actionable: boolean,
   meta: { experimentId: string; reason: string; leaderId?: string },
 ) {
-  const [l] = await tx`select state from learnings where id = ${learningId} for update`;
+  const [l] = await tx`select state, sku_id from learnings where id = ${learningId} for update`;
   const from = l!.state as SignalState;
   const next = nextLearningState(from, supports, actionable);
   await tx`update learnings set state = ${next}, confidence = ${supports}, last_revalidated_at = now(),
@@ -307,7 +309,7 @@ async function reviseLearning(
              history = history || ${tx.json([{ at: new Date().toISOString(), from, to: next, experimentId: meta.experimentId, supports, reason: meta.reason }] as never)}
            where id = ${learningId}`;
   if (next !== from && (next === 'WEAKENING' || next === 'INVALIDATED')) {
-    await emit(tx, ctx, next === 'INVALIDATED' ? 'LEARNING_INVALIDATED' : 'LEARNING_WEAKENED', { type: 'learning', id: learningId }, { from, to: next, supports, experimentId: meta.experimentId, reason: meta.reason });
+    await emit(tx, ctx, next === 'INVALIDATED' ? 'LEARNING_INVALIDATED' : 'LEARNING_WEAKENED', { type: 'learning', id: learningId }, { from, to: next, supports, experimentId: meta.experimentId, reason: meta.reason }, { experimentId: meta.experimentId, skuId: l!.sku_id as string });
   }
   return next;
 }
@@ -322,9 +324,9 @@ export async function markConfounder(
   await tx`insert into confounders (workspace_id, sku_id, kind, starts_at, ends_at, note, source, created_by)
            values (${ctx.workspaceId}, ${input.skuId ?? null}, ${input.kind}, ${input.startsAt}, ${input.endsAt ?? null}, ${input.note ?? null},
                    'merchant', ${actorString(ctx)})`;
-  const exps = await tx`select id from experiments where (${input.skuId ?? null}::uuid is null or sku_id = ${input.skuId ?? null}) and state in ('GATHERING_SIGNAL','DIRECTIONAL','ACTIONABLE')`;
+  const exps = await tx`select id, sku_id from experiments where (${input.skuId ?? null}::uuid is null or sku_id = ${input.skuId ?? null}) and state in ('GATHERING_SIGNAL','DIRECTIONAL','ACTIONABLE')`;
   for (const x of exps) {
-    await emit(tx, ctx, 'EXPERIMENT_CONFOUNDED', { type: 'experiment', id: x.id as string }, { kind: input.kind });
+    await emit(tx, ctx, 'EXPERIMENT_CONFOUNDED', { type: 'experiment', id: x.id as string }, { kind: input.kind }, { skuId: x.sku_id as string });
     await enqueue(tx, ctx.workspaceId, Queues.computeResults, { experimentId: x.id, reason: 'confounder' });
   }
 }

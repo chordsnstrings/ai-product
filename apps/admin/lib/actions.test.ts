@@ -4,7 +4,7 @@ import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { assertStaff, decideApproval, startBreakGlass } from '@arkiv/core';
 import { MockStripe, setBillingGateway } from '@arkiv/billing';
 import { devOutbox } from '@arkiv/email';
-import { DataRequestKind, newId, type StaffRole } from '@arkiv/shared';
+import { DataRequestKind, EVENT_SCHEMA_VERSION, newId, type StaffRole } from '@arkiv/shared';
 import { ACTIONS, type ActionName } from './actions';
 import type { StaffUser } from './staff';
 
@@ -184,7 +184,7 @@ describe('danger zone and jobs actions', () => {
       [admin!.id, { from: 'ADMIN', to: 'OWNER', transfer: true, byStaff: true, reason: 'Ticket #88: owner left the company, confirmed by email' }],
       [t.userId, { from: 'OWNER', to: 'ADMIN', transfer: true, byStaff: true, reason: 'Ticket #88: owner left the company, confirmed by email' }],
     ]);
-    expect(ev.every((e) => e.actor === `staff:${o.staffId}` && e.schema_version === 1)).toBe(true);
+    expect(ev.every((e) => e.actor === `staff:${o.staffId}` && e.schema_version === EVENT_SCHEMA_VERSION)).toBe(true);
     const mails = devOutbox.filter((m) => m.template === 'security_alert');
     expect(mails.map((m) => m.to).sort()).toEqual([t.email, 'next-owner@example.com'].sort());
     expect(mails.every((m) => (m.data as { url: string }).url.endsWith(`/w/${t.slug}/settings/profile`))).toBe(true);

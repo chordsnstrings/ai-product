@@ -45,3 +45,11 @@ update invites i set revoked_at = now()
           from invites where accepted_at is null and revoked_at is null) d
  where i.id = d.id and d.rn > 1;
 create unique index invites_one_live on invites (workspace_id, email) where accepted_at is null and revoked_at is null;
+
+-- ───────────── Event refs (standard §36) ─────────────
+-- Object IDs an event relates to (subject included), so downstream state can be rebuilt from events alone.
+-- The table stays append-only: rows written before this migration keep refs '{}' and are found by subject_id.
+alter table events add column refs jsonb not null default '{}';
+create index events_refs on events using gin (refs jsonb_path_ops);
+-- Commit order within a transaction: events of one transaction share `at` (now()), so replay orders by seq.
+alter table events add column seq bigint generated always as identity;

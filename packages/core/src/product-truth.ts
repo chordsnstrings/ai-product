@@ -62,6 +62,13 @@ const rowToFact = (r: Record<string, unknown>): Fact => ({
   merchantConfirmed: !!r.merchant_confirmed,
 });
 
+/** The value an event records for a fact (§36: events can rebuild product truth). */
+const factValue = (f: { valueText?: string | null; valueNumber?: number | null; valueJson?: unknown }) => ({
+  text: f.valueText ?? null,
+  number: f.valueNumber ?? null,
+  json: f.valueJson === undefined ? null : f.valueJson,
+});
+
 const normValue = (f: { valueText?: string | null; valueNumber?: number | null; valueJson?: unknown }) =>
   f.valueNumber != null ? String(f.valueNumber) : f.valueText != null ? f.valueText.trim().toLowerCase().replace(/\s+/g, ' ') : JSON.stringify(f.valueJson ?? null);
 
@@ -83,12 +90,12 @@ export async function recordFacts(tx: Tx, ctx: TenantContext, skuId: string, fac
         ${f.sourceUrl ?? null}, ${f.confidence ?? 1}, ${f.state}, ${actorString(ctx)})
       returning id`;
     recorded++;
-    await emit(tx, ctx, 'PRODUCT_FACT_OBSERVED', { type: 'sku', id: skuId }, { key: f.key, source: f.sourceType, state: f.state, factId: row!.id });
+    await emit(tx, ctx, 'PRODUCT_FACT_OBSERVED', { type: 'sku', id: skuId }, { key: f.key, source: f.sourceType, state: f.state, factId: row!.id, value: factValue(f) }, { factId: row!.id as string });
     // Material conflict between different non-merchant sources → DISPUTED (both kept, merchant decides).
     const conflicting = existing.filter((e) => e.state !== 'DECIDED' && normValue(rowToFact(e)) !== normValue(f));
     if (MATERIAL_KEYS.has(f.key) && conflicting.length && f.state !== 'DECIDED') {
       await tx`update product_facts set status = 'DISPUTED' where id in ${tx([row!.id as string, ...conflicting.map((c) => c.id as string)])}`;
-      await emit(tx, ctx, 'PRODUCT_CONFLICT_DETECTED', { type: 'sku', id: skuId }, { key: f.key });
+      await emit(tx, ctx, 'PRODUCT_CONFLICT_DETECTED', { type: 'sku', id: skuId }, { key: f.key, factIds: [row!.id, ...conflicting.map((c) => c.id)] }, { factId: row!.id as string });
       disputes.push(f.key);
     }
   }
@@ -114,16 +121,28 @@ export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key:
   const shopify = prior.filter((p) => p.source_type === 'shopify').map((p) => p.id as string);
   if (shopify.length) await tx`update product_facts set status = 'DISPUTED' where id in ${tx(shopify)}`;
   if (key === 'name' && value.text) await tx`update skus set name = ${value.text} where id = ${skuId}`;
-  await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: skuId }, { key, factId: row!.id, decided: true });
+  await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: skuId }, {
+    key,
+    factId: row!.id,
+    decided: true,
+    value: factValue({ valueText: value.text, valueNumber: value.number, valueJson: value.json }),
+    supersedes: nonShopify,
+    disputes: shopify,
+  }, { factId: row!.id as string });
   return row!.id as string;
 }
 
 /** Confirm an observed fact without changing it (becomes merchant-confirmed, still OBSERVED). */
 export async function confirmFact(tx: Tx, ctx: TenantContext, factId: string) {
   if (ctx.actor.kind === 'user' || ctx.actor.kind === 'provisional') assertCan(ctx, 'sku.edit');
-  const [f] = await tx`update product_facts set merchant_confirmed = true where id = ${factId} returning sku_id, normalized_key`;
+  const [f] = await tx`update product_facts set merchant_confirmed = true where id = ${factId} returning sku_id, normalized_key, value_text, value_number, value_json`;
   if (!f) throw new DomainError('NOT_FOUND', 'Fact not found');
-  await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: f.sku_id as string }, { key: f.normalized_key, confirmed: true });
+  await emit(tx, ctx, 'PRODUCT_FACT_CHANGED', { type: 'sku', id: f.sku_id as string }, {
+    key: f.normalized_key,
+    factId,
+    confirmed: true,
+    value: factValue({ valueText: f.value_text as string | null, valueNumber: f.value_number == null ? null : Number(f.value_number), valueJson: f.value_json }),
+  }, { factId });
 }
 
 /**

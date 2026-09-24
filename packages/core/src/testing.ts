@@ -1,5 +1,6 @@
 import sharp from 'sharp';
-import type { Role, WorkspaceState } from '@arkiv/shared';
+import { ownerPool } from '@arkiv/db';
+import { assertEventEnvelope, type EventType, type Role, type WorkspaceState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 
 /** Provider injection for suites outside this package (chaos): e.g. a hanging or failing video provider. */
@@ -26,3 +27,17 @@ export const ctxFor = (workspaceId: string, userId: string, role: Role = 'OWNER'
   actor: { kind: 'user', id: userId },
   requestId: 'test',
 });
+
+/** Events of a workspace that break their registered subject type or required refs (standard §36). */
+export async function eventContractProblems(workspaceId: string): Promise<string[]> {
+  const rows = await ownerPool()`select type, subject_type, subject_id, refs from events where workspace_id = ${workspaceId} order by seq`;
+  const problems: string[] = [];
+  for (const r of rows) {
+    try {
+      assertEventEnvelope(r.type as EventType, r.subject_type ? { type: r.subject_type as string, id: r.subject_id as string } : null, r.refs as Record<string, string>);
+    } catch (e) {
+      problems.push((e as Error).message);
+    }
+  }
+  return problems;
+}
