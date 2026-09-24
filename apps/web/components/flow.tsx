@@ -1158,6 +1158,7 @@ export function AiDisclosureSteps({ disclosure }: { disclosure: ProjectView['dis
 function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked, onProgress }: { projectId: string; assetId: string; src: string; onPlaying?: () => void; onBlocked?: () => void; onProgress?: (seconds: number, ended: boolean) => void }) {
   const sent = useRef(false);
   const el = useRef<HTMLVideoElement>(null);
+  const [muted, setMuted] = useState(true);
   // M12: plays inline at once, muted (captions are burned in). A browser that refuses autoplay gets the controls.
   useEffect(() => {
     const p = el.current?.play();
@@ -1169,6 +1170,7 @@ function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked, onProgres
     fetch(`/api/projects/${projectId}/watched`, { method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ assetId, seconds: Number.isFinite(seconds) ? Math.round(seconds) : 0 }) }).catch(() => {});
   };
   return (
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
     <video
       ref={el}
       src={src}
@@ -1178,6 +1180,7 @@ function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked, onProgres
       playsInline
       preload="auto"
       onPlaying={onPlaying}
+      onVolumeChange={(e) => setMuted(e.currentTarget.muted)}
       style={{ width: '100%', height: '100%', objectFit: 'contain' }}
       onTimeUpdate={(e) => {
         if (e.currentTarget.currentTime >= 3) report(e.currentTarget.currentTime);
@@ -1188,8 +1191,59 @@ function WatchedVideo({ projectId, assetId, src, onPlaying, onBlocked, onProgres
         onProgress?.(e.currentTarget.duration || e.currentTarget.currentTime, true);
       }}
     />
+    {/* P10: plays muted with captions burned in; one tap turns the sound on. */}
+    {muted ? (
+      <button
+        type="button"
+        className="ak-btn ak-btn--secondary ak-btn--sm"
+        style={{ position: 'absolute', top: 12, left: 12 }}
+        onClick={() => {
+          if (!el.current) return;
+          el.current.muted = false;
+          void el.current.play().catch(() => {});
+        }}
+      >
+        Tap for sound
+      </button>
+    ) : null}
+    </div>
   );
 }
+
+/** iOS Safari saves videos through the share sheet ("Save Video"), not the download link (plan 03 P10 edge case). */
+const isIos = () => typeof navigator !== 'undefined' && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+
+/**
+ * A tracked download that, on iOS with file sharing, opens the share sheet with the video instead; anything that
+ * can't share (or fails to) falls back to the normal download.
+ */
+function DownloadLink({ href, filename, className, id, onDownload, children }: { href: string; filename: string; className: string; id?: string; onDownload?: () => void; children: React.ReactNode }) {
+  return (
+    <a
+      id={id}
+      className={className}
+      href={href}
+      download
+      onClick={async (e) => {
+        onDownload?.();
+        if (!isIos() || typeof navigator.canShare !== 'function') return;
+        e.preventDefault();
+        try {
+          const blob = await (await fetch(href)).blob();
+          const file = new File([blob], filename, { type: blob.type || 'video/mp4' });
+          if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
+          else window.location.assign(href);
+        } catch (err) {
+          if ((err as Error).name !== 'AbortError') window.location.assign(href);
+        }
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+const fileName = (href: string) => new URL(href, 'https://x').searchParams.get('name') ?? 'arkiv-ad.mp4';
 
 const ASPECT: Record<string, string> = { '9x16': 'TikTok · Reels · Stories (9:16)', '4x5': 'Feed (4:5)', '1x1': 'Square (1:1)' };
 
@@ -1381,20 +1435,26 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
           <div className="ak-stack ak-after-play" data-show={after.show || !primary}>
             <h2 className="ak-label">Download</h2>
             {v.exports.map((e, i) => (
-              <a key={e.assetId} id={i === 0 ? 'cta' : undefined} className="ak-index-row" href={e.download} download onClick={earn}>
+              <DownloadLink key={e.assetId} id={i === 0 ? 'cta' : undefined} className="ak-index-row" href={e.download} filename={fileName(e.download)} onDownload={earn}>
                 <span>{ASPECT[e.aspect] ?? e.aspect}</span>
                 <span className="ak-index">MP4 ↓</span>
-              </a>
+              </DownloadLink>
             ))}
+            {v.exports.length > 1 ? (
+              <a className="ak-index-row" href={`/api/projects/${projectId}/download-all`} download onClick={earn}>
+                <span>Download all{v.bonus.exports.length ? ' (with the bonus hook)' : ''}</span>
+                <span className="ak-index">ZIP ↓</span>
+              </a>
+            ) : null}
             {v.bonus.exports.length || v.bonus.pending || v.bonus.failed ? (
               <>
                 <h2 className="ak-label">Bonus · alternate opening hook</h2>
                 {v.bonus.exports.length ? (
                   v.bonus.exports.map((e) => (
-                    <a key={e.assetId} className="ak-index-row" href={e.download} download>
+                    <DownloadLink key={e.assetId} className="ak-index-row" href={e.download} filename={fileName(e.download)} onDownload={earn}>
                       <span>{ASPECT[e.aspect] ?? e.aspect} · new first line</span>
                       <span className="ak-index">MP4 ↓</span>
-                    </a>
+                    </DownloadLink>
                   ))
                 ) : v.bonus.failed ? (
                   <p className="ak-small ak-muted">We couldn’t make this one automatically. Our team has been told and will send it to you.</p>
@@ -1435,7 +1495,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
             {earned || !primary ? <Continuation v={v} /> : null}
             {primary ? (
               <StickyCta watchId="cta" mobileOnly>
-                <a className="ak-btn ak-btn--block" href={primary.download} download onClick={earn}>Download · {ASPECT[primary.aspect] ?? primary.aspect}</a>
+                <DownloadLink className="ak-btn ak-btn--block" href={primary.download} filename={fileName(primary.download)} onDownload={earn}>Download · {ASPECT[primary.aspect] ?? primary.aspect}</DownloadLink>
               </StickyCta>
             ) : null}
             <PasskeyPrompt v={v} />
