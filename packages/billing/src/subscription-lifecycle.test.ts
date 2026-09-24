@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
-import { available, transitionWorkspace } from '@arkiv/core';
+import { available, Queues, transitionWorkspace, weekOf } from '@arkiv/core';
 import { ctxFor } from '@arkiv/core/testing';
 import { completeMockCheckout, processStripeEvent, receiveStripeWebhook, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from './billing';
 import { MockStripe, setBillingGateway } from './gateway';
@@ -169,5 +169,14 @@ describe('billing events during a hold or a scheduled deletion (x-sublife-13)', 
     await withTenant(t.workspaceId, (tx) => transitionWorkspace(tx, { workspaceId: t.workspaceId, actor: { kind: 'system', id: 't' } }, 'PURGE_SCHEDULED', 'owner asked'));
     await send('customer.subscription.deleted', { id: subId, customer, metadata: { workspace_id: t.workspaceId } }, T + 30);
     expect(await ws(t.workspaceId)).toMatchObject({ state: 'PURGE_SCHEDULED', state_before_purge: 'CANCELLED' });
+  }, 30_000);
+});
+
+describe('a new subscription (standard §9 "Day 1-2")', () => {
+  it('queues the first recommendations now, under the weekly run’s key', async () => {
+    const { t } = await subscribed('GROWTH');
+    const jobs = await ownerPool()`select payload, singleton_key from outbox where workspace_id = ${t.workspaceId} and queue = ${Queues.weeklyRecommendations}`;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ singleton_key: `recs:${t.workspaceId}:${weekOf()}`, payload: { week: weekOf() } });
   }, 30_000);
 });

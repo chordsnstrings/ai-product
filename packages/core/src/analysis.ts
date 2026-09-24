@@ -16,6 +16,7 @@ import { ProductExtraction } from './intel-schemas';
 import { mockExtraction } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
+import { weekOf } from './recommendations';
 import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
 import { recordVariants } from './sku-variants';
@@ -392,6 +393,13 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed, technique: cut.technique });
       await step(tx, ws, skuId, 'fingerprint', 'done', `${x.packaging.type.replace('_', ' ')}${x.packaging.closure ? ` · ${x.packaging.closure}` : ''}`);
       await tx`update skus set status = 'active' where id = ${skuId}`;
+      // A subscriber's new SKU gets its first recommended experiments now (standard §9 "Day 1-2"), not on the
+      // next Monday's weekly run.
+      const [sub] = await tx`select 1 from workspaces where id = ${ws} and state = 'ACTIVE_PAID' and plan_code is not null`;
+      if (sub) {
+        const week = weekOf();
+        await enqueue(tx, ws, Queues.weeklyRecommendations, { week, skuId }, { singletonKey: `recs:${ws}:${skuId}:${week}` });
+      }
       await transition(tx, ctx, projectId, 'PRODUCT_ANALYZED');
       await transition(tx, ctx, projectId, 'BRIEF_READY');
       await emit(tx, ctx, 'PRODUCT_IMPORTED', { type: 'sku', id: skuId }, { source: extracted?.source ?? 'photos' });

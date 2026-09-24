@@ -22,6 +22,7 @@ import {
   redeemOffer,
   transition,
   transitionWorkspace,
+  weekOf,
   type TenantContext,
 } from '@arkiv/core';
 import { randomUUID } from 'node:crypto';
@@ -750,6 +751,10 @@ async function onSubscriptionCheckout(tx: Tx, ctx: TenantContext, cs: Stripe.Che
   await emit(tx, ctx, 'SUBSCRIPTION_STARTED', { type: 'subscription', id: subRow!.id as string }, { plan, stripeSubscriptionId: subId });
   await recordFunnel('SUBSCRIPTION_STARTED', { workspaceId: ctx.workspaceId, visitorId: await workspaceVisitor(tx, ctx.workspaceId), props: { plan } }, tx);
   await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'subscription_started', plan }, { singletonKey: `sub-started:${subId}` });
+  // The first recommended experiments arrive now (standard §9 "Day 1-2"), not on the next Monday; the key is the
+  // weekly run's, so a Monday subscriber gets one run for the week.
+  const week = weekOf();
+  await enqueue(tx, ctx.workspaceId, Queues.weeklyRecommendations, { week }, { singletonKey: `recs:${ctx.workspaceId}:${week}` });
   return 'processed';
 }
 
