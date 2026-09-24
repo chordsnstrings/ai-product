@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant } from '@arkiv/db';
@@ -10,10 +10,13 @@ import { scanCreativeText, scanPasses } from './compliance';
 import { diffCompositions, type CompositionManifest, type VoiceSegment } from './composition';
 import type { TenantContext } from './context';
 import { authorizeOrTakeOver, settle } from './cost-governor';
+import { versionCreative } from './creatives';
 import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { setExperimentState } from './experiments';
+import { LEASE_BUSY, renewJobLease, withJobLease } from './leases';
 import { synthesizeVoice } from './model-gateway';
+import { enqueue, Queues } from './outbox';
 import { ASPECTS, productionRoutes, voiceLine } from './production';
 import { qaExperimentIntegrity, qaExport, type CheckResult } from './qa';
 import { loadRates } from './rates';
@@ -26,18 +29,39 @@ const HOOK_GAP_MS = 80;
 
 const norm = (s: string | null | undefined) => (s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
+/** Object refs shared by a hook variant's events (the master project's experiment and SKU). */
+const variantRefs = (p: Record<string, unknown>) => ({ experimentId: p.experiment_id as string, skuId: p.sku_id as string, projectId: p.id as string, storyboardId: p.storyboard_id as string | null });
+
+/** A run's lease on a project's hook variants; renewed per variant, so a crashed run's lease lapses quickly. */
+export const VARIANTS_LEASE_SECONDS = 300;
+const variantsLease = (projectId: string) => `variants:${projectId}`;
+
 /**
  * Economical hook variants (§5 Creative Test definition): built from the master's composition manifest — the
  * same footage, the same voice-over for every scene after the hook, the same end card, every export — changing
  * only the opening hook. A spoken hook is re-voiced (one short line, alternate voice copy per §5) and spliced
  * into the master's hook slot; a visual-only hook reuses the master voice-over untouched. Experiment integrity
  * (§25 check 6) compares the two manifests, so a variant that changed anything it promised to hold constant is
- * never shipped (§20 CONTROLLED).
+ * never shipped (§20 CONTROLLED). Each variant is recorded as a new version of the master (CREATIVE_VERSIONED).
+ *
+ * Worker (`hook-variants`). One run per project at a time (§35 "every transition must be idempotent"): a
+ * duplicate or overlapping delivery — a pg-boss retry after the job's expiry while the first run is still going,
+ * or a staff retry — stands down and re-checks later instead of composing the same variants again. Each variant
+ * is claimed when its creative is written (`creative_id is null`), so a variant can never get two creatives.
  */
-/** Object refs shared by a hook variant's events (the master project's experiment and SKU). */
-const variantRefs = (p: Record<string, unknown>) => ({ experimentId: p.experiment_id as string, skuId: p.sku_id as string, projectId: p.id as string, storyboardId: p.storyboard_id as string | null });
-
 export async function produceHookVariants(ctx: TenantContext, projectId: string): Promise<number> {
+  const holder = randomUUID();
+  const r = await withJobLease(ctx.workspaceId, variantsLease(projectId), holder, VARIANTS_LEASE_SECONDS, () => runHookVariants(ctx, projectId, holder));
+  if (r !== LEASE_BUSY) return r;
+  // Another run holds the lease: look again once it has had time to finish (or its lease has lapsed after a
+  // crash). The follow-up finds finished variants already claimed and makes only what is still missing.
+  await withTenant(ctx.workspaceId, (tx) =>
+    enqueue(tx, ctx.workspaceId, Queues.hookVariants, { projectId }, { singletonKey: `variants:${projectId}:recheck`, runAfter: new Date(Date.now() + VARIANTS_LEASE_SECONDS * 1000) }),
+  );
+  return 0;
+}
+
+async function runHookVariants(ctx: TenantContext, projectId: string, holder: string): Promise<number> {
   const ws = ctx.workspaceId;
   const data = await withTenant(ws, async (tx) => {
     const [p] = await tx`select * from projects where id = ${projectId}`;
@@ -68,6 +92,10 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
 
   let made = 0;
   for (const v of data.hookVariants) {
+    // Lease lost (this run stalled past its lease): the run that took over finishes the job.
+    if (!(await renewJobLease(ws, variantsLease(projectId), holder, VARIANTS_LEASE_SECONDS))) return made;
+    const [still] = await withTenant(ws, (tx) => tx`select creative_id from variants where id = ${v.id}`);
+    if (!still || still.creative_id) continue; // made by an earlier run since we listed it
     const hook = (v.label as string).trim();
     // Never ship a hook that makes a claim the vault doesn't cover on every platform it's exported to.
     if (!scanPasses(scanCreativeText([hook], data.allowed, { names: data.names }))) {
@@ -133,20 +161,32 @@ export async function produceHookVariants(ctx: TenantContext, projectId: string)
         await withTenant(ws, (tx) => emit(tx, ctx, 'VARIANT_SKIPPED', { type: 'variant', id: v.id as string }, { reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) }, variantRefs(p)));
         return false;
       }
-      await withTenant(ws, async (tx) => {
+      return withTenant(ws, async (tx) => {
+        // Claim the variant first: an overlapping run that got here before us wins, and we write nothing.
+        const [cur] = await tx`select creative_id from variants where id = ${v.id} for update`;
+        if (!cur || cur.creative_id) return false;
         const ids: string[] = [];
         for (const o of outs) {
           const a = await saveAsset(tx, ws, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId, variantId: v.id, aspect: o.aspect, srt: o.srt, changed } });
           ids.push(a.id);
         }
-        const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition)
-                              values (${ws}, ${p.sku_id}, 'generated', ${p.final_creative_id}, ${projectId}, ${tx.json({ ...(v.genes as object), hookText: hook } as never)}, 1, ${ids},
-                                      ${tx.json(variantManifest as never)})
-                              returning id`;
-        await tx`update variants set creative_id = ${cr!.id} where id = ${v.id}`;
-        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed, creativeId: cr!.id, integrity: integrity.detail }, { ...variantRefs(p), creativeId: cr!.id as string });
+        const creativeId = await versionCreative(tx, ctx, {
+          skuId: p.sku_id as string,
+          parentCreativeId: p.final_creative_id as string,
+          projectId,
+          genome: { ...(v.genes as object), hookText: hook },
+          finalAssetIds: ids,
+          composition: variantManifest,
+          changedVariables: changed.length ? changed : ['hook'],
+          experimentId: p.experiment_id as string,
+          variantId: v.id as string,
+          storyboardId: (p.storyboard_id as string | null) ?? null,
+        });
+        const [claimed] = await tx`update variants set creative_id = ${creativeId} where id = ${v.id} and creative_id is null returning id`;
+        if (!claimed) throw new Error(`variant ${v.id as string} was claimed concurrently`); // rolls back the creative and its assets
+        await emit(tx, ctx, 'VARIANT_GENERATED', { type: 'variant', id: v.id as string }, { changed, creativeId, integrity: integrity.detail }, { ...variantRefs(p), creativeId });
+        return true;
       });
-      return true;
     });
     if (ok) made++;
   }

@@ -128,6 +128,10 @@ export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
   CLAIM_RESTRICTED: z.object({ reason: z.string() }).strict(),
   // COMPLIANCE lifted a block (four-eyes): the claim goes back to review, never straight to approved.
   CLAIM_UNBLOCKED: z.object({ from: z.literal('BLOCKED'), to: z.enum(ClaimStatus), reason: z.string() }).strict(),
+  // A creative derived from a delivered one (a hook variant, a recomposition): its parent and what changed.
+  CREATIVE_VERSIONED: z
+    .object({ parentCreativeId: z.string().uuid(), changedVariables: z.array(z.string()).min(1), variantId: z.string().uuid().nullable(), projectId: z.string().uuid().nullable() })
+    .strict(),
 };
 
 /** Throws when a payload doesn't match the registered schema for its type (types without one always pass). */
@@ -317,6 +321,7 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   RECOMMENDATION_CREATED: ['recommendationId', 'skuId'],
   RECOMMENDATION_ACCEPTED: ['recommendationId', 'experimentId', 'skuId'],
   GENOME_EXTRACTED: ['creativeId'],
+  CREATIVE_VERSIONED: ['creativeId', 'skuId'],
 };
 
 /** Merge the subject into the refs and drop empty values. */

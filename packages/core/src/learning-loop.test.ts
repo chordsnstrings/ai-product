@@ -56,8 +56,24 @@ describe('learning loop (Phases 4–5)', () => {
     await generateStoryboard(ctx, projectId, storyboardId, concept!.selected_concept_id as string);
     await withTenant(t.workspaceId, (tx) => approveForProduction(tx, ctx, projectId, 'creative_test'));
     expect(await produceProject(ctx, projectId)).toBe('complete');
-    expect(await produceHookVariants(ctx, projectId)).toBe(2);
+    // Two deliveries of the job at once (a pg-boss retry after expiry while the first run is still going, or a
+    // staff retry): the variants are made once; a later redelivery makes nothing (x-races-23).
+    const runs = await Promise.all([produceHookVariants(ctx, projectId), produceHookVariants(ctx, projectId)]);
+    expect(runs.sort()).toEqual([0, 2]);
+    expect(await produceHookVariants(ctx, projectId)).toBe(0);
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'creative_test'))).toBe(6); // hook variants cost no extra test
+    const [proj] = await ownerPool()`select final_creative_id from projects where id = ${projectId}`;
+    expect((await ownerPool()`select count(*)::int as n from creatives where parent_creative_id = ${proj!.final_creative_id}`)[0]!.n).toBe(2);
+    expect((await ownerPool()`select count(*)::int as n from events where workspace_id = ${t.workspaceId} and type = 'VARIANT_GENERATED'`)[0]!.n).toBe(3);
+    // Each hook variant is a new version of the master (Appendix B: CREATIVE_VERSIONED), with what changed.
+    const versioned = await ownerPool()`select e.subject_id, e.payload, e.refs, c.parent_creative_id from events e join creatives c on c.id = e.subject_id
+                                        where e.workspace_id = ${t.workspaceId} and e.type = 'CREATIVE_VERSIONED' order by e.seq`;
+    expect(versioned).toHaveLength(2);
+    for (const e of versioned) {
+      expect(e.parent_creative_id).toBe(proj!.final_creative_id);
+      expect(e.payload).toMatchObject({ parentCreativeId: proj!.final_creative_id, changedVariables: ['hook'], projectId });
+      expect(e.refs).toMatchObject({ creativeId: e.subject_id, skuId, experimentId, projectId });
+    }
 
     const variants = await withTenant(t.workspaceId, (tx) => tx`select id, code, label, creative_id from variants where experiment_id = ${experimentId} order by code`);
     expect(variants).toHaveLength(3);

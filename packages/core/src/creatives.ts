@@ -1,0 +1,40 @@
+import type { Tx } from '@arkiv/db';
+import type { TenantContext } from './context';
+import { emit } from './events';
+
+/** A new version of an existing creative: what it is, what it was derived from and what changed. */
+export interface CreativeVersion {
+  skuId: string;
+  parentCreativeId: string;
+  projectId: string | null;
+  genome: Record<string, unknown>;
+  finalAssetIds: string[];
+  composition: unknown;
+  /** The creative variables this version changed relative to its parent (e.g. ['hook']). */
+  changedVariables: string[];
+  experimentId?: string | null;
+  variantId?: string | null;
+  storyboardId?: string | null;
+}
+
+/**
+ * Record a derived creative (Appendix B Creative: CREATIVE_VERSIONED). Every re-render or recomposition of a
+ * delivered creative — a hook variant today — goes through here, so lineage (parent → child, what changed) is
+ * written with the row and can be rebuilt from events alone (§36). Runs in the caller's transaction.
+ */
+export async function versionCreative(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, v: CreativeVersion): Promise<string> {
+  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition)
+                        values (${ctx.workspaceId}, ${v.skuId}, 'generated', ${v.parentCreativeId}, ${v.projectId}, ${tx.json(v.genome as never)}, 1,
+                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)})
+                        returning id`;
+  const id = cr!.id as string;
+  await emit(
+    tx,
+    ctx,
+    'CREATIVE_VERSIONED',
+    { type: 'creative', id },
+    { parentCreativeId: v.parentCreativeId, changedVariables: v.changedVariables, variantId: v.variantId ?? null, projectId: v.projectId },
+    { skuId: v.skuId, projectId: v.projectId, experimentId: v.experimentId ?? null, variantId: v.variantId ?? null, storyboardId: v.storyboardId ?? null },
+  );
+  return id;
+}

@@ -34,6 +34,7 @@ export * from './projects';
 export * from './progress';
 export * from './composite';
 export * from './composition';
+export * from './creatives';
 export * from './production';
 export * from './qa';
 export * from './qa-metrics';
