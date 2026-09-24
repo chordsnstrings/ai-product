@@ -1,7 +1,7 @@
 import { headers } from 'next/headers';
-import { globalTx, withSystem } from '@arkiv/db';
+import { globalTx } from '@arkiv/db';
 import { applyLandingVariant, env, geoFromHeaders, landingBlocksFrom, landingVariantFrom, type LandingBlocks, type LandingVariantContent } from '@arkiv/shared';
-import { assignVariantOrNull, deviceClass, landingExampleUrls, recordFunnel } from '@arkiv/core';
+import { assignVariantOrNull, claimsCheckedLast7Days, deviceClass, publicExampleUrls, recordFunnel } from '@arkiv/core';
 import { ExampleAsset, Testimonial } from '@arkiv/ui';
 import { StickyCta } from '@arkiv/ui/client';
 import { MarketingShell } from '@/components/marketing';
@@ -54,13 +54,12 @@ export async function Landing({ slug, searchParams, preview }: { slug: string; s
       props: { inApp: /Instagram|FBAN|FBAV|TikTok|musical_ly|BytedanceWebview/i.test(ua), device: deviceClass(ua), country: geo?.country ?? null, region: geo?.region ?? null, returning, adId },
     }).catch(() => {});
   }
-  // Cross-tenant aggregate (a count only, no tenant data) and our own demo workspace's examples → system role.
+  // A platform-wide count and our own demo workspace's examples, through narrow database functions: the customer
+  // app never holds a cross-tenant role (plan 02 §3).
   const exampleIds = [...(blocks.hero.visualAssetId ? [blocks.hero.visualAssetId] : []), ...blocks.gallery.items.map((g) => g.assetId)];
-  const [stats, examples] = await withSystem(async (tx) => [
-    await tx`select (select count(*) from events where type = 'CLAIM_CREATED' and at > now() - interval '7 days')::int as claims`,
-    await landingExampleUrls(tx, exampleIds),
-  ] as const).catch(() => [[{ claims: 0 }], new Map<string, { url: string; mime: string }>()] as const);
-  const claimsChecked = Number(stats[0]?.claims ?? 0);
+  const [claimsChecked, examples] = await globalTx(async (tx) => [await claimsCheckedLast7Days(tx), await publicExampleUrls(tx, exampleIds)] as const).catch(
+    () => [0, new Map<string, { url: string; mime: string }>()] as const,
+  );
   // The runtime hides a testimonial whose consent was revoked after publishing (plan 04 §4).
   const testimonialIds = blocks.proof.testimonialIds ?? [];
   const testimonials = testimonialIds.length

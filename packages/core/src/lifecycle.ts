@@ -115,6 +115,14 @@ export async function purgeWorkspace(workspaceId: string, opts: { stripeSubscrip
     await tx`delete from shopify_shops where workspace_id = ${workspaceId}`;
     // Golden cases built (with consent) from this tenant's production output go with the tenant.
     await tx`delete from golden_cases where source_workspace_id = ${workspaceId}`;
+    // Objects another workspace still references under this prefix (a saved preview whose copy was cut short) are
+    // copied to their owner's prefix first; the filter is the storage prefix, the write the owner's own row.
+    const strays = await tx`select id, workspace_id, storage_key, mime from assets where workspace_id <> ${workspaceId} and storage_key like ${`t/${workspaceId}/%`}`;
+    for (const a of strays) {
+      const key = (a.storage_key as string).replace(`t/${workspaceId}/`, `t/${a.workspace_id as string}/`);
+      await storage().put(key, await storage().get(a.storage_key as string), a.mime as string);
+      await tx`update assets set storage_key = ${key} where id = ${a.id} and workspace_id = ${a.workspace_id}`;
+    }
     const objects = await storage().deletePrefix(`t/${workspaceId}/`).catch((e) => {
       undeletable.push(`storage: ${(e as Error).message}`);
       return 0;
