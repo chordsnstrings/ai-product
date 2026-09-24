@@ -1,0 +1,38 @@
+{
+  "_note": "Sanitized Graph API v23.0 ad-level insights response (level=ad, time_increment=1, placement breakdown), written from the Marketing API reference.",
+  "data": [
+    {
+      "account_id": "1234567890",
+      "account_currency": "USD",
+      "campaign_id": "2385000000001",
+      "adset_id": "2385000000002",
+      "ad_id": "2385000000003",
+      "ad_name": "Dew Serum AK-014-B",
+      "date_start": "2026-09-20",
+      "date_stop": "2026-09-20",
+      "publisher_platform": "instagram",
+      "platform_position": "reels",
+      "spend": "42.50",
+      "impressions": "10000",
+      "reach": "8000",
+      "frequency": "1.25",
+      "clicks": "150",
+      "outbound_clicks": [{ "action_type": "outbound_click", "value": "120" }],
+      "video_play_actions": [{ "action_type": "video_view", "value": "6000" }],
+      "video_p25_watched_actions": [{ "action_type": "video_view", "value": "3000" }],
+      "video_p50_watched_actions": [{ "action_type": "video_view", "value": "2000" }],
+      "video_p75_watched_actions": [{ "action_type": "video_view", "value": "1200" }],
+      "video_p100_watched_actions": [{ "action_type": "video_view", "value": "800" }],
+      "video_avg_time_watched_actions": [{ "action_type": "video_view", "value": "4.2" }],
+      "actions": [
+        { "action_type": "offsite_conversion.fb_pixel_add_to_cart", "value": "12" },
+        { "action_type": "offsite_conversion.fb_pixel_initiate_checkout", "value": "7" },
+        { "action_type": "offsite_conversion.fb_pixel_purchase", "value": "4" }
+      ],
+      "action_values": [{ "action_type": "offsite_conversion.fb_pixel_purchase", "value": "152.00" }],
+      "optimization_goal": "OFFSITE_CONVERSIONS",
+      "objective": "OUTCOME_SALES"
+    }
+  ],
+  "paging": { "cursors": { "before": "QVFI", "after": "QVFIUjZA" }, "next": "https://graph.facebook.com/v23.0/act_1234567890/insights?after=QVFIUjZA" }
+}

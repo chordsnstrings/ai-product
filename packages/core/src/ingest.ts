@@ -1,3 +1,4 @@
+import { shopifyGid } from '@arkiv/integrations';
 import { DomainError } from '@arkiv/shared';
 import { assertPublicUrl, guardedRequest, type NetGuard } from './net-guard';
 
@@ -194,7 +195,8 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
     const imageById = new Map((product.images ?? []).filter((i) => i.id != null).map((i) => [i.id!, i.src]));
     return {
       source: 'shopify',
-      shopifyProductId: String(product.id),
+      // The Admin API's gid form, so a later store sync matches this import (§42 "Duplicate import").
+      shopifyProductId: shopifyGid('Product', product.id),
       name: product.title,
       description: stripHtml(product.body_html ?? ''),
       brand: product.vendor,
@@ -211,7 +213,7 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
         const values = [v.option1, v.option2, v.option3];
         const options = Object.fromEntries(optionNames.map((n, i) => [n, values[i]]).filter(([n, val]) => n && val && !(n === 'Title' && val === 'Default Title'))) as Record<string, string>;
         return {
-          externalId: v.id != null ? String(v.id) : undefined,
+          externalId: v.id != null ? shopifyGid('ProductVariant', v.id) : undefined,
           title: v.title,
           options,
           priceMicros: toMicros(v.price),
@@ -286,7 +288,8 @@ export async function importProductUrl(raw: string, opts: { guard?: NetGuard } =
   const url = await assertPublicUrl(raw, opts.guard);
   if (isMarketplaceUrl(url.toString())) throw new DomainError('INVALID', MARKETPLACE_MESSAGE);
   const sj = shopifyJsonUrl(url);
-  const selectedVariantId = url.searchParams.get('variant') ?? undefined;
+  const variantParam = url.searchParams.get('variant');
+  const selectedVariantId = variantParam ? shopifyGid('ProductVariant', variantParam) : undefined;
   let shopify: Partial<ExtractedProduct> | null = null;
   if (sj) {
     const r = await safeFetch(sj, 'application/json', opts).catch(() => null);

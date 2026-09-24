@@ -180,7 +180,7 @@ describe('learning loop (Phases 4–5)', () => {
   it('parses a manual performance CSV into its own per-platform measurement context', () => {
     const rows = parsePerformanceCsv('Date,Ad name,Ad ID,Impressions,Clicks,Spend,Purchases\n2026-09-20,AK-001-A,123,1000,20,$15.00,1', 'meta');
     expect(rows[0]).toMatchObject({ platform: 'meta', measurementContext: 'MERCHANT_IMPORTED_META', spendMicros: 15_000_000 });
-    const tt = parsePerformanceCsv('By Day,Ad name,Ad ID,Ad group name,Impressions,Clicks (destination),Cost,Conversions\n2026-09-20,AK-001-B,777,Group 1,900,12,9.50,2', 'tiktok');
+    const tt = parsePerformanceCsv('By Day,Ad name,Ad ID,Ad group name,Impressions,Clicks (destination),Cost,Complete payment\n2026-09-20,AK-001-B,777,Group 1,900,12,9.50,2', 'tiktok');
     expect(tt[0]).toMatchObject({ platform: 'tiktok', measurementContext: 'MERCHANT_IMPORTED_TIKTOK', spendMicros: 9_500_000, clicks: 12, purchases: 2, date: '2026-09-20' });
     // A TikTok export uploaded as Meta (or the reverse) is refused, as is a row naming the other platform.
     expect(() => parsePerformanceCsv('By Day,Ad name,Ad group name,Cost\n2026-09-20,x,g,1', 'meta')).toThrow(/TikTok Ads Manager export/);

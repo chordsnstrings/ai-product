@@ -165,7 +165,8 @@ export class ProviderError extends Error {
     public readonly provider: string,
     message: string,
     public readonly retryable: boolean,
-    public readonly kind: 'rate_limit' | 'server' | 'invalid' | 'auth' | 'moderation' | 'refusal' | 'timeout' | 'unknown' = 'unknown',
+    /** `schema_changed`: the provider answered with a shape this adapter doesn't know (§47 "fail safely"). */
+    public readonly kind: 'rate_limit' | 'server' | 'invalid' | 'auth' | 'moderation' | 'refusal' | 'timeout' | 'schema_changed' | 'unknown' = 'unknown',
     /** Units the provider billed although the call failed (absent: nothing billed). */
     public readonly billed?: BilledUnits,
   ) {

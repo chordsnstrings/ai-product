@@ -63,8 +63,32 @@ describe('webhook receipts (standard §38: verify, deduplicate, persist raw, asy
     expect(await ownerPool()`select 1 from shopify_shops where shop_domain = 'glow.myshopify.com'`).toHaveLength(0);
     const [dr] = await ownerPool()`select workspace_id, kind, requester_email, status from data_requests`;
     expect(dr).toMatchObject({ workspace_id: t.workspaceId, kind: 'delete_person_in_reviews', requester_email: 'buyer@example.com', status: 'open' });
-    const jobs = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and queue like 'sync-integration%' and payload->>'full' = 'false'`;
-    expect(jobs).toHaveLength(1);
+    // §28 "re-sync on webhook": the one product named is fetched (REST numeric id → gid), not the whole catalogue.
+    const jobs = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and queue = 'sync-shopify-product'`;
+    expect(jobs.map((j) => j.payload)).toEqual([expect.objectContaining({ integrationId: id, productId: 'gid://shopify/Product/1' })]);
+    // Plan 03 A10: the owners are told, once; the other shop's workspace is untouched.
+    const mails = await ownerPool()`select workspace_id, payload from outbox where queue = 'send-email'`;
+    expect(mails.map((m) => [m.workspace_id, m.payload.template, m.payload.provider])).toEqual([[t.workspaceId, 'integration_disconnected', 'Shopify']]);
+    // Reinstalling from another workspace is possible now that the routing is released.
+    const next = await connected('shopify', 'glow.myshopify.com');
+    expect((await integration(next.id))!.status).toBe('active');
+  });
+
+  it('Shopify: products/delete archives the SKU; shop/redact erases the shop’s raw payloads', async () => {
+    const { t, id } = await connected('shopify', 'glow.myshopify.com');
+    const [sku] = await ownerPool()`insert into skus (workspace_id, catalogue_no, name, status, source_kind, shopify_product_id)
+                                    values (${t.workspaceId}, 1, 'Dew Serum', 'active', 'shopify', 'gid://shopify/Product/77') returning id`;
+    const shop = { 'x-shopify-shop-domain': 'glow.myshopify.com' };
+    await receiveWebhook('shopify', 'd-1', 'products/delete', JSON.stringify({ id: 77 }), shop);
+    await receiveWebhook('shopify', 'd-2', 'products/update', JSON.stringify({ id: 78, title: 'secret draft' }), shop);
+    await processPendingWebhooks(deps());
+    expect((await ownerPool()`select status from skus where id = ${sku!.id}`)[0]!.status).toBe('archived');
+    await receiveWebhook('shopify', 'd-3', 'shop/redact', JSON.stringify({ shop_domain: 'glow.myshopify.com' }), shop);
+    await processPendingWebhooks(deps());
+    expect(await integration(id)).toEqual({ status: 'revoked', token_enc: null });
+    const receipts = await ownerPool()`select topic, payload from webhook_receipts order by received_at`;
+    expect(receipts.filter((r) => r.topic.startsWith('products/')).map((r) => r.payload)).toEqual(['', '']);
+    expect(receipts.find((r) => r.topic === 'shop/redact')!.payload).not.toBe('');
   });
 
   it('Meta deauthorize revokes what that user authorised; TikTok authorization removal revokes the named advertisers', async () => {

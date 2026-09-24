@@ -9,7 +9,7 @@ import { ctxFor } from './testing';
 /** Rate-limited syncs checkpoint each page and resume on the page they stopped at (§47). */
 vi.mock('@arkiv/integrations', async (orig) => {
   const real = await orig<typeof import('@arkiv/integrations')>();
-  return { ...real, metaFetchInsights: vi.fn(), tiktokFetchReport: vi.fn() };
+  return { ...real, metaFetchInsights: vi.fn(), tiktokFetchReport: vi.fn(), tiktokFetchGmvMaxStores: vi.fn(async () => []) };
 });
 
 beforeEach(truncateAll);

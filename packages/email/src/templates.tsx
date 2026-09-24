@@ -78,6 +78,9 @@ export interface TemplateMap {
   refund_issued: { amount: string; description: string; note: string | null; url: string };
   flag_expired: { flagKey: string; owner: string; expiredOn: string; url: string };
   integration_disconnected: { provider: string; url: string; workspaceName: string };
+  // A connection whose access token expires soon (Meta long-lived tokens), and a request to move a Shopify store here.
+  integration_expiring: { provider: string; url: string; workspaceName: string; expiresOn: string };
+  shop_transfer_request: { shop: string; requester: string; url: string; workspaceName: string };
   claim_review_result: { claim: string; outcome: string; url: string };
   // Plan 05 §14 compliance queues: more evidence for a restricted claim; a SKU confirmed out of V1 scope; guidance
   // after repeated blocked claims; the outcome of a before/after or possible-minor media review.
@@ -264,6 +267,14 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
     case 'integration_disconnected': {
       const m = d as TemplateMap['integration_disconnected'];
       return { subject: `${m.provider} disconnected from ${m.workspaceName}`, stream: 'transactional', element: (<L preview="Recommendations are now context-limited until you reconnect." label="Integration"><H>{m.provider} disconnected</H><P>Until you reconnect, recommendations use your product and customer language only — not performance.</P><Cta href={m.url}>Reconnect</Cta></L>) };
+    }
+    case 'integration_expiring': {
+      const m = d as TemplateMap['integration_expiring'];
+      return { subject: `Reconnect ${m.provider} before ${m.expiresOn}`, stream: 'transactional', element: (<L preview={`${m.provider} access for ${m.workspaceName} ends on ${m.expiresOn}.`} label="Integration"><H>{m.provider} access ends on {m.expiresOn}</H><P>{m.provider} access tokens expire. Reconnect before then and your results keep syncing without a gap.</P><Cta href={m.url}>Reconnect now</Cta></L>) };
+    }
+    case 'shop_transfer_request': {
+      const m = d as TemplateMap['shop_transfer_request'];
+      return { subject: `Transfer request for ${m.shop}`, stream: 'transactional', element: (<L preview="Nothing changes unless you approve." label="Integration · your decision needed"><H>Someone asked to move {m.shop}</H><P>{m.requester} signed in to {m.shop} through Shopify and asked to connect it to another Arkiv workspace. It is connected to {m.workspaceName} now. If you approve, {m.workspaceName} disconnects the store; its past data stays with you.</P><Cta href={m.url}>Review the request</Cta></L>) };
     }
     case 'claim_review_result': {
       const m = d as TemplateMap['claim_review_result'];

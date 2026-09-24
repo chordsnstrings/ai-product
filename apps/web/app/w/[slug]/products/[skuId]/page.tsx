@@ -33,7 +33,7 @@ export default async function Product({ params, searchParams }: { params: Promis
     const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
     const assets = await tx`select id, kind, mime, created_at, source from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
-    const imported = await tx`select id, genome, platform_refs, created_at from creatives where sku_id = ${skuId} and origin = 'imported' order by created_at desc limit 20`;
+    const imported = await tx`select id, genome, platform_refs, created_at, source_deleted_at from creatives where sku_id = ${skuId} and origin = 'imported' order by created_at desc limit 20`;
     return {
       sku,
       facts,
@@ -184,7 +184,7 @@ export default async function Product({ params, searchParams }: { params: Promis
           <div>
             {d.imported.length === 0 ? <p className="ak-muted">Import past ads so recommendations start from what you’ve already tried.</p> : d.imported.map((c) => {
               const g = (c.genome ?? {}) as { angle?: string; hookMechanism?: string; treatment?: string };
-              return <div key={c.id as string} className="ak-index-row"><span>{String((c.platform_refs as { copy?: string }).copy ?? '').slice(0, 90)}</span><span className="ak-index">{g.angle ? `${g.angle} · ${g.hookMechanism}` : 'analysing…'}</span></div>;
+              return <div key={c.id as string} className="ak-index-row"><span>{String((c.platform_refs as { copy?: string }).copy ?? '').slice(0, 90)}</span><span className="ak-index">{g.angle ? `${g.angle} · ${g.hookMechanism}` : 'analysing…'}{c.source_deleted_at ? ' · Deleted on platform' : ''}</span></div>;
             })}
           </div>
           {canEdit ? (

@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { API_VERSIONS, apiVersions, auditView, CONNECTOR_POLICY, missingScopes, setting, staffCan, type ConnectorProvider } from '@arkiv/core';
+import { API_VERSIONS, apiVersions, auditView, CONNECTOR_POLICY, missingScopes, setting, SHOP_TRANSFER_STAFF_DAYS, staffCan, type ConnectorProvider } from '@arkiv/core';
 import { ActButton, ActForm } from '@/components/act';
 import { ago, d, dt, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs } from '@/lib/prefs';
@@ -41,6 +41,11 @@ export default async function Integrations({ searchParams }: { searchParams: Pro
       versions: await apiVersions(tx),
       appStatus: ((await tx`select value, updated_at from platform_settings where key = 'integrations.app_status'`)[0]?.value ?? {}) as Record<string, { status?: string; note?: string | null; updatedAt?: string; by?: string }>,
       contract: await tx`select provider, api_version, passed, total, failed, commit_sha, ran_at from contract_test_runs order by ran_at desc limit 15`,
+      // Plan 02 §3 layer 8: pending store transfers; staff may approve after 14 days with the requester's OAuth proof.
+      transfers: await tx`select r.id, r.shop_domain, r.created_at, r.proof, f.name as from_name, r.from_workspace_id, t.name as to_name, r.workspace_id,
+                                 extract(day from now() - r.created_at)::int as waited
+                          from shop_transfer_requests r join workspaces f on f.id = r.from_workspace_id join workspaces t on t.id = r.workspace_id
+                          where r.status = 'pending' order by r.created_at limit 50`,
     };
   });
   const scopeCell = (p: ConnectorProvider, granted: string[]) => {
@@ -145,6 +150,30 @@ export default async function Integrations({ searchParams }: { searchParams: Pro
             return [<Mono key="s">{x.shop_domain as string}</Mono>, <Link key="w" href={`/tenants/${x.workspace_id}?tab=integrations`}>{x.name as string}</Link>, ago(x.webhooks_verified_at), !h ? 'not checked' : h.ok ? 'ok' : <strong key="h">missing {(h.missing ?? []).join(', ') || '—'}</strong>, (h?.repaired ?? []).join(', ') || '—', <span key="e" className="ak-small">{h?.error ?? ''}</span>];
           })}
           empty="No Shopify shops connected."
+        />
+      </Section>
+      <Section title={`Shopify store transfers · ${d0.transfers.length} pending`}>
+        <Table
+          head={['Shop', 'From (owner decides)', 'To (requested)', 'Waiting', 'Proof', '']}
+          rows={d0.transfers.map((x) => {
+            const proof = x.proof as { oauthAt?: string } | null;
+            const ok = Number(x.waited) >= SHOP_TRANSFER_STAFF_DAYS && !!proof?.oauthAt;
+            return [
+              <Mono key="s">{x.shop_domain as string}</Mono>,
+              <Link key="f" href={`/tenants/${x.from_workspace_id}?tab=integrations`}>{x.from_name as string}</Link>,
+              <Link key="t" href={`/tenants/${x.workspace_id}?tab=integrations`}>{x.to_name as string}</Link>,
+              `${x.waited as number} days`,
+              proof?.oauthAt ? `Shopify OAuth ${dt(proof.oauthAt)}` : '—',
+              canManage && ok ? (
+                <ActButton key="a" action="integration.shop_transfer_approve" payload={{ requestId: x.id }} reason="Why approve without the owner (e.g. owner unreachable, ticket #)" confirm={`Release ${x.shop_domain as string} from ${x.from_name as string}?`} small>
+                  Approve transfer
+                </ActButton>
+              ) : (
+                <span key="a" className="ak-small ak-muted">{ok ? '' : `the owner decides for ${SHOP_TRANSFER_STAFF_DAYS} days`}</span>
+              ),
+            ];
+          })}
+          empty="No pending store transfers."
         />
       </Section>
       {staleTable}

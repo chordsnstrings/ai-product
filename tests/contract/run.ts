@@ -13,7 +13,7 @@ import path from 'node:path';
 import { closeAll, withSystem } from '@arkiv/db';
 import { API_VERSIONS, contractResultsByProvider, recordContractRun, type ConnectorProvider } from '@arkiv/core';
 
-const SUITE = 'packages/integrations/src/connectors.test.ts';
+const SUITE = 'packages/integrations/src/{connectors,contract}.test.ts';
 
 async function main() {
   const out = path.join(mkdtempSync(path.join(tmpdir(), 'contract-')), 'report.json');

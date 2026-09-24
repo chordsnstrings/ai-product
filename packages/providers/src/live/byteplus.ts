@@ -16,6 +16,20 @@ import type {
 import { ProviderError } from '../types';
 
 /**
+ * Endpoint paths each live adapter calls, pinned here so contract tests assert them (standard §51
+ * "schema-version checks"): ModelArk API v3 (images, video tasks), MiniMax T2A v2, Seed Speech TTS 2.0.
+ */
+export const PROVIDER_API_PATHS = {
+  arkImages: 'images/generations',
+  arkVideoTasks: 'contents/generations/tasks',
+  minimaxTts: '/v1/t2a_v2',
+  seedSpeechResource: 'seed-tts-2.0',
+} as const;
+
+/** A response missing what the adapter reads: never guessed at, reported as a changed provider schema. */
+const schemaChanged = (provider: string, what: string) => new ProviderError(provider, `unexpected response: ${what}`, false, 'schema_changed');
+
+/**
  * BytePlus ModelArk: Seedream (sync images, POST /images/generations) and Seedance (async tasks,
  * POST/GET /contents/generations/tasks). Video parameters ride in the prompt text as `--flag value`.
  * Returned URLs expire, so bytes are downloaded immediately and stored in our own bucket (§39).
@@ -37,7 +51,13 @@ class ArkClient {
         signal: ctrl.signal,
       });
       const text = await res.text();
-      const json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      let json: Record<string, unknown> = {};
+      try {
+        json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch {
+        // A gateway error page is classified by its status below; a 2xx that isn't JSON is a changed contract.
+        if (res.ok) throw schemaChanged('byteplus', 'body is not JSON');
+      }
       if (!res.ok) {
         const err = (json.error ?? {}) as { code?: string; message?: string };
         const code = err.code ?? String(res.status);
@@ -69,7 +89,7 @@ export class SeedreamImage implements ImageProvider {
     this.ark = new ArkClient(apiKey, baseUrl);
   }
   async generate(req: ImageRequest): Promise<ImageResult> {
-    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string; usage?: unknown; created?: number }>('images/generations', 'POST', {
+    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string; usage?: unknown; created?: number }>(PROVIDER_API_PATHS.arkImages, 'POST', {
       model: req.model,
       prompt: req.prompt,
       size: `${req.width}x${req.height}`,
@@ -78,6 +98,7 @@ export class SeedreamImage implements ImageProvider {
       ...(req.references.length ? { image: req.references } : {}),
       ...(req.seed != null ? { seed: req.seed } : {}),
     });
+    if (!Array.isArray(r.data)) throw schemaChanged('byteplus', 'no data array');
     const url = r.data[0]?.url;
     if (!url) throw new ProviderError('byteplus', 'no image returned', true, 'server');
     return {
@@ -122,7 +143,7 @@ export class SeedreamCutout implements SegmentationProvider {
     const size = (v: number) => Math.max(512, Math.round((v * scale) / 8) * 8);
     const backdrop = await backdropFor(req.image);
     const jpeg = await sharp(req.image).rotate().flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toBuffer();
-    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string; usage?: unknown; created?: number }>('images/generations', 'POST', {
+    const r = await this.ark.call<{ model?: string; data: { url?: string }[]; id?: string; usage?: unknown; created?: number }>(PROVIDER_API_PATHS.arkImages, 'POST', {
       model: req.model,
       prompt: cutoutPrompt(backdrop),
       image: [`data:image/jpeg;base64,${jpeg.toString('base64')}`],
@@ -130,6 +151,7 @@ export class SeedreamCutout implements SegmentationProvider {
       response_format: 'url',
       watermark: false,
     });
+    if (!Array.isArray(r.data)) throw schemaChanged('byteplus', 'no data array');
     const url = r.data[0]?.url;
     if (!url) throw new ProviderError('byteplus', 'no image returned', true, 'server');
     const cut = await cutoutFromFlatBackdrop(req.image, await download(url));
@@ -166,7 +188,8 @@ export class SeedanceVideo implements VideoProvider {
     if (req.seed != null) flags.push(`--seed ${req.seed}`);
     const content: unknown[] = [{ type: 'text', text: `${req.prompt} ${flags.join(' ')}` }];
     for (const ref of req.references.slice(0, this.maxRefs)) content.push({ type: 'image_url', image_url: { url: ref }, role: 'reference_image' });
-    const r = await this.ark.call<{ id: string }>('contents/generations/tasks', 'POST', { model: req.model, content });
+    const r = await this.ark.call<{ id?: string }>(PROVIDER_API_PATHS.arkVideoTasks, 'POST', { model: req.model, content });
+    if (!r.id) throw schemaChanged('byteplus', 'video task without id');
     return { providerRequestId: r.id };
   }
   async poll(id: string): Promise<VideoPoll> {
@@ -176,7 +199,8 @@ export class SeedanceVideo implements VideoProvider {
       content?: { video_url?: string };
       error?: { message?: string };
       [k: string]: unknown;
-    }>(`contents/generations/tasks/${encodeURIComponent(id)}`, 'GET');
+    }>(`${PROVIDER_API_PATHS.arkVideoTasks}/${encodeURIComponent(id)}`, 'GET');
+    if (!['queued', 'running', 'succeeded', 'failed', 'cancelled'].includes(String(r.status))) throw schemaChanged('byteplus', `task status ${JSON.stringify(r.status)}`);
     // Everything the provider says about the task except the signed output URL (usage, seed, duration, timings).
     const { content: _content, ...rawMeta } = r;
     void _content;
@@ -191,7 +215,7 @@ export class SeedanceVideo implements VideoProvider {
     return { status: r.status, error: r.error?.message, rawMeta, ...(r.status === 'failed' && seconds > 0 ? { outputSeconds: seconds } : {}) };
   }
   async cancel(id: string): Promise<void> {
-    await this.ark.call(`contents/generations/tasks/${encodeURIComponent(id)}`, 'DELETE');
+    await this.ark.call(`${PROVIDER_API_PATHS.arkVideoTasks}/${encodeURIComponent(id)}`, 'DELETE');
   }
 }
 
@@ -203,7 +227,7 @@ export class MiniMaxTts implements TtsProvider {
     private readonly baseUrl: string,
   ) {}
   async synthesize(req: TtsRequest): Promise<TtsResult> {
-    const res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/v1/t2a_v2`, {
+    const res = await fetch(`${this.baseUrl.replace(/\/$/, '')}${PROVIDER_API_PATHS.minimaxTts}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -215,16 +239,18 @@ export class MiniMaxTts implements TtsProvider {
         language_boost: 'English',
       }),
     });
-    const j = (await res.json()) as {
+    const j = (await res.json().catch(() => ({}))) as {
       data?: { audio?: string };
       extra_info?: { audio_length?: number; usage_characters?: number };
       base_resp?: { status_code: number; status_msg: string };
       trace_id?: string;
     };
-    if (!res.ok || (j.base_resp && j.base_resp.status_code !== 0) || !j.data?.audio) {
+    if (!res.ok || (j.base_resp && j.base_resp.status_code !== 0)) {
       const msg = j.base_resp?.status_msg ?? `HTTP ${res.status}`;
-      throw new ProviderError('minimax', msg, res.status === 429 || res.status >= 500, res.status === 429 ? 'rate_limit' : 'server');
+      const kind = res.status === 429 ? 'rate_limit' : res.status === 401 || res.status === 403 ? 'auth' : res.status >= 500 ? 'server' : res.ok ? 'invalid' : 'server';
+      throw new ProviderError('minimax', msg, res.status === 429 || res.status >= 500, kind);
     }
+    if (!j.data?.audio) throw schemaChanged('minimax', 'no data.audio');
     return {
       bytes: Buffer.from(j.data.audio, 'hex'),
       mime: 'audio/mpeg',
@@ -255,19 +281,27 @@ export class SeedSpeechTts implements TtsProvider {
         'Content-Type': 'application/json',
         'X-Api-App-Id': this.appId,
         'X-Api-Access-Key': this.token,
-        'X-Api-Resource-Id': 'seed-tts-2.0',
+        'X-Api-Resource-Id': PROVIDER_API_PATHS.seedSpeechResource,
       },
       body: JSON.stringify({
         user: { uid: 'arkiv' },
         req_params: { text: req.text, speaker: req.voice, audio_params: { format: 'mp3', sample_rate: 24000 } },
       }),
     });
-    if (!res.ok) throw new ProviderError('byteplus-speech', `HTTP ${res.status}`, res.status >= 500 || res.status === 429, 'server');
+    if (!res.ok) {
+      const kind = res.status === 429 ? 'rate_limit' : res.status === 401 || res.status === 403 ? 'auth' : res.status >= 500 ? 'server' : 'invalid';
+      throw new ProviderError('byteplus-speech', `HTTP ${res.status}`, res.status >= 500 || res.status === 429, kind);
+    }
     // The endpoint streams JSON lines each carrying a base64 audio chunk.
     const chunks: Buffer[] = [];
     for (const line of (await res.text()).split('\n')) {
       if (!line.trim()) continue;
-      const j = JSON.parse(line) as { code?: number; data?: string; message?: string };
+      let j: { code?: number; data?: string; message?: string };
+      try {
+        j = JSON.parse(line) as typeof j;
+      } catch {
+        throw schemaChanged('byteplus-speech', 'a response line is not JSON');
+      }
       if (j.code && j.code !== 0 && j.code !== 20000000) throw new ProviderError('byteplus-speech', j.message ?? `code ${j.code}`, false, 'invalid');
       if (j.data) chunks.push(Buffer.from(j.data, 'base64'));
     }

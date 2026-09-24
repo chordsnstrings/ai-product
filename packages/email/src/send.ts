@@ -47,7 +47,7 @@ export const canResendTemplate = (template: string) => isTemplateName(template) 
 // Every template, as a record so a new template can't be left out.
 const TEMPLATE_NAMES: Record<TemplateName, true> = {
   magic_link: true, invite: true, receipt: true, asset_ready: true, offer_ending: true, storyboard_saved: true, new_concept: true,
-  export_ready: true, refund_issued: true, flag_expired: true, integration_disconnected: true, claim_review_result: true,
+  export_ready: true, refund_issued: true, flag_expired: true, integration_disconnected: true, integration_expiring: true, shop_transfer_request: true, claim_review_result: true,
   claim_evidence_request: true, sku_out_of_scope: true, claims_guidance: true, media_review_result: true,
   cancellation_confirmed: true, plan_ended_payment_failed: true, subscription_started: true, price_change_notice: true, payment_failed: true, security_alert: true,
   weekly_brief: true, friday_summary: true, signal_update: true, day30_review: true, staff_break_glass: true, ownership_transfer_confirm: true, intervention: true,

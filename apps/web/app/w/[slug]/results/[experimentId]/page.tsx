@@ -30,13 +30,16 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     const thumbs = (
       await Promise.all(v.variants.map(async (x) => ({ id: x.id as string, code: x.code as string, label: x.label as string, src: await variantPreviewUrl(tx, x) })))
     ).filter((t) => t.src);
-    return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs };
+    // Ads deleted on the platform (§48): their history stays; the variant is labelled, never back-filled.
+    const deleted = await tx`select v.id from variants v join creatives c on c.id = v.creative_id and c.workspace_id = v.workspace_id
+                             where v.experiment_id = ${experimentId} and c.source_deleted_at is not null`;
+    return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs, deletedVariants: new Set(deleted.map((x) => x.id as string)) };
   });
   if (!d) notFound();
   // One table per measurement context and attribution window: different windows are different measurements (§30).
   const groups = [...new Map(d.results.map((r) => [`${r.measurement_context}|${r.attribution_window}`, { ctx: r.measurement_context as string, window: String(r.attribution_window ?? 'default') }])).values()];
   const windowLabel = (w: string) => (w === 'default' ? null : w.replace(/_/g, ' ').replace(/(\d+)d/g, '$1-day'));
-  const label = new Map(d.variants.map((v) => [v.id as string, `${v.code} · ${v.label}`]));
+  const label = new Map(d.variants.map((v) => [v.id as string, `${v.code} · ${v.label}${d.deletedVariants.has(v.id as string) ? ' · deleted on platform' : ''}`]));
   // Confounder windows that overlapped this test's observed dates (§45), as of the last computation.
   const overlapping = new Set(d.results.flatMap((r) => ((r.confounder_windows as { id: string }[] | null) ?? []).map((c) => c.id)));
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);

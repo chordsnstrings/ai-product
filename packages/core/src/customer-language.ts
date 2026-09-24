@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { parseCsv as parseCsvWith } from './csv';
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
 import { notePromptInjection } from './abuse';
@@ -50,31 +51,8 @@ export async function importSignals(tx: Tx, ctx: TenantContext, skuId: string, i
   return n;
 }
 
-/** RFC 4180 CSV: quoted cells may hold commas, doubled quotes and line breaks. */
-export function parseCsv(raw: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = '';
-  let quoted = false;
-  for (let i = 0; i < raw.length; i++) {
-    const c = raw[i]!;
-    if (quoted) {
-      if (c === '"' && raw[i + 1] === '"') { cell += '"'; i++; }
-      else if (c === '"') quoted = false;
-      else cell += c;
-    } else if (c === '"' && cell.trim() === '') { cell = ''; quoted = true; }
-    else if (c === ',') { row.push(cell); cell = ''; }
-    else if (c === '\n' || c === '\r') {
-      if (c === '\r' && raw[i + 1] === '\n') i++;
-      row.push(cell); cell = '';
-      if (row.some((x) => x.trim())) rows.push(row);
-      row = [];
-    } else cell += c;
-  }
-  row.push(cell);
-  if (row.some((x) => x.trim())) rows.push(row);
-  return rows;
-}
+/** RFC 4180 CSV (shared with the performance import, csv.ts). Review exports are comma-separated. */
+export const parseCsv = (raw: string): string[][] => parseCsvWith(raw, ',');
 
 /** "reviewer.name", "Review Content", "dateCreated", "review_body" → "reviewer name", "review content", "date created", "review body". */
 const normHeader = (h: string) => h.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();

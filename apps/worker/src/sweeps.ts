@@ -32,6 +32,8 @@ import {
   verifyShopifyWebhooks,
   sweepRateLimits,
   sweepHeartbeats,
+  sweepExpiringTokens,
+  sweepStaleIntegrations,
   sweepRetention,
   weekOf,
 } from '@arkiv/core';
@@ -239,15 +241,30 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   'offer-guardrails': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const stopped = await sweepOfferGuardrails(tx); return stopped.length ? stopped : 0; }) },
   // Plan 05 §7: nightly full reconciliation of Stripe (customers, subscriptions, recent charges) against our mirror.
   'stripe-reconcile': { cron: '40 3 * * *', run: async () => { const r = await reconcileStripe(); return r.status === 'completed' ? r.counts : 0; } },
+  // §28 scheduled reconciliation. A degraded connection is retried too, on its backoff schedule (its error's
+  // nextRetryAt), so one transient platform error never stops syncing for good; errors only the merchant or an
+  // adapter fix can clear (missing permissions, a changed API schema) wait for them.
   'sync-integrations': {
     cron: '0 */6 * * *',
     run: () =>
       withSystem(async (tx) => {
-        const rows = await tx`select id, workspace_id from integrations where status = 'active'`;
-        for (const r of rows) await enqueueFor(tx, r.workspace_id as string, 'sync-integration', { integrationId: r.id }, `sync:${r.id}:${new Date().toISOString().slice(0, 13)}`);
+        const rows = await tx`select id, workspace_id from integrations
+                              where status in ('active', 'degraded') and token_enc is not null
+                                and coalesce(error->>'kind', '') not in ('partial_scopes', 'schema_changed')
+                                and coalesce((error->>'nextRetryAt')::timestamptz, now()) <= now()`;
+        // One pending sync per connection: the same key as "Sync now" and the connect-time sync (x-races-16).
+        for (const r of rows) {
+          await tx`insert into outbox (workspace_id, queue, payload, singleton_key)
+                   values (${r.workspace_id as string}, 'sync-integration', ${tx.json({ integrationId: r.id, workspaceId: r.workspace_id })}, ${`sync:${r.id}`})
+                   on conflict (workspace_id, queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing`;
+        }
         return rows.length;
       }),
   },
+  // Appendix B DATA_FRESHNESS_CHANGED: a connection that hasn't synced for FRESHNESS_DAYS is announced stale once.
+  'integration-freshness': { cron: '25 5 * * *', run: () => sweepStaleIntegrations() },
+  // Plan 05 §16 token expiry: reconnect reminder a week ahead; an expired token marks the connection revoked.
+  'integration-token-expiry': { cron: '35 5 * * *', run: async () => { const r = await sweepExpiringTokens(); return r.warned + r.expired ? r : 0; } },
   // Monday 12:00 UTC (~8am ET): This Week recommendations + brief (standard §11 weekly ritual).
   'weekly-recommendations': {
     cron: '0 12 * * 1',

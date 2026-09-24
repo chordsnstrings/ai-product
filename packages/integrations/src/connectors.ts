@@ -55,6 +55,8 @@ export interface NormalizedObservation {
   placement?: string;
   /** IANA timezone the source reports daily dates in (§47); defaults to the connection's timezone. */
   sourceTimezone?: string | null;
+  /** The row adapter that produced this observation (ADAPTER_VERSIONS; §47 "adapter versioning"). */
+  adapterVersion?: string;
 }
 
 // ───────────── Connector policies (plan 05 §16, standard §31) ─────────────
@@ -84,6 +86,60 @@ export function missingScopes(provider: ConnectorProvider, granted: readonly str
 const num = (v: unknown) => (v == null || v === '' ? 0 : Number(v));
 const numOrNull = (v: unknown) => (v == null || v === '' ? null : Number(v));
 const micros = (v: unknown) => Math.round(num(v) * 1_000_000);
+
+// ───────────── Adapter versions and response contracts (§47 "API schema change") ─────────────
+
+/**
+ * Versions of our own row adapters (the mapping from a platform's raw row to NormalizedObservation). Every
+ * observation is stamped with the adapter that produced it, so a mapping change can be traced and re-derived.
+ */
+export const ADAPTER_VERSIONS = { meta: 'meta-insights@2', tiktok: 'tiktok-report@2', tiktokGmvMax: 'tiktok-gmv-max@1', shopify: 'shopify-products@2' } as const;
+
+const isNumeric = (v: unknown) => typeof v === 'number' ? Number.isFinite(v) : typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v));
+
+/**
+ * The fields a raw row must carry for the adapter to read it. A renamed or missing field would otherwise be read
+ * as zero and feed the statistics: the page is refused instead (schema_changed → the connection is degraded and
+ * nothing from that page is ingested).
+ */
+export function assertRowContract(provider: 'meta' | 'tiktok' | 'shopify', row: unknown, fields: { ids?: string[]; numbers?: string[] }, where = 'row'): void {
+  const r = (row ?? {}) as Record<string, unknown>;
+  const bad: string[] = [];
+  for (const f of fields.ids ?? []) if (r[f] == null || String(r[f]).trim() === '') bad.push(f);
+  for (const f of fields.numbers ?? []) if (!isNumeric(r[f])) bad.push(f);
+  if (bad.length) throw new ConnectorError(provider, 'schema_changed', `${where} is missing or has a non-numeric ${bad.join(', ')} — adapter ${ADAPTER_VERSIONS[provider === 'shopify' ? 'shopify' : provider]} needs updating`);
+}
+
+/**
+ * Error class of an HTTP answer that isn't a platform error payload: a 5xx (or an unreadable body) is a
+ * transient outage the sync retries with backoff; 401/403 is revoked access; 429 is a rate limit.
+ */
+export function httpErrorKind(status: number): ConnectorError['kind'] | null {
+  if (status === 401 || status === 403) return 'auth_revoked';
+  if (status === 429) return 'rate_limited';
+  if (status >= 500) return 'network';
+  if (status >= 400) return 'invalid';
+  return null;
+}
+
+/** fetch that turns a dropped connection into a retryable 'network' ConnectorError. */
+async function platformFetch(provider: 'meta' | 'tiktok' | 'shopify', url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    throw new ConnectorError(provider, 'network', `request failed: ${(e as Error).message}`.slice(0, 300));
+  }
+}
+
+/** JSON body, or a 'network' error for a gateway page / truncated body (a 5xx answered with HTML). */
+async function platformJson<T>(provider: 'meta' | 'tiktok' | 'shopify', r: Response): Promise<T> {
+  try {
+    return (await r.json()) as T;
+  } catch {
+    const kind = httpErrorKind(r.status);
+    throw new ConnectorError(provider, kind && kind !== 'invalid' ? kind : 'network', `unreadable response (HTTP ${r.status})`, kind === 'rate_limited' ? 60 : undefined);
+  }
+}
 
 // ───────────── Shopify (§28) ─────────────
 export const SHOPIFY_SCOPES = ['read_products'];
@@ -141,7 +197,7 @@ export function verifyTiktokWebhook(rawBody: string, header: string | null, now 
 }
 
 export async function shopifyExchangeCode(shop: string, code: string): Promise<{ accessToken: string; scopes: string[] }> {
-  const r = await fetch(`https://${shop}/admin/oauth/access_token`, {
+  const r = await platformFetch('shopify', `https://${shop}/admin/oauth/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_id: env().SHOPIFY_API_KEY, client_secret: env().SHOPIFY_API_SECRET, code }),
@@ -151,10 +207,27 @@ export async function shopifyExchangeCode(shop: string, code: string): Promise<{
   return { accessToken: j.access_token, scopes: j.scope.split(',') };
 }
 
+/**
+ * Canonical Shopify ids are Admin GraphQL global ids (`gid://shopify/Product/99`). The storefront's
+ * `/products/<handle>.json` and REST webhooks carry the bare number (`99`): both forms name the same product, so
+ * every id is stored in the gid form (§42 "Duplicate import: detect source/product match").
+ */
+export function shopifyGid(kind: 'Product' | 'ProductVariant', id: string | number): string {
+  const s = String(id).trim();
+  if (/^gid:\/\//.test(s)) return s;
+  return /^\d+$/.test(s) ? `gid://shopify/${kind}/${s}` : s;
+}
+
+/** The numeric part of a Shopify id in either form (`gid://shopify/Product/99` → `99`). */
+export function shopifyNumericId(id: string | number): string {
+  const m = /(\d+)$/.exec(String(id).trim());
+  return m ? m[1]! : String(id);
+}
+
 // ───────────── Shopify webhook registrations (plan 05 §16 "verified nightly") ─────────────
 // App-specific topics we register per shop through the Admin API. The mandatory privacy topics
 // (customers/data_request, customers/redact, shop/redact) are configured on the app itself, not per shop.
-export const SHOPIFY_WEBHOOK_TOPICS = ['app/uninstalled', 'products/create', 'products/update'] as const;
+export const SHOPIFY_WEBHOOK_TOPICS = ['app/uninstalled', 'products/create', 'products/update', 'products/delete'] as const;
 
 export interface ShopifyWebhook {
   id: string;
@@ -168,14 +241,14 @@ export interface ShopifyWebhookClient {
 }
 
 async function shopifyRest<T>(shop: string, token: string, path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
-  const r = await fetch(`https://${shop}/admin/api/${API_VERSIONS.shopify}/${path}`, {
+  const r = await platformFetch('shopify', `https://${shop}/admin/api/${API_VERSIONS.shopify}/${path}`, {
     method: init.method ?? 'GET',
     headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
   });
   if (r.status === 401 || r.status === 403) throw new ConnectorError('shopify', 'auth_revoked', 'access revoked');
   if (r.status === 429) throw new ConnectorError('shopify', 'rate_limited', 'throttled', Number(r.headers.get('retry-after') ?? 2));
-  if (!r.ok) throw new ConnectorError('shopify', 'invalid', `webhooks API ${r.status}`);
+  if (!r.ok) throw new ConnectorError('shopify', httpErrorKind(r.status) ?? 'invalid', `webhooks API ${r.status}`);
   return (await r.json()) as T;
 }
 
@@ -224,12 +297,21 @@ export function missingShopifyWebhooks(existing: ShopifyWebhook[], address: stri
 }
 
 export interface ShopifyProduct {
+  /** Canonical gid (`gid://shopify/Product/N`). */
   id: string;
   title: string;
+  handle?: string | null;
+  productType?: string | null;
+  /** The product's public page, when published to the Online Store. */
+  onlineStoreUrl?: string | null;
   descriptionText: string;
   status: string;
   vendor: string | null;
   images: string[];
+  /** Option names with their values (Size: 30 ml, 50 ml), without the "Title" placeholder. */
+  options?: { name: string; values: string[] }[];
+  /** Product metafields as the store defines them. */
+  metafields?: { namespace: string; key: string; type: string | null; value: string }[];
   variants: {
     id: string;
     title: string;
@@ -245,38 +327,64 @@ export interface ShopifyProduct {
   updatedAt: string;
 }
 
-const PRODUCTS_QUERY = `query Products($cursor: String) {
+const PRODUCT_FIELDS = `id title handle productType onlineStoreUrl description status vendor updatedAt
+      options { name values }
+      metafields(first: 20) { nodes { namespace key type value } }
+      media(first: 6) { nodes { ... on MediaImage { image { url } } } }
+      variants(first: 20) { nodes { id title price compareAtPrice sku barcode availableForSale selectedOptions { name value } image { url } } }`;
+
+export const SHOPIFY_PRODUCTS_QUERY = `query Products($cursor: String) {
   shop { currencyCode ianaTimezone }
   products(first: 50, after: $cursor) {
     pageInfo { hasNextPage endCursor }
-    nodes { id title description status vendor updatedAt
-      media(first: 6) { nodes { ... on MediaImage { image { url } } } }
-      variants(first: 20) { nodes { id title price compareAtPrice sku barcode availableForSale selectedOptions { name value } image { url } } } }
+    nodes { ${PRODUCT_FIELDS} }
   }
 }`;
 
-export async function shopifyFetchProducts(shop: string, token: string, cursor: string | null): Promise<{ products: ShopifyProduct[]; next: string | null; currency: string | null; timezone: string | null }> {
-  const r = await fetch(`https://${shop}/admin/api/${API_VERSIONS.shopify}/graphql.json`, {
+export const SHOPIFY_PRODUCT_QUERY = `query Product($id: ID!) {
+  shop { currencyCode ianaTimezone }
+  product(id: $id) { ${PRODUCT_FIELDS} }
+}`;
+
+async function shopifyGraphql<T>(shop: string, token: string, query: string, variables: Record<string, unknown>): Promise<T> {
+  const r = await platformFetch('shopify', `https://${shop}/admin/api/${API_VERSIONS.shopify}/graphql.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
-    body: JSON.stringify({ query: PRODUCTS_QUERY, variables: { cursor } }),
+    body: JSON.stringify({ query, variables }),
   });
   if (r.status === 401 || r.status === 403) throw new ConnectorError('shopify', 'auth_revoked', 'access revoked');
   if (r.status === 429) throw new ConnectorError('shopify', 'rate_limited', 'throttled', Number(r.headers.get('retry-after') ?? 2));
-  const j = (await r.json()) as { data?: { shop?: { currencyCode?: string; ianaTimezone?: string }; products: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: Record<string, unknown>[] } }; errors?: unknown };
+  if (r.status >= 500) throw new ConnectorError('shopify', 'network', `Admin API ${r.status}`);
+  const j = await platformJson<{ data?: T; errors?: { message?: string; extensions?: { code?: string } }[] }>('shopify', r);
+  if (j.errors?.some((e) => e.extensions?.code === 'THROTTLED')) throw new ConnectorError('shopify', 'rate_limited', 'throttled', 2);
   if (!j.data) throw new ConnectorError('shopify', 'schema_changed', `unexpected response: ${JSON.stringify(j.errors).slice(0, 200)}`);
+  return j.data;
+}
+
+type ShopInfo = { shop?: { currencyCode?: string; ianaTimezone?: string } };
+
+export async function shopifyFetchProducts(shop: string, token: string, cursor: string | null): Promise<{ products: ShopifyProduct[]; next: string | null; currency: string | null; timezone: string | null }> {
+  const d = await shopifyGraphql<ShopInfo & { products?: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: Record<string, unknown>[] } }>(shop, token, SHOPIFY_PRODUCTS_QUERY, { cursor });
+  if (!d.products || !Array.isArray(d.products.nodes)) throw new ConnectorError('shopify', 'schema_changed', 'products connection missing from the response');
   return {
-    products: j.data.products.nodes.map(normalizeShopifyProduct),
-    next: j.data.products.pageInfo.hasNextPage ? j.data.products.pageInfo.endCursor : null,
-    currency: j.data.shop?.currencyCode ?? null,
-    timezone: j.data.shop?.ianaTimezone ?? null,
+    products: d.products.nodes.map(normalizeShopifyProduct),
+    next: d.products.pageInfo?.hasNextPage ? d.products.pageInfo.endCursor : null,
+    currency: d.shop?.currencyCode ?? null,
+    timezone: d.shop?.ianaTimezone ?? null,
   };
 }
 
+/** One product by id (either form), for a products/create|update webhook; null when it no longer exists. */
+export async function shopifyFetchProduct(shop: string, token: string, id: string): Promise<{ product: ShopifyProduct | null; currency: string | null }> {
+  const d = await shopifyGraphql<ShopInfo & { product?: Record<string, unknown> | null }>(shop, token, SHOPIFY_PRODUCT_QUERY, { id: shopifyGid('Product', id) });
+  return { product: d.product ? normalizeShopifyProduct(d.product) : null, currency: d.shop?.currencyCode ?? null };
+}
+
 export function normalizeShopifyProduct(n: Record<string, unknown>): ShopifyProduct {
+  assertRowContract('shopify', n, { ids: ['id', 'title', 'status'] }, 'product');
   const media = ((n.media as { nodes: { image?: { url: string } }[] })?.nodes ?? []).map((m) => m.image?.url).filter(Boolean) as string[];
   const variants = ((n.variants as { nodes: Record<string, unknown>[] })?.nodes ?? []).map((v) => ({
-    id: String(v.id),
+    id: shopifyGid('ProductVariant', String(v.id)),
     title: String(v.title),
     price: num(v.price),
     compareAtPrice: numOrNull(v.compareAtPrice),
@@ -288,15 +396,82 @@ export function normalizeShopifyProduct(n: Record<string, unknown>): ShopifyProd
     available: typeof v.availableForSale === 'boolean' ? v.availableForSale : null,
     imageUrl: ((v.image as { url?: string } | null)?.url as string) ?? null,
   }));
-  return { id: String(n.id), title: String(n.title), descriptionText: String(n.description ?? ''), status: String(n.status), vendor: (n.vendor as string) ?? null, images: media, variants, updatedAt: String(n.updatedAt) };
+  const options = ((n.options as { name: string; values?: string[] }[] | undefined) ?? [])
+    .filter((o) => o.name && !(o.name === 'Title' && (o.values ?? []).every((v) => v === 'Default Title')))
+    .map((o) => ({ name: o.name, values: o.values ?? [] }));
+  const metafields = ((n.metafields as { nodes?: Record<string, unknown>[] } | undefined)?.nodes ?? [])
+    .filter((m) => m && m.key && m.value != null)
+    .map((m) => ({ namespace: String(m.namespace ?? ''), key: String(m.key), type: (m.type as string) ?? null, value: String(m.value) }));
+  return {
+    id: shopifyGid('Product', String(n.id)),
+    title: String(n.title),
+    handle: (n.handle as string) || null,
+    productType: (n.productType as string) || null,
+    onlineStoreUrl: (n.onlineStoreUrl as string) || null,
+    descriptionText: String(n.description ?? ''),
+    status: String(n.status),
+    vendor: (n.vendor as string) || null,
+    images: media,
+    options,
+    metafields,
+    variants,
+    updatedAt: String(n.updatedAt ?? ''),
+  };
+}
+
+/** Readable text of a metafield value (rich text, lists and measurements are JSON). */
+function metafieldText(v: string): string {
+  try {
+    const j = JSON.parse(v) as unknown;
+    if (typeof j === 'string' || typeof j === 'number') return String(j);
+    if (Array.isArray(j)) return j.map((x) => (x && typeof x === 'object' ? String((x as { value?: unknown }).value ?? '') : String(x))).filter(Boolean).join(', ');
+    if (j && typeof j === 'object' && 'value' in j) {
+      const unit = String((j as { unit?: unknown }).unit ?? '').toLowerCase();
+      const short = ({ milliliters: 'ml', millilitres: 'ml', grams: 'g', fluid_ounces: 'fl oz', ounces: 'oz', liters: 'l', kilograms: 'kg' } as Record<string, string>)[unit] ?? unit;
+      return `${String((j as { value: unknown }).value)}${short ? ` ${short}` : ''}`;
+    }
+    // Rich text: every text node, in order.
+    const texts: string[] = [];
+    const walk = (x: unknown) => {
+      if (!x || typeof x !== 'object') return;
+      const o = x as { value?: unknown; children?: unknown[] };
+      if (typeof o.value === 'string') texts.push(o.value);
+      for (const c of o.children ?? []) walk(c);
+    };
+    walk(j);
+    return texts.join(' ').replace(/\s+/g, ' ').trim();
+  } catch {
+    return v.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+}
+
+/**
+ * Metafields that carry product truth (§28 "available relevant metafields"), matched by key whatever the
+ * namespace: ingredients (INCI), size/volume and shade. The first match per key wins.
+ */
+export function shopifyMetafieldFacts(metafields: NonNullable<ShopifyProduct['metafields']>): { key: 'ingredients' | 'size' | 'shade'; value: string; source: string }[] {
+  const out: { key: 'ingredients' | 'size' | 'shade'; value: string; source: string }[] = [];
+  for (const m of metafields) {
+    const k = m.key.toLowerCase();
+    const key = /ingredient|inci/.test(k) ? 'ingredients' : /^(size|volume|net_?(content|contents|volume|weight)|weight|capacity)$/.test(k) ? 'size' : /shade|colou?r_?name/.test(k) ? 'shade' : null;
+    if (!key || out.some((o) => o.key === key)) continue;
+    const value = metafieldText(m.value).slice(0, 2000);
+    if (value) out.push({ key, value, source: `${m.namespace}.${m.key}` });
+  }
+  return out;
 }
 
 // ───────────── Meta Marketing API (§29) ─────────────
 export const META_SCOPES = ['ads_read'];
 export const META_API = `https://graph.facebook.com/${API_VERSIONS.meta}`;
 
-export function metaAuthUrl(state: string) {
-  const q = new URLSearchParams({ client_id: env().META_APP_ID ?? 'dev', redirect_uri: `${env().APP_URL}/api/integrations/meta/callback`, state, scope: META_SCOPES.join(','), response_type: 'code' });
+/**
+ * Meta login dialog. `scopes` asks for only the named permissions again (a partial-scope connection re-asks for
+ * what is missing, never for unrelated permissions, §47); `auth_type=rerequest` re-prompts a declined one.
+ */
+export function metaAuthUrl(state: string, scopes: readonly string[] = META_SCOPES) {
+  const q = new URLSearchParams({ client_id: env().META_APP_ID ?? 'dev', redirect_uri: `${env().APP_URL}/api/integrations/meta/callback`, state, scope: scopes.join(','), response_type: 'code' });
+  if (scopes !== META_SCOPES) q.set('auth_type', 'rerequest');
   return `https://www.facebook.com/${API_VERSIONS.meta}/dialog/oauth?${q}`;
 }
 
@@ -307,6 +482,8 @@ export const META_INSIGHT_FIELDS = [
 ];
 /** Placement breakdown (§45 "store placement/campaign observations separately"). */
 export const META_BREAKDOWNS = ['publisher_platform', 'platform_position'];
+/** The attribution windows the insights request asks for; stored as the observation's window (§45). */
+export const META_ATTRIBUTION_WINDOWS = ['7d_click', '1d_view'] as const;
 
 /** `publisher_platform:platform_position`, lower-cased; 'all' when the row has no breakdown. */
 export function metaPlacement(r: Record<string, unknown>): string {
@@ -319,7 +496,10 @@ type MetaAction = { action_type: string; value: string };
 const actionVal = (arr: unknown, type: string) => num(((arr as MetaAction[]) ?? []).find((a) => a.action_type === type)?.value);
 
 /** Normalize one Meta insights row (ad-level, daily, stated attribution window). We compute CTR/CVR ourselves. */
-export function normalizeMetaInsight(r: Record<string, unknown>, attributionWindow = '7d_click_1d_view'): NormalizedObservation {
+export function normalizeMetaInsight(r: Record<string, unknown>, attributionWindow = META_ATTRIBUTION_WINDOWS.map((w) => w).join('_')): NormalizedObservation {
+  // Required raw fields (§47 "fail safely"): a renamed one must not be read as zero.
+  assertRowContract('meta', r, { ids: ['ad_id', 'date_start'], numbers: ['spend', 'impressions'] }, 'insights row');
+  if (r.clicks != null && !isNumeric(r.clicks)) assertRowContract('meta', r, { numbers: ['clicks'] }, 'insights row');
   return {
     platform: 'meta',
     accountId: String(r.account_id),
@@ -351,7 +531,34 @@ export function normalizeMetaInsight(r: Record<string, unknown>, attributionWind
     campaignType: (r.objective as string) ?? null,
     measurementContext: 'META_PAID_ATTRIBUTED',
     placement: metaPlacement(r),
+    adapterVersion: ADAPTER_VERSIONS.meta,
   };
+}
+
+type MetaError = { code: number; error_subcode?: number; is_transient?: boolean; message: string };
+
+/**
+ * Meta Graph error → our class. Codes 1 and 2 (and anything Meta flags is_transient) are temporary service
+ * errors that are retried with backoff (§47); 4/17/32/613/80004 are throttles; 190 is an expired or revoked
+ * token; 10 and 200–299 are missing permissions. Other request errors are 'invalid'.
+ */
+export function metaErrorKind(e: MetaError, httpStatus = 400): ConnectorError['kind'] {
+  if (e.code === 190 || e.code === 102) return 'auth_revoked';
+  if ([4, 17, 32, 613, 80000, 80004].includes(e.code)) return 'rate_limited';
+  if (e.code === 10 || (e.code >= 200 && e.code < 300)) return 'partial_scopes';
+  if (e.is_transient || e.code === 1 || e.code === 2 || httpStatus >= 500) return 'network';
+  return 'invalid';
+}
+
+async function metaGet<T>(url: string): Promise<T> {
+  const r = await platformFetch('meta', url);
+  const j = await platformJson<T & { error?: MetaError }>('meta', r);
+  if (j.error) {
+    const kind = metaErrorKind(j.error, r.status);
+    throw new ConnectorError('meta', kind, j.error.message, kind === 'rate_limited' ? 60 : undefined);
+  }
+  if (!r.ok) throw new ConnectorError('meta', httpErrorKind(r.status) ?? 'invalid', `Graph API ${r.status}`, r.status === 429 ? 60 : undefined);
+  return j;
 }
 
 export async function metaFetchInsights(token: string, accountId: string, since: string, until: string, after: string | null) {
@@ -361,20 +568,51 @@ export async function metaFetchInsights(token: string, accountId: string, since:
     time_increment: '1',
     fields: META_INSIGHT_FIELDS.join(','),
     time_range: JSON.stringify({ since, until }),
-    action_attribution_windows: JSON.stringify(['7d_click', '1d_view']),
+    action_attribution_windows: JSON.stringify(META_ATTRIBUTION_WINDOWS),
     breakdowns: META_BREAKDOWNS.join(','),
     limit: '200',
   });
   if (after) q.set('after', after);
-  const r = await fetch(`${META_API}/act_${accountId.replace(/^act_/, '')}/insights?${q}`);
-  const j = (await r.json()) as { data?: Record<string, unknown>[]; paging?: { cursors?: { after?: string }; next?: string }; error?: { code: number; message: string } };
-  if (j.error) {
-    if (j.error.code === 190) throw new ConnectorError('meta', 'auth_revoked', j.error.message);
-    if ([4, 17, 32, 613].includes(j.error.code)) throw new ConnectorError('meta', 'rate_limited', j.error.message, 60);
-    if (j.error.code === 200 || j.error.code === 10) throw new ConnectorError('meta', 'partial_scopes', j.error.message);
-    throw new ConnectorError('meta', 'invalid', j.error.message);
-  }
+  const j = await metaGet<{ data?: Record<string, unknown>[]; paging?: { cursors?: { after?: string }; next?: string } }>(`${META_API}/act_${accountId.replace(/^act_/, '')}/insights?${q}`);
+  if (j.data != null && !Array.isArray(j.data)) throw new ConnectorError('meta', 'schema_changed', 'insights response has no data array');
   return { rows: (j.data ?? []).map((r) => normalizeMetaInsight(r)), next: j.paging?.next ? (j.paging.cursors?.after ?? null) : null };
+}
+
+/** Ads Meta reports as gone (§48 "historical creative deleted from ad platform"). */
+const META_GONE = new Set(['DELETED', 'ARCHIVED']);
+
+/**
+ * Effective status of each ad id (`ACTIVE`, `PAUSED`, `DELETED`, `ARCHIVED`, …). An id Meta says does not exist
+ * (error 100) is reported as DELETED; an id it didn't answer for is left out (unknown, never guessed).
+ */
+export async function metaFetchAdStatuses(token: string, adIds: string[]): Promise<Map<string, { status: string; deleted: boolean }>> {
+  const out = new Map<string, { status: string; deleted: boolean }>();
+  const one = async (ids: string[]) => {
+    const q = new URLSearchParams({ ids: ids.join(','), fields: 'id,effective_status', access_token: token });
+    const j = await metaGet<Record<string, { id?: string; effective_status?: string }>>(`${META_API}/?${q}`);
+    for (const id of ids) {
+      const s = j[id]?.effective_status;
+      if (s) out.set(id, { status: s, deleted: META_GONE.has(s) });
+    }
+  };
+  for (let i = 0; i < adIds.length; i += 50) {
+    const chunk = adIds.slice(i, i + 50);
+    try {
+      await one(chunk);
+    } catch (e) {
+      // One missing id fails the whole batch ("does not exist"): ask for each id on its own.
+      if (!(e instanceof ConnectorError) || e.kind !== 'invalid') throw e;
+      for (const id of chunk) {
+        try {
+          await one([id]);
+        } catch (e2) {
+          if (e2 instanceof ConnectorError && e2.kind === 'invalid' && /does not exist|nonexisting|unsupported get request/i.test(e2.message)) out.set(id, { status: 'DELETED', deleted: true });
+          else if (!(e2 instanceof ConnectorError) || e2.kind !== 'invalid') throw e2;
+        }
+      }
+    }
+  }
+  return out;
 }
 
 // ───────────── TikTok API for Business (§30) ─────────────
@@ -385,13 +623,18 @@ export function tiktokAuthUrl(state: string) {
   return `https://business-api.tiktok.com/portal/auth?${q}`;
 }
 
+/** Campaign types whose results include organic and affiliate traffic (Product/LIVE GMV Max, §30). */
+export const isGmvMaxCampaignType = (t: string | null | undefined) => !!t && /GMV_MAX/i.test(t);
+
 /**
  * GMV Max results include organic + affiliate traffic and are NOT comparable with paid-only attribution (§30):
  * they get their own measurement_context.
  */
 export function normalizeTikTokRow(r: { dimensions: Record<string, string>; metrics: Record<string, string> }, advertiserId: string, currency: string, campaignType: string | null): NormalizedObservation {
+  assertRowContract('tiktok', r.dimensions, { ids: ['ad_id', 'stat_time_day'] }, 'report row dimensions');
+  assertRowContract('tiktok', r.metrics, { numbers: ['spend', 'impressions'] }, 'report row metrics');
   const m = r.metrics;
-  const gmvMax = campaignType === 'GMV_MAX' || campaignType === 'PRODUCT_GMV_MAX';
+  const gmvMax = isGmvMaxCampaignType(campaignType);
   return {
     platform: 'tiktok',
     accountId: advertiserId,
@@ -422,11 +665,41 @@ export function normalizeTikTokRow(r: { dimensions: Record<string, string>; metr
     optimizationEvent: m.optimization_event ?? null,
     campaignType,
     measurementContext: gmvMax ? 'TIKTOK_GMV_MAX_TOTAL' : 'TIKTOK_PAID_ATTRIBUTED',
+    adapterVersion: ADAPTER_VERSIONS.tiktok,
   };
 }
 
+type TikTokEnvelope<T> = { code: number; message: string; request_id?: string; data?: T };
+
+/**
+ * TikTok answers HTTP 200 with a `code`: 40001/40105/40102 are revoked or expired access, 40100 and 50002 are
+ * throttles, 40002/40007 missing permissions, other 5xxxx codes are service errors retried with backoff.
+ */
+export function tiktokErrorKind(code: number): ConnectorError['kind'] {
+  if (code === 40001 || code === 40105 || code === 40102) return 'auth_revoked';
+  if (code === 40100 || code === 50002) return 'rate_limited';
+  if (code === 40002 || code === 40007) return 'partial_scopes';
+  if (code >= 50000) return 'network';
+  return 'invalid';
+}
+
+async function tiktokGet<T>(token: string, path: string, params: Record<string, string>): Promise<T> {
+  const r = await platformFetch('tiktok', `${TIKTOK_API}/${path}?${new URLSearchParams(params)}`, { headers: { 'Access-Token': token } });
+  if (r.status >= 500 || r.status === 429) throw new ConnectorError('tiktok', httpErrorKind(r.status)!, `HTTP ${r.status}`, r.status === 429 ? 60 : undefined);
+  const j = await platformJson<TikTokEnvelope<T>>('tiktok', r);
+  if (typeof j.code !== 'number') throw new ConnectorError('tiktok', 'schema_changed', 'response has no code');
+  if (j.code !== 0) {
+    const kind = tiktokErrorKind(j.code);
+    throw new ConnectorError('tiktok', kind, `${j.code}: ${j.message}`, kind === 'rate_limited' ? 60 : undefined);
+  }
+  return (j.data ?? {}) as T;
+}
+
+type TikTokReportRow = { dimensions: Record<string, string>; metrics: Record<string, string> };
+type TikTokPage = { list?: TikTokReportRow[]; page_info?: { page: number; total_page: number } };
+
 export async function tiktokFetchReport(token: string, advertiserId: string, start: string, end: string, page: number) {
-  const q = new URLSearchParams({
+  const d = await tiktokGet<TikTokPage>(token, 'report/integrated/get/', {
     advertiser_id: advertiserId,
     report_type: 'BASIC',
     data_level: 'AUCTION_AD',
@@ -437,12 +710,150 @@ export async function tiktokFetchReport(token: string, advertiserId: string, sta
     page: String(page),
     page_size: '200',
   });
-  const r = await fetch(`${TIKTOK_API}/report/integrated/get/?${q}`, { headers: { 'Access-Token': token } });
-  const j = (await r.json()) as { code: number; message: string; data?: { list: { dimensions: Record<string, string>; metrics: Record<string, string> }[]; page_info: { page: number; total_page: number } } };
-  if (j.code === 40001 || j.code === 40105) throw new ConnectorError('tiktok', 'auth_revoked', j.message);
-  if (j.code === 40100 || j.code === 50002) throw new ConnectorError('tiktok', 'rate_limited', j.message, 60);
-  if (j.code !== 0) throw new ConnectorError('tiktok', 'invalid', j.message);
-  return { list: j.data?.list ?? [], hasMore: (j.data?.page_info.page ?? 1) < (j.data?.page_info.total_page ?? 1) };
+  if (d.list != null && !Array.isArray(d.list)) throw new ConnectorError('tiktok', 'schema_changed', 'report list is not an array');
+  return { list: d.list ?? [], hasMore: (d.page_info?.page ?? 1) < (d.page_info?.total_page ?? 1) };
+}
+
+/**
+ * Campaign type per campaign id (§30: GMV Max results must be recognised to keep their own context). Regular
+ * campaigns come from /campaign/get/ (objective_type, campaign_type); Product and LIVE GMV Max campaigns are listed
+ * by /gmv_max/campaign/get/ and win. Read once per sync.
+ */
+export async function tiktokFetchCampaignTypes(token: string, advertiserId: string, campaignIds: string[]): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  const ids = [...new Set(campaignIds.filter(Boolean))];
+  for (let i = 0; i < ids.length; i += 100) {
+    const d = await tiktokGet<{ list?: { campaign_id: string | number; objective_type?: string; campaign_type?: string; campaign_product_source?: string }[] }>(token, 'campaign/get/', {
+      advertiser_id: advertiserId,
+      filtering: JSON.stringify({ campaign_ids: ids.slice(i, i + 100) }),
+      fields: JSON.stringify(['campaign_id', 'campaign_name', 'objective_type', 'campaign_type']),
+      page_size: '100',
+    });
+    for (const c of d.list ?? []) {
+      const type = [c.campaign_type, c.objective_type].find((t) => isGmvMaxCampaignType(t)) ?? c.objective_type ?? c.campaign_type ?? null;
+      out.set(String(c.campaign_id), type);
+    }
+  }
+  for (const [id, type] of await tiktokFetchGmvMaxCampaigns(token, advertiserId).catch((e) => (e instanceof ConnectorError && (e.kind === 'invalid' || e.kind === 'partial_scopes') ? new Map<string, string>() : Promise.reject(e)))) {
+    out.set(id, type);
+  }
+  return out;
+}
+
+const TIKTOK_WINDOW_DAYS: Record<string, number> = { ONE_DAY: 1, SEVEN_DAYS: 7, FOURTEEN_DAYS: 14, TWENTY_EIGHT_DAYS: 28 };
+
+/** An ad group's attribution setting as our window key ("7d_click_1d_view"; "7d_click" with view-through off). */
+export function tiktokAttributionWindow(click: string | null | undefined, view: string | null | undefined): string | null {
+  const c = click ? TIKTOK_WINDOW_DAYS[click] : undefined;
+  const v = view ? TIKTOK_WINDOW_DAYS[view] : undefined;
+  if (!c && !v) return null;
+  return [c ? `${c}d_click` : null, v ? `${v}d_view` : null].filter(Boolean).join('_');
+}
+
+/**
+ * The attribution window each ad group reports under (§45 "Attribution windows differ: preserve raw window"), so
+ * results are never compared across windows. Ad groups without a stated setting are left out (the report's
+ * default window applies).
+ */
+export async function tiktokFetchAdgroupWindows(token: string, advertiserId: string, adgroupIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (let i = 0; i < adgroupIds.length; i += 100) {
+    const d = await tiktokGet<{ list?: { adgroup_id: string | number; click_attribution_window?: string; view_attribution_window?: string }[] }>(token, 'adgroup/get/', {
+      advertiser_id: advertiserId,
+      filtering: JSON.stringify({ adgroup_ids: adgroupIds.slice(i, i + 100) }),
+      fields: JSON.stringify(['adgroup_id', 'click_attribution_window', 'view_attribution_window']),
+      page_size: '100',
+    });
+    for (const g of d.list ?? []) {
+      const w = tiktokAttributionWindow(g.click_attribution_window, g.view_attribution_window);
+      if (w) out.set(String(g.adgroup_id), w);
+    }
+  }
+  return out;
+}
+
+/** GMV Max campaigns of an advertiser (campaign id → PRODUCT_GMV_MAX | LIVE_GMV_MAX). */
+export async function tiktokFetchGmvMaxCampaigns(token: string, advertiserId: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (let page = 1; page <= 20; page++) {
+    const d = await tiktokGet<{ list?: { campaign_id: string | number; gmv_max_promotion_type?: string; promotion_type?: string }[]; page_info?: { page: number; total_page: number } }>(token, 'gmv_max/campaign/get/', {
+      advertiser_id: advertiserId,
+      filtering: JSON.stringify({ gmv_max_promotion_types: ['PRODUCT_GMV_MAX', 'LIVE_GMV_MAX'] }),
+      page: String(page),
+      page_size: '100',
+    });
+    for (const c of d.list ?? []) out.set(String(c.campaign_id), c.gmv_max_promotion_type ?? c.promotion_type ?? 'PRODUCT_GMV_MAX');
+    if ((d.page_info?.page ?? 1) >= (d.page_info?.total_page ?? 1)) break;
+  }
+  return out;
+}
+
+/** TikTok Shop store ids the advertiser can run GMV Max for (the GMV Max report is per store). */
+export async function tiktokFetchGmvMaxStores(token: string, advertiserId: string): Promise<string[]> {
+  const d = await tiktokGet<{ store_list?: { store_id: string | number; is_gmv_max_available?: boolean }[]; list?: { store_id: string | number }[] }>(token, 'gmv_max/store/list/', { advertiser_id: advertiserId });
+  return [...new Set((d.store_list ?? d.list ?? []).map((s) => String(s.store_id)).filter(Boolean))];
+}
+
+/**
+ * Daily GMV Max results per campaign and creative (item) for the given stores. Each row keeps the GMV Max total
+ * context (organic + affiliate + paid, §30); a campaign-level row without an item is keyed by its campaign.
+ */
+export async function tiktokFetchGmvMaxReport(token: string, advertiserId: string, storeIds: string[], start: string, end: string, page: number) {
+  const d = await tiktokGet<TikTokPage>(token, 'gmv_max/report/get/', {
+    advertiser_id: advertiserId,
+    store_ids: JSON.stringify(storeIds),
+    start_date: start,
+    end_date: end,
+    dimensions: JSON.stringify(['campaign_id', 'item_id', 'stat_time_day']),
+    metrics: JSON.stringify(['cost', 'orders', 'gross_revenue', 'product_impressions', 'product_clicks']),
+    page: String(page),
+    page_size: '200',
+  });
+  if (d.list != null && !Array.isArray(d.list)) throw new ConnectorError('tiktok', 'schema_changed', 'GMV Max report list is not an array');
+  return { list: d.list ?? [], hasMore: (d.page_info?.page ?? 1) < (d.page_info?.total_page ?? 1) };
+}
+
+/** One GMV Max report row as an observation in TIKTOK_GMV_MAX_TOTAL. */
+export function normalizeTikTokGmvMaxRow(r: TikTokReportRow, advertiserId: string, currency: string, campaignType = 'PRODUCT_GMV_MAX'): NormalizedObservation {
+  assertRowContract('tiktok', r.dimensions, { ids: ['campaign_id', 'stat_time_day'] }, 'GMV Max row dimensions');
+  assertRowContract('tiktok', r.metrics, { numbers: ['cost'] }, 'GMV Max row metrics');
+  const d = r.dimensions;
+  const m = r.metrics;
+  const o = normalizeTikTokRow(
+    {
+      dimensions: { ad_id: d.item_id || `gmvmax:${d.campaign_id}`, stat_time_day: d.stat_time_day! },
+      metrics: {
+        campaign_id: d.campaign_id!,
+        spend: m.cost!,
+        impressions: m.product_impressions ?? '0',
+        clicks: m.product_clicks ?? '0',
+        complete_payment: m.orders ?? '0',
+        gross_revenue: m.gross_revenue ?? '0',
+      },
+    },
+    advertiserId,
+    currency,
+    isGmvMaxCampaignType(campaignType) ? campaignType : 'PRODUCT_GMV_MAX',
+  );
+  return { ...o, adapterVersion: ADAPTER_VERSIONS.tiktokGmvMax };
+}
+
+/** Ad statuses (§48): an ad TikTok reports deleted is marked; one it doesn't return stays unknown. */
+export async function tiktokFetchAdStatuses(token: string, advertiserId: string, adIds: string[]): Promise<Map<string, { status: string; deleted: boolean }>> {
+  const out = new Map<string, { status: string; deleted: boolean }>();
+  for (let i = 0; i < adIds.length; i += 100) {
+    const d = await tiktokGet<{ list?: { ad_id: string | number; operation_status?: string; secondary_status?: string }[] }>(token, 'ad/get/', {
+      advertiser_id: advertiserId,
+      filtering: JSON.stringify({ ad_ids: adIds.slice(i, i + 100), primary_status: 'STATUS_ALL' }),
+      fields: JSON.stringify(['ad_id', 'operation_status', 'secondary_status']),
+      page_size: '100',
+    });
+    for (const a of d.list ?? []) {
+      const status = a.secondary_status ?? a.operation_status ?? 'UNKNOWN';
+      out.set(String(a.ad_id), { status, deleted: /DELETE/i.test(status) });
+    }
+  }
+  return out;
 }
 
 // ───────────── OAuth code exchange (Meta, TikTok) ─────────────
@@ -454,38 +865,67 @@ export interface AdAccount {
   timezone: string | null;
 }
 
+export interface ExchangeResult {
+  accessToken: string;
+  accounts: AdAccount[];
+  platformUserId: string | null;
+  /** Permissions the login actually granted (§27 "granted scopes"). */
+  scopes: string[];
+  /** When the token stops working (Meta long-lived user tokens: ~60 days); null when it doesn't expire. */
+  expiresAt: Date | null;
+}
+
 /** Meta: code → short-lived → long-lived (~60 day) user token, plus the ad accounts it can read. */
-export async function metaExchangeCode(code: string): Promise<{ accessToken: string; accounts: AdAccount[]; platformUserId: string | null }> {
+export async function metaExchangeCode(code: string, now = Date.now()): Promise<ExchangeResult> {
   const e = env();
   const q = new URLSearchParams({ client_id: e.META_APP_ID ?? '', client_secret: e.META_APP_SECRET ?? '', redirect_uri: `${e.APP_URL}/api/integrations/meta/callback`, code });
-  const r1 = await fetch(`${META_API}/oauth/access_token?${q}`);
-  const j1 = (await r1.json()) as { access_token?: string; error?: { message: string } };
+  const r1 = await platformFetch('meta', `${META_API}/oauth/access_token?${q}`);
+  const j1 = (await platformJson<{ access_token?: string; expires_in?: number; error?: { message: string } }>('meta', r1));
   if (!j1.access_token) throw new ConnectorError('meta', 'auth_revoked', j1.error?.message ?? 'token exchange failed');
   const q2 = new URLSearchParams({ grant_type: 'fb_exchange_token', client_id: e.META_APP_ID ?? '', client_secret: e.META_APP_SECRET ?? '', fb_exchange_token: j1.access_token });
-  const j2 = (await (await fetch(`${META_API}/oauth/access_token?${q2}`)).json()) as { access_token?: string };
+  const j2 = (await (await platformFetch('meta', `${META_API}/oauth/access_token?${q2}`)).json().catch(() => ({}))) as { access_token?: string; expires_in?: number };
   const token = j2.access_token ?? j1.access_token;
-  const acc = (await (await fetch(`${META_API}/me/adaccounts?${new URLSearchParams({ fields: 'account_id,name,currency,timezone_name', limit: '50', access_token: token })}`)).json()) as {
+  const expiresIn = j2.access_token ? j2.expires_in : j1.expires_in;
+  const acc = (await (await platformFetch('meta', `${META_API}/me/adaccounts?${new URLSearchParams({ fields: 'account_id,name,currency,timezone_name', limit: '50', access_token: token })}`)).json()) as {
     data?: { account_id: string; name: string; currency?: string; timezone_name?: string }[];
   };
   // The app-scoped user id: Meta's deauthorize and data-deletion callbacks name the user, not the ad account.
-  const me = (await (await fetch(`${META_API}/me?${new URLSearchParams({ fields: 'id', access_token: token })}`)).json().catch(() => ({}))) as { id?: string };
-  return { accessToken: token, platformUserId: me.id ?? null, accounts: (acc.data ?? []).map((a) => ({ id: `act_${a.account_id}`, name: a.name, currency: a.currency ?? null, timezone: a.timezone_name ?? null })) };
+  const me = (await (await platformFetch('meta', `${META_API}/me?${new URLSearchParams({ fields: 'id', access_token: token })}`)).json().catch(() => ({}))) as { id?: string };
+  const scopes = await metaGrantedPermissions(token).catch(() => null);
+  return {
+    accessToken: token,
+    platformUserId: me.id ?? null,
+    // Unknown (the permissions call failed) is recorded as what we asked for; a later partial_scopes error corrects it.
+    scopes: scopes ?? [...META_SCOPES],
+    expiresAt: expiresIn && Number(expiresIn) > 0 ? new Date(now + Number(expiresIn) * 1000) : null,
+    accounts: (acc.data ?? []).map((a) => ({ id: `act_${a.account_id}`, name: a.name, currency: a.currency ?? null, timezone: a.timezone_name ?? null })),
+  };
+}
+
+/** Permissions the user granted this app (declined ones are left out). */
+export async function metaGrantedPermissions(token: string): Promise<string[]> {
+  const j = await metaGet<{ data?: { permission: string; status: string }[] }>(`${META_API}/me/permissions?${new URLSearchParams({ access_token: token })}`);
+  return (j.data ?? []).filter((p) => p.status === 'granted').map((p) => p.permission);
 }
 
 /** TikTok Business: auth_code → long-lived access token + authorised advertiser ids. */
-export async function tiktokExchangeCode(authCode: string): Promise<{ accessToken: string; accounts: AdAccount[]; platformUserId: string | null }> {
+export async function tiktokExchangeCode(authCode: string): Promise<ExchangeResult> {
   const e = env();
-  const r = await fetch(`${TIKTOK_API}/oauth2/access_token/`, {
+  const r = await platformFetch('tiktok', `${TIKTOK_API}/oauth2/access_token/`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: e.TIKTOK_APP_ID, secret: e.TIKTOK_APP_SECRET, auth_code: authCode }),
   });
-  const j = (await r.json()) as { code: number; message: string; data?: { access_token: string; advertiser_ids: string[] } };
+  const j = (await platformJson<{ code: number; message: string; data?: { access_token: string; advertiser_ids: string[]; scope?: (number | string)[] } }>('tiktok', r));
   if (j.code !== 0 || !j.data) throw new ConnectorError('tiktok', 'auth_revoked', j.message);
   const info = await tiktokAdvertiserInfo(j.data.access_token, j.data.advertiser_ids).catch(() => new Map<string, Partial<AdAccount>>());
   return {
     accessToken: j.data.access_token,
     platformUserId: null,
+    // TikTok names granted permissions by numeric scope id.
+    scopes: (j.data.scope ?? []).map(String),
+    // TikTok Business access tokens don't expire; they end when the advertiser revokes them.
+    expiresAt: null,
     accounts: j.data.advertiser_ids.map((id) => ({ id, name: info.get(id)?.name ?? `Advertiser ${id}`, currency: info.get(id)?.currency ?? null, timezone: info.get(id)?.timezone ?? null })),
   };
 }
@@ -498,7 +938,7 @@ export async function tiktokAdvertiserInfo(token: string, advertiserIds: string[
   const out = new Map<string, Partial<AdAccount>>();
   for (let i = 0; i < advertiserIds.length; i += 100) {
     const q = new URLSearchParams({ advertiser_ids: JSON.stringify(advertiserIds.slice(i, i + 100)), fields: JSON.stringify(['advertiser_id', 'name', 'currency', 'timezone', 'display_timezone']) });
-    const r = await fetch(`${TIKTOK_API}/advertiser/info/?${q}`, { headers: { 'Access-Token': token } });
+    const r = await platformFetch('tiktok', `${TIKTOK_API}/advertiser/info/?${q}`, { headers: { 'Access-Token': token } });
     const j = (await r.json()) as { code: number; data?: { list?: { advertiser_id: string; name?: string; currency?: string; timezone?: string; display_timezone?: string }[] } };
     if (j.code !== 0) continue;
     for (const a of j.data?.list ?? []) {
@@ -506,6 +946,23 @@ export async function tiktokAdvertiserInfo(token: string, advertiserIds: string[
     }
   }
   return out;
+}
+
+// ───────────── Permissions → features (§47 "Partial scopes") ─────────────
+
+/**
+ * What each permission we ask for makes possible. A connection missing one shows exactly these features as
+ * unavailable, and re-asks for that permission only.
+ */
+export const PERMISSION_FEATURES: Record<ConnectorProvider, Record<string, string[]>> = {
+  shopify: { read_products: ['Product, price and variant import', 'Stock-out detection', 'Live product updates from your store'] },
+  meta: { ads_read: ['Ad results (spend, clicks, purchases) for your tests', 'Video watch metrics', 'Spotting ads deleted in Ads Manager'] },
+  tiktok: {},
+};
+
+/** Features unavailable on a connection, by the permission each one needs. */
+export function unavailableFeatures(provider: ConnectorProvider, granted: readonly string[] | null | undefined): { scope: string; features: string[] }[] {
+  return missingScopes(provider, granted).map((scope) => ({ scope, features: PERMISSION_FEATURES[provider][scope] ?? [] }));
 }
 
 /** Per-connector policy (the scope lists are defined with each connector above). */

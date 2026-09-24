@@ -24,6 +24,8 @@ export const QUEUE_CONFIG: Record<string, { concurrency: number; expireInSeconds
   [Queues.processUpload]: { concurrency: 4, expireInSeconds: 120, retryLimit: 2 },
   [Queues.sendEmail]: { concurrency: 4, expireInSeconds: 60, retryLimit: 5 },
   [Queues.syncIntegration]: { concurrency: 2, expireInSeconds: 1800, retryLimit: 3 },
+  // One store product changed (products/create|update webhook, §28).
+  [Queues.syncShopifyProduct]: { concurrency: 2, expireInSeconds: 120, retryLimit: 3 },
   [Queues.computeResults]: { concurrency: 2, expireInSeconds: 300, retryLimit: 3 },
   [Queues.weeklyRecommendations]: { concurrency: 2, expireInSeconds: 1800, retryLimit: 2 },
   [Queues.exportWorkspace]: { concurrency: 1, expireInSeconds: 1800, retryLimit: 2 },

@@ -25,6 +25,7 @@ export const Queues = {
   stripeEvent: 'stripe-event',
   sendEmail: 'send-email',
   syncIntegration: 'sync-integration',
+  syncShopifyProduct: 'sync-shopify-product',
   computeResults: 'compute-results',
   weeklyRecommendations: 'weekly-recommendations',
   exportWorkspace: 'export-workspace',
@@ -60,6 +61,8 @@ export const QUEUE_POLICY: Record<QueueName, { idempotent: boolean; spends: bool
   [Queues.stripeEvent]: { idempotent: true, spends: false },
   [Queues.sendEmail]: { idempotent: true, spends: false },
   [Queues.syncIntegration]: { idempotent: true, spends: false },
+  // Applying one product again is idempotent; a new SKU's analysis is its own job (authorized there).
+  [Queues.syncShopifyProduct]: { idempotent: true, spends: false },
   [Queues.computeResults]: { idempotent: true, spends: false },
   [Queues.weeklyRecommendations]: { idempotent: true, spends: true },
   [Queues.exportWorkspace]: { idempotent: true, spends: false },
