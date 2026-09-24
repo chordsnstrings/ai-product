@@ -5,6 +5,7 @@ import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
 import { confoundRunning, LIVE_STATES, recordExperimentApproval, setExperimentState } from './experiment-state';
+import { authorizeFromQuote } from './render-quotes';
 import type { Proposal } from './intel-schemas';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { FRESHNESS_DAYS } from './performance';
@@ -128,7 +129,7 @@ export async function createExperiment(
  * production is approved against a Creative Test and the approval is recorded and evented once — a replay (double
  * click, retried request) changes nothing and emits nothing.
  */
-export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId: string): Promise<{ changed: boolean; projectId: string }> {
+export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId: string, opts: { quoteId?: string } = {}): Promise<{ changed: boolean; projectId: string }> {
   assertCan(ctx, 'spend.creative_test');
   const [e] = await tx`select id, state, sku_id, approved_at from experiments where id = ${experimentId} for update`;
   if (!e) throw new DomainError('NOT_FOUND', 'Experiment not found');
@@ -137,6 +138,9 @@ export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId
   const projectId = v.project_id as string;
   if (e.approved_at) return { changed: false, projectId };
   if (!['DRAFT', 'RECOMMENDED', 'APPROVED'].includes(e.state as string)) throw new DomainError('CONFLICT', 'This test has already moved past approval.');
+  // With a render quote (the customer app always sends one, §38): the Cost Governor authorization is made now, in
+  // this transaction, against the storyboard and rates the merchant was shown; a refusal rolls the approval back.
+  if (opts.quoteId) await authorizeFromQuote(tx, ctx, experimentId, opts.quoteId);
   // The project's transition to STORYBOARD_APPROVED records the approval (syncExperimentWithProject); a project
   // approved earlier (a replay) is recorded here. Either way it happens once.
   await approveForProduction(tx, ctx, projectId, 'creative_test');

@@ -221,6 +221,44 @@ function reusableRenders(scenes: SceneRow[], versions: VersionRow[]): Map<string
   return out;
 }
 
+/**
+ * The plan a production run prices and reserves (routes and rates of today; renders that can be reused are not
+ * priced again; a plate per strict scene that can be staged on a generated setting). Shared by the run itself and
+ * the render quote given before approval (§38 render-estimate), so the two always agree.
+ */
+async function planRun(
+  tx: Tx,
+  ws: string,
+  projectId: string,
+  purpose: Purpose,
+  scenes: SceneRow[],
+  versions: VersionRow[],
+  imagery: Awaited<ReturnType<typeof productImagery>>,
+): Promise<{ routes: ProductionRoutes; rates: Map<string, RateTable>; plan: ProductionPlan }> {
+  const routes = await productionRoutes(tx, ws);
+  const rates = await loadRates(tx);
+  const ownPlates = new Set(versions.filter((v) => v.kind === 'frame' && v.lineage?.projectId === projectId && v.status === 'accepted' && v.lineage?.plateAssetId).map((v) => v.scene_id));
+  const wantsPlate = (s: SceneRow) => s.production_mode === 'STRICT_COMPOSITE' && s.purpose !== 'cta' && !!imagery.cutout?.keyed && !!routes.plate && !ownPlates.has(s.id);
+  const voChars = scenes.reduce((n, s) => n + ((s.spoken_line as string | null)?.trim().length ?? 0), 0);
+  const plan = planProduction(scenes, voChars, routes, rates, {
+    reuse: new Set(reusableRenders(scenes, versions).keys()),
+    plates: scenes.filter(wantsPlate).length,
+    ceilingMicros: CEILING_PURPOSES.includes(purpose) ? COST_LIMITS.CREATIVE_TEST_CEILING : null,
+  });
+  return { routes, rates, plan };
+}
+
+/** Load what planRun needs for a project's current storyboard (null when there is none yet). */
+export async function planProjectRun(tx: Tx, ws: string, projectId: string, purpose: Purpose) {
+  const [p] = await tx`select storyboard_id, sku_id from projects where id = ${projectId} and workspace_id = ${ws}`;
+  if (!p?.storyboard_id) return null;
+  const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${ws} order by position`) as unknown as SceneRow[];
+  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+                             where workspace_id = ${ws} and scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
+  const run = await planRun(tx, ws, projectId, purpose, scenes, versions, await productImagery(tx, p.sku_id as string));
+  return { ...run, storyboardId: p.storyboard_id as string, scenes };
+}
+
 /** What a production retry would reserve at today's rates and routes (plan 05 §12), reusing accepted renders. */
 export async function productionEstimate(tx: Tx, workspaceId: string, projectId: string): Promise<Micros | null> {
   const [p] = await tx`select storyboard_id, sku_id, entitlement_unit from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
@@ -449,14 +487,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   let plan: ProductionPlan;
   try {
     ({ auth, routes, plan } = await withTenant(ws, async (tx) => {
-      const routes = await productionRoutes(tx, ws);
-      const wantsPlate = (s: SceneRow) => s.production_mode === 'STRICT_COMPOSITE' && s.purpose !== 'cta' && !!imagery.cutout?.keyed && !!routes.plate && !plateFrame(s.id);
-      const voChars = scenes.reduce((n, s) => n + ((s.spoken_line as string | null)?.trim().length ?? 0), 0);
-      const plan = planProduction(scenes, voChars, routes, await loadRates(tx), {
-        reuse: new Set(reusable.keys()),
-        plates: scenes.filter(wantsPlate).length,
-        ceilingMicros: CEILING_PURPOSES.includes(purpose) ? COST_LIMITS.CREATIVE_TEST_CEILING : null,
-      });
+      const { routes, plan } = await planRun(tx, ws, projectId, purpose, scenes, versions, imagery);
       const [cur] = p.authorization_id ? await tx`select id, status from cost_authorizations where id = ${p.authorization_id} for update` : [];
       let a: { authorizationId: string; token: string } | null = null;
       if (cur?.status === 'active') {

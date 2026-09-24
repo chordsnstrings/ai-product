@@ -68,7 +68,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
           <p className="ak-small ak-muted">Includes the master ad plus {variants.filter((x) => !x.projectId && x.role === 'variant').length} hook variants · 1 Creative Test · {testsLeft} left</p>
           {canApprove && sb?.status === 'ready' ? (
             testsLeft > 0 ? (
-              <div><ActionButton slug={slug} action="experiment-approve" body={{ experimentId }} variant="primary">Approve and produce · 1 Creative Test</ActionButton></div>
+              <ApproveWithEstimate slug={slug} experimentId={experimentId} storyboardKey={JSON.stringify(sb.scenes.map((x) => [x.id, x.spokenLine, x.overlayText, x.locked]))} />
             ) : (
               <Banner tone="warn">No Creative Tests left this period. <a href={`/w/${slug}/settings/billing`}>Upgrade</a> to produce this test.</Banner>
             )
@@ -134,6 +134,61 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
           </form>
         ) : null}
       </Sheet>
+    </div>
+  );
+}
+
+type Quote = { quoteId: string; estimateMicros: number; ceilingMicros: number; withinCeiling: boolean; entitlementAvailable: boolean; blockedReason: string | null; expiresAt: string };
+const dollars = (m: number) => `$${(m / 1_000_000).toFixed(2)}`;
+
+/**
+ * §38 Production: the merchant sees what producing costs and whether it can be authorised before approving; the
+ * approval carries that quote and an idempotency key, and the Cost Governor reserves in the same request.
+ */
+function ApproveWithEstimate({ slug, experimentId, storyboardKey }: { slug: string; experimentId: string; storyboardKey: string }) {
+  const router = useRouter();
+  const [quote, setQuote] = useState<Quote | null>(null);
+  const [key, setKey] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    setErr(null);
+    try {
+      setQuote(await api<Quote>(`/api/w/${slug}/render-estimate`, { experimentId }));
+      setKey(crypto.randomUUID());
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  }, [slug, experimentId]);
+  // A new estimate whenever the storyboard's words or locks change.
+  useEffect(() => {
+    void load();
+  }, [load, storyboardKey]);
+  async function approve() {
+    if (!quote || !key) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api(`/api/w/${slug}/experiment-approve`, { experimentId, quoteId: quote.quoteId, idempotencyKey: key });
+      router.refresh();
+    } catch (e) {
+      setErr((e as Error).message);
+      // An expired estimate, a changed storyboard or new prices: show the fresh estimate to approve instead.
+      if (/estimate|changed/i.test((e as Error).message)) await load();
+    }
+    setBusy(false);
+  }
+  if (!quote) return err ? <Banner tone="warn">{err}</Banner> : <p className="ak-small ak-muted">Estimating production cost…</p>;
+  const ok = !quote.blockedReason;
+  return (
+    <div className="ak-panel ak-stack" style={{ maxWidth: 520 }}>
+      <p className="ak-small" style={{ margin: 0 }}>
+        Production estimate <strong>{dollars(quote.estimateMicros)}</strong> of the {dollars(quote.ceilingMicros)} a Creative Test covers ·{' '}
+        {quote.entitlementAvailable ? 'uses 1 Creative Test' : 'no Creative Test available'}
+      </p>
+      {quote.blockedReason ? <Banner tone="warn">{quote.blockedReason}</Banner> : null}
+      {err ? <p className="ak-error ak-small" role="alert">{err}</p> : null}
+      <div><Button variant="primary" onClick={() => void approve()} disabled={busy || !ok}>{busy ? '…' : 'Approve and produce · 1 Creative Test'}</Button></div>
     </div>
   );
 }

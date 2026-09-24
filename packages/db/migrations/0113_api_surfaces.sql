@@ -165,3 +165,30 @@ grant execute on function webhook_receive(text, text, text, text, jsonb) to app_
 -- Meta's deauthorize and data-deletion callbacks name the app-scoped user who authorised the connection.
 alter table integrations add column platform_user_id text;
 create index integrations_platform_user on integrations (provider, platform_user_id) where platform_user_id is not null;
+
+-- ───────────── Render quotes (standard §38 Production: "render endpoint requires cost authorization and idempotency key") ─
+-- POST render-estimate prices the approved-to-be storyboard at today's rates and runs the Cost Governor's checks
+-- without reserving; approval must present a live quote for the same storyboard and rate versions, and the
+-- authorization is created in the approval transaction.
+create table render_quotes (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  project_id uuid not null,
+  experiment_id uuid,
+  storyboard_id uuid not null,
+  storyboard_hash text not null,
+  rate_versions jsonb not null,
+  estimate_micros bigint not null,
+  ceiling_micros bigint,
+  within_ceiling boolean not null,
+  entitlement_available boolean not null,
+  blocked_reason text,
+  created_by text not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  unique (workspace_id, id),
+  foreign key (workspace_id, project_id) references projects(workspace_id, id) on delete cascade on update cascade
+);
+create index on render_quotes (workspace_id, project_id, created_at desc);
+select arkiv_tenant_table('render_quotes'); insert into table_registry values ('render_quotes', 'tenant');

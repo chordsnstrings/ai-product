@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
 import {
   acceptSourceFact,
+  idempotent,
+  renderQuote,
   confirmFacts,
   approveClaim,
   approveExperiment,
@@ -129,11 +131,20 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       return json({ ok: true });
     }
     /* ── Studio ── */
-    case 'experiment-approve': {
+    case 'render-estimate': {
+      // §38 POST /experiments/:id/render-estimate: cost at today's rates + whether it would be authorised, no reservation.
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
+      return json({ ok: true, ...(await t((tx) => renderQuote(tx, ctx, experimentId))) });
+    }
+    case 'experiment-approve': {
+      // §38 "render endpoint requires cost authorization and idempotency key": a live quote from render-estimate and
+      // an Idempotency-Key; a retried request with the same key returns the first answer.
+      const i = await body(req, z.object({ experimentId: uuid, quoteId: uuid, idempotencyKey: z.string().min(8).max(100).optional() }));
+      const key = req.headers.get('idempotency-key') ?? i.idempotencyKey;
+      if (!key || key.length < 8 || key.length > 100) throw new DomainError('INVALID', 'An Idempotency-Key is required to approve production.');
       assertCan(ctx, 'spend.creative_test');
-      await t((tx) => approveExperiment(tx, ctx, experimentId));
-      return json({ ok: true });
+      const r = await t((tx) => idempotent(tx, ctx.workspaceId, 'experiment-approve', key, { experimentId: i.experimentId, quoteId: i.quoteId }, () => approveExperiment(tx, ctx, i.experimentId, { quoteId: i.quoteId })));
+      return json({ ok: true, replayed: r.replayed, ...r.result });
     }
     case 'experiment-archive': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
