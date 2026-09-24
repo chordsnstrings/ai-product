@@ -8,7 +8,7 @@ import type { ProjectView } from '@/lib/views';
 import { ActionButton, ActionForm, SheetButton } from './actions';
 import { AiDisclosureSteps, CancelProduction, Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
 
-type V = { id: string; code: string; label: string; role: string; projectId: string | null; projectState: string | null; files: { aspect: string; url: string }[] };
+type V = { id: string; code: string; label: string; role: string; projectId: string | null; projectState: string | null; files: { aspect: string; label: string; url: string }[] };
 
 export function StudioClient({ slug, experimentId, state, masterProjectId, variants, testsLeft, canApprove, disclosure = null }: { slug: string; experimentId: string; state: string; masterProjectId: string | null; variants: V[]; testsLeft: number; canApprove: boolean; disclosure?: ProjectView['disclosure'] }) {
   const router = useRouter();
@@ -105,7 +105,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
                 <tr key={x.id}>
                   <td className="ak-mono">{x.code}</td>
                   <td>{x.label}{x.role === 'control' ? <span className="ak-chip" style={{ marginLeft: 8 }}>control</span> : null}</td>
-                  <td>{x.files.length ? x.files.map((f) => <a key={f.aspect} href={f.url} style={{ marginRight: 10 }}>{f.aspect} ↓</a>) : <span className="ak-muted">{x.projectState ? x.projectState.toLowerCase().replace(/_/g, ' ') : 'pending'}</span>}</td>
+                  <td>{x.files.length ? x.files.map((f) => <a key={f.label} href={f.url} style={{ marginRight: 10 }}>{f.label} ↓</a>) : <span className="ak-muted">{x.projectState ? x.projectState.toLowerCase().replace(/_/g, ' ') : 'pending'}</span>}</td>
                   <td>
                     <SheetButton variant="text" label="Link ad" title={`Link an ad to ${x.code}`} description="Only needed if the ad name doesn’t contain the code.">
                       <ActionForm slug={slug} action="link-ad" extra={{ variantId: x.id }} submit="Link" fields={[{ name: 'platform', label: 'Platform', type: 'select', options: [{ value: 'meta', label: 'Meta' }, { value: 'tiktok', label: 'TikTok' }] }, { name: 'adId', label: 'Ad ID', required: true }]} />

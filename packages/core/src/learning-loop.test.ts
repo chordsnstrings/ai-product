@@ -85,9 +85,16 @@ describe('learning loop (Phases 4–5)', () => {
     const flags = await ownerPool()`select ai_generated, synthetic_people from creatives where parent_creative_id = ${proj!.final_creative_id}`;
     expect(flags.every((f) => f.ai_generated === true && f.synthetic_people === true)).toBe(true);
 
-    const variants = await withTenant(t.workspaceId, (tx) => tx`select id, code, label, creative_id from variants where experiment_id = ${experimentId} order by code`);
+    const variants = await withTenant(t.workspaceId, (tx) => tx`select v.id, v.code, v.label, v.creative_id, v.platform_assets, c.final_asset_ids from variants v join creatives c on c.id = v.creative_id where v.experiment_id = ${experimentId} order by v.code`);
     expect(variants).toHaveLength(3);
     expect(variants.every((v) => v.creative_id)).toBe(true);
+    // Variant.platform_assets[] (§20): master and hook variants list their exports per placement — 9:16 for TikTok
+    // and Reels, 4:5 and 1:1 for the feed — each one of the variant's own exports.
+    for (const v of variants) {
+      const pa = v.platform_assets as { platform: string; aspect: string; assetId: string }[];
+      expect(pa.map((x) => `${x.platform}:${x.aspect}`)).toEqual(['TIKTOK:9x16', 'INSTAGRAM_REELS:9x16', 'FACEBOOK_FEED:4x5', 'FACEBOOK_FEED:1x1']);
+      expect(pa.every((x) => (v.final_asset_ids as string[]).includes(x.assetId))).toBe(true);
+    }
 
     // Hook variants hold everything but the hook constant (§20 CONTROLLED; exp-01, prod-24, prod-25): the master's
     // footage, its voice-over for every later scene, its end card and every export — only the opening changes.

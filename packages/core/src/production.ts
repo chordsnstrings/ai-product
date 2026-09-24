@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
-import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformsFor, type LogicalVoice, type Micros, type Platform, type ProjectState } from '@arkiv/shared';
+import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProjectState } from '@arkiv/shared';
 import { brandAccent, captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
@@ -982,7 +982,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0 } as never)},
             1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
-        if (p.variant_id) await tx`update variants set creative_id = ${cr!.id} where id = ${p.variant_id}`;
+        if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');

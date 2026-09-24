@@ -2,11 +2,14 @@ import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
 import { assetUrl, balances, experimentView } from '@arkiv/core';
+import type { Platform, PlatformAsset } from '@arkiv/shared';
 import { SignalChip } from '@arkiv/ui';
 import { StudioClient } from '@/components/studio';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Studio · Arkiv' };
+
+const PLACEMENT_LABEL: Record<Platform, string> = { TIKTOK: 'TikTok', INSTAGRAM_REELS: 'Reels', FACEBOOK_FEED: 'Feed' };
 
 /** A3 Studio: approve and refine an experiment before spend; then download variants and link them to ads. */
 export default async function Studio({ params }: { params: Promise<{ slug: string; experimentId: string }> }) {
@@ -20,12 +23,18 @@ export default async function Studio({ params }: { params: Promise<{ slug: strin
     const [sku] = await tx`select name, catalogue_no from skus where id = ${v.experiment.sku_id}`;
     const variants = await Promise.all(
       v.variants.map(async (x) => {
-        let files: { aspect: string; url: string }[] = [];
+        let files: { aspect: string; label: string; url: string }[] = [];
+        // Variant.platform_assets[] (§20): one download per placement, named for the platform it goes to.
+        const placements = (x.platform_assets as PlatformAsset[] | null) ?? [];
+        if (placements.length) {
+          files = await Promise.all(placements.map(async (pa) => ({ aspect: pa.aspect, label: `${PLACEMENT_LABEL[pa.platform]} ${pa.aspect.replace('x', ':')}`, url: await assetUrl(tx, pa.assetId, 3600, `${x.code}-${pa.platform.toLowerCase()}-${pa.aspect}.mp4`) })));
+          return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files };
+        }
         const creativeId = x.creative_id ?? (x.project_id ? (await tx`select final_creative_id from projects where id = ${x.project_id}`)[0]?.final_creative_id : null);
         if (creativeId) {
           const [cr] = await tx`select final_asset_ids from creatives where id = ${creativeId}`;
           const assets = (cr?.final_asset_ids as string[] | undefined)?.length ? await tx`select id, lineage from assets where id in ${tx(cr!.final_asset_ids as string[])}` : [];
-          files = await Promise.all(assets.map(async (a) => ({ aspect: (a.lineage as { aspect?: string }).aspect ?? 'video', url: await assetUrl(tx, a.id as string, 3600, `${x.code}-${(a.lineage as { aspect?: string }).aspect ?? 'ad'}.mp4`) })));
+          files = await Promise.all(assets.map(async (a) => ({ aspect: (a.lineage as { aspect?: string }).aspect ?? 'video', label: (a.lineage as { aspect?: string }).aspect ?? 'video', url: await assetUrl(tx, a.id as string, 3600, `${x.code}-${(a.lineage as { aspect?: string }).aspect ?? 'ad'}.mp4`) })));
         }
         return { id: x.id as string, code: x.code as string, label: x.label as string, role: x.role as string, projectId: (x.project_id as string) ?? null, projectState: (x.project_state as string) ?? null, files };
       }),
