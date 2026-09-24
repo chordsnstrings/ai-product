@@ -148,3 +148,48 @@ describe('"change picture" runs as a job (§34)', () => {
     await expect(withTenant(t.workspaceId, (tx) => requestFrameRegeneration(tx, ctx, scenes[3]!.id as string, 'softer shadows'))).rejects.toMatchObject({ code: 'PAYMENT_REQUIRED' });
   }, 60_000);
 });
+
+describe('free frame changes under concurrency (x-races-12)', () => {
+  async function storyboard() {
+    const { t, ctx, skuId, projectId } = await preview();
+    await analyzeProduct(ctx, skuId, projectId);
+    const [c] = await ownerPool()`select id from concepts where project_id = ${projectId} order by idx limit 1`;
+    const { storyboardId } = await withTenant(t.workspaceId, (tx) => selectConcept(tx, ctx, projectId, c!.id as string));
+    await generateStoryboard(ctx, projectId, storyboardId, c!.id as string);
+    const scenes = await ownerPool()`select id from scenes where storyboard_id = ${storyboardId} order by position`;
+    return { t, ctx, storyboardId, sceneIds: scenes.map((s) => s.id as string) };
+  }
+  const used = async (storyboardId: string) => Number((await ownerPool()`select sum(free_regenerations_used)::int as n from scenes where storyboard_id = ${storyboardId}`)[0]!.n);
+
+  it('parallel requests on different scenes never exceed the three free changes', async () => {
+    const { t, ctx, sceneIds } = await storyboard();
+    expect(sceneIds.length).toBeGreaterThanOrEqual(5);
+    const results = await Promise.allSettled(sceneIds.slice(0, 5).map((id) => withTenant(t.workspaceId, (tx) => requestFrameRegeneration(tx, ctx, id, 'softer shadows'))));
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(3);
+    const refused = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(refused).toHaveLength(2);
+    for (const r of refused) expect(r.reason).toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    expect(await jobs('regenerate-frame-free')).toHaveLength(3);
+  }, 60_000);
+
+  it('a request whose job ran late cannot push the storyboard past its allowance', async () => {
+    const { t, ctx, storyboardId, sceneIds } = await storyboard();
+    await ownerPool()`update scenes set free_regenerations_used = 1 where id = any(${sceneIds.slice(2, 4)}::uuid[])`;
+    // Change A is queued, then sits in a backed-up queue long enough to go stale at request time…
+    await withTenant(t.workspaceId, (tx) => requestFrameRegeneration(tx, ctx, sceneIds[0]!, 'warmer light'));
+    await ownerPool()`update progress_steps set started_at = now() - interval '11 minutes' where subject_id = ${sceneIds[0]!}`;
+    // …so change B is accepted (2 used + nothing live in flight).
+    await withTenant(t.workspaceId, (tx) => requestFrameRegeneration(tx, ctx, sceneIds[1]!, 'marble counter'));
+    // Both jobs now run at once: only one of them may draw.
+    const outcomes = await Promise.all([regenerateFrame(ctx, sceneIds[0]!, 'warmer light', 2), regenerateFrame(ctx, sceneIds[1]!, 'marble counter', 2)]);
+    expect(outcomes.filter((o) => o === 'done')).toHaveLength(1);
+    expect(outcomes.filter((o) => o === 'skipped')).toHaveLength(1);
+    expect(await used(storyboardId)).toBe(3);
+    const refused = await ownerPool()`select status, detail from progress_steps where subject_id = any(${sceneIds.slice(0, 2)}::uuid[]) and step_key = 'frame.v2' and status = 'failed'`;
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.detail).toMatch(/free frame changes/);
+    // The refused change spent nothing.
+    const auths = await ownerPool()`select count(*)::int as n from cost_authorizations where idempotency_key like 'frame:%' and workspace_id = ${t.workspaceId}`;
+    expect(auths[0]!.n).toBe(1);
+  }, 60_000);
+});

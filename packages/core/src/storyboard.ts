@@ -242,10 +242,24 @@ export async function setSceneLock(tx: Tx, ctx: TenantContext, sceneId: string, 
 export const frameStepKey = (version: number) => `frame.v${version}`;
 const FRAME_REQUEST_STALE_MINUTES = 10;
 
+/** Free changes a storyboard has used, plus changes in flight (optionally only those a worker is drawing). */
+async function freeChangesTaken(tx: Tx, storyboardId: string, opts: { statuses: readonly string[]; except?: { sceneId: string; key: string } }) {
+  const [u] = await tx`select coalesce(sum(free_regenerations_used), 0)::int as used,
+                              (select count(*)::int from progress_steps ps join scenes x on x.id = ps.subject_id and x.workspace_id = ps.workspace_id
+                               where x.storyboard_id = ${storyboardId} and ps.step_key like 'frame.v%' and ps.status = any(${opts.statuses as string[]})
+                                 and not (ps.subject_id = ${opts.except?.sceneId ?? null}::uuid and ps.step_key = ${opts.except?.key ?? ''})
+                                 and ps.started_at > now() - make_interval(mins => ${FRAME_REQUEST_STALE_MINUTES})) as inflight
+                       from scenes where storyboard_id = ${storyboardId}`;
+  return Number(u!.used) + Number(u!.inflight);
+}
+
+const FREE_CHANGES_USED = 'You’ve used the free frame changes. Your ad can still be adjusted after production.';
+
 /**
  * "Change picture" (pre-purchase: 3 free per storyboard). Validates and enqueues in one transaction; the frame
  * is drawn by the `regenerate-frame` job (§34). Locked scenes are never regenerated (§13). In-flight requests
- * count against the free allowance so parallel clicks cannot exceed it.
+ * count against the free allowance, and requests are serialized per storyboard (row lock), so parallel clicks —
+ * on one scene or on several — cannot exceed it.
  */
 export async function requestFrameRegeneration(tx: Tx, ctx: TenantContext, sceneId: string, instruction: string) {
   assertCan(ctx, 'sku.edit');
@@ -254,6 +268,8 @@ export async function requestFrameRegeneration(tx: Tx, ctx: TenantContext, scene
   const [s] = await tx`select s.id, s.locked, sb.id as sb_id, sb.status as sb_status from scenes s join storyboards sb on sb.id = s.storyboard_id
                        where s.id = ${sceneId} for update of s`;
   if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
+  // Every change on this storyboard counts against one allowance: take the storyboard lock before counting.
+  await tx`select id from storyboards where id = ${s.sb_id} for update`;
   if (s.locked) throw new DomainError('CONFLICT', 'This scene is locked.');
   if (s.sb_status === 'approved') throw new DomainError('CONFLICT', 'This storyboard is approved for production.');
   const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${sceneId} and kind = 'frame'`;
@@ -261,12 +277,7 @@ export async function requestFrameRegeneration(tx: Tx, ctx: TenantContext, scene
   const [inflight] = await tx`select step_key from progress_steps where subject_id = ${sceneId} and step_key = ${frameStepKey(version)}
                               and status in ('pending','active') and started_at > now() - make_interval(mins => ${FRAME_REQUEST_STALE_MINUTES})`;
   if (inflight) return { sceneId, version, replayed: true };
-  const [u] = await tx`select coalesce(sum(free_regenerations_used), 0)::int as used,
-                              (select count(*)::int from progress_steps ps join scenes x on x.id = ps.subject_id
-                               where x.storyboard_id = ${s.sb_id} and ps.step_key like 'frame.v%' and ps.status in ('pending','active')
-                                 and ps.started_at > now() - make_interval(mins => ${FRAME_REQUEST_STALE_MINUTES})) as pending
-                       from scenes where storyboard_id = ${s.sb_id}`;
-  if (u!.used + u!.pending >= FREE_FRAME_REGENERATIONS) throw new DomainError('PAYMENT_REQUIRED', 'You’ve used the free frame changes. Your ad can still be adjusted after production.');
+  if ((await freeChangesTaken(tx, s.sb_id as string, { statuses: ['pending', 'active'] })) >= FREE_FRAME_REGENERATIONS) throw new DomainError('PAYMENT_REQUIRED', FREE_CHANGES_USED);
   const c = classifyClaim(text);
   if (c.status === 'BLOCKED') throw new DomainError('GATE_BLOCKED', c.matched[0]!.reason);
   await tx`insert into progress_steps (workspace_id, subject_id, step_key, label, status, started_at, position)
@@ -304,6 +315,13 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
   let auth: Awaited<ReturnType<typeof authorize>>;
   try {
     auth = await withTenant(ws, async (tx) => {
+      // Before any spend, claim the free change under the storyboard lock: changes already made plus changes
+      // another worker is drawing right now. A request that outlived its queue slot (stale, so no longer counted
+      // at request time) can't push the storyboard past its allowance when its job finally runs.
+      await tx`select id from storyboards where id = ${info.s.sb_id} for update`;
+      if ((await freeChangesTaken(tx, info.s.sb_id as string, { statuses: ['active'], except: { sceneId, key } })) >= FREE_FRAME_REGENERATIONS) {
+        throw new DomainError('PAYMENT_REQUIRED', FREE_CHANGES_USED);
+      }
       const a = await authorizeOrTakeOver(
         tx,
         ctx,
@@ -311,11 +329,14 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
         FRAME_REQUEST_STALE_MINUTES,
       );
       await step(tx, ws, sceneId, key, 'active');
+      // The claim is live from now (not from when the request was queued), so it counts for its whole draw.
+      await tx`update progress_steps set started_at = now() where workspace_id = ${ws} and subject_id = ${sceneId} and step_key = ${key}`;
       return a;
     });
   } catch (e) {
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'failed', frameFailure(e)));
+    if (e instanceof DomainError && e.code === 'PAYMENT_REQUIRED') return 'skipped';
     throw e;
   }
   try {
@@ -352,7 +373,7 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
 }
 
 function frameFailure(e: unknown): string {
-  if (e instanceof DomainError && (e.code === 'GATE_BLOCKED' || e.code === 'UNAVAILABLE')) return e.message;
+  if (e instanceof DomainError && (e.code === 'GATE_BLOCKED' || e.code === 'UNAVAILABLE' || e.code === 'PAYMENT_REQUIRED')) return e.message;
   return 'We couldn’t redraw this frame just now. Your free changes weren’t used — please try again.';
 }
 
