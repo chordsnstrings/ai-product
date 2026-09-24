@@ -1,5 +1,5 @@
 import { globalTx } from '@arkiv/db';
-import { allowKey, createProvisionalWorkspace, hit, resolveProvisional, type TenantContext } from '@arkiv/core';
+import { allowKey, createProvisionalWorkspace, hit, resolveProvisional, type ClientFingerprint, type TenantContext } from '@arkiv/core';
 import { DomainError } from '@arkiv/shared';
 import { currentUser, provisionalToken, setProvisionalCookie } from '@/lib/session';
 
@@ -8,7 +8,8 @@ import { currentUser, provisionalToken, setProvisionalCookie } from '@/lib/sessi
  * visitor's provisional workspace — created (and its cookie set) on first use when `create` is set. Shared by
  * the preview submit and the upload endpoints so an upload and the preview it feeds land in the same workspace.
  */
-export async function previewContext(ip: string | null, opts: { create: boolean }): Promise<TenantContext> {
+export async function previewContext(client: ClientFingerprint, opts: { create: boolean }): Promise<TenantContext> {
+  const ip = client.ip;
   const user = await currentUser();
   if (user) {
     const ws = await globalTx((tx) => tx`select * from list_user_workspaces(${user.userId})`);
@@ -20,7 +21,8 @@ export async function previewContext(ip: string | null, opts: { create: boolean 
   if (!wsId) {
     if (!opts.create) throw new DomainError('NOT_FOUND', 'Upload not found. Please add the photo again.');
     if (ip) await hit(`provisional:ip:${ip.split('.').slice(0, 3).join('.')}`, 15, 3600, undefined, { allow: [allowKey.ip(ip)] });
-    const p = await createProvisionalWorkspace();
+    // Counted against the visitor's network, device and ASN for the farm detector (plan 05 §15).
+    const p = await createProvisionalWorkspace(client);
     await setProvisionalCookie(p.token);
     wsId = p.workspaceId;
   }

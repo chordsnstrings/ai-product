@@ -54,6 +54,15 @@ export const SETTING_DEFAULTS = {
   // Plan 05 §12 job detail "logs and traces (link out)": URL templates with {jobId}, {queue} and {requestId}.
   'ops.log_url_template': '',
   'ops.trace_url_template': '',
+  // Plan 05 §15 rights intake: inbound email to this address (besides rights@, takedown@, copyright@, dmca@, legal@)
+  // opens a rights case.
+  'rights.intake_address': '',
+  // Plan 05 §16: the console warns this many days before an API version in integrations.api_versions is sunset.
+  'integrations.sunset_banner_days': 60,
+  // Plan 05 §22 system health: links out to logs, traces and metrics (observability vendor to confirm).
+  'ops.logs_url': '',
+  'ops.traces_url': '',
+  'ops.metrics_url': '',
 } as const;
 export type SettingKey = keyof typeof SETTING_DEFAULTS;
 

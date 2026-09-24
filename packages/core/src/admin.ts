@@ -650,7 +650,7 @@ export async function cancelProjectBeforeDispatch(s: Staff, workspaceId: string,
  */
 export const NO_SPEND_QUEUES: ReadonlySet<string> = new Set([Queues.sendEmail, Queues.syncIntegration, Queues.computeResults, Queues.processUpload, Queues.exportWorkspace]);
 
-export type OpsCommandKind = 'job.retry' | 'job.bulk_retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks' | 'stripe.reconcile';
+export type OpsCommandKind = 'job.retry' | 'job.bulk_retry' | 'job.cancel' | 'dlq.requeue' | 'eval.run' | 'integration.verify_webhooks' | 'stripe.reconcile' | 'taxonomy.remap';
 
 export interface RetryEstimate {
   /** What the retried work would cost at today's published rates. */
@@ -711,6 +711,8 @@ function opsPermission(kind: OpsCommandKind): Permission {
       return 'evals.run';
     case 'integration.verify_webhooks':
       return 'integrations.manage';
+    case 'taxonomy.remap':
+      return 'taxonomy.manage';
     case 'job.retry':
       return 'jobs.retry_nospend';
     case 'job.bulk_retry':

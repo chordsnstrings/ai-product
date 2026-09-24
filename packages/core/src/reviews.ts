@@ -1,5 +1,5 @@
 import type { Tx } from '@arkiv/db';
-import { DomainError, Taxonomy } from '@arkiv/shared';
+import { DomainError } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { creativeMap } from './genome';
@@ -50,8 +50,8 @@ export async function buildSkuReview(tx: Tx, skuId: string, period: { start: Dat
                              from learnings where sku_id = ${skuId} and valid_from < ${period.end} order by confidence desc`;
   const map = await creativeMap(tx, skuId);
   const covered = new Set(map.cells.map((c) => `${c.angle}|${c.treatment}`));
-  const untested = Taxonomy.angle
-    .map((angle) => ({ angle, treatments: Taxonomy.treatment.filter((t) => !covered.has(`${angle}|${t}`)) as string[] }))
+  const untested = map.angles
+    .map((angle) => ({ angle, treatments: map.treatments.filter((t) => !covered.has(`${angle}|${t}`)) as string[] }))
     .filter((a) => !map.cells.some((c) => c.angle === a.angle))
     .slice(0, 8);
   const recs = await tx`select id, slot, proposal->>'hypothesis' as hypothesis, score from recommendations

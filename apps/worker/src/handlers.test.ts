@@ -165,3 +165,23 @@ describe('observability: request ids join requests, jobs and logs (standard §34
     expect(prometheusText([{ name: 'arkiv_jobs', labels: { queue: 'a"b', state: 'created' }, value: 2 }])).toContain('arkiv_jobs{queue="a\\"b",state="created"} 2');
   });
 });
+
+describe('marketing quiet hours (plan 05 §18)', () => {
+  it('re-queues a marketing email due in the workspace’s quiet hours for 08:00 local; transactional mail is not held', async () => {
+    // A fixed-offset zone where it is currently 22:xx (Etc/GMT-N is UTC+N).
+    const offset = (((22 - new Date().getUTCHours()) % 24) + 24) % 24;
+    const shift = offset > 12 ? offset - 24 : offset;
+    const tz = shift === 0 ? 'Etc/GMT' : `Etc/GMT${shift > 0 ? '-' : '+'}${Math.abs(shift)}`;
+    const t = await makeTenant({ state: 'ACTIVE_FREE' });
+    await ownerPool()`update workspaces set timezone = ${tz} where id = ${t.workspaceId}`;
+    const jobId = newId();
+    await runJob(Queues.sendEmail, { workspaceId: t.workspaceId, template: 'storyboard_saved', projectId: newId() }, jobId);
+    const [q] = await ownerPool()`select payload, run_after from outbox where workspace_id = ${t.workspaceId} and singleton_key = ${`quiet:${jobId}`}`;
+    expect(q!.payload).toMatchObject({ template: 'storyboard_saved' });
+    const hours = (new Date(q!.run_after as string).getTime() - Date.now()) / 3600_000;
+    expect(hours).toBeGreaterThan(9);
+    expect(hours).toBeLessThanOrEqual(10);
+    await runJob(Queues.sendEmail, { workspaceId: t.workspaceId, template: 'payment_failed' }, newId());
+    expect(await ownerPool()`select 1 from outbox where workspace_id = ${t.workspaceId} and singleton_key like 'quiet:%'`).toHaveLength(1);
+  });
+});

@@ -71,6 +71,9 @@ const EnvSchema = z.object({
   SPACES_BUCKET: z.string().optional(),
   SPACES_KEY: z.string().optional(),
   SPACES_SECRET: z.string().optional(),
+  /** Optional, read-only use: the console reads the managed database's latest backup (plan 05 §22). */
+  DO_API_TOKEN: z.string().optional(),
+  DO_DATABASE_CLUSTER_ID: z.string().optional(),
 
   SHOPIFY_API_KEY: z.string().optional(),
   SHOPIFY_API_SECRET: z.string().optional(),

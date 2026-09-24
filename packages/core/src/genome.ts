@@ -6,6 +6,7 @@ import { authorize, settle } from './cost-governor';
 import { emit } from './events';
 import { Genome } from './intel-schemas';
 import { mockGenome } from './mock-intel';
+import { canonicalTaxonomy, taxonomyRemaps, type TaxonomyFamily } from './taxonomy';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, Queues } from './outbox';
 import { evidenceFloor } from './statistics';
@@ -55,8 +56,12 @@ export async function extractGenome(ctx: TenantContext, creativeId: string) {
       maxTokens: 800,
     });
     await withTenant(ws, async (tx) => {
-      await tx`update creatives set genome = ${tx.json(r.data as never)}, genome_version = ${Taxonomy.version} where id = ${creativeId}`;
-      await emit(tx, ctx, 'GENOME_EXTRACTED', { type: 'creative', id: creativeId }, { angle: r.data.angle, version: Taxonomy.version });
+      // Stored against the current canonical taxonomy: values renamed or deprecated (with a replacement) since
+      // Appendix A follow the approved remaps (plan 05 §19).
+      const tax = await canonicalTaxonomy(tx);
+      const genome = canonicalGenome(r.data, await taxonomyRemaps(tx));
+      await tx`update creatives set genome = ${tx.json(genome as never)}, genome_version = ${tax.version} where id = ${creativeId}`;
+      await emit(tx, ctx, 'GENOME_EXTRACTED', { type: 'creative', id: creativeId }, { angle: genome.angle, version: tax.version });
       await settle(tx, ctx, auth.authorizationId, 'consumed');
     });
     return true;
@@ -82,9 +87,10 @@ export async function creativeMap(tx: Tx, skuId: string) {
            max(case state when 'ACTIONABLE' then 4 when 'DIRECTIONAL' then 3 when 'GATHERING_SIGNAL' then 2 when 'INCONCLUSIVE' then 1 else 0 end) as best
     from items where angle is not null group by 1, 2`;
   const state = (b: number) => (['untested', 'inconclusive', 'gathering', 'directional', 'actionable'] as const)[b] ?? 'untested';
+  const tax = await canonicalTaxonomy(tx);
   return {
-    angles: Taxonomy.angle,
-    treatments: Taxonomy.treatment,
+    angles: tax.families.angle,
+    treatments: tax.families.treatment,
     cells: rows.map((r) => ({ angle: r.angle as string, treatment: r.treatment as string, count: r.n as number, state: state(Number(r.best)) })),
   };
 }
@@ -125,4 +131,16 @@ export async function meaningfulCoverage(tx: Tx, skuId: string): Promise<Coverag
     if (r.treatment) cells.add(`${a}|t:${r.treatment as string}`);
   }
   return { angles, cells };
+}
+
+const GENOME_KEYS: [string, TaxonomyFamily][] = [['angle', 'angle'], ['secondaryAngle', 'angle'], ['hookMechanism', 'hook'], ['proofMechanism', 'proof'], ['treatment', 'treatment']];
+
+/** A genome with renamed/deprecated taxonomy values replaced by their canonical successors. */
+export function canonicalGenome<G extends Record<string, unknown>>(g: G, remaps: Record<TaxonomyFamily, Record<string, string>>): G {
+  const out: Record<string, unknown> = { ...g };
+  for (const [key, fam] of GENOME_KEYS) {
+    const v = out[key];
+    if (typeof v === 'string' && remaps[fam][v]) out[key] = remaps[fam][v];
+  }
+  return out as G;
 }

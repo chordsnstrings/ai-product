@@ -7,6 +7,7 @@ import { saveAsset, type AssetKind } from './assets';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
+import { allowKey } from './allowlist';
 import { hit } from './rate-limit';
 import { quarantineKey, storage } from './storage';
 import { holdForReview, nameReviewFlags } from './vision';
@@ -39,7 +40,7 @@ export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, 
   assertCan(ctx, 'sku.edit');
   // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
   // still spends the budget, and the counter row is not locked across decoding and storage I/O.
-  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600);
+  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, undefined, { subject: [allowKey.ws(ctx.workspaceId)] });
   const family = ALLOWED[declaredMime];
   if (!family) throw new DomainError('INVALID', 'That file type isn’t supported. Use JPG, PNG, WebP, MP4 or PDF.');
   if (bytes > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.', { maxBytes: UPLOAD_LIMITS[family].maxBytes });
@@ -174,7 +175,7 @@ export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind:
   assertCan(ctx, 'sku.edit');
   // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
   // still spends the budget, and the counter row is not locked across decoding and storage I/O.
-  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600);
+  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, undefined, { subject: [allowKey.ws(ctx.workspaceId)] });
   const v = await validateMedia(raw);
   const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });
   // Merchant media named as a before/after or showing children waits for compliance review (plan 05 §14).

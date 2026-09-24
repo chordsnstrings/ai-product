@@ -25,7 +25,8 @@ export const DATA_RECIPIENTS: readonly DataRecipient[] = [
     purpose: 'Application hosting, database and file storage',
     data: 'All service data: account details, product data, uploads, generated ads, performance data',
     region: 'United States (New York)',
-    hosts: ['*.digitaloceanspaces.com'],
+    // api.digitalocean.com: the staff console reads the managed database's backup list (metadata only).
+    hosts: ['*.digitaloceanspaces.com', 'api.digitalocean.com'],
   },
   {
     name: 'Stripe',

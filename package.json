@@ -21,7 +21,8 @@
     "e2e": "playwright test",
     "smoke": "tsx tests/smoke/funnel.ts",
     "smoke:admin": "tsx tests/smoke/admin.ts",
-    "test:chaos": "vitest run tests/chaos"
+    "test:chaos": "vitest run tests/chaos",
+    "test:contract": "tsx tests/contract/run.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",

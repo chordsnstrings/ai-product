@@ -35,6 +35,7 @@ import {
   evalDatasetFor,
   jobErrorClass,
   assertCandidatePrompt,
+  assertContractTestsPass,
   addGoldenCase,
   retireGoldenCase,
   DATASETS,
@@ -49,6 +50,12 @@ import {
   setLandingStatus,
   setOfferExperiment,
   normalizeAllowKey,
+  normalizeCidr,
+  proposeTaxonomyChange,
+  reviewTaxonomyProposal,
+  TAXONOMY_FAMILIES,
+  parseBannerAudience,
+  describeAudience,
   QA_VERDICT_KEY,
   Queues,
   registerExecutor,
@@ -75,7 +82,7 @@ import {
   validateRateTable,
 } from '@arkiv/core';
 import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
-import { canResendTemplate, sendEmail, type TemplateName } from '@arkiv/email';
+import { canResendTemplate, isTemplateName, sendEmail, templateSamples, type TemplateName } from '@arkiv/email';
 import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
@@ -161,6 +168,23 @@ async function workspaceSlug(workspaceId: string) {
   const [w] = await withAdmin((tx) => tx`select slug from workspaces where id = ${workspaceId}`);
   if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
   return w.slug as string;
+}
+
+/** Force the challenge and/or tighten rate limits for a normalised abuse key, until a time (plan 05 §15). */
+async function setAbuseOverride(s: StaffUser, rawKey: string, set: { forceChallenge?: boolean; rateLimitFactor?: number }, days: number, why: string) {
+  const key = normalizeAllowKey(rawKey);
+  return withAdmin(async (tx) => {
+    const [b] = await tx`select force_challenge, rate_limit_factor, until, reason from abuse_overrides where key = ${key} for update`;
+    const [r] = await tx`insert into abuse_overrides (key, force_challenge, rate_limit_factor, reason, until, created_by)
+                         values (${key}, ${set.forceChallenge ?? false}, ${set.rateLimitFactor ?? null}, ${why}, now() + make_interval(days => ${days}), ${s.staffId})
+                         on conflict (key) do update set
+                           force_challenge = abuse_overrides.force_challenge or excluded.force_challenge,
+                           rate_limit_factor = coalesce(least(abuse_overrides.rate_limit_factor, excluded.rate_limit_factor), abuse_overrides.rate_limit_factor, excluded.rate_limit_factor),
+                           reason = excluded.reason, until = greatest(abuse_overrides.until, excluded.until), created_by = excluded.created_by, updated_at = now()
+                         returning force_challenge, rate_limit_factor, until`;
+    await audit(tx, s, set.forceChallenge ? 'abuse.challenge' : 'abuse.tighten', { type: 'key', id: key }, { reason: why, before: b ?? null, after: r ?? null });
+    return { message: `${key}: ${r!.force_challenge ? 'challenge forced' : 'no forced challenge'}${r!.rate_limit_factor != null ? `, limits at ${Math.round(Number(r!.rate_limit_factor) * 100)}%` : ''} until ${new Date(r!.until as string).toISOString().slice(0, 10)}.` };
+  });
 }
 
 export const ACTIONS = {
@@ -696,6 +720,20 @@ export const ACTIONS = {
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),
   'dlq.requeue': a({ perm: 'jobs.manage', reauth: true, schema: z.object({ queue: z.string(), limit: z.number().int().min(1).max(1000).default(100), reason }), run: (s, i) => requestOpsCommand(s, 'dlq.requeue', { queue: i.queue, limit: i.limit }, i.reason).then(() => ({ message: 'Redrive queued' })) }),
 
+  /* §16 platform app status (Meta app review, TikTok app, Shopify listing): recorded by staff, shown on the page. */
+  'integration.app_status': a({
+    perm: 'integrations.manage',
+    schema: z.object({ provider: z.enum(['meta', 'tiktok', 'shopify']), status: z.enum(['unknown', 'in_review', 'approved', 'live', 'rejected', 'suspended', 'action_required']), note: z.string().max(300).optional() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select value from platform_settings where key = 'integrations.app_status' for update`;
+        const before = ((b?.value as Record<string, unknown> | null) ?? {}) as Record<string, unknown>;
+        const after = { ...before, [i.provider]: { status: i.status, note: i.note ?? null, updatedAt: new Date().toISOString(), by: s.email } };
+        await tx`insert into platform_settings (key, value, updated_by) values ('integrations.app_status', ${tx.json(after as never)}, ${s.staffId})
+                 on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'integration.app_status', { type: 'setting', id: 'integrations.app_status' }, { before: before[i.provider] ?? null, after: after[i.provider] });
+      }),
+  }),
   'integration.verify': a({ perm: 'integrations.manage', schema: z.object({}), run: (s) => requestOpsCommand(s, 'integration.verify_webhooks', {}, 'nightly check run manually').then(() => ({ message: 'Verification queued' })) }),
 
   /* ── QA review (content → break-glass) ── */
@@ -840,12 +878,60 @@ export const ACTIONS = {
     schema: z.object({ id: uuid, status: z.enum(['frozen', 'resolved_kept', 'resolved_removed']), resolution: z.string().max(1000).optional() }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        const [b] = await tx`select status, resolution from rights_cases where id = ${i.id} for update`;
+        const [b] = await tx`select status, resolution, asset_id, workspace_id from rights_cases where id = ${i.id} for update`;
         if (!b) throw new DomainError('NOT_FOUND', 'Case not found');
-        const [c] = await tx`update rights_cases set status = ${i.status}, resolution = ${i.resolution ?? null}, resolved_at = case when ${i.status} like 'resolved%' then now() end where id = ${i.id} returning asset_id, workspace_id`;
-        // Freezing marks the asset's rights expired so it can't be used in new production.
-        if (c?.asset_id && i.status !== 'resolved_kept') await tx`update assets set rights_expires_at = now() where id = ${c.asset_id}`;
-        await audit(tx, s, `rights.${i.status}`, { type: 'rights_case', id: i.id }, { workspaceId: (c?.workspace_id as string) ?? null, reason: i.resolution ?? null, before: b, after: { status: i.status, resolution: i.resolution ?? null } });
+        if (String(b.status).startsWith('resolved')) throw new DomainError('CONFLICT', 'This case is already resolved.');
+        await tx`update rights_cases set status = ${i.status}, resolution = ${i.resolution ?? null}, resolved_at = case when ${i.status} like 'resolved%' then now() end where id = ${i.id}`;
+        // Freezing (or removing) makes the asset unavailable for new production (vision.ts usableAssetIds); a case
+        // resolved as kept lifts the freeze. The attested expiry date is left as it was.
+        if (b.asset_id && b.workspace_id) {
+          if (i.status === 'resolved_kept') await tx`update assets set rights_frozen_at = null where id = ${b.asset_id} and workspace_id = ${b.workspace_id}`;
+          else await tx`update assets set rights_frozen_at = coalesce(rights_frozen_at, now()) where id = ${b.asset_id} and workspace_id = ${b.workspace_id}`;
+        }
+        await audit(tx, s, `rights.${i.status}`, { type: 'rights_case', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, reason: i.resolution ?? null, before: { status: b.status, resolution: b.resolution }, after: { status: i.status, resolution: i.resolution ?? null } });
+      }),
+  }),
+  /* §15 enforcement: every action is time-boxed and audited; "suspend" is tenant.hold (🔐) from the same page. */
+  'abuse.challenge': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), days: z.number().int().min(1).max(30).default(7), reason }),
+    run: (s, i) => setAbuseOverride(s, i.key, { forceChallenge: true }, i.days, i.reason),
+  }),
+  'abuse.tighten': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), factor: z.number().min(0.05).max(0.9).default(0.25), days: z.number().int().min(1).max(30).default(7), reason }),
+    run: (s, i) => setAbuseOverride(s, i.key, { rateLimitFactor: i.factor }, i.days, i.reason),
+  }),
+  'abuse.override_remove': a({
+    perm: 'abuse.manage',
+    schema: z.object({ key: z.string().min(3), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`delete from abuse_overrides where key = ${i.key} returning force_challenge, rate_limit_factor, until, reason`;
+        if (!b) throw new DomainError('NOT_FOUND', 'No enforcement on that key');
+        await audit(tx, s, 'abuse.override_remove', { type: 'key', id: i.key }, { reason: i.reason, before: b, after: null });
+      }),
+  }),
+  'abuse.block_ip': a({
+    perm: 'abuse.manage',
+    reauth: true,
+    schema: z.object({ cidr: z.string().min(3).max(60), hours: z.number().int().min(1).max(24 * 30).default(24), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const cidr = normalizeCidr(i.cidr);
+        const [b] = await tx`insert into ip_blocks (cidr, reason, until, created_by) values (network(${cidr}::inet), ${i.reason}, now() + make_interval(hours => ${i.hours}), ${s.staffId}) returning id, cidr::text as cidr, until`;
+        await audit(tx, s, 'abuse.block_ip', { type: 'ip_block', id: b!.id as string }, { reason: i.reason, after: { cidr: b!.cidr, hours: i.hours } });
+        return { message: `Blocked ${b!.cidr as string} until ${new Date(b!.until as string).toISOString().slice(0, 16).replace('T', ' ')} UTC.` };
+      }),
+  }),
+  'abuse.unblock_ip': a({
+    perm: 'abuse.manage',
+    schema: z.object({ id: uuid, reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`update ip_blocks set lifted_at = now(), lifted_by = ${s.staffId} where id = ${i.id} and lifted_at is null returning cidr::text as cidr, until`;
+        if (!b) throw new DomainError('NOT_FOUND', 'No active block with that id');
+        await audit(tx, s, 'abuse.unblock_ip', { type: 'ip_block', id: i.id }, { reason: i.reason, before: b, after: { lifted: true } });
       }),
   }),
 
@@ -1002,6 +1088,8 @@ export const ACTIONS = {
                                   where ${i.email ? tx`email = ${i.email.toLowerCase()}` : tx`encode(sha256(convert_to(lower(email::text), 'UTF8')), 'hex') = ${i.emailKey!}`}
                                   returning email, reason, stream, created_at`;
         if (!before) throw new DomainError('NOT_FOUND', 'That address isn’t suppressed.');
+        // A deliverable address again: any Owner bounce banner for it is lifted (plan 05 §18).
+        await tx`select email_owner_bounce(${before.email as string}, false)`;
         await audit(tx, s, 'email.unsuppress', { type: 'email', id: before.email as string }, { reason: i.reason, before });
       }),
   }),
@@ -1018,11 +1106,34 @@ export const ACTIONS = {
       if (!row.data) throw new DomainError('CONFLICT', 'This email was sent before its content was recorded, so it can’t be resent.');
       const res = await sendEmail(row.template as TemplateName, row.to_email as string, row.data as never, { idempotencyKey: `resend:${i.logId}:${i.requestId}`, workspaceId: (row.workspace_id as string) ?? null });
       await withAdmin((tx) => audit(tx, s, 'email.resend', { type: 'email_log', id: i.logId }, { workspaceId: (row.workspace_id as string) ?? null, reason: i.reason, before: { template: row.template, status: row.status }, after: { outcome: res.status } }));
-      const said = { sent: 'Resent.', logged: 'Resent (logged; no provider configured here).', duplicate: 'Already resent.', suppressed: 'Not sent: the address is suppressed. Unsuppress it first.', capped: 'Not sent: marketing frequency cap reached for this address.' }[res.status];
+      const said = { sent: 'Resent.', logged: 'Resent (logged; no provider configured here).', duplicate: 'Already resent.', suppressed: 'Not sent: the address is suppressed. Unsuppress it first.', capped: 'Not sent: marketing frequency cap reached for this address.', paused: 'Not sent: marketing email is paused (complaint rate). Resume it on the Email page first.' }[res.status];
       return { status: res.status, message: said };
     },
   }),
-  'email.test': a({ perm: 'email.read', schema: z.object({ template: z.enum(['magic_link', 'receipt', 'asset_ready', 'weekly_brief', 'cancellation_confirmed']) }), run: async (s, i) => { const samples = { magic_link: { url: `${env().APP_URL}/auth/magic/test`, purpose: 'login' as const }, receipt: { productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: env().APP_URL }, asset_ready: { productName: 'Dew Serum', url: env().APP_URL, catalogueNo: '014' }, weekly_brief: { workspaceName: 'Sample Brand', week: 'Week 39', recommendations: [{ hypothesis: 'Texture close-ups beat talking heads for serums', slot: 'EXPLOIT' }], url: env().APP_URL }, cancellation_confirmed: { planName: 'Growth', endsOn: 'October 23', exportUrl: env().APP_URL } }; await sendEmail(i.template, s.email, samples[i.template] as never, { idempotencyKey: `test:${i.template}:${newId()}` }); return { message: `Sent to ${s.email}` }; } }),
+  /* §18 preview with sample data and test-send to staff: every template, with its sample data, to the staff member. */
+  'email.test': a({
+    perm: 'email.read',
+    schema: z.object({ template: z.string().refine(isTemplateName, 'Unknown template') }),
+    run: async (s, i) => {
+      const template = i.template as TemplateName;
+      const r = await sendEmail(template, s.email, templateSamples(env().APP_URL)[template] as never, { idempotencyKey: `test:${template}:${newId()}` });
+      return { message: r.status === 'sent' || r.status === 'logged' ? `Sent to ${s.email}` : `Not sent (${r.status}) to ${s.email}` };
+    },
+  }),
+  /* §18 complaint-rate guard: marketing sends paused automatically; staff resume once the cause is dealt with. */
+  'email.marketing_resume': a({
+    perm: 'email.manage',
+    schema: z.object({ reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [b] = await tx`select value from platform_settings where key = 'email.marketing_paused' for update`;
+        if (!b || b.value === null) throw new DomainError('CONFLICT', 'Marketing email is not paused.');
+        await tx`update platform_settings set value = 'null'::jsonb, updated_by = ${s.staffId}, updated_at = now() where key = 'email.marketing_paused'`;
+        await tx`update platform_alerts set resolved_at = now(), resolved_by = ${s.staffId}, resolution = ${i.reason} where kind = 'email.marketing_paused' and resolved_at is null`;
+        await audit(tx, s, 'email.marketing_resume', { type: 'setting', id: 'email.marketing_paused' }, { reason: i.reason, before: b.value, after: null });
+        return { message: 'Marketing email resumed.' };
+      }),
+  }),
 
   /* ── Flags, settings, banner ── */
   'flag.set': a({
@@ -1036,6 +1147,8 @@ export const ACTIONS = {
       return withAdmin(async (tx) => {
         const [b] = await tx`select enabled, rules from feature_flags where key = ${i.key}`;
         if (!b) throw new DomainError('NOT_FOUND', 'Unknown flag');
+        // An API-version switch needs a passing contract test run on that version first (plan 05 §16, standard §51).
+        await assertContractTestsPass(tx, i.key, i.enabled && !b.enabled);
         await tx`update feature_flags set enabled = ${i.enabled}, rules = ${tx.json((i.rules ?? b.rules) as never)}, updated_at = now() where key = ${i.key}`;
         await audit(tx, s, 'flag.set', { type: 'flag', id: i.key }, { reason: i.reason, before: b, after: { enabled: i.enabled, rules: i.rules } });
       });
@@ -1058,8 +1171,40 @@ export const ACTIONS = {
         return { message: 'Saved. Other processes pick it up within 30 seconds.' };
       }),
   }),
-  'banner.set': a({ perm: 'system.banner', schema: z.object({ text: z.string().max(200).default(''), tone: z.enum(['info', 'warn', 'risk']).default('warn') }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into platform_settings (key, value, updated_by) values ('status.banner', ${tx.json(i.text ? { text: i.text, tone: i.tone, at: new Date().toISOString() } : null)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`; await audit(tx, s, 'banner.set', { type: 'setting', id: 'status.banner' }, { after: i }); }) }),
+  /* §22 status banner: to every tenant, or a subset (plans, workspaces with a connector, listed workspaces). */
+  'banner.set': a({
+    perm: 'system.banner',
+    schema: z.object({
+      text: z.string().max(200).default(''),
+      tone: z.enum(['info', 'warn', 'risk']).default('warn'),
+      audience: z.enum(['all', 'plans', 'integration', 'workspaces']).default('all'),
+      plans: z.string().max(200).optional(),
+      provider: z.string().max(20).optional(),
+      workspaceIds: z.string().max(20_000).optional(),
+    }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const value = i.text ? { text: i.text, tone: i.tone, at: new Date().toISOString(), audience: parseBannerAudience(i) } : null;
+        const [b] = await tx`select value from platform_settings where key = 'status.banner'`;
+        // Clearing stores JSON null (the column is not null; tx.json(null) would be SQL NULL).
+        await tx`insert into platform_settings (key, value, updated_by) values ('status.banner', ${value ? tx.json(value as never) : tx`'null'::jsonb`}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'banner.set', { type: 'setting', id: 'status.banner' }, { before: b?.value ?? null, after: value });
+        return { message: value ? `Published to ${describeAudience(value.audience)}.` : 'Banner cleared.' };
+      }),
+  }),
   'ops.restore_drill': a({ perm: 'system.read', schema: z.object({ result: z.enum(['passed', 'failed']), notes: z.string().max(500).optional() }), run: (s, i) => withAdmin(async (tx) => { await tx`insert into platform_settings (key, value, updated_by) values ('ops.restore_drill', ${tx.json({ at: new Date().toISOString(), result: i.result, notes: i.notes ?? null, by: s.email })}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_at = now()`; await audit(tx, s, 'ops.restore_drill', { type: 'setting', id: 'ops.restore_drill' }, { after: i }); }) }),
+  /* §22 backups: the last successful backup as checked by staff (when the DigitalOcean API isn't configured). */
+  'ops.backup_check': a({
+    perm: 'system.read',
+    schema: z.object({ lastBackupAt: z.string().refine((v) => !Number.isNaN(Date.parse(v)), 'Enter the backup time'), result: z.enum(['ok', 'missing', 'failed']), notes: z.string().max(500).optional() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        if (Date.parse(i.lastBackupAt) > Date.now() + 5 * 60_000) throw new DomainError('INVALID', 'The backup time is in the future.');
+        const value = { at: new Date().toISOString(), lastBackupAt: new Date(i.lastBackupAt).toISOString(), result: i.result, notes: i.notes ?? null, by: s.email };
+        await tx`insert into platform_settings (key, value, updated_by) values ('ops.backup_check', ${tx.json(value)}, ${s.staffId}) on conflict (key) do update set value = excluded.value, updated_by = excluded.updated_by, updated_at = now()`;
+        await audit(tx, s, 'ops.backup_check', { type: 'setting', id: 'ops.backup_check' }, { after: value });
+      }),
+  }),
 
   /* ── Privacy ── */
   'privacy.create': a({ perm: 'privacy.manage', schema: z.object({ kind: z.enum(DataRequestKind), requesterEmail: z.string().email(), workspaceId: uuid.optional(), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [r] = await tx`insert into data_requests (kind, requester_email, workspace_id, notes, due_at) values (${i.kind}, ${i.requesterEmail}, ${i.workspaceId ?? null}, ${i.notes ?? null}, now() + interval '45 days') returning id`; await audit(tx, s, 'privacy.create', { type: 'data_request', id: r!.id as string }, { workspaceId: i.workspaceId ?? null }); }) }),
@@ -1098,7 +1243,23 @@ export const ACTIONS = {
   }),
 
   /* ── Taxonomy ── */
-  'taxonomy.version': a({ perm: 'taxonomy.manage', reauth: true, schema: z.object({ spec: z.record(z.string(), z.unknown()), reason }), run: (s, i) => withAdmin(async (tx) => { const [v] = await tx`select coalesce(max(version), 0) + 1 as v from taxonomy_versions`; await tx`insert into taxonomy_versions (version, spec) values (${v!.v}, ${tx.json({ ...i.spec, changeReason: i.reason, by: s.email } as never)})`; await audit(tx, s, 'taxonomy.version', { type: 'taxonomy', id: String(v!.v) }, { reason: i.reason, after: i.spec }); return { message: `Taxonomy v${v!.v} recorded. Existing genomes keep their version until remapped.` }; }) }),
+  /* §19 taxonomy: a proposal (add / rename / deprecate one value) → review by a second staff member → new version
+     and, when genomes must move, a remap the worker applies. Nothing becomes canonical without review. */
+  'taxonomy.propose': a({
+    perm: 'taxonomy.manage',
+    schema: z.object({ family: z.enum(TAXONOMY_FAMILIES), op: z.enum(['add', 'rename', 'deprecate']), value: z.string().trim().toUpperCase(), to: z.string().trim().toUpperCase().optional(), reason }),
+    run: (s, i) => withAdmin(async (tx) => ({ id: await proposeTaxonomyChange(tx, s, { family: i.family, op: i.op, value: i.value, to: i.to || null, reason: i.reason }), message: 'Proposed. Another staff member reviews it before it becomes canonical.' })),
+  }),
+  'taxonomy.review': a({
+    perm: 'taxonomy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, approve: z.boolean(), note: z.string().trim().min(4, 'A review note is required') }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const r = await reviewTaxonomyProposal(tx, s, i.id, i.approve, i.note);
+        return { message: r.version ? `Taxonomy v${r.version} recorded.${r.remap ? ' Existing genomes are being remapped.' : ''}` : 'Proposal rejected.' };
+      }),
+  }),
 
   /* ── Staff ── */
   // Invite staff: the account starts with no roles; the requested roles go through four-eyes like any role

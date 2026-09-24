@@ -5,9 +5,12 @@ import { isAllowlisted } from './allowlist';
 /**
  * Fixed-window counter in Postgres (no Redis in V1). Returns remaining budget or throws RATE_LIMITED.
  * Keys look like `login:ip:1.2.3.4`, `magic:email:a@b.com`, `upload:ws:<id>`.
+ * `allow` and `subject` name who is asking (normalised abuse keys: ip:/24, domain:, ws:). Staff can tighten the
+ * limit to a fraction for any of them (plan 05 §15 "rate-limit tighten"); an allowlisted `allow` key also lifts it.
  */
-export async function hit(key: string, limit: number, windowSeconds: number, tx?: Tx, opts: { allow?: (string | null | undefined)[] } = {}): Promise<number> {
+export async function hit(key: string, limit: number, windowSeconds: number, tx?: Tx, opts: { allow?: (string | null | undefined)[]; subject?: (string | null | undefined)[] } = {}): Promise<number> {
   const run = async (t: Tx) => {
+    limit = Math.max(1, Math.floor(limit * (await tightenFactor(t, [...(opts.allow ?? []), ...(opts.subject ?? [])]))));
     const [row] = await t`
       insert into rate_limits (key, window_start, count)
       values (${key}, to_timestamp(floor(extract(epoch from now()) / ${windowSeconds}) * ${windowSeconds}), 1)
@@ -31,4 +34,12 @@ export async function hit(key: string, limit: number, windowSeconds: number, tx?
 export async function sweepRateLimits(tx: Tx): Promise<number> {
   const r = await tx`delete from rate_limits where window_start < now() - interval '1 day'`;
   return r.count;
+}
+
+/** Smallest active staff-set rate-limit factor for these keys (1 when none). */
+async function tightenFactor(t: Tx, keys: (string | null | undefined)[] | undefined): Promise<number> {
+  const ks = [...new Set((keys ?? []).filter((k): k is string => !!k))];
+  if (!ks.length) return 1;
+  const [o] = await t`select min(rate_limit_factor)::float8 as f from abuse_overrides where key in ${t(ks)} and until > now() and rate_limit_factor is not null`;
+  return o?.f == null ? 1 : Math.min(1, Math.max(0.01, Number(o.f)));
 }

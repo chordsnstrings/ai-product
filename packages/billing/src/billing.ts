@@ -1,6 +1,8 @@
 import { globalTx, withSystem, withTenant, type Tx } from '@arkiv/db';
 import { DomainError, PLANS, env, formatUsd, microsToCents, type PlanCode } from '@arkiv/shared';
 import {
+  CARD_FAILURE_EVENTS,
+  noteFailedPayment,
   isFlagOn,
   append,
   approveForProduction,
@@ -478,6 +480,11 @@ export async function processStripeEvent(eventId: string): Promise<StripeOutcome
   const paymentIntent = typeof obj.payment_intent === 'string' ? obj.payment_intent : ((obj.payment_intent as { id?: string } | null)?.id ?? null);
   const workspaceId = await routeEvent(event, obj, { customerId, metaWorkspace: meta.workspace_id || null, paymentIntent, assigned: (row.workspace_id as string) ?? null });
   const staffAssigned = !!row.workspace_id && row.workspace_id === workspaceId;
+  // Card testing (plan 05 §15): failed card payments per customer, counted once per event (its first claim).
+  if ((CARD_FAILURE_EVENTS as readonly string[]).includes(event.type) && Number(row.attempts) === 1) {
+    const card = ((obj.payment_method_details as { card?: { fingerprint?: string } } | undefined)?.card?.fingerprint ?? null) as string | null;
+    await withSystem((tx) => noteFailedPayment(tx, { customerId, workspaceId, eventId: event.id, cardFingerprint: card })).catch(() => {});
+  }
   if (!HANDLED_TYPES.includes(event.type)) {
     await release('ignored');
     return 'ignored';

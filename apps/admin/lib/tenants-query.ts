@@ -1,6 +1,7 @@
 import type { Tx } from '@arkiv/db';
 import { RISK_BAND_MIN, RISK_WEIGHTS } from '@arkiv/core';
 import { COST_LIMITS, PLANS } from '@arkiv/shared';
+import { integrationFresh } from './sql';
 
 /**
  * Tenant list query (plan 05 §2.1), shared by the page and its CSV export so both apply the same filters.
@@ -55,7 +56,7 @@ export function tenantRows(tx: Tx, f: TenantFilters, opts: { limit: number; tz: 
         (select coalesce(sum(amount), 0) from ledger_entries where workspace_id = w.id and unit = 'creative_test'
            and type in ('CREDIT_GRANTED','CREDIT_RESERVED','CREDIT_RELEASED','CREDIT_REFUNDED','CREDIT_EXPIRED','CREDIT_ADJUSTED'))::int as tests_available,
         (select least(100, coalesce(sum(coalesce((${weights}->>indicator)::int, 10)), 0)) from (select distinct indicator from risk_flags r where r.workspace_id = w.id and r.resolved_at is null) f)::int as risk_score,
-        (select coalesce(json_agg(json_build_object('provider', i.provider, 'status', i.status, 'fresh', coalesce(i.status = 'active' and i.last_success_at > now() - interval '7 days', false)) order by i.provider), '[]')
+        (select coalesce(json_agg(json_build_object('provider', i.provider, 'status', i.status, 'fresh', ${integrationFresh(tx, 'i')}) order by i.provider), '[]')
            from integrations i where i.workspace_id = w.id and i.status <> 'disconnected') as conns
       from workspaces w
       where (${f.test === '1'} or not w.is_test)

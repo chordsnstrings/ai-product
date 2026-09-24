@@ -344,6 +344,44 @@ describe('danger zone and jobs actions', () => {
     const keys = await ownerPool()`select key from abuse_allowlist order by key`;
     expect(keys.map((k) => k.key)).toEqual(['domain:agency.com', 'ip:203.0.113']);
   });
+
+  it('enforcement is time-boxed and audited: challenge, tighten, block an IP range and lift it', async () => {
+    const c = await staff(['COMPLIANCE']);
+    await act(c, 'abuse.challenge', { key: '203.0.113.77', days: 7, reason: 'bot burst on previews' });
+    await act(c, 'abuse.tighten', { key: 'ip:203.0.113', factor: 0.25, days: 3, reason: 'bot burst on previews' });
+    const [o] = await ownerPool()`select key, force_challenge, rate_limit_factor::float8 as f, until > now() + interval '6 days' as week from abuse_overrides`;
+    // Tightening keeps the forced challenge and the longer window.
+    expect(o).toEqual({ key: 'ip:203.0.113', force_challenge: true, f: 0.25, week: true });
+    await expect(act(c, 'abuse.block_ip', { cidr: '10.0.0.0/8', hours: 24, reason: 'too wide' })).rejects.toThrow(/16 or narrower/);
+    const r = await act(c, 'abuse.block_ip', { cidr: '203.0.113.77/24', hours: 24, reason: 'provisional farm' });
+    expect(String(r.message)).toMatch(/Blocked 203\.0\.113\.0\/24/);
+    const [b] = await ownerPool()`select id, cidr::text as cidr from ip_blocks`;
+    await act(c, 'abuse.unblock_ip', { id: b!.id, reason: 'farm stopped' });
+    await expect(act(c, 'abuse.unblock_ip', { id: b!.id, reason: 'farm stopped' })).rejects.toThrow(/No active block/);
+    await act(c, 'abuse.override_remove', { key: 'ip:203.0.113', reason: 'burst over' });
+    const audit = await ownerPool()`select action from admin_audit_log where action like 'abuse.%' order by id`;
+    expect(audit.map((x) => x.action)).toEqual(['abuse.challenge', 'abuse.tighten', 'abuse.block_ip', 'abuse.unblock_ip', 'abuse.override_remove']);
+  });
+
+  it('freezing a rights case makes the asset unavailable for production; resolving as kept lifts it', async () => {
+    const c = await staff(['COMPLIANCE']);
+    const t = await makeTenant();
+    const assetId = newId();
+    const expires = new Date(Date.now() + 30 * 86400_000);
+    await ownerPool()`insert into assets (id, workspace_id, kind, storage_key, mime, bytes, checksum_sha256, source, rights_expires_at)
+                      values (${assetId}, ${t.workspaceId}, 'creator_footage', 'k/1', 'video/mp4', 1, 'x', 'upload', ${expires})`;
+    await act(c, 'rights.create', { complainant: 'Sam Lens', detail: 'my footage used without licence', workspaceId: t.workspaceId, assetId });
+    const [rc] = await ownerPool()`select id from rights_cases`;
+    await act(c, 'rights.update', { id: rc!.id, status: 'frozen' });
+    const [a1] = await ownerPool()`select rights_frozen_at is not null as frozen, rights_expires_at from assets where id = ${assetId}`;
+    expect(a1!.frozen).toBe(true);
+    // The attested expiry date is kept.
+    expect(new Date(a1!.rights_expires_at as string).getTime()).toBe(expires.getTime());
+    await act(c, 'rights.update', { id: rc!.id, status: 'resolved_kept', resolution: 'licence shown' });
+    const [a2] = await ownerPool()`select rights_frozen_at from assets where id = ${assetId}`;
+    expect(a2!.rights_frozen_at).toBeNull();
+    await expect(act(c, 'rights.update', { id: rc!.id, status: 'frozen' })).rejects.toThrow(/already resolved/);
+  });
 });
 
 describe('staff sign-in policies (plan 05 §0.1, §23)', () => {
@@ -635,6 +673,92 @@ describe('prompts, evals and golden sets (plan 05 §11)', () => {
       expect(r).toEqual({ circuit_open: true, circuit_auto: false, circuit_reason: 'provider incident', changed: true });
     } finally {
       await ownerPool()`update model_routes set circuit_open = false, circuit_auto = false, circuit_until = null, circuit_reason = null, circuit_changed_at = null where task = 'video.scene'`;
+    }
+  });
+});
+
+describe('email & lifecycle actions (plan 05 §18)', () => {
+  it('test-sends any template with its sample data, and resumes paused marketing with an audit record', async () => {
+    const g = await staff(['GROWTH']);
+    for (const template of ['day30_review', 'intervention', 'claims_guidance']) {
+      expect(String((await act(g, 'email.test', { template })).message)).toMatch(/^Sent to/);
+      expect(devOutbox.at(-1)).toMatchObject({ to: g.email, template });
+    }
+    await expect(act(g, 'email.test', { template: 'nope' })).rejects.toThrow(/Unknown template/);
+    await expect(act(g, 'email.marketing_resume', { reason: 'list cleaned' })).rejects.toThrow(/not paused/);
+    await ownerPool()`insert into platform_settings (key, value) values ('email.marketing_paused', '{"at":"2026-09-24T00:00:00Z","rate":0.002}')`;
+    await ownerPool()`insert into platform_alerts (kind, subject_type, subject_id, message) values ('email.marketing_paused', 'email_stream', 'marketing', 'paused')`;
+    try {
+      await act(g, 'email.marketing_resume', { reason: 'removed purchased list segment' });
+      const [p] = await ownerPool()`select value from platform_settings where key = 'email.marketing_paused'`;
+      expect(p!.value).toBeNull();
+      expect(await ownerPool()`select 1 from platform_alerts where kind = 'email.marketing_paused' and resolved_at is null`).toHaveLength(0);
+      const [a] = await ownerPool()`select reason, before from admin_audit_log where action = 'email.marketing_resume'`;
+      expect(a).toMatchObject({ reason: 'removed purchased list segment', before: { rate: 0.002 } });
+    } finally {
+      await ownerPool()`delete from platform_settings where key = 'email.marketing_paused'`;
+    }
+  });
+
+  it('unsuppressing an owner address lifts the workspace bounce banner', async () => {
+    const t = await makeTenant({ email: 'bouncy@brand.example' });
+    await ownerPool()`update workspaces set owner_email_bouncing_at = now() where id = ${t.workspaceId}`;
+    await ownerPool()`insert into email_suppressions (email, reason, stream) values ('bouncy@brand.example', 'hard_bounce', 'all')`;
+    await act(await staff(['SUPPORT']), 'email.unsuppress', { email: 'bouncy@brand.example', reason: 'address fixed by customer' });
+    const [w] = await ownerPool()`select owner_email_bouncing_at from workspaces where id = ${t.workspaceId}`;
+    expect(w!.owner_email_bouncing_at).toBeNull();
+  });
+});
+
+describe('system health actions (plan 05 §22)', () => {
+  it('publishes a banner to a subset of tenants, validates the audience, and records backup checks', async () => {
+    const ops = await staff(['OPS']);
+    try {
+      await expect(act(ops, 'banner.set', { text: 'TikTok sync delayed', tone: 'warn', audience: 'integration', provider: 'pinterest' })).rejects.toThrow(/shopify, meta or tiktok/);
+      const r = await act(ops, 'banner.set', { text: 'TikTok sync delayed', tone: 'warn', audience: 'integration', provider: 'tiktok' });
+      expect(r.message).toBe('Published to workspaces with tiktok connected.');
+      const [b] = await ownerPool()`select value from platform_settings where key = 'status.banner'`;
+      expect(b!.value).toMatchObject({ text: 'TikTok sync delayed', tone: 'warn', audience: { kind: 'integration', provider: 'tiktok' } });
+      expect((await act(ops, 'banner.set', { text: '' })).message).toBe('Banner cleared.');
+      const audits = await ownerPool()`select after from admin_audit_log where action = 'banner.set' order by id`;
+      expect(audits.map((a) => a.after === null ? null : (a.after as { audience: { kind: string } }).audience.kind)).toEqual(['integration', null]);
+
+      await expect(act(ops, 'ops.backup_check', { lastBackupAt: '2999-01-01T00:00', result: 'ok' })).rejects.toThrow(/future/);
+      await act(ops, 'ops.backup_check', { lastBackupAt: '2026-09-24T03:00', result: 'ok', notes: 'daily snapshot present' });
+      const [bk] = await ownerPool()`select value from platform_settings where key = 'ops.backup_check'`;
+      expect(bk!.value).toMatchObject({ result: 'ok', notes: 'daily snapshot present', by: ops.email });
+    } finally {
+      await ownerPool()`delete from platform_settings where key in ('ops.backup_check')`;
+      await ownerPool()`update platform_settings set value = 'null'::jsonb where key = 'status.banner'`;
+    }
+  });
+});
+
+describe('integrations health actions (plan 05 §16)', () => {
+  it('an API-version switch flag needs a passing contract run; app status is recorded and audited', async () => {
+    const eng = await staff(['ENGINEERING']);
+    await act(eng, 'flag.create', { key: 'api.meta_version.v24_0', description: 'Switch Meta adapter to v24.0', owner: 'eng', kind: 'boolean' });
+    try {
+      await expect(act(eng, 'flag.set', { key: 'api.meta_version.v24_0', enabled: true, reason: 'sunset of v23' })).rejects.toThrow(/No contract test run/);
+      await ownerPool()`insert into contract_test_runs (provider, api_version, suite, passed, total) values ('meta', 'v24.0', 'connectors', true, 6)`;
+      await act(eng, 'flag.set', { key: 'api.meta_version.v24_0', enabled: true, reason: 'sunset of v23' });
+      const [f] = await ownerPool()`select enabled from feature_flags where key = 'api.meta_version.v24_0'`;
+      expect(f!.enabled).toBe(true);
+    } finally {
+      await ownerPool()`delete from feature_flags where key = 'api.meta_version.v24_0'`;
+    }
+    const ops = await staff(['OPS']);
+    const [orig] = await ownerPool()`select value from platform_settings where key = 'integrations.app_status'`;
+    try {
+      await act(ops, 'integration.app_status', { provider: 'meta', status: 'in_review', note: 'ads_read advanced access submitted' });
+      const [st] = await ownerPool()`select value from platform_settings where key = 'integrations.app_status'`;
+      const v = st!.value as Record<string, { status: string }>;
+      expect(v.meta).toMatchObject({ status: 'in_review', note: 'ads_read advanced access submitted' });
+      expect(v.tiktok).toMatchObject({ status: 'unknown' });
+      const [a] = await ownerPool()`select after from admin_audit_log where action = 'integration.app_status'`;
+      expect(a!.after).toMatchObject({ status: 'in_review' });
+    } finally {
+      await ownerPool()`update platform_settings set value = ${ownerPool().json(orig!.value as never)} where key = 'integrations.app_status'`;
     }
   });
 });

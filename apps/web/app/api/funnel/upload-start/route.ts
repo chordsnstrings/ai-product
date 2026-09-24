@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { hit, recordFunnelOnce } from '@arkiv/core';
+import { allowKey, hit, recordFunnelOnce } from '@arkiv/core';
 import { body, clientIp, json, route } from '@/lib/http';
 import { visitorId } from '@/lib/session';
 
@@ -14,7 +14,7 @@ export const POST = route(async (req) => {
   const vid = await visitorId();
   const ip = clientIp(req);
   await hit(`funnel:upload-start:v:${vid}`, 20, 3600);
-  if (ip) await hit(`funnel:upload-start:ip:${ip}`, 200, 3600);
+  if (ip) await hit(`funnel:upload-start:ip:${ip}`, 200, 3600, undefined, { subject: [allowKey.ip(ip)] });
   const recorded = await recordFunnelOnce('UPLOAD_STARTED', { visitorId: vid, page: b.page ?? null, variant: b.variant ?? null, props: { method: b.method, via: 'intent' } });
   return json({ ok: true, recorded });
 });

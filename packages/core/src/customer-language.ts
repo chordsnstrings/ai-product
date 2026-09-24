@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError } from '@arkiv/shared';
+import { notePromptInjection } from './abuse';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { emit } from './events';
@@ -44,6 +45,8 @@ export async function importSignals(tx: Tx, ctx: TenantContext, skuId: string, i
                      ${it.author ? createHash('sha256').update(it.author.toLowerCase()).digest('hex') : null}, ${it.observedAt ?? null})`;
     n++;
   }
+  // Imported reviews are data, never instructions (§48); attempts to smuggle instructions in are recorded.
+  if (n) await notePromptInjection(tx, { workspaceId: ctx.workspaceId, source: 'reviews', text: items.map((it) => it.text).join('\n'), subject: { type: 'sku', id: skuId } });
   return n;
 }
 
@@ -245,4 +248,48 @@ export async function clusterThemes(ctx: TenantContext, skuId: string) {
     await withTenant(ws, (tx) => settle(tx, ctx, auth.authorizationId, 'consumed'));
     throw e;
   }
+}
+
+/** Themes free-text feedback usually falls into (cancellation reasons, plan 05 §17); first match wins. */
+const FEEDBACK_THEMES: { theme: string; re: RegExp }[] = [
+  { theme: 'Price / budget', re: /\b(price|pricing|expensive|cost|costs|afford|budget|money|cheaper|too much)\b/i },
+  { theme: 'Results / performance', re: /\b(results?|roas|sales|conversions?|didn.?t (work|convert|perform)|no (lift|impact)|performance|ctr)\b/i },
+  { theme: 'Creative quality', re: /\b(quality|looks? (fake|off|weird|ai)|fake|uncanny|wrong (product|label|colou?r)|artifacts?|blurry)\b/i },
+  { theme: 'Not using it / no time', re: /\b(time|busy|didn.?t use|not using|haven.?t used|forgot|bandwidth)\b/i },
+  { theme: 'Switching / in-house', re: /\b(switch(ing|ed)?|competitor|another (tool|app|platform)|agency|in.?house|freelancer)\b/i },
+  { theme: 'Product or technical issues', re: /\b(bugs?|errors?|broken|slow|crash|integration|connect(ion)?|shopify|meta|tiktok)\b/i },
+  { theme: 'Business paused / closing', re: /\b(clos(e|ing)|shut(ting)? down|paus(e|ing)|seasonal|sold|pivot|stopp?ed selling)\b/i },
+];
+const FEEDBACK_STOP = new Set(['the', 'and', 'for', 'but', 'not', 'too', 'was', 'are', 'you', 'your', 'our', 'with', 'this', 'that', 'just', 'have', 'had', 'will', 'from', 'more', 'very', 'really', 'dont', 'didnt', 'wasnt', 'would', 'could', 'also', 'much', 'some']);
+
+/**
+ * Cluster short free-text answers (the cancel flow's "anything else?") into themes, deterministically and without
+ * model spend: known themes first, then the remaining answers grouped by the word most of them share. Each theme
+ * keeps its count and a few verbatim examples.
+ */
+export function clusterFreeText(texts: string[], opts: { examples?: number } = {}): { theme: string; count: number; examples: string[] }[] {
+  const keep = opts.examples ?? 3;
+  const groups = new Map<string, string[]>();
+  const rest: string[] = [];
+  for (const raw of texts) {
+    const t = raw.trim();
+    if (!t) continue;
+    const hit = FEEDBACK_THEMES.find((f) => f.re.test(t));
+    if (hit) groups.set(hit.theme, [...(groups.get(hit.theme) ?? []), t]);
+    else rest.push(t);
+  }
+  const words = (t: string) => [...new Set(t.toLowerCase().replace(/'/g, '').replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length >= 4 && !FEEDBACK_STOP.has(w)))];
+  // Remaining answers: repeatedly take the word shared by the most of them (two or more) as a theme.
+  let pool = rest;
+  for (;;) {
+    const freq = new Map<string, number>();
+    for (const t of pool) for (const w of words(t)) freq.set(w, (freq.get(w) ?? 0) + 1);
+    const [top, n] = [...freq.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0] ?? ['', 0];
+    if (n < 2) break;
+    groups.set(`“${top}”`, pool.filter((t) => words(t).includes(top)));
+    pool = pool.filter((t) => !words(t).includes(top));
+  }
+  if (pool.length) groups.set('Other', pool);
+  const other = (theme: string) => (theme === 'Other' ? 1 : 0);
+  return [...groups.entries()].map(([theme, xs]) => ({ theme, count: xs.length, examples: xs.slice(0, keep) })).sort((a, b) => other(a.theme) - other(b.theme) || b.count - a.count);
 }

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { MAX_PREVIEW_PHOTOS, startPhotoUploads } from '@arkiv/core';
-import { body, clientIp, json, route } from '@/lib/http';
+import { assertNotBlocked, MAX_PREVIEW_PHOTOS, startPhotoUploads } from '@arkiv/core';
+import { body, clientFingerprint, json, route } from '@/lib/http';
 import { previewContext } from '@/lib/preview-context';
 
 /**
@@ -10,7 +10,9 @@ import { previewContext } from '@/lib/preview-context';
  */
 export const POST = route(async (req) => {
   const i = await body(req, z.object({ files: z.array(z.object({ mime: z.string().max(100), bytes: z.number().int().positive() })).min(1).max(MAX_PREVIEW_PHOTOS) }));
-  const ctx = await previewContext(clientIp(req), { create: true });
+  const client = clientFingerprint(req);
+  await assertNotBlocked(client.ip);
+  const ctx = await previewContext(client, { create: true });
   const uploads = await withTenant(ctx.workspaceId, (tx) => startPhotoUploads(tx, ctx, i.files));
   return json({ uploads });
 });

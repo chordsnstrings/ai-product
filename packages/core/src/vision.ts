@@ -80,9 +80,18 @@ export async function holdForReview(tx: Tx, items: { assetId: string; flags: Med
   return held;
 }
 
-/** The given assets minus media held for review or rejected by compliance, in the same order. */
+/**
+ * The given assets minus media that can't go into new production, in the same order: held for review or rejected by
+ * compliance (plan 05 §14), usage rights expired (standard §48 creator rights expiry), or frozen by an open
+ * takedown case (plan 05 §15).
+ */
 export async function usableAssetIds(tx: Tx, ids: string[]): Promise<string[]> {
   if (!ids.length) return [];
-  const blocked = new Set((await tx`select id from assets where id = any(${ids}::uuid[]) and review_status in ('pending', 'rejected')`).map((r) => r.id as string));
+  const blocked = new Set(
+    (
+      await tx`select id from assets where id = any(${ids}::uuid[])
+                 and (review_status in ('pending', 'rejected') or rights_frozen_at is not null or rights_expires_at <= now() or deleted_at is not null)`
+    ).map((r) => r.id as string),
+  );
   return ids.filter((id) => !blocked.has(id));
 }

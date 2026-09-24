@@ -27,6 +27,7 @@ export async function MarketingShell({ children, loggedIn }: { children: ReactNo
             <Link href={f.terms}>Terms</Link>
             <Link href={f.privacy}>Privacy</Link>
             <Link href="/legal/subprocessors">Subprocessors</Link>
+            <Link href="/rights">Report a rights issue</Link>
             <a href={`mailto:${f.support}`}>Contact</a>
           </span>
         </div>

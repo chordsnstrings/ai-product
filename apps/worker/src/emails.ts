@@ -1,7 +1,7 @@
 import { withTenant } from '@arkiv/db';
 import { env, formatUsd, PLANS, PRICES, type PlanCode, type RiskIndicator } from '@arkiv/shared';
-import { sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
-import { assetUrl, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
+import { isTemplateName, quietHoursDelay, sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
+import { assetUrl, enqueue, Queues, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
 
 /**
  * Builds template data for queued emails from tenant data, and picks recipients (owners/admins by default).
@@ -16,8 +16,14 @@ async function recipients(workspaceId: string, roles = ['OWNER', 'ADMIN']): Prom
 export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, unknown>, jobId: string) {
   const ws = ctx.workspaceId;
   const app = env().APP_URL;
-  const [w] = await withTenant(ws, (tx) => tx`select slug, name from workspaces where id = ${ws}`);
+  const [w] = await withTenant(ws, (tx) => tx`select slug, name, timezone from workspaces where id = ${ws}`);
   const base = `${app}/w/${w!.slug}`;
+  // Quiet hours (plan 05 §18): marketing email queued between 20:00 and 08:00 workspace time waits until 08:00.
+  const quiet = typeof data.template === 'string' && isTemplateName(data.template) ? quietHoursDelay(data.template, w!.timezone as string | null) : null;
+  if (quiet) {
+    await withTenant(ws, (tx) => enqueue(tx, ws, Queues.sendEmail, data, { runAfter: quiet, singletonKey: `quiet:${jobId}` }));
+    return;
+  }
   const send = async <T extends TemplateName>(t: T, d: TemplateMap[T], to?: string[]) => {
     for (const email of to ?? (await recipients(ws))) {
       await sendEmail(t, email, d, { idempotencyKey: `${jobId}:${t}:${email}`, workspaceId: ws });

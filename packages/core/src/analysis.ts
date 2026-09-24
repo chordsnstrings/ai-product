@@ -1,5 +1,6 @@
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, FREE_EXPLORATION, PROVISIONAL, newId, type ProjectState } from '@arkiv/shared';
+import { notePromptInjection, recordAbuseSignal } from './abuse';
 import { allowKey, isAllowlisted } from './allowlist';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
@@ -218,12 +219,15 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
   //    (a serum page whose store menu lists "Sunscreen" is still a serum). Photo-only uploads are checked on
   //    what the label says, after extraction.
   const scopeText = extracted ? productScopeText(extracted) : '';
+  // Imported page text is data, never instructions (§48); an injection attempt is still recorded for trust & safety.
+  if (extracted) await withTenant(ws, (tx) => notePromptInjection(tx, { workspaceId: ws, source: 'product_page', text: `${scopeText}\n${extracted.rawText}`, subject: { type: 'sku', id: skuId } }));
   const excluded = excludedProductReason(scopeText);
   const other = scopeText.trim() ? nonSkincareCategory(scopeText) : null;
   if (excluded || other) {
     const reason = excluded ?? `We’re built for skincare. This looks like ${other}.`;
     await withTenant(ws, async (tx) => {
       await tx`update skus set status = 'rejected', reject_reason = ${reason} where id = ${skuId}`;
+      await recordAbuseSignal(tx, { kind: 'prohibited_upload', key: allowKey.ws(ws)!, workspaceId: ws, detail: { skuId, stage: 'page', reason } });
       await step(tx, ws, skuId, 'identify', 'failed', reason);
       await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason });
       await recordFunnel('SKU_REJECTED', { workspaceId: ws, props: { reason } }, tx);
@@ -289,6 +293,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       const reason = labelExcluded ?? 'We’re built for skincare. This product doesn’t look like skincare.';
       await withTenant(ws, async (tx) => {
         await tx`update skus set status = 'rejected', reject_reason = ${reason} where id = ${skuId}`;
+        await recordAbuseSignal(tx, { kind: 'prohibited_upload', key: allowKey.ws(ws)!, workspaceId: ws, detail: { skuId, stage: 'label', reason } });
         await step(tx, ws, skuId, 'identify', 'failed', reason);
         await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason });
         await settle(tx, ctx, auth.authorizationId, 'consumed');

@@ -5,7 +5,7 @@ import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs, daysFrom } from '@/lib/prefs';
 import { conversionDrop, hardFailAlert, SLA_HOURS, slaBreach } from '@/lib/pulse';
-import { notTest } from '@/lib/sql';
+import { integrationFresh, notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
 
 export const metadata = { title: 'Pulse' };
@@ -74,7 +74,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
                              and created_at >= date_trunc('day', now(), ${tz}) - interval '7 days' and created_at < date_trunc('day', now(), ${tz}) ${t()}`;
     // Appendix C: all variable cost over the distinct paid ads customers actually exported.
     const usable = await costPerUsableExport(tx, { days, includeTest: prefs.includeTest });
-    const [conn] = await tx`select count(*)::int as n, count(*) filter (where status = 'active' and last_success_at > now() - interval '7 days')::int as fresh from integrations where status <> 'disconnected' ${t()}`;
+    const [conn] = await tx`select count(*)::int as n, count(*) filter (where ${integrationFresh(tx)})::int as fresh from integrations where status <> 'disconnected' ${t()}`;
     const [risk] = await tx`select count(*)::int as n from risk_flags where raised_at >= date_trunc('day', now(), ${tz}) and resolved_at is null ${t()}`;
     const queues = await tx`
       select 'Restricted claims' as q, count(*)::int as n, min(created_at) as oldest, '/claims' as href from claims where status = 'RESTRICTED' ${t()}
