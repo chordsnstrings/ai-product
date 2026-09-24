@@ -28,13 +28,14 @@ revoke all on function stripe_event_complete from public;
 grant execute on function stripe_event_complete to app_rw, system_rw;
 
 -- ───────────── Outbox singleton keys (standard §35, §39) ─────────────
--- At most one undispatched job per (queue, singleton key), enforced by the database so concurrent enqueues
--- cannot both insert. Existing duplicates (from the old select-then-insert) are folded into the oldest row.
+-- At most one undispatched job per (workspace, queue, singleton key), enforced by the database so concurrent
+-- enqueues cannot both insert. Scoped by workspace: one tenant's key can never suppress another tenant's job.
+-- Existing duplicates (from the old select-then-insert) are folded into the oldest row.
 update outbox o set dispatched_at = now()
-  from (select id, row_number() over (partition by queue, singleton_key order by created_at, id) as rn
+  from (select id, row_number() over (partition by workspace_id, queue, singleton_key order by created_at, id) as rn
           from outbox where singleton_key is not null and dispatched_at is null) d
  where o.id = d.id and d.rn > 1;
-create unique index outbox_singleton_pending on outbox (queue, singleton_key)
+create unique index outbox_singleton_pending on outbox (workspace_id, queue, singleton_key)
   where singleton_key is not null and dispatched_at is null;
 -- Sweeps enqueue a reminder once per key ever (dispatched rows included).
 create index outbox_singleton on outbox (workspace_id, queue, singleton_key) where singleton_key is not null;

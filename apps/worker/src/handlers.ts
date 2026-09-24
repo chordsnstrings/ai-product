@@ -119,7 +119,7 @@ export const handlers: Record<string, Handler> = {
     const skus = await withTenant(ctx.workspaceId, (tx) => tx`select id from skus where status = 'active' order by catalogue_no limit 30`);
     let n = 0;
     for (const s of skus) n += await generateRecommendations(ctx, s.id as string, week).catch((e) => (e instanceof DomainError ? 0 : Promise.reject(e)));
-    if (n) await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week }, { singletonKey: `brief:${week}` }));
+    if (n) await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week }, { singletonKey: `brief:${ctx.workspaceId}:${week}` }));
     return n;
   },
   [Queues.exportWorkspace]: async (ctx, d, jobId) => {

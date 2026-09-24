@@ -37,7 +37,7 @@ async function enqueueFor(tx: Parameters<Parameters<typeof withSystem>[0]>[0], w
   await tx`insert into outbox (workspace_id, queue, payload, singleton_key, priority)
            select ${workspaceId}, ${queue}, ${tx.json({ ...payload, workspaceId })}, ${singletonKey}, ${priority}
            where not exists (select 1 from outbox where workspace_id = ${workspaceId} and queue = ${queue} and singleton_key = ${singletonKey})
-           on conflict (queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing`;
+           on conflict (workspace_id, queue, singleton_key) where singleton_key is not null and dispatched_at is null do nothing`;
 }
 
 const sysCtx = (workspaceId: string, id: string): TenantContext => ({ ...systemContext(workspaceId, id), actor: { kind: 'system', id } });

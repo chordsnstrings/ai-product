@@ -78,6 +78,10 @@ describe('non-overlapping jobs and atomic singleton keys (standard §35/§39, x-
     await ownerPool()`update outbox set dispatched_at = now() where id = ${pending[0]!.id}`;
     expect(await withTenant(t.workspaceId, (tx) => enqueue(tx, t.workspaceId, Queues.exportWorkspace, {}, { singletonKey: `export:${t.workspaceId}` }))).toBe(true);
     expect(await withTenant(t.workspaceId, (tx) => enqueue(tx, t.workspaceId, Queues.exportWorkspace, {}, { singletonKey: `export:${t.workspaceId}` }))).toBe(false);
+    // Keys are per workspace: another tenant's pending job with the same key never suppresses this one's.
+    const other = await makeTenant();
+    expect(await withTenant(other.workspaceId, (tx) => enqueue(tx, other.workspaceId, Queues.sendEmail, { template: 'weekly_brief' }, { singletonKey: 'brief:2026-09-21' }))).toBe(true);
+    expect(await withTenant(t.workspaceId, (tx) => enqueue(tx, t.workspaceId, Queues.sendEmail, { template: 'weekly_brief' }, { singletonKey: 'brief:2026-09-21' }))).toBe(true);
   });
 
   it('builds one export for a double click, even after the first job was dispatched', async () => {

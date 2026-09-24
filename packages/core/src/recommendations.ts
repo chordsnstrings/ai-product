@@ -64,6 +64,7 @@ export interface Scored {
   confidence: number;
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BASIS_CONFIDENCE = { performance: 0.55, context_limited: 0.4, cold_start: 0.3 } as const;
 const LEARNING_CONFIDENCE: Record<string, number> = { ACTIONABLE: 0.2, DIRECTIONAL: 0.1, WEAKENING: -0.1, INVALIDATED: -0.2 };
 
@@ -127,7 +128,8 @@ export function scoreProposal(p: Proposal, s: ScoringContext): Scored {
   const score = (Object.keys(WEIGHTS) as (keyof typeof WEIGHTS)[]).reduce((acc, k) => acc + WEIGHTS[k] * b[k], 0);
   const themeMatched = !!theme && theme.o > 0;
   const used = [...(themeMatched && theme!.t.id ? [theme!.t.id] : []), ...learn.map((l) => l.id).filter((x): x is string => !!x)];
-  const rationaleIds = [...new Set([...(p.rationaleIds ?? []), ...used])].slice(0, 12);
+  // Only packet item ids (uuids) are stored; anything else was dropped by the gate or never belonged here.
+  const rationaleIds = [...new Set([...(p.rationaleIds ?? []), ...used])].filter((id) => UUID.test(id)).slice(0, 12);
   return { proposal: p, slot: slotFor(p, s), score: gates.passed ? score : 0, breakdown: b, gates, rationaleIds, confidence: recommendationConfidence(s.basis, learn, themeMatched) };
 }
 
