@@ -4,6 +4,7 @@ import { saveAsset } from './assets';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { fetchImage, findSize, type ExtractedVariant } from './ingest';
+import { usableAssetIds } from './vision';
 
 /**
  * Product variants (standard §42 "Variants / sizes: store variant-specific price/media where relevant; do not
@@ -145,7 +146,8 @@ export function variantTruth(variants: readonly SkuVariant[], chosen: SkuVariant
 export async function referenceAssetIds(tx: Tx, skuId: string, projectId: string | null): Promise<string[]> {
   const [fp] = await tx`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and active`;
   const variant = projectId ? await projectVariant(tx, projectId) : null;
-  return [...new Set([...(variant?.imageAssetIds ?? []), ...((fp?.reference_asset_ids as string[]) ?? [])])].slice(0, 2);
+  // Media held for compliance review (before/after, possible minors) or rejected is never a production input (plan 05 §14).
+  return (await usableAssetIds(tx, [...new Set([...(variant?.imageAssetIds ?? []), ...((fp?.reference_asset_ids as string[]) ?? [])])])).slice(0, 2);
 }
 
 /**

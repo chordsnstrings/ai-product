@@ -19,8 +19,7 @@ import { planSteps, step } from './progress';
 import { recordFacts, type FactInput } from './product-truth';
 import { recordVariants } from './sku-variants';
 import { isTerminal, transition } from './projects';
-import { EXTRACT_PRODUCT_SYSTEM } from './prompts';
-import { cutout, dominantColors, toJpegBase64 } from './vision';
+import { cutout, dominantColors, holdForReview, nameReviewFlags, toJpegBase64, usableAssetIds, type MediaReviewFlags } from './vision';
 import { nextCatalogueNo } from './workspaces';
 
 /**
@@ -215,7 +214,7 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       token: auth.token,
       task: 'extract.product_facts',
       subject: { type: 'sku', id: skuId },
-      system: EXTRACT_PRODUCT_SYSTEM,
+      template: 'extract-product',
       content: [
         ...images,
         { type: 'untrusted', sourceId: 'product_page', text: extracted ? JSON.stringify({ name: extracted.name, description: extracted.description, ingredients: extracted.ingredients, size: extracted.sizeText, price: extracted.priceMicros ? extracted.priceMicros / 1e6 : null }).slice(0, 12000) : 'No product page; photos only.' },
@@ -235,6 +234,19 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
         await settle(tx, ctx, auth.authorizationId, 'consumed');
       });
       return { status: 'rejected', reason };
+    }
+    // Before/after photos and photos that may show minors wait for compliance review (plan 05 §14, standard §48):
+    // the analyst's look plus the photo's own name/source. They never become fingerprint references or cut-outs.
+    const usable = await holdFlaggedPhotos(ws, photoIds.slice(0, 3), x.imageReview ?? []);
+    if (!usable.length) {
+      await withTenant(ws, async (tx) => {
+        await tx`update progress_steps set status = 'failed', detail = ${PHOTOS_IN_REVIEW} where subject_id = ${skuId} and status = 'active'`;
+        // The merchant can add a plain photo and try again (retryAnalysis) without waiting for our review.
+        await tx`update skus set status = 'needs_input' where id = ${skuId}`;
+        await transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: 'photos_in_review' });
+        await settle(tx, ctx, auth.authorizationId, 'consumed');
+      });
+      return { status: 'needs_input', reason: 'photos_in_review' };
     }
     await withTenant(ws, async (tx) => {
       const vf: FactInput[] = [
@@ -263,7 +275,8 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
     // 6. Visual Fingerprint + cut-out (deterministic keying; a photo keying can't separate gets one background-removal
     //    try when the storyboard first needs the cut-out — see cutout.ts).
     await withTenant(ws, (tx) => step(tx, ws, skuId, 'fingerprint', 'active'));
-    const cut = await cutout(photos[0]!);
+    const cutFrom = photoIds.indexOf(usable[0]!);
+    const cut = await cutout(photos[cutFrom]!);
     const colors = await dominantColors(cut.png);
     await withTenant(ws, async (tx) => {
       const c = await saveAsset(tx, ws, {
@@ -272,13 +285,13 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
         kind: 'cutout',
         skuId,
         source: 'generated',
-        lineage: { from: photoIds[0], keyed: cut.keyed, technique: cut.technique, coverage: Math.round(cut.coverage * 1000) / 1000, spread: Math.round(cut.spread * 1000) / 1000 },
+        lineage: { from: usable[0], keyed: cut.keyed, technique: cut.technique, coverage: Math.round(cut.coverage * 1000) / 1000, spread: Math.round(cut.spread * 1000) / 1000 },
       });
       const [v] = await tx`select coalesce(max(version), 0) + 1 as v from visual_fingerprints where sku_id = ${skuId}`;
       await tx`update visual_fingerprints set active = false where sku_id = ${skuId}`;
       await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text, brand_text,
                  package_type, closure, dominant_colors, transparency, thresholds)
-               values (${ws}, ${skuId}, ${v!.v}, ${photoIds}, ${c.id}, ${x.labelText}, ${x.brand}, ${x.packaging.type}, ${x.packaging.closure},
+               values (${ws}, ${skuId}, ${v!.v}, ${[...usable, ...(await usableAssetIds(tx, photoIds.slice(3)))]}, ${c.id}, ${x.labelText}, ${x.brand}, ${x.packaging.type}, ${x.packaging.closure},
                  ${tx.json(colors)}, ${x.packaging.transparent ? 'transparent' : 'opaque'},
                  ${tx.json({ paletteDistanceMax: 70, labelMustMatch: !!x.labelText } as never)})`;
       await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed, technique: cut.technique });
@@ -309,6 +322,28 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
     });
     throw e;
   }
+}
+
+const PHOTOS_IN_REVIEW = 'Your photos need a quick check by our team (before/after or people in shot). Add a plain photo of the product to continue now.';
+
+/**
+ * Hold the analysed photos the product analyst flagged (by position) or whose source names a before/after or a
+ * child, and return the ones production may use, in order.
+ */
+async function holdFlaggedPhotos(ws: string, photoIds: string[], review: { index: number; beforeAfter: boolean; possibleMinor: boolean }[]): Promise<string[]> {
+  return withTenant(ws, async (tx) => {
+    const rows = await tx`select id, origin from assets where id = any(${photoIds}::uuid[])`;
+    const items = photoIds.map((id, i) => {
+      const seen = review.find((r) => r.index === i);
+      const named = nameReviewFlags(JSON.stringify(rows.find((r) => r.id === id)?.origin ?? {}));
+      const sources: MediaReviewFlags['sources'] = [];
+      if (seen && (seen.beforeAfter || seen.possibleMinor)) sources.push('vision');
+      if (named.beforeAfter || named.possibleMinor) sources.push('name');
+      return { assetId: id, flags: { beforeAfter: !!seen?.beforeAfter || named.beforeAfter, possibleMinor: !!seen?.possibleMinor || named.possibleMinor, sources } };
+    });
+    await holdForReview(tx, items);
+    return usableAssetIds(tx, photoIds);
+  });
 }
 
 // ───────────── A failed analysis (plan 03 P3 edge cases) ─────────────

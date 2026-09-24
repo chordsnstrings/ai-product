@@ -9,6 +9,7 @@ import type { TenantContext } from './context';
 import { actorString } from './context';
 import { hit } from './rate-limit';
 import { quarantineKey, storage } from './storage';
+import { holdForReview, nameReviewFlags } from './vision';
 
 /**
  * Upload pipeline (plan 02 §3 layer 4; standard §48 malicious uploads):
@@ -169,5 +170,14 @@ export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind:
   assertCan(ctx, 'sku.edit');
   await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, tx);
   const v = await validateMedia(raw);
-  return saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });
+  const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });
+  // Merchant media named as a before/after or showing children waits for compliance review (plan 05 §14).
+  if (REVIEWABLE_KINDS.has(kind)) {
+    const named = nameReviewFlags(JSON.stringify(origin));
+    await holdForReview(tx, [{ assetId: asset.id, flags: { ...named, sources: ['name'] } }]);
+  }
+  return asset;
 }
+
+/** Merchant-supplied media that can end up in an ad (and so in the before/after and minors review). */
+const REVIEWABLE_KINDS: ReadonlySet<AssetKind> = new Set<AssetKind>(['product_photo', 'reference_view', 'creator_footage', 'historical_creative']);

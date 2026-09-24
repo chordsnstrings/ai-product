@@ -43,6 +43,138 @@ export async function repeatedFidelityFailures(tx: Tx, days: number, opts: { inc
   return { paid, repeated, rate: paid ? repeated / paid : NaN };
 }
 
+// ───────────── QA calibration against human verdicts (plan 05 §13) ─────────────
+
+/** One reviewed automated check: what QA decided, what the reviewer said, and a numeric score if it had one. */
+export interface ReviewedCheck {
+  check: string;
+  provider: string;
+  /** Automated verdict: true = the check passed. */
+  autoPass: boolean;
+  agree: boolean;
+  /** e.g. the product-fidelity palette distance. */
+  score?: number | null;
+}
+
+export interface CalibrationRow {
+  check: string;
+  provider: string;
+  /** A "positive" is a defect: the check failed the output. */
+  tp: number;
+  fp: number;
+  fn: number;
+  tn: number;
+  precision: number | null;
+  recall: number | null;
+  /** Median score of outputs reviewers judged good / defective (null when unscored). */
+  goodScoreMedian: number | null;
+  badScoreMedian: number | null;
+  /** A threshold between the two (null without both sides or when they overlap the wrong way). */
+  suggestedThreshold: number | null;
+}
+
+const median = (xs: number[]) => {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
+};
+
+/**
+ * QA precision/recall vs human verdicts, by check and provider (plan 05 §13 Metrics). The human truth is the
+ * automated verdict when the reviewer agreed and its opposite when they disagreed. Precision: of the outputs QA
+ * failed, how many were really defective; recall: of the really defective ones, how many QA caught. Scored checks
+ * also get the median score of good and defective outputs and a threshold between them — input for QA threshold
+ * tuning ("disagreements feed … QA threshold tuning").
+ */
+export function qaCalibration(rows: ReviewedCheck[]): CalibrationRow[] {
+  const groups = new Map<string, ReviewedCheck[]>();
+  for (const r of rows) {
+    const k = `${r.check}\u0000${r.provider}`;
+    groups.set(k, [...(groups.get(k) ?? []), r]);
+  }
+  return [...groups.values()]
+    .map((g) => {
+      let tp = 0, fp = 0, fn = 0, tn = 0;
+      const good: number[] = [];
+      const bad: number[] = [];
+      for (const r of g) {
+        const defective = r.agree ? !r.autoPass : r.autoPass;
+        if (!r.autoPass && defective) tp++;
+        else if (!r.autoPass && !defective) fp++;
+        else if (r.autoPass && defective) fn++;
+        else tn++;
+        if (typeof r.score === 'number' && Number.isFinite(r.score)) (defective ? bad : good).push(r.score);
+      }
+      const gm = median(good);
+      const bm = median(bad);
+      return {
+        check: g[0]!.check,
+        provider: g[0]!.provider,
+        tp,
+        fp,
+        fn,
+        tn,
+        precision: tp + fp ? tp / (tp + fp) : null,
+        recall: tp + fn ? tp / (tp + fn) : null,
+        goodScoreMedian: gm,
+        badScoreMedian: bm,
+        // Higher distance = worse: a threshold only makes sense when defective outputs score above good ones.
+        suggestedThreshold: gm !== null && bm !== null && bm > gm ? Math.round(((gm + bm) / 2) * 10) / 10 : null,
+      };
+    })
+    .sort((a, b) => a.check.localeCompare(b.check) || a.provider.localeCompare(b.provider));
+}
+
+/**
+ * Reviewed checks for calibration (admin/system role, cross-tenant aggregates): each verdict joined to the stored
+ * QA report check it judged and to the provider(s) that rendered the project's scenes.
+ */
+export async function reviewedChecks(tx: Tx, opts: { includeTest?: boolean } = {}): Promise<ReviewedCheck[]> {
+  const rows = await tx`
+    select r.verdicts, p.qa_report,
+           coalesce((select string_agg(distinct j.provider, '+' order by j.provider) from provider_jobs j
+                     where j.workspace_id = r.workspace_id and j.project_id = r.project_id and (j.task like 'video.%' or j.task like 'image.%')), 'none') as provider
+    from qa_reviews r join projects p on p.id = r.project_id and p.workspace_id = r.workspace_id
+    where (${!!opts.includeTest} or r.workspace_id not in (select id from workspaces where is_test))`;
+  const out: ReviewedCheck[] = [];
+  for (const r of rows) {
+    const checks = ((r.qa_report as QaReport | null)?.checks ?? []) as CheckResult[];
+    for (const [key, verdict] of Object.entries((r.verdicts ?? {}) as Record<string, string>)) {
+      const n = Number(key.split(':')[0]);
+      const c = checks[n - 1];
+      if (!c || `${n}:${c.check}` !== key) continue;
+      const score = typeof c.data?.paletteDistance === 'number' ? (c.data.paletteDistance as number) : null;
+      out.push({ check: c.check, provider: r.provider as string, autoPass: !!c.pass, agree: verdict === 'agree', score });
+    }
+  }
+  return out;
+}
+
+/** Label-OCR diff for QA review (plan 05 §13): reference label words vs the words read on the output. */
+export function labelDiff(reference: string | null | undefined, read: string | null | undefined): { word: string; status: 'same' | 'missing' | 'extra' }[] {
+  const words = (s: string | null | undefined) => (s ?? '').split(/\s+/).map((w) => w.trim()).filter(Boolean);
+  const norm = (w: string) => w.toLowerCase().replace(/[^a-z0-9%]/g, '');
+  const ref = words(reference);
+  const got = words(read);
+  // Longest common subsequence on normalised words, so a reordered or dropped word shows where it went wrong.
+  const L = Array.from({ length: ref.length + 1 }, () => new Array<number>(got.length + 1).fill(0));
+  for (let i = ref.length - 1; i >= 0; i--) for (let j = got.length - 1; j >= 0; j--) L[i]![j] = norm(ref[i]!) === norm(got[j]!) ? L[i + 1]![j + 1]! + 1 : Math.max(L[i + 1]![j]!, L[i]![j + 1]!);
+  const out: { word: string; status: 'same' | 'missing' | 'extra' }[] = [];
+  let i = 0, j = 0;
+  while (i < ref.length && j < got.length) {
+    if (norm(ref[i]!) === norm(got[j]!)) {
+      out.push({ word: got[j]!, status: 'same' });
+      i++;
+      j++;
+    } else if (L[i + 1]![j]! >= L[i]![j + 1]!) out.push({ word: ref[i++]!, status: 'missing' });
+    else out.push({ word: got[j++]!, status: 'extra' });
+  }
+  while (i < ref.length) out.push({ word: ref[i++]!, status: 'missing' });
+  while (j < got.length) out.push({ word: got[j++]!, status: 'extra' });
+  return out;
+}
+
 const CUSTOMER_LABEL: Partial<Record<CheckResult['check'], string>> = {
   product_fidelity: 'Product accuracy',
   visual: 'Visual quality',

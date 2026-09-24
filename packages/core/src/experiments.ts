@@ -153,6 +153,14 @@ interface ObsAgg {
 }
 
 /**
+ * A result that would be actionable while an operational confounder (stock-out, site outage, price change…)
+ * overlapped the test is OPERATIONALLY_CONFOUNDED instead (§45): it must not create or strengthen a learning.
+ */
+export function withConfounders(state: ExperimentState, confounders: number): ExperimentState {
+  return confounders > 0 && state === 'ACTIONABLE' ? 'OPERATIONALLY_CONFOUNDED' : state;
+}
+
+/**
  * Compute results for an experiment (job `compute-results`). Excludes merchant/auto confounder windows from
  * causal interpretation (§45). Writes experiment_results, updates experiment state and learnings.
  */
@@ -211,7 +219,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   const best = primary.find((s) => s.state === 'ACTIONABLE') ?? primary.find((s) => s.state === 'DIRECTIONAL') ?? primary.find((s) => s.state === 'INCONCLUSIVE');
   let expState: ExperimentState = agg.length ? 'GATHERING_SIGNAL' : (e.state as ExperimentState);
   if (best) expState = best.state as ExperimentState;
-  if (confounded!.n > 0 && expState === 'ACTIONABLE') expState = 'OPERATIONALLY_CONFOUNDED';
+  expState = withConfounders(expState, confounded!.n);
   const prev = e.state as string;
   if (agg.length) await setExperimentState(tx, ctx, experimentId, expState, 'results');
   if (prev !== expState && agg.length) await emit(tx, ctx, 'CONFIDENCE_CHANGED', { type: 'experiment', id: experimentId }, { from: prev, to: expState }, { skuId: e.sku_id as string });

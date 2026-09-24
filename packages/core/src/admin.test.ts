@@ -60,7 +60,9 @@ describe('permissions', () => {
     await expect(requestOpsCommand(support, 'job.retry', { queue: 'extract-genome', jobId: 'j3' }, 'retry genome')).rejects.toThrow(/no provider spend/);
     await expect(requestOpsCommand(support, 'job.cancel', { queue: 'send-email', jobId: 'j1' }, 'stop it')).rejects.toThrow(/role/);
     await expect(requestOpsCommand(support, 'dlq.requeue', { queue: 'produce-project', limit: 100 }, 'redrive all')).rejects.toThrow(/role/);
-    await requestOpsCommand(ops, 'job.retry', { queue: 'produce-project', jobId: 'j2' }, 'retry render');
+    // A retry that can spend needs the operator to confirm the fresh Cost Governor estimate (plan 05 §12).
+    await expect(requestOpsCommand(ops, 'job.retry', { queue: 'produce-project', jobId: 'j2' }, 'retry render')).rejects.toThrow(/may spend/);
+    await requestOpsCommand(ops, 'job.retry', { queue: 'produce-project', jobId: 'j2', confirmSpend: true }, 'retry render');
     await requestOpsCommand(ops, 'dlq.requeue', { queue: 'produce-project', limit: 100 }, 'redrive all');
     const cmds = await ownerPool()`select kind, payload->>'queue' as queue from ops_commands order by created_at`;
     expect(cmds.map((c) => `${c.kind}:${c.queue}`)).toEqual(['job.retry:send-email', 'job.retry:produce-project', 'dlq.requeue:produce-project']);

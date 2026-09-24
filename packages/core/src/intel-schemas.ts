@@ -23,6 +23,8 @@ export const ProductExtraction = z.object({
   suggestedViews: z.array(z.enum(['front', 'side', 'back', 'swatch', 'closure', 'in_hand'])).max(4),
   assetQualityConfidence: z.number().min(0).max(1),
   multipleProductsVisible: z.boolean(),
+  /** Photos that need compliance review before use (plan 05 §14 "before/after and minors"), by 0-based position. */
+  imageReview: z.array(z.object({ index: z.number().int().min(0).max(9), beforeAfter: z.boolean(), possibleMinor: z.boolean() })).max(10).optional(),
 });
 export type ProductExtraction = z.infer<typeof ProductExtraction>;
 
@@ -120,5 +122,7 @@ export const FidelityCheck = z.object({
   skinAlteredUnnaturally: z.boolean(),
   impliesMedicalResult: z.boolean(),
   notes: z.string().max(300),
+  /** Label text read on the generated frame (fidelity@1.1.0), for the QA review OCR diff (plan 05 §13). */
+  labelTextRead: z.string().max(400).nullable().optional(),
 });
 export type FidelityCheck = z.infer<typeof FidelityCheck>;

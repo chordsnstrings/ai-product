@@ -66,4 +66,54 @@ describe('job.cancel on a production job (standard §38; arch-11)', () => {
     const [cmd] = await ownerPool()`select status, result from ops_commands`;
     expect(cmd).toMatchObject({ status: 'done', result: { production: { status: 'not cancelled', reason: 'This ad has already been delivered.' } } });
   });
+
+  it('reports what a cancel means for the job’s dispatch state (§39)', async () => {
+    const boss = { getJobById: async () => ({ id: 'job-2', state: 'active', data: {} }), cancel: async () => ({ affected: 1 }) } as unknown as PgBoss;
+    await ownerPool()`insert into ops_commands (kind, payload, requested_by, reason) values ('job.cancel', ${ownerPool().json({ queue: 'send-email', jobId: 'job-2' })}, ${newId()}, 'stop the send')`;
+    await processOpsCommands(boss);
+    const [cmd] = await ownerPool()`select status, result from ops_commands`;
+    expect(cmd).toMatchObject({ status: 'done', result: { dispatchState: 'active', dispatch: expect.stringMatching(/^in flight/) } });
+  });
+});
+
+describe('job.bulk_retry (plan 05 §12)', () => {
+  it('retries the chosen failed jobs, skipping held workspaces and jobs that are no longer failed', async () => {
+    const ok = await makeTenant();
+    const held = await makeTenant({ state: 'SUSPENDED' });
+    const jobs: Record<string, { id: string; state: string; data: { workspaceId: string } }> = {
+      a: { id: 'a', state: 'failed', data: { workspaceId: ok.workspaceId } },
+      b: { id: 'b', state: 'failed', data: { workspaceId: held.workspaceId } },
+      c: { id: 'c', state: 'completed', data: { workspaceId: ok.workspaceId } },
+    };
+    const retried: string[] = [];
+    const boss = {
+      getJobById: async (_q: string, id: string) => jobs[id] ?? null,
+      retry: async (_q: string, ids: string | string[]) => {
+        retried.push(...[ids].flat());
+        return { affected: [ids].flat().length };
+      },
+    } as unknown as PgBoss;
+    await ownerPool()`insert into ops_commands (kind, payload, requested_by, reason) values ('job.bulk_retry', ${ownerPool().json({ queue: 'send-email', errorClass: 'timeout', jobIds: ['a', 'b', 'c', 'gone'] })}, ${newId()}, 'provider recovered')`;
+    await processOpsCommands(boss);
+    expect(retried).toEqual(['a']);
+    const [cmd] = await ownerPool()`select status, result from ops_commands`;
+    expect(cmd).toMatchObject({ status: 'done', result: { requested: 4, retried: 1, skipped: 3, errorClass: 'timeout' } });
+  });
+});
+
+describe('eval.run on a model dataset (plan 05 §11)', () => {
+  it('runs the candidate through the gateway and stores per-case latency and cost on the run', async () => {
+    const staffId = newId();
+    await ownerPool()`insert into staff_users (id, email, name, password_hash, roles) values (${staffId}, ${`${staffId.slice(-6)}@arkiv.test`}, 'Eng', 'x', '{ENGINEERING}')`;
+    const [run] = await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by)
+                                    values ('extract.product_facts', 'extract-product@1.1.0', 'claude-opus-5-5', 'extract.packaging', 'queued', ${staffId}) returning id`;
+    await ownerPool()`insert into ops_commands (kind, payload, requested_by, reason)
+                      values ('eval.run', ${ownerPool().json({ dataset: 'extract.packaging', evalRunId: run!.id, task: 'extract.product_facts', model: 'claude-opus-5-5', promptVersion: 'extract-product@1.1.0' })}, ${staffId}, 'candidate')`;
+    await processOpsCommands({} as PgBoss);
+    const [r] = await ownerPool()`select status, cases, score, cost_micros, latency_p50_ms, results from eval_runs where id = ${run!.id}`;
+    expect(r).toMatchObject({ status: 'passed', cases: 5 });
+    expect(Number(r!.cost_micros)).toBeGreaterThan(0);
+    expect(r!.latency_p50_ms).not.toBeNull();
+    expect((r!.results as { latencyMs: number; costMicros: number }[]).every((c) => c.costMicros > 0 && c.latencyMs >= 0)).toBe(true);
+  });
 });

@@ -25,6 +25,8 @@ export interface ClaimRow {
   origin: string;
   sourceText: string | null;
   blockReason: string | null;
+  /** Our compliance team's note on a RESTRICTED claim (kept restricted, or what evidence is needed). */
+  complianceNote: string | null;
 }
 
 const toClaim = (r: Record<string, unknown>): ClaimRow => ({
@@ -41,6 +43,7 @@ const toClaim = (r: Record<string, unknown>): ClaimRow => ({
   origin: r.origin as string,
   sourceText: (r.source_text as string) ?? null,
   blockReason: (r.block_reason as string) ?? null,
+  complianceNote: (r.compliance_note as string) ?? null,
 });
 
 export async function proposeClaim(

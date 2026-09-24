@@ -8,7 +8,6 @@ import { Genome } from './intel-schemas';
 import { mockGenome } from './mock-intel';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, Queues } from './outbox';
-import { GENOME_SYSTEM } from './prompts';
 
 /**
  * CreativeGenomeService (§19): every historical or new ad gets a versioned structured genome using the
@@ -47,7 +46,7 @@ export async function extractGenome(ctx: TenantContext, creativeId: string) {
       token: auth.token,
       task: 'genome.extract',
       subject: { type: 'creative', id: creativeId },
-      system: GENOME_SYSTEM,
+      template: 'genome',
       content: [{ type: 'untrusted', sourceId: 'ad_copy', text: copy.slice(0, 8000) }, { type: 'text', text: `Taxonomy v${Taxonomy.version}.` }],
       schema: Genome,
       mock: () => mockGenome(copy),

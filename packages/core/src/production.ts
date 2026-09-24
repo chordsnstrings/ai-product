@@ -588,14 +588,16 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       const exactFallback = async (s: SceneRow, n: number, why: string): Promise<Slot> => {
         await withTenant(ws, (tx) => step(tx, ws, projectId, 'accuracy', 'active', 'Using your exact product photo for this shot'));
         const prior = fallbackFrame(s.id);
+        // Recorded on the report so the QA review queue finds "failed QA twice (technique switched)" (plan 05 §13).
+        const techniqueSwitch = { sceneId: s.id, from: 'generative', to: 'exact_product_composite', why };
         if (prior?.asset_id) {
-          checks.push({ check: 'product_fidelity', pass: true, hard: false, detail: `Scene ${n}: switched to exact product composite (${why}); checked earlier` });
+          checks.push({ check: 'product_fidelity', pass: true, hard: false, detail: `Scene ${n}: switched to exact product composite (${why}); checked earlier`, data: { techniqueSwitch } });
           return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
         }
         const fb = await exactProductFrame(imagery, { purpose: s.purpose });
         if (!fb) throw new FinalQaFailure(`Scene ${n}: repeated QA failure and no exact product image to fall back to`);
         const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: 'The exact product photo placed on a plain studio backdrop', frameBytes: fb.bytes, referenceBytes: refs, fingerprint, planText: 'exact product composite', attempt: 3 });
-        checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: switched to exact product composite (${why}) — ${c.detail}` })));
+        checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: switched to exact product composite (${why}) — ${c.detail}`, data: { ...(c.data ?? {}), techniqueSwitch } })));
         if (hardFidelityFail(res)) throw new FinalQaFailure(`Scene ${n}: even the exact product composite failed product QA`);
         const saved = await saveFrame(s, fb.bytes, fb.technique, { ...fb.lineage, fallback: true, reason: why }, res);
         return still(s, n, { bytes: fb.bytes, ...saved, technique: fb.technique });

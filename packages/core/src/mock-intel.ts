@@ -51,6 +51,8 @@ export function mockExtraction(input: { name?: string; description?: string; tex
     suggestedViews: ['side', 'swatch'],
     assetQualityConfidence: 0.8,
     multipleProductsVisible: false,
+    // Test hooks: page text markers make the mock analyst flag the first photo for compliance review.
+    imageReview: /\[\[review:before_after\]\]/.test(all) ? [{ index: 0, beforeAfter: true, possibleMinor: false }] : /\[\[review:minor\]\]/.test(all) ? [{ index: 0, beforeAfter: false, possibleMinor: true }] : [],
   };
 }
 

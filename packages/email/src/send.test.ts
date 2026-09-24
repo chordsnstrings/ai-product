@@ -42,3 +42,18 @@ describe('email footer (plan 05 §20 support email setting)', () => {
     expect(devOutbox.at(-1)!.html).toContain('help@arkiv.example');
   });
 });
+
+describe('compliance emails (plan 05 §14)', () => {
+  it('renders the evidence request, out-of-scope, guidance and media review emails', async () => {
+    const ev = await renderEmail('claim_evidence_request', { claim: 'Clinically proven to reduce redness', productName: 'Dew Serum', note: 'Send the study summary.', url: 'http://localhost/w/x/products/1/claims' });
+    expect(ev.subject).toBe('More evidence needed: Clinically proven to reduce redness');
+    expect(ev.html).toContain('Send the study summary.');
+    const oos = await renderEmail('sku_out_of_scope', { productName: 'Daily SPF 50', reason: 'Sunscreens are OTC drugs', url: 'http://localhost/w/x/products' });
+    expect(oos.html).toContain('Sunscreens are OTC drugs');
+    const g = await renderEmail('claims_guidance', { workspaceName: 'Dew Co', blocked: 3, examples: ['Cures acne'], url: 'http://localhost/w/x/products' });
+    expect(g.html).toContain('Cures acne');
+    const m = await renderEmail('media_review_result', { productName: 'Dew Serum', outcome: 'rejected', note: 'It shows a before/after comparison.', url: 'http://localhost/w/x/products/1' });
+    expect(m.subject).toMatch(/won’t be used/);
+    for (const t of ['claim_evidence_request', 'sku_out_of_scope', 'claims_guidance', 'media_review_result']) expect(canResendTemplate(t)).toBe(true);
+  });
+});

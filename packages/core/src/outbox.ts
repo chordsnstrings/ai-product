@@ -34,6 +34,59 @@ export const Queues = {
 } as const;
 export type QueueName = (typeof Queues)[keyof typeof Queues];
 
+/**
+ * What a staff retry of each queue's jobs may do (plan 05 §12 "retry only if the handler is idempotent and no new
+ * spend, or with a fresh Cost Governor authorization shown to the operator"). `idempotent`: a re-run can't double
+ * any effect (keyed authorizations, leases, idempotent ledger/Stripe writes). `spends`: the handler calls billable
+ * providers through the gateway.
+ */
+export const QUEUE_POLICY: Record<QueueName, { idempotent: boolean; spends: boolean }> = {
+  [Queues.analyzeProduct]: { idempotent: true, spends: true },
+  [Queues.analyzeProductFree]: { idempotent: true, spends: true },
+  [Queues.generateConcepts]: { idempotent: true, spends: true },
+  [Queues.generateConceptsFree]: { idempotent: true, spends: true },
+  [Queues.generateStoryboard]: { idempotent: true, spends: true },
+  [Queues.generateStoryboardFree]: { idempotent: true, spends: true },
+  [Queues.regenerateFrame]: { idempotent: true, spends: true },
+  [Queues.regenerateFrameFree]: { idempotent: true, spends: true },
+  [Queues.recoveryConcept]: { idempotent: true, spends: true },
+  [Queues.refundPurchase]: { idempotent: true, spends: false },
+  [Queues.produceProject]: { idempotent: true, spends: true },
+  [Queues.hookVariants]: { idempotent: true, spends: true },
+  [Queues.processUpload]: { idempotent: true, spends: false },
+  [Queues.stripeEvent]: { idempotent: true, spends: false },
+  [Queues.sendEmail]: { idempotent: true, spends: false },
+  [Queues.syncIntegration]: { idempotent: true, spends: false },
+  [Queues.computeResults]: { idempotent: true, spends: false },
+  [Queues.weeklyRecommendations]: { idempotent: true, spends: true },
+  [Queues.exportWorkspace]: { idempotent: true, spends: false },
+  // A purge deletes everything; re-running one is a staff decision on the tenant, not a queue retry.
+  [Queues.purgeWorkspace]: { idempotent: false, spends: false },
+  [Queues.extractGenome]: { idempotent: true, spends: true },
+  [Queues.customerThemes]: { idempotent: true, spends: true },
+  [Queues.transferSku]: { idempotent: true, spends: false },
+};
+
+export const queuePolicy = (queue: string) => (QUEUE_POLICY as Record<string, { idempotent: boolean; spends: boolean } | undefined>)[queue] ?? null;
+
+/**
+ * A failed job's error class for bulk retry (plan 05 §12 "bulk retry by error class"): its error code, else its
+ * message with ids, numbers and quoted values replaced, so "timeout after 180000ms for job 1f2e…" groups together.
+ */
+export function jobErrorClass(output: unknown): string {
+  const o = (output ?? {}) as { code?: unknown; name?: unknown; message?: unknown };
+  if (typeof o.code === 'string' && o.code) return o.code;
+  const msg = typeof o.message === 'string' ? o.message : typeof output === 'string' ? output : JSON.stringify(output ?? '');
+  const shape = msg
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<id>')
+    .replace(/[“"'][^“”"']{1,80}[”"']/g, '<value>')
+    .replace(/\d+(\.\d+)?/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+  return shape || (typeof o.name === 'string' ? o.name : 'unknown');
+}
+
 /** Tenants currently paying for a plan; everyone else (provisional, free, lapsed) is free-tier traffic. */
 const PAYING: ReadonlySet<WorkspaceState> = new Set(['ACTIVE_PAID', 'PAST_DUE']);
 export const isFreeTier = (ctx: { workspaceState: WorkspaceState }) => !PAYING.has(ctx.workspaceState);

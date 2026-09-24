@@ -72,6 +72,12 @@ export interface TemplateMap {
   flag_expired: { flagKey: string; owner: string; expiredOn: string; url: string };
   integration_disconnected: { provider: string; url: string; workspaceName: string };
   claim_review_result: { claim: string; outcome: string; url: string };
+  // Plan 05 §14 compliance queues: more evidence for a restricted claim; a SKU confirmed out of V1 scope; guidance
+  // after repeated blocked claims; the outcome of a before/after or possible-minor media review.
+  claim_evidence_request: { claim: string; productName: string; note: string; url: string };
+  sku_out_of_scope: { productName: string; reason: string; url: string };
+  claims_guidance: { workspaceName: string; blocked: number; examples: string[]; url: string };
+  media_review_result: { productName: string; outcome: 'approved' | 'rejected'; note: string; url: string };
   cancellation_confirmed: { planName: string; endsOn: string; exportUrl: string };
   subscription_started: { planName: string; tests: number; price: string; renewsOn: string; url: string };
   price_change_notice: { planName: string; oldPrice: string; newPrice: string; effectiveOn: string; url: string };
@@ -240,6 +246,68 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: 
     case 'claim_review_result': {
       const m = d as TemplateMap['claim_review_result'];
       return { subject: `Claim review: ${m.outcome}`, stream: 'transactional', element: (<L preview={m.claim} label="Claims Vault"><H>{m.outcome}</H><Meta rows={[['Claim', m.claim], ['Outcome', m.outcome]]} /><Cta href={m.url}>Open Claims Vault</Cta></L>) };
+    }
+    case 'claim_evidence_request': {
+      const m = d as TemplateMap['claim_evidence_request'];
+      return {
+        subject: `More evidence needed: ${m.claim}`,
+        stream: 'transactional',
+        element: (
+          <L preview={`Our compliance team needs more support for this claim on ${m.productName}.`} label="Claims Vault">
+            <H>More evidence needed</H>
+            <Meta rows={[['Claim', m.claim], ['Product', m.productName]]} />
+            <P>{m.note}</P>
+            <P>Until then the claim stays restricted: ads use neutral wording instead. Attach a study, test report or certificate to the claim and we’ll review it again.</P>
+            <Cta href={m.url}>Add evidence</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'sku_out_of_scope': {
+      const m = d as TemplateMap['sku_out_of_scope'];
+      return {
+        subject: `${m.productName} is outside what Arkiv can advertise today`,
+        stream: 'transactional',
+        element: (
+          <L preview="Sunscreens, acne treatments and other drug or OTC products are out of scope for now." label="Products">
+            <H>We can’t make ads for this product yet</H>
+            <Meta rows={[['Product', m.productName], ['Why', m.reason]]} />
+            <P>Arkiv V1 makes ads for cosmetic skincare only. Products regulated as drugs or over-the-counter medicines (sunscreens, acne treatments and similar) need claims review we don’t offer yet. Nothing was charged for this product.</P>
+            <Cta href={m.url}>See your products</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'claims_guidance': {
+      const m = d as TemplateMap['claims_guidance'];
+      return {
+        subject: 'A few claims we can’t use in ads — and what works instead',
+        stream: 'transactional',
+        element: (
+          <L preview="Why some claims are blocked, and wording that still sells." label="Claims Vault">
+            <H>About the claims we couldn’t use</H>
+            <P>{`${m.blocked} claims added to ${m.workspaceName} recently describe treating a condition or changing how skin works. Ad platforms and US rules treat those as drug claims, so we never put them in ads.`}</P>
+            {m.examples.length ? <Meta rows={m.examples.slice(0, 3).map((e, i) => [`Example ${i + 1}`, e])} /> : null}
+            <P>Wording about how the product looks, feels and is used — with the evidence you have — is what we can use. Your Claims Vault suggests alternatives next to each blocked claim.</P>
+            <Cta href={m.url}>Open Claims Vault</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'media_review_result': {
+      const m = d as TemplateMap['media_review_result'];
+      return {
+        subject: m.outcome === 'approved' ? `A photo of ${m.productName} is cleared for ads` : `A photo of ${m.productName} won’t be used in ads`,
+        stream: 'transactional',
+        element: (
+          <L preview={m.note} label="Products">
+            <H>{m.outcome === 'approved' ? 'Photo cleared' : 'Photo not used'}</H>
+            <Meta rows={[['Product', m.productName], ['Outcome', m.outcome === 'approved' ? 'Cleared for ads' : 'Not used in ads']]} />
+            <P>{m.note}</P>
+            <Cta href={m.url}>See the product</Cta>
+          </L>
+        ),
+      };
     }
     case 'cancellation_confirmed': {
       const m = d as TemplateMap['cancellation_confirmed'];
