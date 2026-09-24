@@ -144,8 +144,41 @@ async function platformJson<T>(provider: 'meta' | 'tiktok' | 'shopify', r: Respo
 // ───────────── Shopify (§28) ─────────────
 export const SHOPIFY_SCOPES = ['read_products'];
 
+/**
+ * A demo store for PROVIDERS_MODE=mock (plan 03 P2 "Connect Shopify" in dev, tests and demos): its install
+ * completes at once with a signed callback, and it lists a few fixture skincare products. Any other shop is real.
+ */
+export const SHOPIFY_DEMO_SHOP = 'arkiv-demo.myshopify.com';
+export const isShopifyDemo = (shop: string) => env().PROVIDERS_MODE === 'mock' && shop === SHOPIFY_DEMO_SHOP;
+
+const DEMO_PRODUCTS: ShopifyProduct[] = [
+  ['1001', 'Dew Drop Hydrating Serum', 'Serum', 'A lightweight serum with hyaluronic acid and panthenol that absorbs quickly and leaves skin feeling soft.', 34, 'dew-drop-serum'],
+  ['1002', 'Cloud Cream Moisturiser', 'Moisturizer', 'A whipped moisturiser with ceramides and squalane for a comfortable, non-greasy finish.', 42, 'cloud-cream'],
+  ['1003', 'Gentle Milk Cleanser', 'Cleanser', 'A creamy cleanser with glycerin that rinses clean without a tight feeling.', 24, 'milk-cleanser'],
+].map(([id, title, productType, description, price, handle]) => ({
+  id: `gid://shopify/Product/${id}`,
+  title: title as string,
+  handle: handle as string,
+  productType: productType as string,
+  onlineStoreUrl: `https://${SHOPIFY_DEMO_SHOP}/products/${handle}`,
+  descriptionText: description as string,
+  status: 'ACTIVE',
+  vendor: 'Arkiv Demo',
+  images: [],
+  options: [],
+  metafields: [],
+  variants: [{ id: `gid://shopify/ProductVariant/${id}1`, title: 'Default Title', price: price as number, compareAtPrice: null, sku: `DEMO-${id}`, barcode: null, options: {}, available: true, imageUrl: null }],
+  updatedAt: '2026-09-01T00:00:00Z',
+}));
+
 export function shopifyInstallUrl(shop: string, state: string): string {
   if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop)) throw new ConnectorError('shopify', 'invalid', 'Enter your .myshopify.com domain');
+  if (isShopifyDemo(shop)) {
+    // The demo store "approves" at once: a callback signed exactly as Shopify signs one.
+    const q: Record<string, string> = { code: 'demo', shop, state, timestamp: String(Math.floor(Date.now() / 1000)) };
+    const msg = Object.keys(q).sort().map((k) => `${k}=${q[k]}`).join('&');
+    return `${env().APP_URL}/api/integrations/shopify/callback?${new URLSearchParams({ ...q, hmac: hmacHex(env().SHOPIFY_API_SECRET ?? 'dev', msg) })}`;
+  }
   const q = new URLSearchParams({ client_id: env().SHOPIFY_API_KEY ?? 'dev', scope: SHOPIFY_SCOPES.join(','), redirect_uri: `${env().APP_URL}/api/integrations/shopify/callback`, state });
   return `https://${shop}/admin/oauth/authorize?${q}`;
 }
@@ -197,6 +230,7 @@ export function verifyTiktokWebhook(rawBody: string, header: string | null, now 
 }
 
 export async function shopifyExchangeCode(shop: string, code: string): Promise<{ accessToken: string; scopes: string[] }> {
+  if (isShopifyDemo(shop)) return { accessToken: 'demo-shop-token', scopes: SHOPIFY_SCOPES };
   const r = await platformFetch('shopify', `https://${shop}/admin/oauth/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -364,6 +398,7 @@ async function shopifyGraphql<T>(shop: string, token: string, query: string, var
 type ShopInfo = { shop?: { currencyCode?: string; ianaTimezone?: string } };
 
 export async function shopifyFetchProducts(shop: string, token: string, cursor: string | null): Promise<{ products: ShopifyProduct[]; next: string | null; currency: string | null; timezone: string | null }> {
+  if (isShopifyDemo(shop)) return { products: DEMO_PRODUCTS, next: null, currency: 'USD', timezone: 'America/New_York' };
   const d = await shopifyGraphql<ShopInfo & { products?: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: Record<string, unknown>[] } }>(shop, token, SHOPIFY_PRODUCTS_QUERY, { cursor });
   if (!d.products || !Array.isArray(d.products.nodes)) throw new ConnectorError('shopify', 'schema_changed', 'products connection missing from the response');
   return {
@@ -376,6 +411,7 @@ export async function shopifyFetchProducts(shop: string, token: string, cursor: 
 
 /** One product by id (either form), for a products/create|update webhook; null when it no longer exists. */
 export async function shopifyFetchProduct(shop: string, token: string, id: string): Promise<{ product: ShopifyProduct | null; currency: string | null }> {
+  if (isShopifyDemo(shop)) return { product: DEMO_PRODUCTS.find((p) => p.id === shopifyGid('Product', id)) ?? null, currency: 'USD' };
   const d = await shopifyGraphql<ShopInfo & { product?: Record<string, unknown> | null }>(shop, token, SHOPIFY_PRODUCT_QUERY, { id: shopifyGid('Product', id) });
   return { product: d.product ? normalizeShopifyProduct(d.product) : null, currency: d.shop?.currencyCode ?? null };
 }

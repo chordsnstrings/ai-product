@@ -7,6 +7,8 @@ import { logger } from '@arkiv/shared/log';
 
 const log = logger('oauth-callback');
 import { currentUser } from '@/lib/session';
+import { clientFingerprint } from '@/lib/http';
+import { previewContext } from '@/lib/preview-context';
 
 /**
  * OAuth callback for Shopify / Meta / TikTok. The state must verify AND the signed-in user must still be an
@@ -19,6 +21,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
   const st = verifyState(q.state ?? '');
   const back = (slug: string, msg: string) => NextResponse.redirect(`${env().APP_URL}/w/${slug}/settings/integrations?${new URLSearchParams({ result: msg })}`, 303);
   if (!st || st.provider !== provider) return NextResponse.redirect(`${env().APP_URL}/app?error=connection_expired`, 303);
+  // "Connect Shopify" from the upload step (plan 03 P2): the store joins the preview it was started from.
+  if (st.preview === '1' && provider === 'shopify') return previewShopifyCallback(req, q, st);
   const user = await currentUser();
   if (!user || user.userId !== st.uid) return NextResponse.redirect(`${env().APP_URL}/login?next=${encodeURIComponent(`/w/${st.slug}/settings/integrations`)}`, 303);
   const [m] = await globalTx((tx) => tx`select * from list_user_workspaces(${user.userId}) where workspace_id = ${st.ws!}`);
@@ -72,5 +76,27 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
     return NextResponse.redirect(`${env().APP_URL}/w/${st.slug}/settings/integrations?${new URLSearchParams({ pick: pendingId })}`, 303);
   } catch (e) {
     return back(st.slug!, e instanceof Error ? e.message : 'Connection failed.');
+  }
+}
+
+/**
+ * The upload-step Shopify connection: only the browser (preview cookie) or the signed-in user that started it can
+ * finish it, into the workspace it was started for. The store is then offered as a product picker (/start/shopify)
+ * — an unsaved preview never imports the whole catalogue.
+ */
+async function previewShopifyCallback(req: Request, q: Record<string, string>, st: Record<string, string>) {
+  const retry = (msg: string) => NextResponse.redirect(`${env().APP_URL}/start?${new URLSearchParams({ shopify_error: msg })}`, 303);
+  try {
+    const ctx = await previewContext(clientFingerprint(req), { create: false });
+    const sameActor = st.uid ? ctx.actor.kind === 'user' && ctx.actor.id === st.uid : ctx.actor.kind === 'provisional';
+    if (ctx.workspaceId !== st.ws || !sameActor) return retry('That connection was started in another browser. Please connect your store again.');
+    if (!verifyShopifyQuery(q)) return retry('Shopify signature check failed. Try again.');
+    const shop = q.shop!;
+    const tok = await shopifyExchangeCode(shop, q.code!);
+    await withTenant(ctx.workspaceId, (tx) => saveIntegration(tx, ctx, { provider: 'shopify', externalAccountId: shop, displayName: shop, token: tok.accessToken, scopes: tok.scopes }));
+    await registerShopifyWebhooks(shop, tok.accessToken).catch((err: unknown) => log.warn('webhook registration failed', { shop, err }));
+    return NextResponse.redirect(`${env().APP_URL}/start/shopify`, 303);
+  } catch (e) {
+    return retry(e instanceof DomainError || e instanceof Error ? e.message : 'We couldn’t connect that store.');
   }
 }

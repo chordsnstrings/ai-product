@@ -49,18 +49,19 @@ export interface StartPreviewInput {
   ip?: string | null;
 }
 
-/** Create the SKU + preview project and enqueue analysis (transactional). */
-export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPreviewInput) {
-  assertCan(ctx, 'sku.create');
-  if (!input.url && !input.photoAssetIds?.length) throw new DomainError('INVALID', 'Add a product link or at least one photo.');
-  // The SKU caps are counted under the workspace row lock (the same lock nextCatalogueNo takes), so parallel
-  // submissions queue here and each sees the others' SKUs instead of all counting before any commits.
+/**
+ * The product caps of a preview (plan 02 §2.1, standard §5): a provisional workspace holds PROVISIONAL.MAX_SKUS
+ * products (more for staff-allowlisted evaluators); a signed-in free workspace adds a few a day. Counted under the
+ * workspace row lock (the same lock nextCatalogueNo takes), so parallel submissions queue here and each sees the
+ * others' SKUs instead of all counting before any commits.
+ */
+export async function assertCanAddSku(tx: Tx, ctx: TenantContext, ip: string | null) {
   if (ctx.workspaceState === 'PROVISIONAL' || isFreeTier(ctx)) await tx`select 1 from workspaces where id = ${ctx.workspaceId} for update`;
   if (ctx.workspaceState === 'PROVISIONAL') {
     const [n] = await tx`select count(*)::int as n from skus`;
     if (n!.n >= PROVISIONAL.MAX_SKUS) {
       // Staff-allowlisted evaluators (agencies, photographers) get a higher, still bounded, allowance (plan 05 §15).
-      const allowed = n!.n < PROVISIONAL.ALLOWLISTED_MAX_SKUS && (await isAllowlisted(tx, [allowKey.ws(ctx.workspaceId), allowKey.ip(input.ip)]));
+      const allowed = n!.n < PROVISIONAL.ALLOWLISTED_MAX_SKUS && (await isAllowlisted(tx, [allowKey.ws(ctx.workspaceId), allowKey.ip(ip)]));
       if (!allowed) throw new DomainError('PAYMENT_REQUIRED', 'Save your work to add more products.', { needsAccount: true });
     }
   } else if (isFreeTier(ctx)) {
@@ -70,6 +71,13 @@ export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPrevi
       throw new DomainError('PAYMENT_REQUIRED', `Free accounts can add ${FREE_EXPLORATION.SKUS_PER_DAY} products a day. Produce an ad from one of them, or come back tomorrow.`, { freeLimit: 'skus_per_day' });
     }
   }
+}
+
+/** Create the SKU + preview project and enqueue analysis (transactional). */
+export async function startPreview(tx: Tx, ctx: TenantContext, input: StartPreviewInput) {
+  assertCan(ctx, 'sku.create');
+  if (!input.url && !input.photoAssetIds?.length) throw new DomainError('INVALID', 'Add a product link or at least one photo.');
+  await assertCanAddSku(tx, ctx, input.ip ?? null);
   const skuId = newId();
   const projectId = newId();
   const no = await nextCatalogueNo(tx);

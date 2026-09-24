@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { decryptToken, encryptToken, signState, verifyState } from './crypto';
 import { hmacHex } from './crypto';
-import { normalizeMetaInsight, normalizeShopifyProduct, normalizeTikTokRow, verifyShopifyQuery } from './connectors';
+import { normalizeMetaInsight, normalizeShopifyProduct, normalizeTikTokRow, SHOPIFY_DEMO_SHOP, shopifyExchangeCode, shopifyInstallUrl, verifyShopifyQuery } from './connectors';
 
 /** Replaces the character at `i` with a different one, so the string always changes. */
 const flipChar = (s: string, i: number) => s.slice(0, i) + (s[i] === 'A' ? 'B' : 'A') + s.slice(i + 1);
@@ -74,5 +74,18 @@ describe('Shopify product normalization (§42 variants)', () => {
     ]);
     const single = normalizeShopifyProduct({ id: '2', title: 'Balm', status: 'ACTIVE', variants: { nodes: [{ id: '21', title: 'Default Title', price: '20', selectedOptions: [{ name: 'Title', value: 'Default Title' }] }] } });
     expect(single.variants[0]!.options).toEqual({});
+  });
+});
+
+describe('mock-mode Shopify demo store (plan 03 P2 "Connect Shopify")', () => {
+  it('installs at once with a callback signed like Shopify’s; real shops still go to Shopify', async () => {
+    const url = new URL(shopifyInstallUrl(SHOPIFY_DEMO_SHOP, 'state-1'));
+    expect(url.pathname).toBe('/api/integrations/shopify/callback');
+    const q = Object.fromEntries(url.searchParams);
+    expect(q).toMatchObject({ shop: SHOPIFY_DEMO_SHOP, state: 'state-1', code: 'demo' });
+    expect(verifyShopifyQuery(q)).toBe(true);
+    expect(verifyShopifyQuery({ ...q, shop: 'other.myshopify.com' })).toBe(false);
+    expect(await shopifyExchangeCode(SHOPIFY_DEMO_SHOP, 'demo')).toMatchObject({ accessToken: 'demo-shop-token' });
+    expect(new URL(shopifyInstallUrl('real-store.myshopify.com', 's')).host).toBe('real-store.myshopify.com');
   });
 });
