@@ -84,6 +84,7 @@ export interface Scored {
   confidence: number;
 }
 
+const NEAR_DUPLICATE = 'near-duplicate';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BASIS_CONFIDENCE = { performance: 0.55, context_limited: 0.4, cold_start: 0.3 } as const;
 const LEARNING_CONFIDENCE: Record<string, number> = { ACTIONABLE: 0.2, DIRECTIONAL: 0.1, WEAKENING: -0.1, INVALIDATED: -0.2 };
@@ -171,7 +172,7 @@ export function hardGates(p: Proposal, s: ScoringContext): { passed: boolean; re
   }
   for (const w of p.claimWordings) if (!s.approvedClaims.some((a) => a.toLowerCase().includes(w.toLowerCase()))) reasons.push(`claim lacks approval/evidence: “${w}”`);
   if (s.fidelityConfidence < 0.3 && p.estimatedGenerationClass !== 'remix') reasons.push('product fidelity too uncertain for generated interaction; add clearer photos');
-  if (s.recentKeys.has(`${p.angle}|${p.hookMechanism}`)) reasons.push('near-duplicate of a test run in the last 21 days');
+  if (s.recentKeys.has(`${p.angle}|${p.hookMechanism}`)) reasons.push(`${NEAR_DUPLICATE} of a test run in the last 21 days`);
   if (p.estimatedGenerationClass === 'premium') reasons.push('premium production exceeds the standard Creative Test cost ceiling');
   if (p.treatment === 'RAW_UGC' && !s.hasRealAssets) reasons.push('needs real footage/assets that are not in the library');
   if (p.proofMechanism === 'BEFORE_AFTER_RESTRICTED') reasons.push('before/after requires separate policy review');
@@ -262,8 +263,10 @@ export async function scoringContext(tx: Tx, skuId: string) {
   const learnings = await tx`select id, relevant_genes->>'angle' as angle, state, variable, winner_genes, loser_genes, effect, confidence from learnings
                              where sku_id = ${skuId} and not confounded and state <> 'INVALIDATED'
                                and (${platforms.length === 0} or scope_platform = 'blended' or scope_platform = any(${platforms}::text[]))`;
-  const fatigue = await tx`select distinct e.genes->>'angle' as angle from experiments e join experiment_results r on r.experiment_id = e.id
-                           where e.sku_id = ${skuId} and e.state = 'ACTIONABLE' and r.computed_at < now() - interval '21 days'`;
+  // Measured decay of a test's winner (§45), not the age of a computation: recent CTR / hold rate against its
+  // first days live (experiments.fatigue, refreshed with results).
+  const fatigue = await tx`select distinct e.genes->>'angle' as angle from experiments e
+                           where e.sku_id = ${skuId} and e.state not in ('INVALIDATED','ARCHIVED') and (e.fatigue->>'fatigued')::boolean is true`;
   const [assets] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind in ('creator_footage','historical_creative') and deleted_at is null`;
   const approved = (await tx`select preferred_wording, mandatory_qualifier from claims where sku_id = ${skuId} and status in ('VERIFIED','VERIFIED_WITH_QUALIFIER')`).map((c) => `${c.preferred_wording}${c.mandatory_qualifier ? ' ' + c.mandatory_qualifier : ''}`);
   const hasPerf = learnings.length > 0;
@@ -360,7 +363,17 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
     }
     const scored = candidates.map((c) => gateAndScore(c, sc, { approvedClaims: productContext.approvedClaims, names, packetIds, ingredientsVerified, prohibited }));
     const picked = composePortfolio(scored, sc.maturity, 3, sc.realized);
+    const refreshes = await withTenant(ws, (tx) => refreshProposals(tx, skuId, scored, picked));
     await withTenant(ws, async (tx) => {
+      // A fatigued winner (§45): a controlled refresh — same angle, a new opening, the current winner as control.
+      for (const r of refreshes) {
+        const [row] = await tx`
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, kind, control_creative_id)
+          values (${ws}, ${skuId}, ${week}, 'EXPLOIT', ${tx.json(r.proposal as never)}, ${r.scored.score}, ${tx.json(r.scored.breakdown)}, ${tx.json(r.scored.gates)}, ${sc.basis},
+                  ${r.scored.rationaleIds}::uuid[], ${r.scored.confidence}, 'refresh', ${r.controlCreativeId})
+          returning id`;
+        await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: row!.id as string }, { slot: 'EXPLOIT', score: r.scored.score, basis: sc.basis, confidence: r.scored.confidence, rationaleIds: r.scored.rationaleIds, refresh: true }, { skuId });
+      }
       for (const p of picked) {
         const [r] = await tx`
           insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence)
@@ -378,11 +391,54 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
       }
       await settle(tx, ctx, auth.authorizationId, 'consumed');
     });
-    return picked.length;
+    return picked.length + refreshes.length;
   } catch (e) {
     await withTenant(ws, (tx) => settle(tx, ctx, auth.authorizationId, 'consumed'));
     throw e;
   }
+}
+
+/**
+ * Controlled refresh proposals (§45 "recommend controlled refresh"): for each test whose leading variant is
+ * measurably fatiguing and has a delivered creative, the best gate-passing candidate on the same angle with a new
+ * hook becomes a hook test against the winner (its creative is the control). Nothing is proposed when no such
+ * candidate exists — a refresh never changes the angle that won.
+ */
+export async function refreshProposals(tx: Tx, skuId: string, scored: readonly Scored[], picked: readonly Scored[]) {
+  const winners = await tx`
+    select e.id, e.genes->>'angle' as angle, e.fatigue->>'reason' as reason, v.label as hook, v.creative_id
+    from experiments e join variants v on v.id = (e.fatigue->>'winnerVariantId')::uuid and v.workspace_id = e.workspace_id
+    where e.sku_id = ${skuId} and (e.fatigue->>'fatigued')::boolean is true and e.state not in ('INVALIDATED','ARCHIVED')
+      and v.creative_id is not null
+      and not exists (select 1 from recommendations r where r.control_creative_id = v.creative_id and r.status in ('open','accepted')
+                        and r.created_at > now() - interval '21 days')
+    order by e.created_at desc limit 2`;
+  const used = new Set(picked.map((p) => p.proposal));
+  const out: { proposal: Proposal; scored: Scored; controlCreativeId: string }[] = [];
+  // A refresh is deliberately close to the test it refreshes: the near-duplicate gate is waived for it (and
+  // recorded), every other gate still applies.
+  const eligible = (s: Scored) => s.gates.passed || (s.gates.reasons.length > 0 && s.gates.reasons.every((r) => r.startsWith(NEAR_DUPLICATE)));
+  for (const w of winners) {
+    const hook = String(w.hook ?? '');
+    const cand = scored
+      .filter((s) => eligible(s) && !used.has(s.proposal) && s.proposal.angle === w.angle)
+      .map((s) => ({ s, hooks: s.proposal.hookOptions.filter((h) => !eq(h, hook)) }))
+      .filter((x) => x.hooks.length > 0)
+      .sort((a, b) => b.s.score - a.s.score)[0];
+    if (!cand) continue;
+    used.add(cand.s.proposal);
+    const proposal: Proposal = {
+      ...cand.s.proposal,
+      hookOptions: cand.hooks.slice(0, 3),
+      primaryVariable: 'hook',
+      riskProfile: 'lower_risk',
+      whyNow: `Your winning ad (“${hook}”) is wearing out: ${w.reason ?? 'its results are decaying'}. Refresh the opening and keep the angle that won; the current ad runs as the control.`.slice(0, 220),
+    };
+    const score = (Object.keys(WEIGHTS) as (keyof typeof WEIGHTS)[]).reduce((acc, k) => acc + WEIGHTS[k] * cand.s.breakdown[k], 0);
+    const refreshed: Scored = { ...cand.s, proposal, slot: 'EXPLOIT', score, gates: { passed: true, reasons: [], ...(cand.s.gates.passed ? {} : { waived: cand.s.gates.reasons }) } as Scored['gates'] };
+    out.push({ proposal, scored: refreshed, controlCreativeId: w.creative_id as string });
+  }
+  return out;
 }
 
 export async function dismissRecommendation(tx: Tx, ctx: TenantContext, id: string, reason: string) {

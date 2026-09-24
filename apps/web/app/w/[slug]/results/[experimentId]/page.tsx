@@ -5,6 +5,7 @@ import { withTenant } from '@arkiv/db';
 import { experimentView } from '@arkiv/core';
 import { MeasurementContextCaveat, measurementContextLabel, type MeasurementContext } from '@arkiv/shared';
 import { Banner, SignalChip } from '@arkiv/ui';
+import { ActionButton } from '@/components/actions';
 import { workspacePage } from '@/lib/tenant';
 
 export const metadata: Metadata = { title: 'Test results · Arkiv' };
@@ -20,7 +21,8 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     const [e] = await tx`select id from experiments where id = ${experimentId}`;
     if (!e) return null;
     const v = await experimentView(tx, experimentId);
-    const conf = await tx`select kind, starts_at, ends_at, note from confounders where (sku_id is null or sku_id = ${v.experiment.sku_id}) and starts_at > now() - interval '120 days' order by starts_at desc`;
+    const conf = await tx`select id, kind, source, status, starts_at, ends_at, note from confounders where (sku_id is null or sku_id = ${v.experiment.sku_id})
+                          and status <> 'dismissed' and coalesce(ends_at, now()) > now() - interval '120 days' order by starts_at desc`;
     const revised = await tx`select max(superseded_at) as at from performance_observations where variant_id in ${tx(v.variants.length ? v.variants.map((x) => x.id as string) : ['00000000-0000-0000-0000-000000000000'])}`;
     return { ...v, conf, revisedAt: revised[0]?.at as string | null };
   });
@@ -29,6 +31,14 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
   const groups = [...new Map(d.results.map((r) => [`${r.measurement_context}|${r.attribution_window}`, { ctx: r.measurement_context as string, window: String(r.attribution_window ?? 'default') }])).values()];
   const windowLabel = (w: string) => (w === 'default' ? null : w.replace(/_/g, ' ').replace(/(\d+)d/g, '$1-day'));
   const label = new Map(d.variants.map((v) => [v.id as string, `${v.code} · ${v.label}`]));
+  // Confounder windows that overlapped this test's observed dates (§45), as of the last computation.
+  const overlapping = new Set(d.results.flatMap((r) => ((r.confounder_windows as { id: string }[] | null) ?? []).map((c) => c.id)));
+  const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
+  const day = (x: unknown) => new Date(x as string).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const scopeOf = (ctx: string, window: string) => {
+    const r = d.results.find((x) => x.measurement_context === ctx && String(x.attribution_window ?? 'default') === window);
+    return (r?.scope ?? {}) as { optimizationEvent?: string; campaignType?: string; excludedImpressions?: number };
+  };
   return (
     <>
       <p className="ak-index"><Link href={`/w/${slug}/results`}>Results</Link> / <Link href={`/w/${slug}/studio/${experimentId}`}>Studio</Link></p>
@@ -45,6 +55,17 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
           <section key={`${ctx}|${window}`} className="ak-section">
             <h2 className="ak-label">{measurementContextLabel(ctx)}{windowLabel(window) ? ` · attribution ${windowLabel(window)}` : ''}</h2>
             {MeasurementContextCaveat[ctx as MeasurementContext] ? <Banner tone="warn">{MeasurementContextCaveat[ctx as MeasurementContext]}</Banner> : null}
+            {(() => {
+              // Compared only within one campaign context (§45); other campaigns' delivery is left out and said so.
+              const sc = scopeOf(ctx, window);
+              const parts = [sc.optimizationEvent ? `optimized for ${sc.optimizationEvent.replace(/_/g, ' ').toLowerCase()}` : null, sc.campaignType ? `${sc.campaignType.replace(/_/g, ' ').toLowerCase()} campaigns` : null].filter(Boolean);
+              return parts.length || sc.excludedImpressions ? (
+                <p className="ak-small ak-muted">
+                  Compared within {parts.length ? parts.join(', ') : 'one campaign context'}.
+                  {sc.excludedImpressions ? ` ${Number(sc.excludedImpressions).toLocaleString()} impressions from campaigns with a different goal are left out so the variants are compared like for like.` : ''}
+                </p>
+              ) : null;
+            })()}
             <div className="ak-scroll-x">
               <table className="ak-table">
                 <thead><tr><th>Variant</th><th>Metric</th><th>Observed</th><th>Estimated</th><th>Range (90%)</th><th>Chance best</th><th>Signal</th></tr></thead>
@@ -71,8 +92,25 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
         <p className="ak-small ak-muted" style={{ maxWidth: 640 }}>Estimates shrink small samples toward your product’s average so one lucky day doesn’t look like a winner. “Gathering” means not enough data yet; “Directional” is a lean; “Actionable” means the evidence floor was met and it will shape next week’s recommendations.</p>
         {d.conf.length ? (
           <>
-            <h3 className="ak-label">Confounders in this period</h3>
-            {d.conf.map((c, i) => <div key={i} className="ak-index-row"><span>{String(c.kind).replace(/_/g, ' ')}{c.note ? ` — ${c.note}` : ''}</span><span className="ak-index">{new Date(c.starts_at as string).toLocaleDateString()}</span></div>)}
+            <h3 className="ak-label">Things that happened around this test</h3>
+            <p className="ak-small ak-muted" style={{ maxWidth: 640 }}>Days inside an active window are left out of the comparison; a window that overlaps the test’s dates marks the read as confounded.</p>
+            {d.conf.map((c) => (
+              <div key={c.id as string} className="ak-index-row">
+                <span>
+                  {String(c.kind).replace(/_/g, ' ')}{c.note ? ` — ${c.note}` : ''}
+                  <span className="ak-small ak-muted" style={{ display: 'block' }}>
+                    {day(c.starts_at)}{c.ends_at ? ` – ${day(c.ends_at)}` : ' – ongoing'} · {c.source === 'automatic' ? 'detected automatically' : c.source === 'staff' ? 'marked by Arkiv' : 'marked by your team'}
+                    {c.status === 'pending_confirmation' ? ' · waiting for your confirmation' : overlapping.has(c.id as string) ? ' · overlaps this test' : ''}
+                  </span>
+                </span>
+                {canEdit ? (
+                  <span className="ak-row">
+                    {c.status === 'pending_confirmation' ? <ActionButton slug={slug} action="confounder-decide" body={{ id: c.id, decision: 'confirm' }} variant="text">It happened</ActionButton> : null}
+                    <ActionButton slug={slug} action="confounder-decide" body={{ id: c.id, decision: 'dismiss' }} variant="text" confirm="Dismiss this? The affected tests are read again without it.">Dismiss</ActionButton>
+                  </span>
+                ) : null}
+              </div>
+            ))}
           </>
         ) : null}
       </section>

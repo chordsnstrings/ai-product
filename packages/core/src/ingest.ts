@@ -201,7 +201,9 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
       productType: product.product_type || undefined,
       priceMicros: toMicros(v0?.price),
       compareAtMicros: toMicros(v0?.compare_at_price),
-      currency: 'USD',
+      // The product JSON carries no currency: it comes from the storefront page (og / JSON-LD / Shopify.currency) or
+      // the shop's meta.json — never assumed (§47 "never sum raw values across currencies").
+      currency: undefined,
       images: (product.images ?? []).map((i) => i.src),
       sku: v0?.sku || undefined,
       gtin: v0?.barcode || undefined,
@@ -224,6 +226,12 @@ export function parseShopifyProduct(json: string): Partial<ExtractedProduct> | n
   } catch {
     return null;
   }
+}
+
+/** The storefront's active currency from Shopify's inline `Shopify.currency = {"active":"EUR",…}`. */
+export function shopifyActiveCurrency(html: string): string | undefined {
+  const m = /Shopify\.currency\s*=\s*\{[^}]*"active"\s*:\s*"([A-Z]{3})"/.exec(html);
+  return m?.[1];
 }
 
 /** Parse any product page HTML into structured fields (JSON-LD → OpenGraph → text heuristics). */
@@ -249,7 +257,7 @@ export function parseProductHtml(html: string, pageUrl: string): ExtractedProduc
     brand: ld?.brand,
     productType: ld?.productType,
     priceMicros: ld?.priceMicros ?? toMicros(og.price),
-    currency: ld?.currency ?? og.currency,
+    currency: ld?.currency ?? og.currency ?? shopifyActiveCurrency(html),
     images: [...(ld?.images ?? []), ...(og.image ? [og.image] : [])].map((i) => new URL(i, pageUrl).toString()).filter((v, i, a) => a.indexOf(v) === i),
     sku: ld?.sku,
     gtin: ld?.gtin,
@@ -283,7 +291,19 @@ export async function importProductUrl(raw: string, opts: { guard?: NetGuard } =
   if (page && page.status >= 400 && !shopify) {
     throw new DomainError('UNAVAILABLE', page.status === 403 || page.status === 429 ? 'That store blocked our reader.' : 'We couldn’t open that page.', { status: page.status });
   }
-  const parsed = page ? parseProductHtml(page.body, page.finalUrl) : { source: 'html' as const, images: [], rawText: '' };
+  const parsed: ExtractedProduct = page ? parseProductHtml(page.body, page.finalUrl) : { source: 'html' as const, images: [], rawText: '' };
+  if (shopify && !parsed.currency) {
+    // The shop's own currency (storefront /meta.json), when the page didn't state one.
+    const m = await safeFetch(`${url.origin}/meta.json`, 'application/json', opts).catch(() => null);
+    if (m && m.status === 200) {
+      try {
+        const c = (JSON.parse(m.body) as { currency?: string }).currency;
+        if (c && /^[A-Z]{3}$/.test(c)) parsed.currency = c;
+      } catch {
+        /* no currency: left unknown */
+      }
+    }
+  }
   if (shopify) {
     return {
       ...parsed,

@@ -463,6 +463,20 @@ export const ACTIONS = {
       }),
   }),
   'rates.publish': a({ perm: 'rates.propose', reauth: true, schema: z.object({ rateTableId: uuid, reason }), run: (s, i) => requestOrExecute(s, 'rates.publish', { rateTableId: i.rateTableId }, i.reason) }),
+  // §47 reporting currency: a new version of a currency's FX rate (USD per unit). Observations ingested from then on
+  // convert with it; stored rows keep the rate they were converted with.
+  'fx.set': a({
+    perm: 'rates.propose',
+    schema: z.object({ currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/), usdPerUnit: z.coerce.number().positive().max(100_000), source: z.string().trim().min(2).max(200), reason }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const [prev] = await tx`select usd_per_unit, version from fx_rates where currency = ${i.currency} order by version desc limit 1`;
+        const version = Number(prev?.version ?? 0) + 1;
+        const [r] = await tx`insert into fx_rates (currency, usd_per_unit, version, source, created_by) values (${i.currency}, ${i.usdPerUnit}, ${version}, ${i.source}, ${s.staffId}) returning id`;
+        await audit(tx, s, 'fx.set', { type: 'fx_rate', id: r!.id as string }, { reason: i.reason, before: prev ? { usdPerUnit: Number(prev.usd_per_unit), version: prev.version } : null, after: { currency: i.currency, usdPerUnit: i.usdPerUnit, version } });
+        return { message: `${i.currency} v${version}: 1 ${i.currency} = ${i.usdPerUnit} USD from today.` };
+      }),
+  }),
 
   /* ── Providers & routes ── */
   // Opening a circuit may carry staff's estimate of when it closes: customers whose ads are queued behind it see

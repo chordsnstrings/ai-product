@@ -8,7 +8,9 @@ import {
   attachEvidence,
   cancelDeletion,
   changeRole,
+  connectSelectedAccounts,
   createExperiment,
+  decideConfounder,
   decideFact,
   deleteAsset,
   disconnectIntegration,
@@ -66,7 +68,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         assertCan(ctx, 'integration.manage');
         if (!(file instanceof File)) throw new DomainError('INVALID', 'Choose a CSV file');
         if (file.size > 10 * 1024 * 1024) throw new DomainError('INVALID', 'CSV must be under 10 MB');
-        const rows = parsePerformanceCsv(await file.text());
+        // The day column is in the ad account's reporting timezone (§47); the uploader can name it.
+        const tz = z.string().trim().max(64).regex(/^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+)*$/).optional().parse((form.get('timezone') as string | null) || undefined) ?? null;
+        const rows = parsePerformanceCsv(await file.text(), { timezone: tz });
         if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
         const r = await t((tx) => ingestObservations(tx, ctx, null, rows));
         return json({ ok: true, ...r });
@@ -109,7 +113,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const r = await t(async (tx) => {
         const [rec] = await tx`select * from recommendations where id = ${id} and status = 'open' for update`;
         if (!rec) throw new DomainError('CONFLICT', 'This recommendation was already handled.');
-        return createExperiment(tx, ctx, { skuId: rec.sku_id as string, proposal: Proposal.parse(rec.proposal), recommendationId: id, slot: rec.slot as 'EXPLOIT' });
+        // A refresh of a fatigued winner runs the winner as the control (§45 "controlled refresh").
+        return createExperiment(tx, ctx, { skuId: rec.sku_id as string, proposal: Proposal.parse(rec.proposal), recommendationId: id, slot: rec.slot as 'EXPLOIT', controlCreativeId: (rec.control_creative_id as string | null) ?? null });
       });
       return json({ ...r, next: `/w/${slug}/studio/${r.experimentId}` });
     }
@@ -154,6 +159,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       const i = await body(req, z.object({ skuId: uuid.nullish(), kind: z.enum(['stockout', 'site_outage', 'price_change', 'offer_change', 'influencer_event', 'audience_change', 'bid_change', 'landing_change', 'viral_event', 'other']), startsAt: z.string().date(), endsAt: z.string().date().nullish(), note: z.string().max(300).nullish() }));
       await t((tx) => markConfounder(tx, ctx, i));
       return json({ ok: true });
+    }
+    case 'confounder-decide': {
+      // Confirm an automatic candidate (a detected sales spike) or dismiss a confounder that didn't happen (§45).
+      const i = await body(req, z.object({ id: uuid, decision: z.enum(['confirm', 'dismiss']) }));
+      return json({ ok: true, ...(await t((tx) => decideConfounder(tx, ctx, i.id, i.decision))) });
     }
     /* ── Product Brain + Claims ── */
     case 'fact': {
@@ -274,6 +284,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       assertCan(ctx, 'integration.manage');
       await t((tx) => enqueue(tx, ctx.workspaceId, Queues.syncIntegration, { integrationId: id }, { singletonKey: `sync:${id}` }));
       return json({ ok: true });
+    }
+    case 'integration-select': {
+      // The merchant picks which ad accounts on the login belong to this workspace (§47); `replace` switches.
+      const i = await body(req, z.object({ pendingId: uuid, accountIds: z.array(z.string().min(1).max(64)).min(1).max(200), mode: z.enum(['add', 'replace']).default('add') }));
+      const r = await t((tx) => connectSelectedAccounts(tx, ctx, i.pendingId, i.accountIds, { replace: i.mode === 'replace' }));
+      return json({ ok: true, ...r, next: `/w/${slug}/settings/integrations?${new URLSearchParams({ result: `Connected ${r.connected} account${r.connected === 1 ? '' : 's'}${r.disconnected ? `, disconnected ${r.disconnected}` : ''}. First sync running.` })}` });
     }
     case 'integration-demo': {
       // Dev/test only: a demo ad account so the loop can be exercised without platform credentials.

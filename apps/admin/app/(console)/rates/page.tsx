@@ -13,7 +13,9 @@ export const metadata = { title: 'Rate tables' };
  */
 export default async function Rates() {
   await requireStaff('rates.propose');
-  const { rows, inEffect } = await withAdmin(async (tx) => ({
+  const { rows, inEffect, fx } = await withAdmin(async (tx) => ({
+    // FX rates for the reporting currency (§47): newest version per currency.
+    fx: await tx`select distinct on (currency) currency, usd_per_unit, version, effective_from, source from fx_rates order by currency, version desc`,
     rows: await tx`select r.*, c.name as creator, a.name as approver from provider_rate_tables r left join staff_users c on c.id = r.created_by left join staff_users a on a.id = r.approved_by order by r.provider, r.model, r.version desc`,
     inEffect: await loadRates(tx),
   }));
@@ -59,6 +61,18 @@ export default async function Rates() {
           ))}
         </Section>
       ) : null}
+      <Section title="FX rates (reporting currency)">
+        <p className="ak-small ak-muted">Ad spend and purchase value are stored in their native currency and converted to each workspace’s reporting currency at ingest with these rates; money is never summed raw across currencies.</p>
+        <Table head={['Currency', 'USD per unit', 'Version', 'Effective', 'Source']} rows={fx.map((f) => [<Mono key="c">{f.currency as string}</Mono>, String(Number(f.usd_per_unit)), `v${f.version}`, dt(f.effective_from), f.source as string])} />
+        <div className="ak-panel" style={{ maxWidth: 560, marginTop: 12 }}>
+          <ActForm action="fx.set" submit="Save new rate" fields={[
+            { name: 'currency', label: 'Currency (ISO 4217)', required: true, placeholder: 'EUR' },
+            { name: 'usdPerUnit', label: 'USD per 1 unit', required: true, placeholder: '1.08' },
+            { name: 'source', label: 'Source', required: true, placeholder: 'ECB reference rate 2026-09-24' },
+            { name: 'reason', label: 'Reason', required: true },
+          ]} />
+        </div>
+      </Section>
       <Section title="Propose a new version">
         <div className="ak-panel" style={{ maxWidth: 560 }}>
           <ActForm action="rates.propose" submit="Create draft" fields={[
