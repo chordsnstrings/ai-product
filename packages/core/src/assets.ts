@@ -23,7 +23,8 @@ export type AssetKind =
   | 'evidence_doc'
   | 'brand_logo'
   | 'historical_creative'
-  | 'thumbnail';
+  | 'thumbnail'
+  | 'captions';
 
 const EXT: Record<string, string> = {
   'image/png': 'png',
@@ -34,6 +35,7 @@ const EXT: Record<string, string> = {
   'audio/mpeg': 'mp3',
   'application/pdf': 'pdf',
   'text/plain': 'txt',
+  'application/x-subrip': 'srt',
   'application/zip': 'zip',
 };
 
@@ -81,6 +83,14 @@ export async function saveAsset(tx: Tx, workspaceId: string, a: SaveAssetInput) 
       ${height}, ${durationMs}, ${checksum}, ${a.source}, ${tx.json((a.origin ?? {}) as never)},
       ${tx.json((a.lineage ?? {}) as never)}, ${a.rightsAttestedBy ?? null}, ${a.rightsAttestedBy ? new Date() : null})`;
   return { id, key, checksum, width, height, durationMs };
+}
+
+/**
+ * A finished ad's SRT captions as their own asset (plan 06 Phase 3 #6 "captions (burned-in + SRT)"): downloadable
+ * next to the MP4s. Linked from the creative (captions_asset_id) and each export's lineage.
+ */
+export async function saveCaptions(tx: Tx, workspaceId: string, skuId: string, srt: string, lineage: Record<string, unknown>) {
+  return saveAsset(tx, workspaceId, { bytes: Buffer.from(srt, 'utf8'), mime: 'application/x-subrip', kind: 'captions', skuId, source: 'composed', lineage });
 }
 
 export async function getAsset(tx: Tx, assetId: string) {

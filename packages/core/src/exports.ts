@@ -22,11 +22,16 @@ export interface ExportedAsset {
  * one of the project's exports.
  */
 export async function recordAssetExport(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, assetId: string, projectId: string): Promise<ExportedAsset | null> {
-  const [a] = await tx`select a.id, a.lineage, p.id as project_id, p.variant_id, p.experiment_id, p.sku_id
+  const [a] = await tx`select a.id, a.kind, a.lineage, p.id as project_id, p.variant_id, p.experiment_id, p.sku_id
                        from assets a join projects p on p.workspace_id = a.workspace_id and p.id::text = a.lineage->>'projectId'
                        where a.id = ${assetId} and a.workspace_id = ${ctx.workspaceId} and p.id = ${projectId}
-                         and a.kind = 'final_export' and a.deleted_at is null`;
+                         and a.kind in ('final_export', 'captions') and a.deleted_at is null`;
   if (!a) return null;
+  // The SRT captions file (plan 06 Phase 3 #6) is a download of the ad's text: recorded, never counted as a video export.
+  if (a.kind === 'captions') {
+    await emit(tx, ctx, 'ASSET_EXPORTED', { type: 'asset', id: assetId }, { aspect: null, projectId, variantId: null, captions: true }, { projectId, skuId: a.sku_id as string });
+    return { assetId, projectId, variantId: null, experimentId: (a.experiment_id as string | null) ?? null, aspect: null };
+  }
   const lineage = (a.lineage ?? {}) as { aspect?: string; variantId?: string };
   const variantId = lineage.variantId ?? (a.variant_id as string | null) ?? null;
   const experimentId = (a.experiment_id as string | null) ?? null;
@@ -48,7 +53,7 @@ export async function deliveryBundle(tx: Tx, ctx: Pick<TenantContext, 'workspace
   const [p] = await tx`select p.final_creative_id, p.bonus_hook_creative_id, s.name as sku_name from projects p join skus s on s.id = p.sku_id
                        where p.id = ${projectId} and p.workspace_id = ${ctx.workspaceId} and p.state = 'COMPLETE'`;
   if (!p?.final_creative_id) return null;
-  const creatives = await tx`select id, final_asset_ids from creatives where workspace_id = ${ctx.workspaceId}
+  const creatives = await tx`select id, final_asset_ids, captions_asset_id from creatives where workspace_id = ${ctx.workspaceId}
                              and id = any(${[p.final_creative_id as string, ...(p.bonus_hook_creative_id ? [p.bonus_hook_creative_id as string] : [])]}::uuid[])`;
   const base = String(p.sku_name).replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-|-$/g, '') || 'arkiv-ad';
   const files: Record<string, [Uint8Array, { level: 0 }]> = {};
@@ -59,6 +64,10 @@ export async function deliveryBundle(tx: Tx, ctx: Pick<TenantContext, 'workspace
       if (!exported) continue;
       const name = `${base}${bonus ? '-alt-hook' : ''}-${exported.aspect ?? assetId.slice(0, 8)}.mp4`;
       files[name] = [new Uint8Array(await assetBytes(tx, assetId)), { level: 0 }];
+    }
+    // The master's SRT captions travel with it (the bonus hook has its own opening line, so its own SRT).
+    if (c.captions_asset_id && (await recordAssetExport(tx, ctx, c.captions_asset_id as string, projectId))) {
+      files[`${base}${bonus ? '-alt-hook' : ''}.srt`] = [new Uint8Array(await assetBytes(tx, c.captions_asset_id as string)), { level: 0 }];
     }
   }
   const count = Object.keys(files).length;

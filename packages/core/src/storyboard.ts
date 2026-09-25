@@ -148,10 +148,10 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
                  values (${ws}, ${storyboardId}, ${i}, ${s.purpose}, ${s.durationMs}, ${s.visualPlan}, ${s.productBehavior},
                    ${s.spokenLine}, ${s.overlayText}, ${p.mode}, ${s.showsHumanSkin}, ${p.reason}, ${p.estimateMicros})`;
       }
-      await tx`update storyboards set status = 'generating' where id = ${storyboardId}`;
+      await tx`update storyboards set status = 'generating', prompt_version = ${promptVersion}, model = ${model} where id = ${storyboardId}`;
       await step(tx, ws, storyboardId, 'frames', 'active');
-      void promptVersion;
-      void model;
+      // Version 1 of every scene's script (§24 independently versioned scenes).
+      for (const r of await tx`select id from scenes where storyboard_id = ${storyboardId} and workspace_id = ${ws}`) await recordScriptVersion(tx, ws, r.id as string, 'storyboard', { promptVersion, model });
     });
 
     // Each scene records the Claim IDs its lines use (§24), mapped against the Claims Vault.
@@ -342,6 +342,8 @@ export async function editScene(
              overlay_text = ${patch.overlayText === undefined ? s.overlay_text : patch.overlayText},
              duration_ms = ${patch.durationMs ?? s.duration_ms}
            where id = ${sceneId}`;
+  // The edit is a new script version, never only an overwrite (§24).
+  await recordScriptVersion(tx, ctx.workspaceId, sceneId, 'edit', { by: `${ctx.actor.kind}:${ctx.actor.id}` });
   // The storyboard's hook is the opening scene's line: editing that line edits the hook too, so a blocked hook can
   // be fixed from its scene and hook variants keep recognising a spoken hook.
   if (Number(s.position) === 0 && s.hook_text) {
@@ -349,6 +351,24 @@ export async function editScene(
     if (hook && hook.trim()) await tx`update storyboards set hook_text = ${hook.trim().slice(0, 90)} where id = ${s.storyboard_id}`;
   }
   return { billable: false };
+}
+
+export type ScriptSource = 'storyboard' | 'edit' | 'frame_redraw' | 'delivered_edit' | 'change';
+
+/**
+ * Record a scene's current script as a new version (§24 "a project timeline is a composition of independently
+ * versioned scenes"): its words, timing, visual plan and product behaviour, and what changed it. Edits, frame
+ * redraws and post-delivery edits each add one, so a composition can be traced to the exact script it was made from.
+ */
+export async function recordScriptVersion(tx: Tx, workspaceId: string, sceneId: string, source: ScriptSource, extra: Record<string, unknown> = {}): Promise<string | null> {
+  const [s] = await tx`select spoken_line, overlay_text, duration_ms, visual_plan, product_behavior, production_mode from scenes where id = ${sceneId} and workspace_id = ${workspaceId}`;
+  if (!s) return null;
+  const [n] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where workspace_id = ${workspaceId} and scene_id = ${sceneId} and kind = 'script'`;
+  const script = { spoken: s.spoken_line ?? null, overlay: s.overlay_text ?? null, durationMs: s.duration_ms, visualPlan: s.visual_plan, productBehavior: s.product_behavior ?? null, productionMode: s.production_mode };
+  const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, status, script, lineage)
+                       values (${workspaceId}, ${sceneId}, ${n!.v}, 'script', 'accepted', ${tx.json(script as never)}, ${tx.json({ source, ...extra } as never)})
+                       returning id`;
+  return v!.id as string;
 }
 
 export async function setSceneLock(tx: Tx, ctx: TenantContext, sceneId: string, locked: boolean) {
@@ -479,6 +499,8 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
                            values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, ${composite ? 'generated_bg+exact_product' : 'generated'}, ${img.modelVersion}, 'succeeded', ${tx.json(lineage as never)}, ${img.jobId}, ${costMicros}) returning id`;
       await tx`update scenes set current_version_id = ${v!.id}, free_regenerations_used = free_regenerations_used + 1,
                  visual_plan = ${`${info.s.visual_plan}. ${instruction}`.slice(0, 300)} where id = ${sceneId}`;
+      // The redraw changed the visual plan: a new script version keeps the previous plan (§24).
+      await recordScriptVersion(tx, ws, sceneId, 'frame_redraw', { instruction, frameVersionId: v!.id });
       await settle(tx, ctx, auth.authorizationId, 'consumed');
       await step(tx, ws, sceneId, key, 'done');
     });

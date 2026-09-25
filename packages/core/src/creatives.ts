@@ -23,6 +23,8 @@ export interface CreativeVersion {
   experimentId?: string | null;
   variantId?: string | null;
   storyboardId?: string | null;
+  /** The version's SRT captions asset (plan 06 Phase 3 #6). */
+  captionsAssetId?: string | null;
 }
 
 /**
@@ -33,9 +35,9 @@ export interface CreativeVersion {
 export async function versionCreative(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, v: CreativeVersion): Promise<string> {
   // A version keeps its parent's AI-content flags (standard §40): it reuses the parent's media.
   const [parent] = await tx`select ai_generated, synthetic_people from creatives where id = ${v.parentCreativeId} and workspace_id = ${ctx.workspaceId}`;
-  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
+  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, captions_asset_id)
                         values (${ctx.workspaceId}, ${v.skuId}, 'generated', ${v.parentCreativeId}, ${v.projectId}, ${tx.json(v.genome as never)}, (${GENOME_VERSION_SQL(tx)}),
-                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)}, ${!!parent?.ai_generated}, ${!!parent?.synthetic_people})
+                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)}, ${!!parent?.ai_generated}, ${!!parent?.synthetic_people}, ${v.captionsAssetId ?? null})
                         returning id`;
   const id = cr!.id as string;
   await emit(

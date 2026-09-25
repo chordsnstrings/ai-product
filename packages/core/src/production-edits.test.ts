@@ -8,6 +8,11 @@ import { append, available, currentPeriodKey } from './ledger';
 import { mockConcepts } from './mock-intel';
 import { approveForProduction, archiveExperiment, blockedLines, finishAfterEdit, impliedFlags, produceProject, reopenForEdit } from './production';
 import { editScene, generateStoryboard, selectConcept } from './storyboard';
+import { toSrt, withTempDir } from '@arkiv/media';
+import { assetBytes } from './assets';
+import type { CompositionManifest } from './composition';
+import { deliveryBundle, recordAssetExport } from './exports';
+import { applyDeliveredTextEdit, composeFromManifest, requestTextEdit } from './recompose';
 import { ctxFor, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
 
@@ -134,4 +139,90 @@ describe('implied-claim flags (standard §25.3: prod-19)', () => {
       { claim: 'Looks like a clinic', basis: 'visual', severity: 'review', scene: 2 },
     ]);
   });
+});
+
+async function delivered() {
+  const r = await storyboardReady();
+  await withTenant(r.t.workspaceId, async (tx) => {
+    await append(tx, r.ctx, { type: 'CREDIT_GRANTED', unit: 'taste', amount: 1, idempotencyKey: `pay:${r.projectId}` });
+    await approveForProduction(tx, r.ctx, r.projectId, 'taste');
+  });
+  expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+  const [c] = await ownerPool()`select c.id, c.composition, c.captions_asset_id from projects p join creatives c on c.id = p.final_creative_id where p.id = ${r.projectId}`;
+  return { ...r, creativeId: c!.id as string, manifest: c!.composition as CompositionManifest, captionsAssetId: c!.captions_asset_id as string | null };
+}
+
+describe('delivered ad: SRT, reproducible composition, text edits (plan 06 Phase 3 #6, standard §24/§25: prod-28, prod-33, prod-12)', () => {
+  it('stores the SRT as its own downloadable asset, and recomposing the manifest reproduces the timeline', async () => {
+    const r = await delivered();
+    expect(r.captionsAssetId).toBeTruthy();
+    const [a] = await ownerPool()`select kind, mime from assets where id = ${r.captionsAssetId}`;
+    expect(a).toMatchObject({ kind: 'captions', mime: 'application/x-subrip' });
+    const srt = (await withTenant(r.t.workspaceId, (tx) => assetBytes(tx, r.captionsAssetId!))).toString('utf8');
+    expect(srt).toBe(toSrt(r.manifest.captions));
+    // Each export points at it, the SRT isn't a video export, and downloading it is recorded against the project.
+    const exportsLineage = await ownerPool()`select lineage->>'captionsAssetId' as c from assets where kind = 'final_export' and lineage->>'projectId' = ${r.projectId}`;
+    expect(exportsLineage.every((e) => e.c === r.captionsAssetId)).toBe(true);
+    expect(await withTenant(r.t.workspaceId, (tx) => recordAssetExport(tx, r.ctx, r.captionsAssetId!, r.projectId))).toMatchObject({ aspect: null });
+    const bundle = await withTenant(r.t.workspaceId, (tx) => deliveryBundle(tx, r.ctx, r.projectId));
+    expect(bundle!.files).toBe(r.manifest.aspects.length + 1);
+    // §24: the composition is reproducible from its manifest (scene versions, voice clips, cues, end card).
+    const outs = await withTempDir((dir) => composeFromManifest(r.t.workspaceId, r.manifest, dir));
+    expect(outs.map((o) => o.aspect)).toEqual(r.manifest.aspects);
+    expect(outs.every((o) => o.durationMs === r.manifest.durationMs)).toBe(true);
+    expect(outs[0]!.srt).toBe(srt);
+    // Every scene has its script version 1 from the storyboard.
+    const scripts = await ownerPool()`select v.lineage->>'source' as source from scene_versions v join scenes s on s.id = v.scene_id where s.storyboard_id = ${r.storyboardId} and v.kind = 'script'`;
+    expect(scripts.length).toBeGreaterThan(0);
+    expect(scripts.every((x) => x.source === 'storyboard')).toBe(true);
+  }, 300_000);
+
+  it('edits the words of a delivered ad without a render or a credit, and refuses a blocked line up front', async () => {
+    const r = await delivered();
+    const body = r.manifest.scenes;
+    const spokenScene = body.find((s) => s.spokenText)!;
+    const overlayScene = body.find((s) => s.sceneId !== spokenScene.sceneId) ?? body[0]!;
+    // A line the claim rules refuse never queues.
+    await expect(withTenant(r.t.workspaceId, (tx) => requestTextEdit(tx, r.ctx, r.projectId, { scenes: [{ sceneId: overlayScene.sceneId, overlayText: 'Cures acne overnight' }] }))).rejects.toMatchObject({ code: 'GATE_BLOCKED' });
+    const viewer = { ...r.ctx, role: 'VIEWER' as const };
+    await expect(withTenant(r.t.workspaceId, (tx) => requestTextEdit(tx, viewer, r.projectId, { cta: 'Shop the serum' }))).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const edits = { scenes: [{ sceneId: overlayScene.sceneId, overlayText: 'Morning and night' }, { sceneId: spokenScene.sceneId, spokenLine: 'Smooth it on after cleansing.' }], cta: 'Shop the serum' };
+    const tts = async () => (await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task like 'tts.%'`)[0]!.n as number;
+    const ttsBefore = await tts();
+    const videoBefore = await videoJobs(r.t.workspaceId);
+    expect(await withTenant(r.t.workspaceId, (tx) => requestTextEdit(tx, r.ctx, r.projectId, edits))).toEqual({ queued: true, revoiced: 1 });
+    const [job] = await ownerPool()`select payload as data from outbox where queue = 'recompose-project' and payload->>'projectId' = ${r.projectId} order by created_at desc limit 1`;
+    expect((job!.data as { edits: unknown }).edits).toEqual(edits);
+    // A second request while the first waits is refused (one edit at a time).
+    await expect(withTenant(r.t.workspaceId, (tx) => requestTextEdit(tx, r.ctx, r.projectId, { cta: 'Buy now' }))).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    expect(await applyDeliveredTextEdit(r.ctx, r.projectId, edits, r.creativeId)).toBe('recomposed');
+    const [p] = await ownerPool()`select p.final_creative_id, c.parent_creative_id, c.composition, c.captions_asset_id from projects p join creatives c on c.id = p.final_creative_id where p.id = ${r.projectId}`;
+    expect(p!.final_creative_id).not.toBe(r.creativeId);
+    expect(p!.parent_creative_id).toBe(r.creativeId);
+    const m = p!.composition as CompositionManifest;
+    expect(m.scenes.find((s) => s.sceneId === overlayScene.sceneId)!.overlayText).toBe('Morning and night');
+    expect(m.scenes.find((s) => s.sceneId === spokenScene.sceneId)!.spokenText).toBe('Smooth it on after cleansing.');
+    expect(m.endCard.cta).toBe('Shop the serum');
+    // Same footage: every scene keeps its asset; captions follow the new spoken line.
+    expect(m.scenes.map((s) => s.assetId)).toEqual(r.manifest.scenes.map((s) => s.assetId));
+    expect(m.captions.map((c) => c.text).join(' ')).toContain('Smooth it on');
+    const srt = (await withTenant(r.t.workspaceId, (tx) => assetBytes(tx, p!.captions_asset_id as string))).toString('utf8');
+    expect(srt).toContain('Smooth it on');
+    // One short voice line for the changed line, no render, no credit.
+    expect(await tts()).toBe(ttsBefore + 1);
+    expect(await videoJobs(r.t.workspaceId)).toBe(videoBefore);
+    expect(await withTenant(r.t.workspaceId, (tx) => available(tx, 'taste'))).toBe(0);
+    const [entries] = await ownerPool()`select count(*)::int as n from ledger_entries where project_id = ${r.projectId} and type = 'CREDIT_CONSUMED'`;
+    expect(entries!.n).toBe(1);
+    // The storyboard follows, each edited scene with a new script version (§24).
+    const [sc] = await ownerPool()`select overlay_text from scenes where id = ${overlayScene.sceneId}`;
+    expect(sc!.overlay_text).toBe('Morning and night');
+    const edited = await ownerPool()`select scene_id from scene_versions where kind = 'script' and lineage->>'source' = 'delivered_edit'`;
+    expect(edited.map((e) => e.scene_id).sort()).toEqual([overlayScene.sceneId, spokenScene.sceneId].sort());
+    const [st] = await ownerPool()`select status from progress_steps where subject_id = ${r.projectId} and step_key = 'text_edit'`;
+    expect(st!.status).toBe('done');
+    // A stale edit (the ad changed since it was asked for) is not applied onto the new version.
+    expect(await applyDeliveredTextEdit(r.ctx, r.projectId, { cta: 'Buy now' }, r.creativeId)).toBe('unchanged');
+  }, 300_000);
 });

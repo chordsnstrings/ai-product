@@ -24,7 +24,9 @@ import {
   SLOW_STEP_MS,
   stepEta,
   storyboardView,
+  TEXT_EDIT_STEP,
   verifiedIngredients,
+  type CompositionManifest,
   type Proposal,
   type QaReport,
 } from '@arkiv/core';
@@ -50,7 +52,9 @@ export async function projectView(workspaceId: string, projectId: string) {
     if (p.storyboard_id) storyboard = await storyboardBlock(tx, p.storyboard_id as string);
     // Project-subject steps also hold queued concept requests ("concepts.batch.N"); production shows only its own.
     const projectSteps = await listSteps(tx, projectId);
-    const productionSteps = projectSteps.filter((s) => !String(s.step_key).startsWith('concepts.batch.'));
+    // Post-delivery edits have their own status (edit.status below), not a production step.
+    const productionSteps = projectSteps.filter((s) => !String(s.step_key).startsWith('concepts.batch.') && s.step_key !== TEXT_EDIT_STEP);
+    const editStep = projectSteps.find((s) => s.step_key === TEXT_EDIT_STEP) ?? null;
     const conceptStep = projectSteps
       .filter((s) => String(s.step_key).startsWith('concepts.batch.'))
       .sort((a, b) => Number(String(b.step_key).split('.').pop()) - Number(String(a.step_key).split('.').pop()))[0];
@@ -61,13 +65,30 @@ export async function projectView(workspaceId: string, projectId: string) {
     const creativeTestsLeft = Math.max(0, await available(tx, 'creative_test', workspaceId));
     const [purchase] = await tx`select status, kind, amount_micros from purchases where project_id = ${projectId} order by created_at desc limit 1`;
     let exports: { aspect: string; assetId: string; url: string; download: string }[] = [];
+    // The SRT captions of the delivered ad (plan 06 Phase 3 #6), and its words as the merchant can edit them (§25).
+    let captions: { download: string } | null = null;
+    let words: { scenes: { sceneId: string; position: number; spokenLine: string | null; overlayText: string | null; endCard: boolean }[]; cta: string } | null = null;
     // What in the delivered ad is AI-generated (standard §40), for the platform disclosure steps on delivery.
     let disclosure: { aiGenerated: boolean; syntheticPeople: boolean; syntheticVoice: boolean } | null = null;
     // Finished work is stored but not delivered while the workspace is suspended (plan 05 §2.3).
     const [ws] = await tx`select state from workspaces where id = ${workspaceId}`;
     const deliveryHeld = DELIVERY_HOLD_STATES.has(ws?.state as WorkspaceState);
     if (p.final_creative_id && !deliveryHeld) {
-      const [cr] = await tx`select final_asset_ids, ai_generated, synthetic_people, composition->'disclosure'->>'syntheticVoice' as synthetic_voice from creatives where id = ${p.final_creative_id}`;
+      const [cr] = await tx`select final_asset_ids, ai_generated, synthetic_people, composition->'disclosure'->>'syntheticVoice' as synthetic_voice, captions_asset_id, composition from creatives where id = ${p.final_creative_id}`;
+      if (cr?.captions_asset_id) {
+        const name = `${String(p.sku_name).replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.srt`;
+        captions = { download: `/api/assets/${cr.captions_asset_id}/download?name=${encodeURIComponent(name)}&project=${projectId}` };
+      }
+      const m = (cr?.composition ?? null) as CompositionManifest | null;
+      if (m?.scenes?.length && m.scenes.every((x) => x.assetId)) {
+        words = {
+          scenes: [
+            ...m.scenes.map((x, i) => ({ sceneId: x.sceneId, position: i + 1, spokenLine: x.spokenText, overlayText: x.overlayText, endCard: false })),
+            ...(m.endCard.sceneId ? [{ sceneId: m.endCard.sceneId, position: m.scenes.length + 1, spokenLine: m.endCard.spokenText, overlayText: null, endCard: true }] : []),
+          ],
+          cta: m.endCard.cta,
+        };
+      }
       if (cr) disclosure = { aiGenerated: !!cr.ai_generated, syntheticPeople: !!cr.synthetic_people, syntheticVoice: cr.synthetic_voice === 'true' };
       const assets = await tx`select id, lineage from assets where id in ${tx((cr?.final_asset_ids as string[]) ?? ['00000000-0000-0000-0000-000000000000'])}`;
       exports = await Promise.all(
@@ -172,6 +193,11 @@ export async function projectView(workspaceId: string, projectId: string) {
         /** §8 creative goal the ideas are drafted for (performance by default). */
         goal: ((CreativeGoal as readonly string[]).includes(p.goal as string) ? p.goal : 'performance') as CreativeGoal,
         deliveryHeld,
+        /** A delivered ad's words, editable without a new render (§25); an experiment's ad keeps its words. */
+        edit:
+          p.state === 'COMPLETE' && words && !p.experiment_id
+            ? { ...words, status: editStep ? { status: editStep.status as string, detail: (editStep.detail as string | null) ?? null } : null }
+            : null,
       },
       sku: {
         id: p.sku_id as string,
@@ -232,6 +258,7 @@ export async function projectView(workspaceId: string, projectId: string) {
       plan: { subscribed: !!sub, planCode: (sub?.plan_code as string | undefined) ?? null, creativeTestsLeft },
       purchase: purchase ? { status: purchase.status as string, kind: purchase.kind as string, amountMicros: Number(purchase.amount_micros) } : null,
       exports,
+      captions,
       // An offer bonus is shown only when the offer carries it (what is shown is what is delivered, §8).
       bonus: { offered: quote.kind === 'taste' && bonusHooks(quote.bonus) > 0, exports: bonusExports, pending: bonusPending, failed: !!p.bonus_hook_failed_at },
       disclosure,

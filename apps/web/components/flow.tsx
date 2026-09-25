@@ -1625,6 +1625,87 @@ function NotRight({ projectId, v }: { projectId: string; v: View }) {
 }
 
 /**
+ * Standard §25 retry policy "Text/CTA/price/caption-only edit | Usually no render charge": the merchant changes the
+ * delivered ad's spoken lines, on-screen text or CTA. Same footage, no credit used; every line is checked against the
+ * claim rules before anything is made, and the new files replace the downloads when ready.
+ */
+function EditWords({ projectId, v, onQueued }: { projectId: string; v: View; onQueued: () => void }) {
+  const edit = v.project.edit;
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<{ scenes: Record<string, { spokenLine: string; overlayText: string }>; cta: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (!edit) return null;
+  const status = edit.status?.status;
+  const working = status === 'pending' || status === 'active';
+  const start = () => {
+    setDraft({ scenes: Object.fromEntries(edit.scenes.map((s) => [s.sceneId, { spokenLine: s.spokenLine ?? '', overlayText: s.overlayText ?? '' }])), cta: edit.cta });
+    setErr(null);
+    setOpen(true);
+  };
+  return (
+    <>
+      {working ? <p className="ak-small ak-muted" role="status">Updating your ad’s words — the new files replace these in a minute. No charge.</p> : null}
+      {status === 'failed' && edit.status?.detail ? <p className="ak-small ak-error" role="alert">{edit.status.detail}</p> : null}
+      {!working ? <button type="button" className="ak-textbtn" onClick={start}>Edit the words</button> : null}
+      <Sheet open={open} onOpenChange={setOpen} title="Edit the words" description="Same footage, no credit used. Every line is checked against the claim rules first.">
+        {draft ? (
+          <form
+            className="ak-stack"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setBusy(true);
+              setErr(null);
+              try {
+                const scenes = edit.scenes
+                  .map((s) => {
+                    const d = draft.scenes[s.sceneId]!;
+                    const out: { sceneId: string; spokenLine?: string | null; overlayText?: string | null } = { sceneId: s.sceneId };
+                    if (d.spokenLine.trim() !== (s.spokenLine ?? '')) out.spokenLine = d.spokenLine.trim() || null;
+                    if (!s.endCard && d.overlayText.trim() !== (s.overlayText ?? '')) out.overlayText = d.overlayText.trim() || null;
+                    return out;
+                  })
+                  .filter((x) => Object.keys(x).length > 1);
+                await api(`/api/projects/${projectId}/edit-text`, { scenes, ...(draft.cta.trim() !== edit.cta ? { cta: draft.cta.trim() } : {}) });
+                setOpen(false);
+                onQueued();
+              } catch (x) {
+                setErr((x as Error).message);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            {edit.scenes.map((s) => (
+              <fieldset key={s.sceneId} className="ak-stack" style={{ border: 0, padding: 0, margin: 0, gap: 6 }}>
+                <legend className="ak-label">{s.endCard ? 'End card' : `Scene ${s.position}`}</legend>
+                <label className="ak-field">
+                  <span className="ak-small">Spoken line</span>
+                  <textarea className="ak-textarea" maxLength={160} value={draft.scenes[s.sceneId]!.spokenLine} onChange={(e) => setDraft({ ...draft, scenes: { ...draft.scenes, [s.sceneId]: { ...draft.scenes[s.sceneId]!, spokenLine: e.target.value } } })} />
+                </label>
+                {s.endCard ? null : (
+                  <label className="ak-field">
+                    <span className="ak-small">On-screen text</span>
+                    <input className="ak-input" maxLength={70} value={draft.scenes[s.sceneId]!.overlayText} onChange={(e) => setDraft({ ...draft, scenes: { ...draft.scenes, [s.sceneId]: { ...draft.scenes[s.sceneId]!, overlayText: e.target.value } } })} />
+                  </label>
+                )}
+              </fieldset>
+            ))}
+            <label className="ak-field">
+              <span className="ak-label">Call to action</span>
+              <input className="ak-input" maxLength={40} required value={draft.cta} onChange={(e) => setDraft({ ...draft, cta: e.target.value })} />
+            </label>
+            <p className="ak-small ak-muted" style={{ margin: 0 }}>A changed spoken line is voiced again in the same voice; if it’s too long for its scene we’ll ask for a shorter one.</p>
+            {err ? <p className="ak-error" role="alert">{err}</p> : null}
+            <Button type="submit" disabled={busy}>{busy ? 'Checking…' : 'Update my ad'}</Button>
+          </form>
+        ) : null}
+      </Sheet>
+    </>
+  );
+}
+
+/**
  * Plan 03 P10 #4 / plan 04 L17 / standard §8: the continuation card appears only once the finished ad has been
  * watched (10 seconds, or to the end) or exported — never before. It names the two strategic directions that are
  * still untested, and for a one-off buyer leads to the plans.
@@ -1668,7 +1749,8 @@ const CONTINUE_AFTER_S = 10;
 
 export function DeliverFlow({ projectId }: { projectId: string }) {
   // Kept live only while the offer's bonus hook is still being made.
-  const { data: v, error } = useProject(projectId, useCallback((x: View | null) => !!x?.bonus.pending, []));
+  // Kept live while the offer's bonus hook or an edit of the ad's words is being made.
+  const { data: v, error, refresh, resume } = useProject(projectId, useCallback((x: View | null) => !!x?.bonus.pending || ['pending', 'active'].includes(x?.project.edit?.status?.status ?? ''), []));
   const after = useShowAfterPlay();
   const [earned, setEarned] = useState(false);
   const earn = useCallback(() => {
@@ -1712,6 +1794,12 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
                 <span className="ak-index">MP4 ↓</span>
               </DownloadLink>
             ))}
+            {v.captions ? (
+              <DownloadLink className="ak-index-row" href={v.captions.download} filename={fileName(v.captions.download)} onDownload={earn}>
+                <span>Captions</span>
+                <span className="ak-index">SRT ↓</span>
+              </DownloadLink>
+            ) : null}
             {v.exports.length > 1 ? (
               <a className="ak-index-row" href={`/api/projects/${projectId}/download-all`} download onClick={earn}>
                 <span>Download all{v.bonus.exports.length ? ' (with the bonus hook)' : ''}</span>
@@ -1764,6 +1852,7 @@ export function DeliverFlow({ projectId }: { projectId: string }) {
               <li>{slug ? <a href={`/w/${slug}/settings/integrations`}>Connect your ad account</a> : 'Connect your ad account'} and we’ll tell you what it taught you.</li>
             </ol>
             {slug ? <LinkButton href={`/w/${slug}/this-week`} variant="secondary">Go to your archive</LinkButton> : null}
+            <EditWords projectId={projectId} v={v} onQueued={() => { resume(); refresh(); }} />
             <NotRight projectId={projectId} v={v} />
             {earned || !primary ? <Continuation v={v} /> : null}
             {primary ? (

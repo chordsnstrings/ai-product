@@ -5,7 +5,7 @@ import { withTenant, type Tx } from '@arkiv/db';
 import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProductionMode, type ProjectState } from '@arkiv/shared';
 import { brandAccent, captionCues, composeAd, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
-import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
+import { assetBytes, saveAsset, saveCaptions, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
 import { classifyClaim, showsSyntheticPeople, syntheticTestimonials, type LineMapping } from './compliance';
@@ -55,7 +55,7 @@ export const CONTINUITY_TASK = 'qa.continuity';
 /** Frames of the finished 9:16 export the implied-claim scan looks at. */
 const IMPLIED_FRAMES = 3;
 /** A voice-over may run this far past the end of the ad before the export is refused (never cut mid-word). */
-const VO_OVERFLOW_TOLERANCE_MS = 250;
+export const VO_OVERFLOW_TOLERANCE_MS = 250;
 
 type SceneRow = Record<string, unknown> & { id: string; production_mode: string; duration_ms: number; purpose: string };
 
@@ -1249,11 +1249,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, (tx) => advance(tx, ctx, projectId, 'FINAL_QA'));
       const exportAssets: { aspect: Aspect; assetId: string }[] = [];
+      // The SRT (the same cues in every format) is its own downloadable asset (plan 06 Phase 3 #6).
+      const captionsAsset = await withTenant(ws, (tx) => saveCaptions(tx, ws, sku.id as string, outs[0]!.srt, { projectId, storyboardId: sb.id }));
       for (const o of outs) {
         checks.push(...(await qaExport(o.file, o.aspect, totalMs)));
         const bytes = await readFile(o.file);
         const a = await withTenant(ws, (tx) =>
-          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, storyboardId: sb.id, disclosure } }),
+          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captionsAsset.id, storyboardId: sb.id, disclosure } }),
         );
         exportAssets.push({ aspect: o.aspect, assetId: a.id });
       }
@@ -1269,10 +1271,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, async (tx) => {
         const [cr] = await tx`
-          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
+          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, captions_asset_id)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
-            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
+            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople}, ${captionsAsset.id})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap, ...(impliedReview.length ? { impliedClaims: impliedReview } : {}) } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;

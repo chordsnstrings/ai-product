@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, selectHeroProduct, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, produceWithCreativeTest, retryAnalysis, retryProduction, retryStoryboard, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, selectHeroProduct, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, requestTextEdit, produceWithCreativeTest, retryAnalysis, retryProduction, retryStoryboard, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { CreativeGoal, DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -17,6 +17,8 @@ import { projectAccess } from '@/lib/tenant';
  *   finish    – produce again after that fix, with the same entitlement (no new checkout)
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   recompose – "Update my ad" after the product's price or size changed: new on-screen text, same footage (§42)
+ *   edit-text – change a delivered ad's spoken lines, on-screen text or CTA: recomposed from the same footage, no
+ *               entitlement used (§25 "Text/CTA/price/caption-only edit"). Queued: 202
  *   select-product – mark the hero product in a photo that shows several (plan 03 P2); the analysis resumes
  *   storyboard-retry – draw the chosen idea's storyboard again after we failed to (P7 edge, §14)
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
@@ -112,6 +114,19 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
     case 'recompose': {
       if (a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
       const r = await withTenant(a.ctx.workspaceId, (tx) => requestRecompose(tx, a.ctx, id));
+      return json({ ok: true, ...r }, r.queued ? 202 : 200);
+    }
+    case 'edit-text': {
+      if (a.provisional) throw new DomainError('FORBIDDEN', 'Please sign in to continue.', { needsAccount: true });
+      const line = (max: number) => z.string().max(max).nullable().optional();
+      const edits = await body(
+        req,
+        z.object({
+          scenes: z.array(z.object({ sceneId: z.string().uuid(), spokenLine: line(160), overlayText: line(70) })).max(12).optional(),
+          cta: z.string().trim().min(1).max(40).optional(),
+        }),
+      );
+      const r = await withTenant(a.ctx.workspaceId, (tx) => requestTextEdit(tx, a.ctx, id, edits));
       return json({ ok: true, ...r }, r.queued ? 202 : 200);
     }
     case 'finish': {

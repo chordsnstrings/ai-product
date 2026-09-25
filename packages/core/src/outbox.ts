@@ -55,8 +55,9 @@ export const QUEUE_POLICY: Record<QueueName, { idempotent: boolean; spends: bool
   [Queues.refundPurchase]: { idempotent: true, spends: false },
   [Queues.produceProject]: { idempotent: true, spends: true },
   [Queues.hookVariants]: { idempotent: true, spends: true },
-  // Media only (no provider call); an ad already showing the current facts is left alone.
-  [Queues.recomposeProject]: { idempotent: true, spends: false },
+  // A price/size recomposition is media only; a merchant's text edit re-voices a changed line (one keyed TTS
+  // authorization per line). An ad already showing the current words is left alone.
+  [Queues.recomposeProject]: { idempotent: true, spends: true },
   [Queues.processUpload]: { idempotent: true, spends: false },
   [Queues.stripeEvent]: { idempotent: true, spends: false },
   [Queues.sendEmail]: { idempotent: true, spends: false },
