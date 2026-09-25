@@ -16,11 +16,12 @@ beforeEach(async () => {
   await truncateAll();
   gw = new MockStripe();
   setBillingGateway(gw);
+  T = Math.floor(Date.now() / 1000);
 });
 afterAll(closeAll);
 
 const day = 86400;
-const T = Math.floor(Date.now() / 1000);
+let T = Math.floor(Date.now() / 1000);
 let n = 0;
 /** Deliver one event created at `created` (Stripe's clock, unix seconds). */
 async function send(type: string, object: Record<string, unknown>, created: number) {
@@ -35,6 +36,9 @@ async function subscribed(plan: 'LAUNCH' | 'GROWTH' | 'SCALE') {
   const consentId = await withTenant(t.workspaceId, (tx) => recordAutoRenewConsent(tx, free, { userId: t.userId, plan, agreed: true }));
   const co = await withTenant(t.workspaceId, (tx) => startSubscriptionCheckout(tx, free, plan, consentId, { id: t.userId, email: t.email }));
   await completeMockCheckout(co.sessionId);
+  // The mock checkout stamps its events with the real time, so the test's Stripe clock starts after them: on a slow
+  // runner a clock taken earlier falls behind, and later events look stale to the out-of-order guard.
+  T = Math.floor(Date.now() / 1000) + 1;
   const [s] = await ownerPool()`select s.stripe_subscription_id, w.stripe_customer_id from subscriptions s join workspaces w on w.id = s.workspace_id where s.workspace_id = ${t.workspaceId}`;
   const subId = s!.stripe_subscription_id as string;
   const customer = s!.stripe_customer_id as string;
