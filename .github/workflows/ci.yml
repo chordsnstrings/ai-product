@@ -102,6 +102,9 @@ jobs:
       - name: Base schema (merge base) with seed data
         run: |
           git worktree add ../base "$(git merge-base HEAD origin/${{ github.base_ref }})"
+          # A base without migrations (e.g. a docs-only first commit) has no schema to build: every migration in this
+          # change is then pending and is dry-run against the empty database.
+          if [ ! -d ../base/packages/db/migrations ]; then echo "Base has no migrations; dry-running all of them."; exit 0; fi
           cd ../base && pnpm install --frozen-lockfile && pnpm db:migrate && pnpm db:seed
       - run: pnpm install --frozen-lockfile
       - name: Apply this change's migrations to it, then roll back
