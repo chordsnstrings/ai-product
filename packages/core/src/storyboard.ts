@@ -51,8 +51,26 @@ async function checkFrame(inspect: boolean, input: SceneQaInput): Promise<CheckR
   return [{ check: 'product_fidelity', pass, hard: !pass, detail: pass ? 'Product matches reference (deterministic checks)' : `Product identity mismatch: ${det.failures.map((f) => f.detail).join('; ')}`, data: { deterministic: det, inspector: 'not run' } }];
 }
 
+/** What a generated frame is checked against (§16): the active fingerprint, two reference photos and the cut-out. */
+async function frameFidelity(tx: Tx, skuId: string, refAssetIds: readonly string[], cutout: Buffer | null): Promise<Pick<SceneQaInput, 'referenceBytes' | 'fingerprint'>> {
+  const [fp] = await tx`select label_text, closure, dominant_colors, liquid_color, thresholds from visual_fingerprints where sku_id = ${skuId} and active order by version desc limit 1`;
+  return {
+    referenceBytes: await Promise.all(refAssetIds.slice(0, 2).map((id) => assetBytes(tx, id))),
+    fingerprint: {
+      labelText: (fp?.label_text as string | null) ?? null,
+      closure: (fp?.closure as string | null) ?? null,
+      dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
+      liquidColor: (fp?.liquid_color as string | null) ?? null,
+      thresholds: fidelityThresholds(fp?.thresholds),
+      cutout,
+    },
+  };
+}
+
 /** A frame inspection: two reference photos and the frame at 768 px, plus the fingerprint text; a short JSON answer. */
 const FRAME_QA_TOKENS = { input: 4_000, output: 600 };
+/** A redraw's own inspection, priced as the gateway debits it (three images, the inspector's full answer budget). */
+const REDRAW_QA_TOKENS = { input: 6_000, output: 800 };
 /** Free "Change picture" redraws per storyboard before a purchase (plan 03 P7). */
 export const FREE_FRAME_REGENERATIONS = 3;
 
@@ -171,27 +189,14 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     const { imagery, refs, refAssetIds } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId), refs: await referenceDataUrls(tx, skuId, projectId), refAssetIds: await referenceAssetIds(tx, skuId, projectId) }));
     const cut = imagery.cutout?.keyed ? imagery.cutout : null;
     // What a generated frame is checked against (§16): the active fingerprint, its reference photos and the cut-out.
-    const fidelity = await withTenant(ws, async (tx) => {
-      const [fp] = await tx`select label_text, closure, dominant_colors, liquid_color, thresholds from visual_fingerprints where sku_id = ${skuId} and active order by version desc limit 1`;
-      const refBytes = await Promise.all(refAssetIds.slice(0, 2).map((id) => assetBytes(tx, id)));
-      return {
-        referenceBytes: refBytes,
-        fingerprint: {
-          labelText: (fp?.label_text as string | null) ?? null,
-          closure: (fp?.closure as string | null) ?? null,
-          dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
-          liquidColor: (fp?.liquid_color as string | null) ?? null,
-          thresholds: fidelityThresholds(fp?.thresholds),
-          cutout: cut?.bytes ?? null,
-        },
-      };
-    });
+    const fidelity = await withTenant(ws, (tx) => frameFidelity(tx, skuId, refAssetIds, cut?.bytes ?? null));
     let generated = 0;
     for (const s of scenes) {
       let bytes: Buffer;
       let technique: string;
       let lineage: Record<string, unknown> = {};
       let jobModel: string | null = null;
+      let jobPrompt: string | null = null;
       let qa: CheckResult[] | null = null;
       // A hybrid is a generated setting *plus the exact product*: without a clean cut-out it would show only the
       // generated (unchecked) product, so it falls back to the exact-product frame instead.
@@ -214,6 +219,7 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
         technique = s.production_mode === 'HYBRID' && cut ? 'generated_bg+exact_product' : 'generated';
         lineage = { providerJobId: img.jobId, ...(cut && technique === 'generated_bg+exact_product' ? { cutoutAssetId: cut.assetId } : {}) };
         jobModel = img.modelVersion;
+        jobPrompt = img.promptVersion;
         if (technique === 'generated') {
           // The model drew the product itself: check it before the customer sees it (plan 06 Phase 2 D4; §54 rule
           // 4). A frame that fails is replaced by the exact-product composite, and the check is kept with it.
@@ -226,6 +232,7 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
             technique = fb?.technique ?? 'backdrop';
             lineage = { ...(fb?.lineage ?? {}), fidelityFallback: true, rejectedProviderJobId: img.jobId, rejectedBecause: failed.detail.slice(0, 200) };
             jobModel = null;
+            jobPrompt = null;
           }
         }
       } else {
@@ -241,12 +248,14 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
         // §41: the job's output id, and the job (with its cost) on the version it produced.
         const jobId = (lineage.providerJobId as string | undefined) ?? null;
         const { costMicros } = jobId ? await linkJobOutput(tx, ws, jobId, a.id) : { costMicros: 0 };
-        const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage, qa, provider_job_id, cost_micros)
-                             values (${ws}, ${s.id}, 1, 'frame', ${a.id}, ${technique}, ${jobModel}, 'succeeded', ${tx.json(lineage as never)}, ${tx.json((qa ?? {}) as never)}, ${jobId}, ${costMicros})
+        const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, status, lineage, qa, provider_job_id, cost_micros)
+                             values (${ws}, ${s.id}, 1, 'frame', ${a.id}, ${technique}, ${jobModel}, ${jobPrompt}, 'succeeded', ${tx.json(lineage as never)}, ${tx.json((qa ?? {}) as never)}, ${jobId}, ${costMicros})
                              on conflict (workspace_id, scene_id, kind, version) do update set asset_id = excluded.asset_id, technique = excluded.technique, lineage = excluded.lineage, qa = excluded.qa,
-                               provider_job_id = excluded.provider_job_id, cost_micros = excluded.cost_micros
+                               provider_job_id = excluded.provider_job_id, cost_micros = excluded.cost_micros, model = excluded.model, prompt_version = excluded.prompt_version
                              returning id`;
-        await tx`update scenes set current_version_id = ${v!.id} where id = ${s.id}`;
+        // §24 source assets: the merchant's own images this frame was made from (reference photos, the cut-out).
+        const sources = sourceAssetIds(lineage, jobId ? refAssetIds : []);
+        await tx`update scenes set current_version_id = ${v!.id}, source_asset_ids = ${sources}::uuid[] where id = ${s.id}`;
       });
     }
     await withTenant(ws, async (tx) => {
@@ -353,6 +362,12 @@ export async function editScene(
   return { billable: false };
 }
 
+/** The merchant's own images a frame was made from: the cut-out or photo it composites, and the model's references. */
+export function sourceAssetIds(lineage: Record<string, unknown>, references: readonly string[]): string[] {
+  const own = ['cutoutAssetId', 'referenceAssetId'].map((k) => lineage[k]).filter((x): x is string => typeof x === 'string');
+  return [...new Set([...own, ...references])];
+}
+
 export type ScriptSource = 'storyboard' | 'edit' | 'frame_redraw' | 'delivered_edit' | 'change';
 
 /**
@@ -439,7 +454,7 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
     if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
     const [done] = await tx`select 1 from scene_versions where scene_id = ${sceneId} and kind = 'frame' and version = ${version}`;
     const imagery = done ? null : await productImagery(tx, s.sku_id as string);
-    return { s, done: !!done, cut: imagery?.cutout?.keyed ? imagery.cutout : null, refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string, s.project_id as string), refAssetIds: done ? [] : await referenceAssetIds(tx, s.sku_id as string, s.project_id as string) };
+    return { s, done: !!done, imagery, cut: imagery?.cutout?.keyed ? imagery.cutout : null, refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string, s.project_id as string), refAssetIds: done ? [] : await referenceAssetIds(tx, s.sku_id as string, s.project_id as string) };
   });
   if (info.done) {
     await withTenant(ws, (tx) => step(tx, ws, sceneId, key, 'done'));
@@ -463,7 +478,17 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
       const a = await authorizeOrTakeOver(
         tx,
         ctx,
-        { purpose: 'storyboard', projectId: info.s.project_id as string, skuId: info.s.sku_id as string, lines: await routedLines(tx, ws, [{ task: 'image.storyboard_frame', kind: 'image', images: 1 }]), idempotencyKey: `frame:${sceneId}:${version}` },
+        {
+          purpose: 'storyboard',
+          projectId: info.s.project_id as string,
+          skuId: info.s.sku_id as string,
+          // The redrawn frame is inspected for product fidelity like the storyboard's own (plan 03 P7 edge case).
+          lines: await routedLines(tx, ws, [
+            { task: 'image.storyboard_frame', kind: 'image', images: 1 },
+            { task: 'qa.fidelity', kind: 'llm', inputTokens: REDRAW_QA_TOKENS.input, outputTokens: REDRAW_QA_TOKENS.output },
+          ]),
+          idempotencyKey: `frame:${sceneId}:${version}`,
+        },
         FRAME_REQUEST_STALE_MINUTES,
       );
       await step(tx, ws, sceneId, key, 'active');
@@ -490,13 +515,37 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
       mockLabel: `${info.s.purpose} · ${instruction}`.slice(0, 90),
     });
     const composite = !!info.cut && info.s.production_mode !== 'GENERATIVE_INTERACTION';
-    const bytes = composite ? await compositeProduct(img.bytes, info.cut!.bytes, '9x16', { scale: 0.4, anchor: 'lower', shadow: true }) : img.bytes;
-    const lineage = { providerJobId: img.jobId, instruction, ...(composite ? { cutoutAssetId: info.cut!.assetId } : {}) };
+    let bytes = composite ? await compositeProduct(img.bytes, info.cut!.bytes, '9x16', { scale: 0.4, anchor: 'lower', shadow: true }) : img.bytes;
+    let technique = composite ? 'generated_bg+exact_product' : 'generated';
+    let lineage: Record<string, unknown> = { providerJobId: img.jobId, instruction, ...(composite ? { cutoutAssetId: info.cut!.assetId } : {}) };
+    let model: string | null = img.modelVersion;
+    let promptVersion: string | null = img.promptVersion;
+    let qa: CheckResult[] | null = null;
+    if (!composite) {
+      // The model drew the product itself: checked before the merchant sees it; a frame that fails is replaced by the
+      // exact-product composite (plan 03 P7 edge case, plan 06 Phase 2 #4), and the check is kept with it.
+      const fidelity = await withTenant(ws, (tx) => frameFidelity(tx, info.s.sku_id as string, info.refAssetIds, info.cut?.bytes ?? null));
+      qa = await checkFrame(true, { ctx, token: auth.token, sceneId, sceneText: `${info.s.visual_plan}. ${instruction}`, frameBytes: bytes, ...fidelity, planText: `${info.s.visual_plan} ${instruction}`, attempt: 1 });
+      const failed = qa?.find((c) => !c.pass && (c.check === 'product_fidelity' || c.hard));
+      if (failed && info.imagery) {
+        const fb = await exactProductFrame(info.imagery, { purpose: info.s.purpose as string });
+        bytes = fb?.bytes ?? (await productionBackdrop('9x16', info.imagery.palette));
+        technique = fb?.technique ?? 'backdrop';
+        lineage = { ...(fb?.lineage ?? {}), instruction, fidelityFallback: true, rejectedProviderJobId: img.jobId, rejectedBecause: failed.detail.slice(0, 200) };
+        model = null;
+        promptVersion = null;
+      }
+    }
     await withTenant(ws, async (tx) => {
-      const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: info.s.sku_id as string, source: 'generated', lineage: { sceneId, ...lineage } });
-      const { costMicros } = await linkJobOutput(tx, ws, img.jobId, a.id);
-      const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage, provider_job_id, cost_micros)
-                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, ${composite ? 'generated_bg+exact_product' : 'generated'}, ${img.modelVersion}, 'succeeded', ${tx.json(lineage as never)}, ${img.jobId}, ${costMicros}) returning id`;
+      const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: info.s.sku_id as string, source: 'generated', lineage: { sceneId, technique, ...lineage } });
+      // The job paid for the draw either way (its cost stays on this version); its output is the drawn image only
+      // when that is what is shown.
+      const [job] = await tx`select coalesce(actual_micros, 0) as c from provider_jobs where id = ${img.jobId} and workspace_id = ${ws}`;
+      if (!lineage.fidelityFallback) await linkJobOutput(tx, ws, img.jobId, a.id);
+      const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, status, lineage, qa, provider_job_id, cost_micros)
+                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, ${technique}, ${model}, ${promptVersion}, 'succeeded', ${tx.json(lineage as never)}, ${tx.json((qa ?? {}) as never)},
+                                   ${img.jobId}, ${Number(job?.c ?? 0)}) returning id`;
+      await tx`update scenes set source_asset_ids = ${sourceAssetIds(lineage, lineage.fidelityFallback ? [] : info.refAssetIds)}::uuid[] where id = ${sceneId}`;
       await tx`update scenes set current_version_id = ${v!.id}, free_regenerations_used = free_regenerations_used + 1,
                  visual_plan = ${`${info.s.visual_plan}. ${instruction}`.slice(0, 300)} where id = ${sceneId}`;
       // The redraw changed the visual plan: a new script version keeps the previous plan (§24).

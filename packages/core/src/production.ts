@@ -183,7 +183,7 @@ export function planProduction(
   voiceChars: number,
   routes: ProductionRoutes,
   rates: Map<string, RateTable>,
-  opts: { reuse?: ReadonlySet<string>; plates?: number; ceilingMicros?: Micros | null } = {},
+  opts: { reuse?: ReadonlySet<string>; plates?: number; ceilingMicros?: Micros | null; stillChecks?: number } = {},
 ): ProductionPlan {
   const generative = scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION' && !opts.reuse?.has(s.id)).map((s) => s.id);
   const seconds = Object.fromEntries(generative.map((id) => [id, genSeconds(scenes.find((x) => x.id === id)!.duration_ms)])) as Record<string, number>;
@@ -202,7 +202,7 @@ export function planProduction(
   ];
   const tail = (reserve: number): CostLine[] => {
     const repairs = generative.length ? Math.min(generative.length, Math.floor((reserve + 1e-6) / shortest)) : 0;
-    const inspections = 2 * generative.length + repairs + plates + 1;
+    const inspections = 2 * generative.length + repairs + plates + 1 + (opts.stillChecks ?? 0);
     return [
       ...voice(),
       dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
@@ -275,7 +275,23 @@ export function renderInputHash(s: SceneRow): string {
     .digest('hex');
 }
 
-type VersionRow = { id: string; scene_id: string; version: number; kind: string; asset_id: string | null; status: string; technique: string | null; input_hash: string | null; lineage: Record<string, unknown> };
+type VersionRow = { id: string; scene_id: string; version: number; kind: string; asset_id: string | null; status: string; technique: string | null; input_hash: string | null; lineage: Record<string, unknown>; qa?: unknown };
+
+/**
+ * A still the model drew the product in (a storyboard frame with technique 'generated') that has no passing
+ * product-fidelity check on record: production inspects it before it can be composed (§25 every output passes
+ * product checks; plan 03 P7 edge case).
+ */
+export function uncheckedGeneratedStill(v: Pick<VersionRow, 'technique' | 'qa'> | undefined): boolean {
+  if (!v || v.technique !== 'generated') return false;
+  const checks = Array.isArray(v.qa) ? (v.qa as CheckResult[]) : [];
+  return !checks.some((c) => c.check === 'product_fidelity' && c.pass);
+}
+
+/** Scenes composed as a still whose current frame needs that inspection. */
+function stillsToInspect(scenes: SceneRow[], versions: VersionRow[]): number {
+  return scenes.filter((s) => s.production_mode !== 'GENERATIVE_INTERACTION' && s.production_mode !== 'STRICT_COMPOSITE' && uncheckedGeneratedStill(versions.find((v) => v.id === s.current_version_id))).length;
+}
 
 /** Accepted renders a run may reuse instead of rendering again: a locked scene keeps its render; otherwise the inputs must be unchanged. */
 function reusableRenders(scenes: SceneRow[], versions: VersionRow[]): Map<string, VersionRow> {
@@ -314,7 +330,7 @@ async function planRun(
   const [ov] = await tx`select ceiling_override_micros from projects where id = ${projectId} and workspace_id = ${ws}`;
   const ceilingMicros = CEILING_PURPOSES.includes(purpose) ? Math.max(COST_LIMITS.CREATIVE_TEST_CEILING, Number(ov?.ceiling_override_micros ?? 0)) : null;
   const reuse = new Set(reusableRenders(scenes, versions).keys());
-  const planFor = (rows: SceneRow[]) => planProduction(rows, voChars, routes, rates, { reuse, plates: rows.filter(wantsPlate).length, ceilingMicros });
+  const planFor = (rows: SceneRow[]) => planProduction(rows, voChars, routes, rates, { reuse, plates: rows.filter(wantsPlate).length, ceilingMicros, stillChecks: stillsToInspect(rows, versions) });
   let plan = planFor(scenes);
   // §44 "Model price doubles": a paid promise whose plan no longer fits its class ceiling at today's rates (the
   // rates rose after the storyboard was approved) is re-planned within it first — the lowest-priority generated
@@ -357,7 +373,7 @@ export async function planProjectRun(tx: Tx, ws: string, projectId: string, purp
   const [p] = await tx`select storyboard_id, sku_id from projects where id = ${projectId} and workspace_id = ${ws}`;
   if (!p?.storyboard_id) return null;
   const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${ws} order by position`) as unknown as SceneRow[];
-  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                              where workspace_id = ${ws} and scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
   const run = await planRun(tx, ws, projectId, purpose, scenes, versions, await productImagery(tx, p.sku_id as string));
   return { ...run, storyboardId: p.storyboard_id as string, scenes };
@@ -368,12 +384,12 @@ export async function productionEstimate(tx: Tx, workspaceId: string, projectId:
   const [p] = await tx`select storyboard_id, sku_id, entitlement_unit from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
   if (!p?.storyboard_id) return null;
   const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${workspaceId} order by position`) as unknown as SceneRow[];
-  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                              where workspace_id = ${workspaceId} and scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
   const routes = await productionRoutes(tx, workspaceId);
   const rates = await loadRates(tx);
   const voChars = scenes.reduce((n, s) => n + ((s.spoken_line as string | null)?.trim().length ?? 0), 0);
-  const plan = planProduction(scenes, voChars, routes, rates, { reuse: new Set(reusableRenders(scenes, versions).keys()), ceilingMicros: COST_LIMITS.CREATIVE_TEST_CEILING });
+  const plan = planProduction(scenes, voChars, routes, rates, { reuse: new Set(reusableRenders(scenes, versions).keys()), ceilingMicros: COST_LIMITS.CREATIVE_TEST_CEILING, stillChecks: stillsToInspect(scenes, versions) });
   return estimate(rates, plan.lines).totalMicros;
 }
 
@@ -389,6 +405,8 @@ export async function approveForProduction(tx: Tx, ctx: TenantContext, projectId
   const [sb] = await tx`select status from storyboards where id = ${p.storyboard_id}`;
   if (sb?.status !== 'ready') throw new DomainError('CONFLICT', 'Storyboard is not ready yet.');
   await tx`update storyboards set status = 'approved', approved_at = now(), approved_by = ${ctx.actor.kind + ':' + ctx.actor.id} where id = ${p.storyboard_id}`;
+  // §24: each scene records its approval state (the storyboard is approved as a whole, scene by scene).
+  await tx`update scenes set approved_at = now(), approved_by = ${ctx.actor.kind + ':' + ctx.actor.id} where storyboard_id = ${p.storyboard_id} and workspace_id = ${ctx.workspaceId}`;
   await transition(tx, ctx, projectId, 'STORYBOARD_APPROVED', { patch: { entitlement_unit: unit, kind: unit === 'creative_test' ? 'creative_test' : unit } });
   await planSteps(tx, ctx.workspaceId, projectId, PRODUCTION_STEPS);
   await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor }, { singletonKey: `produce:${projectId}`, priority: priorityFor(ctx, 'production') });
@@ -595,7 +613,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     const [sku] = await tx`select * from skus where id = ${p.sku_id}`;
     const [fp] = await tx`select * from visual_fingerprints where sku_id = ${p.sku_id} and active`;
     const [variant] = p.variant_id ? await tx`select * from variants where id = ${p.variant_id}` : [null];
-    const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+    const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                                where scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
     const brand = await brandBrainFor(tx, p.sku_id as string);
     return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
@@ -1030,6 +1048,20 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         }
       };
 
+      /**
+       * A still composed as it was approved — unless the model drew the product in it and no passing product check is
+       * on record: it is inspected first, and a failing frame becomes the exact-product composite (plan 06 Phase 2
+       * #4 "exact-product composite for any frame failing fidelity").
+       */
+      const checkedStill = async (s: SceneRow, n: number): Promise<Slot> => {
+        const f = await frameOf(s, n);
+        if (!uncheckedGeneratedStill(versions.find((v) => v.id === f.versionId))) return still(s, n, f);
+        const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, frameBytes: f.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt: 1 });
+        if (hardFidelityFail(res)) return exactFallback(s, n, 'generated frame failed product QA');
+        checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n} (generated still): ${c.detail}` })));
+        return still(s, n, f);
+      };
+
       const body = scenes.filter((s) => s.purpose !== 'cta');
       const ctaScene = scenes.find((s) => s.purpose === 'cta') ?? null;
       const slots: Slot[] = [];
@@ -1038,7 +1070,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await heartbeat();
         if (s.production_mode === 'GENERATIVE_INTERACTION') slots.push(await generative(s, n, await frameOf(s, n)));
         else if (s.production_mode === 'STRICT_COMPOSITE') slots.push(await strict(s, n));
-        else slots.push(await still(s, n, await frameOf(s, n)));
+        else slots.push(await checkedStill(s, n));
       }
 
       // Continuity of generated people across scenes (§44, §48): scenes that break it with the first become the
