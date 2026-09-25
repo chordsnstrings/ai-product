@@ -126,7 +126,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
           <div className="ak-row" style={{ marginTop: 16 }}>
             {state === 'READY_TO_RUN' ? <ActionButton slug={slug} action="experiment-live" body={{ experimentId }} variant="primary">I’ve launched these ads</ActionButton> : null}
             <a className="ak-btn ak-btn--secondary" href={`/w/${slug}/results/${experimentId}`}>See results</a>
-            <ActionButton slug={slug} action="experiment-archive" body={{ experimentId }} variant="text" confirm="Archive this test? Its learnings stay in your archive.">Archive</ActionButton>
+            <ActionButton slug={slug} action="experiment-archive" body={{ experimentId }} variant="text" confirm="Archive this test? Its learnings stay in your archive; an ad still being made is cancelled.">Archive</ActionButton>
           </div>
         </section>
       ) : null}

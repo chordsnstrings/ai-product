@@ -26,6 +26,7 @@ import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { GENOME_VERSION_SQL } from './creatives';
+import { setExperimentState } from './experiment-state';
 import { qaClaims, qaClipContract, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
@@ -502,6 +503,31 @@ async function advance(tx: Tx, ctx: TenantContext, projectId: string, to: Projec
 }
 
 const RUNNABLE: readonly ProjectState[] = ['STORYBOARD_APPROVED', ...IN_PRODUCTION, 'NEEDS_USER_ACTION'];
+/** States from which the pre-spend claims gate can still stop a run (before scene QA and composition). */
+const PRE_SPEND_GATE: readonly ProjectState[] = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'NEEDS_USER_ACTION'];
+
+/**
+ * The claims, testimonial and statement checks on an approved storyboard's lines (the same checks the run repeats
+ * after rendering, when the finished scenes are known), with no model call. Null when every line passes.
+ */
+export async function preSpendClaimsGate(
+  tx: Tx,
+  skuId: string,
+  scenes: readonly SceneRow[],
+  sb: Record<string, unknown> | undefined,
+  names: (string | null | undefined)[],
+  brandCta?: string | null,
+): Promise<{ checks: CheckResult[]; detail: string; statementMap: unknown } | null> {
+  const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb?.hook_text, ((sb?.cta_text as string | null) ?? '').trim() || brandCta].filter(Boolean) as string[];
+  const claims = await claimsQaForExports(tx, skuId, lines, ASPECTS, { names });
+  const testimonials = testimonialCheck([...scenes]);
+  const mapping = ((claims.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? []) as LineMapping[];
+  const statementMap = mapStatements(lines, mapping, await factsForStatements(tx, skuId));
+  const statements = statementCheck(statementMap);
+  if (claims.pass && !testimonials && statements.pass) return null;
+  const checks = [claims, ...(testimonials ? [testimonials] : []), statements];
+  return { checks, statementMap, detail: [claims.pass ? null : claims.detail, testimonials?.detail, statements.pass ? null : statements.detail].filter(Boolean).join(' | ') };
+}
 
 /**
  * Produce an approved storyboard (render → QA → claims → voice → compose → final QA → deliver), resumably.
@@ -602,6 +628,27 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
   const unit = (p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'>) ?? 'taste';
   const purpose: Purpose = unit === 'creative_test' ? 'creative_test' : unit;
+  // 0. Claims gate before any spend (§25 "stop expensive loops", Launch Gate 3): a claim revoked, restricted or
+  //    narrowed since the storyboard was approved stops the ad here — deterministic, no model call, nothing reserved —
+  //    instead of after every scene was rendered. The merchant fixes the line and resumes (reopenForEdit).
+  if (PRE_SPEND_GATE.includes(p.state as ProjectState)) {
+    const gate = await withTenant(ws, (tx) => preSpendClaimsGate(tx, sku.id as string, scenes, sb, [sku.name as string, brand?.name ?? null], brand?.brain.cta));
+    if (gate) {
+      await withTenant(ws, async (tx) => {
+        const [cur] = await tx`select state, authorization_id from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+        if (!cur || !PRE_SPEND_GATE.includes(cur.state as ProjectState)) return;
+        await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
+        await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: `before production: ${gate.detail}`.slice(0, 1000), code: 'claims_blocked' });
+        await tx`update projects set qa_report = ${tx.json({ ...summarize(gate.checks), statementMap: gate.statementMap, stage: 'pre_spend' } as never)}, outage = null where id = ${projectId} and workspace_id = ${ws}`;
+        // A reservation held by a paused or interrupted run goes back: nothing more is spent on this storyboard.
+        if (cur.authorization_id) {
+          const [a] = await tx`select status from cost_authorizations where id = ${cur.authorization_id} and workspace_id = ${ws}`;
+          if (a?.status === 'active') await settle(tx, ctx, cur.authorization_id as string, 'released');
+        }
+      });
+      return 'failed';
+    }
+  }
   // The run's liveness: renews its lease (or stops, LeaseLost), records projects.heartbeat_at for the progress
   // view and keeps its reservation from expiring under it (§39).
   let authorizationId: string | null = (p.authorization_id as string | null) ?? null;
@@ -1151,6 +1198,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // The whole creative — script, on-screen text, hook, CTA and the finished pictures together — is scanned
       // for implied claims (§25 check 3, §43 "Visual implies a medical result"). An implied medical,
       // structure/function or before/after result blocks the ad like a blocked line.
+      let impliedReview: ImpliedFlag[] = [];
       if (routes.implied) {
         await heartbeat();
         const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
@@ -1168,11 +1216,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           throw e;
         }
         checks.push(implied);
+        impliedReview = impliedFlags(implied);
         if (!implied.pass) {
           await withTenant(ws, async (tx) => {
             await step(tx, ws, projectId, 'claims', 'failed', 'Something in the ad needs changing before we can finish');
             await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: implied.detail.slice(0, 500), code: 'claims_blocked' });
-            await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), impliedClaims: implied.data } as never)} where id = ${projectId}`;
+            await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), impliedClaims: impliedFlags(implied) } as never)} where id = ${projectId}`;
             await settle(tx, ctx, auth.authorizationId, 'released');
           });
           return;
@@ -1226,7 +1275,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
-        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
+        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap, ...(impliedReview.length ? { impliedClaims: impliedReview } : {}) } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
         // §41 final acceptance: the provider jobs whose output is in the delivered creative (its scene versions and
         // voice clips).
         const versionIds = manifest.scenes.map((m) => m.versionId).filter((x): x is string => !!x);
@@ -1371,6 +1420,27 @@ export async function failProduction(tx: Tx, ctx: TenantContext, projectId: stri
                         and status = 'paid' and kind in ('taste','standalone') order by created_at desc limit 1`;
   if (pu) await enqueue(tx, ctx.workspaceId, Queues.refundPurchase, { projectId, purchaseId: pu.id, reason: 'guarantee' }, { singletonKey: `refund:${pu.id}`, priority: 20 });
   return true;
+}
+
+/** One implied-claim flag as the compliance queue lists it (qa_report.impliedClaims is an array of these). */
+export interface ImpliedFlag {
+  claim: string;
+  basis: 'text' | 'visual' | 'combined';
+  severity: 'block' | 'review';
+  scene: number | null;
+  text?: string;
+}
+
+/**
+ * The flags of a whole-creative implied-claim scan (§25 check 3): the reviewer's implications ('block' stops the ad,
+ * 'review' is borderline and goes to the compliance queue) and the deterministic signals (always 'block').
+ */
+export function impliedFlags(c: CheckResult): ImpliedFlag[] {
+  const d = (c.data ?? {}) as { impliedClaims?: ImpliedFlag[]; deterministic?: { text: string; claim: string }[] };
+  return [
+    ...(d.deterministic ?? []).map((x): ImpliedFlag => ({ claim: x.claim, basis: 'text', severity: 'block', scene: null, text: x.text })),
+    ...(d.impliedClaims ?? []).map((x): ImpliedFlag => ({ claim: x.claim, basis: x.basis, severity: x.severity, scene: x.scene ?? null })),
+  ];
 }
 
 /** A line that stopped production at the claims check, with why and a compliant alternative when one is known. */
@@ -1543,6 +1613,31 @@ export async function cancelProduction(tx: Tx, ctx: TenantContext, projectId: st
   if (await productionRunning(tx, ctx.workspaceId, projectId)) return { status: 'cancelling', decision };
   const done = await finalizeCancel(tx, ctx, projectId);
   return { status: done === 'REFUNDED' ? 'refunded' : 'cancelled', decision };
+}
+
+/**
+ * Archive an experiment (merchant "Archive"): its production, if one is still running or waiting, is cancelled first
+ * (standard §25 "Cancellation before dispatch | No charge | Release reserved entitlement"), so an archived test never
+ * keeps a produce job or a reserved Creative Test alive. What happens to the credit follows cancelDecision; a
+ * production past cancelling (delivered) is left as it is.
+ */
+export async function archiveExperiment(tx: Tx, ctx: TenantContext, experimentId: string): Promise<{ cancelled: { projectId: string; status: 'cancelled' | 'refunded' | 'cancelling'; message: string }[] }> {
+  assertCan(ctx, 'experiment.create');
+  const [e] = await tx`select id from experiments where id = ${experimentId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!e) throw new DomainError('NOT_FOUND', 'Experiment not found');
+  const projects = await tx`select distinct p.id from variants v join projects p on p.id = v.project_id and p.workspace_id = v.workspace_id
+                            where v.workspace_id = ${ctx.workspaceId} and v.experiment_id = ${experimentId}
+                              and p.state <> all(${['COMPLETE', 'CANCELLED', 'REFUNDED']}::text[]) and p.cancel_requested_at is null`;
+  const cancelled: { projectId: string; status: 'cancelled' | 'refunded' | 'cancelling'; message: string }[] = [];
+  for (const row of projects) {
+    const projectId = row.id as string;
+    if (!(await cancelDecision(tx, ctx.workspaceId, projectId)).allowed) continue;
+    const r = await cancelProduction(tx, ctx, projectId, { reason: 'experiment archived' });
+    cancelled.push({ projectId, status: r.status, message: r.decision.message });
+  }
+  // Cancelling the master may already have archived the experiment (syncExperimentWithProject).
+  await setExperimentState(tx, ctx, experimentId, 'ARCHIVED', 'archived by merchant');
+  return { cancelled };
 }
 
 /**

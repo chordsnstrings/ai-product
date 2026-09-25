@@ -67,9 +67,11 @@ export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
   // REFUNDED: a paid storyboard reopened to fix a blocked line, then cancelled (its payment goes back).
   STORYBOARD_READY: ['STORYBOARD_APPROVED', 'CONCEPT_SELECTED', 'CONCEPTS_READY', 'REFUNDED', ...PRE_RENDER_SIDE],
   // Approved = paid for / entitlement committed. Cancelling is still possible before anything is dispatched.
-  STORYBOARD_APPROVED: ['RENDER_RESERVED', ...IN_FLIGHT_SIDE],
-  RENDER_RESERVED: ['RENDERING', ...IN_FLIGHT_SIDE],
-  RENDERING: ['QA_RUNNING', ...IN_FLIGHT_SIDE],
+  // BLOCKED_COMPLIANCE before any spend: the claims gate runs on the approved lines before the reservation (§25,
+  // Launch Gate 3), again when a paused or interrupted run resumes.
+  STORYBOARD_APPROVED: ['RENDER_RESERVED', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
+  RENDER_RESERVED: ['RENDERING', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
+  RENDERING: ['QA_RUNNING', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
   QA_RUNNING: ['COMPOSING', 'BLOCKED_COMPLIANCE', ...IN_FLIGHT_SIDE],
   COMPOSING: ['PLATFORM_VARIANTS', ...IN_FLIGHT_SIDE],
   // The whole-creative implied-claim scan runs on the composed ad (§43): it can still block it.
@@ -83,6 +85,7 @@ export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
     'RENDERING', // provider outage over: the held reservation resumes rendering
     'PRODUCT_UPLOADED', // the merchant retries a failed analysis: it starts again from the upload
     'PROVIDER_FAILED',
+    'BLOCKED_COMPLIANCE', // a line was revoked while production was paused: blocked before it resumes spending
     'CANCELLED',
     'REFUNDED',
   ],

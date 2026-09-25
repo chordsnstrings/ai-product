@@ -44,6 +44,7 @@ import {
   saveIntegration,
   scheduleDeletion,
   setExperimentState,
+  archiveExperiment,
   setStockIntent,
   STOCK_INTENTS,
   transferOwnership,
@@ -209,8 +210,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'experiment-archive': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
       assertCan(ctx, 'experiment.create');
-      await t((tx) => setExperimentState(tx, ctx, experimentId, 'ARCHIVED', 'archived by merchant'));
-      return json({ ok: true });
+      // Its production (if still running or waiting) is cancelled first: no produce job or reserved credit survives.
+      const r = await t((tx) => archiveExperiment(tx, ctx, experimentId));
+      return json({ ok: true, ...r });
     }
     case 'experiment-live': {
       const { experimentId } = await body(req, z.object({ experimentId: uuid }));
