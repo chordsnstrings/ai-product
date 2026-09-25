@@ -32,8 +32,16 @@ function routeExists(pathname: string, dir = webApp): boolean {
   });
 }
 
+/** A fixed-offset zone where it is around midday now, so marketing quiet hours (20:00–08:00 local) never hold these sends. */
+function daytimeZone(): string {
+  let offset = (12 - new Date().getUTCHours() + 24) % 24;
+  if (offset > 12) offset -= 24;
+  return offset === 0 ? 'UTC' : `Etc/GMT${offset > 0 ? '-' : '+'}${Math.abs(offset)}`; // Etc/GMT signs are inverted
+}
+
 async function abandoned(opts: { hoursAgo?: number } = {}) {
   const t = await makeTenant({ state: 'ACTIVE_FREE' });
+  await ownerPool()`update workspaces set timezone = ${daytimeZone()} where id = ${t.workspaceId}`;
   const skuId = await makeSku(t.workspaceId);
   const projectId = newId();
   const updated = new Date(Date.now() - (opts.hoursAgo ?? 1) * 3600_000);
