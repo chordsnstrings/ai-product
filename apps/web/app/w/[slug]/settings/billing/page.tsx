@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
-import { periodUsage, quoteAfterOffer, setting } from '@arkiv/core';
+import { currentPlanPrices, pendingPriceChange, periodUsage, quoteAfterOffer, setting, subscriptionPrice } from '@arkiv/core';
 import { formatUsd, PLANS, type PlanCode } from '@arkiv/shared';
 import { Banner, LinkButton } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
@@ -23,7 +23,11 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
     const [cust] = await tx`select customer_id from stripe_customers where workspace_id = ${w.ctx.workspaceId}`;
     // The per-ad price this workspace would pay today (its live standalone version), not a constant.
     const perAd = sub ? null : (await quoteAfterOffer(tx)).priceMicros;
-    return { sub, usage, purchases, perAd, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
+    // Plan 04 §3: what this subscription pays, a notified price change, and today's prices for plan changes.
+    const own = sub ? await subscriptionPrice(tx, { id: sub.id as string, workspaceId: w.ctx.workspaceId, planCode: sub.plan_code as PlanCode, createdAt: sub.created_at as string }) : null;
+    const change = sub ? await pendingPriceChange(tx, w.ctx.workspaceId, sub.id as string) : null;
+    const prices = await currentPlanPrices(tx);
+    return { sub, usage, purchases, perAd, own, change, prices, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
   });
   const canManage = ['OWNER', 'ADMIN'].includes(w.ctx.role);
   const plan = d.sub ? PLANS[d.sub.plan_code as PlanCode] : null;
@@ -40,7 +44,8 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
           <div className="ak-between" style={{ flexWrap: 'wrap', gap: 12 }}>
             <div>
               <h2 className="ak-label">Current plan</h2>
-              <p className="ak-h2" style={{ margin: 0 }}>{plan!.name} · {formatUsd(plan!.priceMicros, 0)}/month</p>
+              <p className="ak-h2" style={{ margin: 0 }}>{plan!.name} · {formatUsd(d.own!.priceMicros, 0)}/month</p>
+              {d.change ? <p className="ak-small" role="status">Price change: {formatUsd(d.change.oldPriceMicros, 0)} → {formatUsd(d.change.newPriceMicros, 0)}/month from your first renewal on or after {fmt(d.change.effectiveFrom.toISOString())}. You can cancel anytime before then.</p> : null}
               <p className="ak-small ak-muted">
                 {d.usage ? `${d.usage.remaining} of ${d.usage.granted} Creative Tests left this period` : null}
                 {d.sub.current_period_end ? ` · ${d.sub.cancel_at_period_end ? 'ends' : 'renews'} ${fmt(d.sub.current_period_end as string)}` : null}
@@ -72,12 +77,12 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
             {(['LAUNCH', 'GROWTH', 'SCALE'] as const).map((c) => {
               const p = PLANS[c];
               const current = c === d.sub!.plan_code;
-              const up = p.priceMicros > plan!.priceMicros;
+              const up = d.prices[c] > d.own!.priceMicros;
               const scheduled = c === d.sub!.pending_plan_code;
               return (
                 <div key={c} className={`ak-card${current ? ' ak-card--pick' : ''}`}>
                   <h3 className="ak-label">{p.name}</h3>
-                  <p style={{ margin: 0 }}>{formatUsd(p.priceMicros, 0)}/mo · {p.creativeTestsPerMonth} tests</p>
+                  <p style={{ margin: 0 }}>{formatUsd(d.prices[c], 0)}/mo · {p.creativeTestsPerMonth} tests</p>
                   {current ? <span className="ak-small ak-muted">Current plan</span> : scheduled ? <span className="ak-small ak-muted">Starts at renewal</span> : (
                     <ActionButton slug={slug} action="change-plan" body={{ plan: c }} confirm={up ? `Upgrade to ${p.name} now? You'll be charged the prorated difference today and get extra tests for this period.` : `Downgrade to ${p.name} at the end of this period? Nothing changes until then.`}>
                       {up ? 'Upgrade now' : 'Downgrade at renewal'}

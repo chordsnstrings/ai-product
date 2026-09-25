@@ -105,6 +105,10 @@ export interface TemplateMap {
   // Plan 03 P9 edge: a production running past 20 minutes (still working on it; nothing extra to pay).
   production_delayed: { productName: string; minutes: number; url: string };
   staff_break_glass: { staffName: string; reason: string; when: string; url: string };
+  // Plan 05 §23: a single-use link to join the staff console (password + authenticator set by the invitee).
+  staff_invite: { name: string; inviterName: string; url: string; expiresIn: string };
+  // Plan 05 §21: staff deleted a person's review text from the workspace on a privacy request (tenant notice).
+  review_text_erased: { workspaceName: string; deleted: number; reference: string; url: string };
   ownership_transfer_confirm: { workspaceName: string; newOwner: string; reason: string; url: string; expiresIn: string };
   intervention: { label: string; headline: string; body: string; cta: string; url: string };
 }
@@ -471,6 +475,14 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
     case 'intervention': {
       const m = d as TemplateMap['intervention'];
       return { subject: m.headline, stream: 'transactional', element: (<L preview={m.body.slice(0, 90)} label={m.label}><H>{m.headline}</H><P>{m.body}</P><Cta href={m.url}>{m.cta}</Cta></L>) };
+    }
+    case 'staff_invite': {
+      const m = d as TemplateMap['staff_invite'];
+      return { subject: 'You’re invited to the Arkiv staff console', stream: 'transactional', element: (<L preview={`${m.inviterName} invited you. The link works for ${m.expiresIn}.`} label="Staff console"><H>Join the Arkiv staff console</H><P>{m.inviterName} invited you, {m.name}. Open the link to set your own password and enrol your authenticator app. It works once, for {m.expiresIn}.</P><Cta href={m.url}>Accept invite</Cta><P>Your roles take effect once a second administrator approves them. If you weren’t expecting this, ignore this email.</P></L>) };
+    }
+    case 'review_text_erased': {
+      const m = d as TemplateMap['review_text_erased'];
+      return { subject: 'We removed review text from your workspace', stream: 'transactional', element: (<L preview={`${m.deleted} review snippet${m.deleted === 1 ? '' : 's'} removed on a privacy request.`} label="Privacy"><H>Review text removed</H><P>A person asked us to delete their personal information. Our team removed the review text that identified them from {m.workspaceName}. Nothing else in your workspace changed; customer themes refresh on the next analysis.</P><Meta rows={[['Snippets removed', String(m.deleted)], ['Request reference', m.reference]]} /><Cta href={m.url}>View access log</Cta></L>) };
     }
     case 'staff_break_glass': {
       const m = d as TemplateMap['staff_break_glass'];

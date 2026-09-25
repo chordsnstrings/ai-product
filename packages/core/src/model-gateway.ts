@@ -26,12 +26,12 @@ import type { z } from 'zod';
 import { raiseAlert } from './alerts';
 import { saveAsset } from './assets';
 import type { TenantContext } from './context';
-import { consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
+import { authorizationRateVersions, consumeAuthorization, creditBack, recordProviderCost } from './cost-governor';
 import { emit } from './events';
 import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
 import { findPrompt } from './prompts';
-import { actualCost, loadRates, priceLine, promoSplit, type CostLine } from './rates';
+import { actualCost, loadRates, loadRatesPinned, priceLine, promoSplit, type CostLine } from './rates';
 
 /**
  * Model Gateway (§33): provider-agnostic, and the ONLY path to a billable provider. Every call must present a
@@ -295,7 +295,8 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
       throw new DomainError('UNAVAILABLE', 'Production is paused for maintenance. Your place is held.', { killSwitch: 'renders' });
     }
     const costLine = line(r);
-    const rates = await loadRates(tx);
+    // Debited at the rates the authorization was priced on: a rate rise after the promise never strands the job.
+    const rates = await loadRatesPinned(tx, await authorizationRateVersions(tx, meta.token));
     const expected = priceLine(rates, costLine).micros;
     const auth = await consumeAuthorization(tx, meta.token, expected);
     const [job] = await tx`
@@ -323,6 +324,19 @@ async function begin(meta: CallMeta, line: (r: Route) => CostLine, requestFinger
 function unitsOf(line: CostLine): Record<string, unknown> {
   const { provider: _p, model: _m, ...units } = line as CostLine & { provider: string; model: string };
   return units;
+}
+
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+/** The call's input refs plus what the gateway derives from its inputs (content hashes of images/references). */
+const withInputRefs = <M extends CallMeta>(call: M, derived: Record<string, unknown>): M => (Object.keys(derived).length ? { ...call, inputRefs: { ...(call.inputRefs ?? {}), ...derived } } : call);
+
+/**
+ * A provider job's output was saved as an asset (standard §41 "output ID"): link it, and return what the call
+ * actually cost so the scene version / asset that used it can carry it. Tenant role, explicit workspace filter.
+ */
+export async function linkJobOutput(tx: Tx, workspaceId: string, jobId: string, assetId: string): Promise<{ costMicros: number }> {
+  const [j] = await tx`update provider_jobs set output_asset_id = ${assetId} where id = ${jobId} and workspace_id = ${workspaceId} returning actual_micros`;
+  return { costMicros: Number(j?.actual_micros ?? 0) };
 }
 
 const gatewayLog = logger('gateway');
@@ -430,6 +444,9 @@ async function closeJob(
     // The failure class is kept on the job: the circuit breaker counts outage-class failures per route (plan 05 §10).
     const extra = { ...(outcome.wireModel ? { wireModel: outcome.wireModel } : {}), ...(outcome.ok ? {} : { errorKind: outcome.errorKind }), ...(billed.length ? { billedOnFailure: billed.map(unitsOf) } : {}) };
     const raw = outcome.rawMeta || Object.keys(extra).length ? { ...(outcome.rawMeta ?? {}), ...extra } : null;
+    // §41 token/compute usage: the units the provider reported (tokens incl. cached, seconds, characters, images),
+    // plus what failed attempts were billed for.
+    const usage = line || billed.length ? { ...(line ? unitsOf(line) : {}), ...(billed.length ? { billedOnFailure: billed.map(unitsOf) } : {}) } : null;
     const [closed] = await tx`
       update provider_jobs set status = ${outcome.ok ? 'succeeded' : 'failed'}, actual_micros = ${actual}, savings_micros = ${savingsMicros},
         latency_ms = ${outcome.latencyMs}, completed_at = now(),
@@ -438,6 +455,8 @@ async function closeJob(
         error = ${outcome.ok ? null : outcome.error},
         output = ${outcome.ok && outcome.output !== undefined ? tx.json(outcome.output as never) : null},
         output_asset_id = ${outcome.ok ? (outcome.outputAssetId ?? null) : null},
+        moderation_status = ${outcome.ok ? 'passed' : outcome.errorKind === 'moderation' ? 'rejected' : null},
+        usage = ${usage ? tx.json(usage as never) : null},
         raw_meta = coalesce(raw_meta, '{}'::jsonb) || coalesce(${raw ? tx.json(raw as never) : null}::jsonb, '{}'::jsonb)
       where id = ${started.jobId} and workspace_id = ${meta.ctx.workspaceId} and status = 'dispatched'
       returning provider_request_id`;
@@ -552,9 +571,11 @@ async function llmOnce<T>(call: LlmCall<T>, p: ProviderSet, adapter: LlmProvider
   // Priced with the template the route actually sends (its version may be older or newer than the latest).
   const approxIn = (r: Route) => Math.ceil(((call.system?.length ?? routedPrompt(r, call.template!).length) + contentLen) / 4);
   const maxTokens = call.maxTokens ?? 8000;
-  const started = await begin(call, (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn(r), outputTokens: maxTokens }), {
+  // Images are identified by their content hash, in the fingerprint and on the job's input refs (§41).
+  const imageSha256 = call.content.filter((c) => c.type === 'image').map((c) => sha256((c as { base64: string }).base64));
+  const started = await begin(withInputRefs(call, imageSha256.length ? { imageSha256 } : {}), (r) => lineFor(r, { kind: 'llm', inputTokens: approxIn(r), outputTokens: maxTokens }), {
     task: call.task,
-    content: call.content.map((c) => (c.type === 'image' ? { type: 'image', len: c.base64.length } : c)),
+    content: call.content.map((c) => (c.type === 'image' ? { type: 'image', sha256: sha256(c.base64) } : c)),
   });
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.
@@ -602,11 +623,14 @@ export interface ImageCall extends CallMeta {
 
 export async function generateImage(call: ImageCall): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
   const p = await providers();
+  // An eval of a candidate measures that candidate: it never fails over to another route.
+  if (call.candidate) return imageOnce(call, p);
   return withRouteFallback(call, p.image, (m, a) => imageOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'image', pr));
 }
 
 async function imageOnce(call: ImageCall, p: ProviderSet, adapter: ImageProvider = p.image): Promise<ImageResult & { jobId: string; promptVersion: string; task: string }> {
-  const started = await begin(call, (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: call.references.length });
+  const referenceSha256 = call.references.map(sha256);
+  const started = await begin(withInputRefs(call, { referenceSha256 }), (rt) => lineFor(rt, { kind: 'image', images: 1 }), { prompt: call.prompt, refs: referenceSha256 });
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.
   const release = await acquireSlot(started.route.provider, started.policy.concurrencyLimit);
@@ -640,6 +664,7 @@ export async function removeBackground(call: CutoutCall): Promise<SegmentationRe
   const p = await providers();
   const adapter = p.segmentation;
   if (!adapter) throw new DomainError('UNAVAILABLE', 'Background removal isn’t available right now.', { notConfigured: 'segmentation' });
+  if (call.candidate) return cutoutOnce(call, p, adapter);
   return withRouteFallback(call, adapter, (m, a) => cutoutOnce({ ...call, task: m.task }, p, a));
 }
 
@@ -704,11 +729,13 @@ export interface ProviderQueueState {
  */
 export async function generateVideo(call: VideoCall): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
   const p = await providers();
+  if (call.candidate) return videoOnce(call, p);
   return withRouteFallback(call, p.video, (m, a) => videoOnce({ ...call, task: m.task }, p, a), (pr) => adapterFor(p, 'video', pr));
 }
 
 async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider = p.video): Promise<{ bytes: Buffer; jobId: string; modelVersion?: string; promptVersion: string; task: string }> {
-  const started = await begin(call, (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false, ...(call.videoInputSeconds ? { videoInputSeconds: call.videoInputSeconds } : {}) }), { prompt: call.prompt, seconds: call.seconds, refs: call.references.length });
+  const referenceSha256 = call.references.map(sha256);
+  const started = await begin(withInputRefs(call, { referenceSha256 }), (rt) => lineFor(rt, { kind: 'video', seconds: call.seconds, resolution: call.resolution, retryReserve: false, ...(call.videoInputSeconds ? { videoInputSeconds: call.videoInputSeconds } : {}) }), { prompt: call.prompt, seconds: call.seconds, refs: referenceSha256 });
   const line = started.line;
   const wire = wireModelFor(started.route, p);
   // Waiting for a concurrency slot is not provider latency.
@@ -827,6 +854,8 @@ const voiceFallbackEligible = (e: unknown) => e instanceof ProviderError || (e i
 export async function synthesizeVoice(call: TtsCall): Promise<VoiceResult> {
   const p = await providers();
   const primary = await withTenant(call.ctx.workspaceId, (tx) => route(tx, call.task, call.ctx.workspaceId));
+  // An eval of a candidate measures that route's own provider, with no fallback.
+  if (call.candidate) return ttsCall(call, call.task, p.tts?.name === primary.provider ? p.tts : p.ttsFallback?.name === primary.provider ? p.ttsFallback : p.tts);
   try {
     return await ttsCall(call, call.task, p.tts);
   } catch (primaryErr) {

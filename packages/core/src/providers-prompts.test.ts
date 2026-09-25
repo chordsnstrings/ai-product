@@ -8,7 +8,8 @@ import { circuitTrips, evaluateCircuits, CIRCUIT_BREAKER } from './circuits';
 import { authorize } from './cost-governor';
 import { evalDatasetFor } from './evals';
 import { llmJson, routedLines, routedPrompt, versionDrift } from './model-gateway';
-import { findPrompt, latestPrompt, parsePromptRef, PROMPT_TEMPLATES, promptRef } from './prompts';
+import { findPrompt, latestPrompt, parsePromptRef, PROMPT_HASHES, PROMPT_TEMPLATES, promptRef } from './prompts';
+import PROMPT_LOCK from './prompts.lock.json';
 import { clearSettingsCache } from './settings';
 import { ctxFor } from './testing';
 
@@ -214,5 +215,19 @@ describe('prompt registry (plan 05 §11)', () => {
     await expect(inspect(ctx, token)).rejects.toMatchObject({ code: 'UNAVAILABLE' });
     expect(await ownerPool()`select 1 from provider_jobs where workspace_id = ${t.workspaceId}`).toHaveLength(0);
     expect(() => routedPrompt({ task: 'qa.fidelity', promptVersion: 'concepts@1.1.0' }, 'fidelity')).toThrow();
+  });
+});
+
+describe('prompt versions name exactly one text (standard §41)', () => {
+  it('pins every registered version’s content hash: editing a version’s text needs a new version', () => {
+    // A mismatch here means a registered template's text changed. Add a new version (and route to it through an
+    // eval) instead of editing the old one; add the new version's hash to prompts.lock.json.
+    expect(PROMPT_HASHES).toEqual(PROMPT_LOCK);
+  });
+
+  it('routes only to registered, pinned versions', async () => {
+    const routes = await ownerPool()`select task, prompt_version from model_routes where task like any (array['extract.%', 'creative_director.%', 'genome.%', 'customer_language.%', 'qa.%'])`;
+    expect(routes.length).toBeGreaterThan(0);
+    for (const r of routes) expect(PROMPT_HASHES[r.prompt_version as string], r.task as string).toBeDefined();
   });
 });

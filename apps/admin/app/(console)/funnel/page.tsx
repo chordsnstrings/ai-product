@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { cacByCampaign, FUNNEL_SLICES, funnelBySlice, monthTwoPlus, planMix, stageLatency, staffCan, tasteCohorts, uploadDropoff, type CohortBy, type FunnelSlice } from '@arkiv/core';
+import { adSpendByAd, cacByCampaign, FUNNEL_SLICES, funnelBySlice, monthTwoPlus, planMix, stageLatency, staffCan, tasteCohorts, uploadDropoff, type CohortBy, type FunnelSlice } from '@arkiv/core';
 import { ActForm } from '@/components/act';
 import { d, FilterChip, money, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs, daysFrom } from '@/lib/prefs';
@@ -34,6 +34,7 @@ export default async function Funnel({ searchParams }: { searchParams: Promise<{
     dropoff: await uploadDropoff(tx, { days, includeTest: prefs.includeTest }),
     cohort: await tasteCohorts(tx, { by: cohortBy, days: Math.max(days, 120), tz: prefs.tz, includeTest: prefs.includeTest }),
     cac: await cacByCampaign(tx, { days, includeTest: prefs.includeTest }),
+    byAd: await adSpendByAd(tx, { days, limit: 30 }),
     latency: await stageLatency(tx, { days, includeTest: prefs.includeTest }),
     plans: await planMix(tx, { includeTest: prefs.includeTest }),
     month2: await monthTwoPlus(tx, { includeTest: prefs.includeTest }),
@@ -46,6 +47,12 @@ export default async function Funnel({ searchParams }: { searchParams: Promise<{
   const cacRow = (r: typeof d0.cac.total) => [
     r.campaign === '' ? '(no campaign)' : r.campaign, money(r.spendMicros, 0), r.tasteBuyers, r.subscribers,
     r.mediaCacPerTaste != null ? money(r.mediaCacPerTaste) : '—', money(r.previewCogsMicros), money(r.tasteContributionMicros), r.effectiveSubscriberCac != null ? money(r.effectiveSubscriberCac) : '—',
+    r.paybackMonths != null ? `${r.paybackMonths} mo` : '—',
+  ];
+  const optMoney = (m: number | null, dp?: number) => (m == null ? '—' : money(m, dp));
+  const acqRow = (r: typeof d0.cac.total) => [
+    r.campaign === '' ? '(no campaign)' : r.campaign, r.impressions ? r.impressions.toLocaleString('en-US') : '—', optMoney(r.cpmMicros), r.clicks ? r.clicks.toLocaleString('en-US') : '—',
+    r.ctr == null ? '—' : pct(r.ctr), optMoney(r.cpcMicros), r.landingViews, r.lpvPerClick == null ? '—' : pct(r.lpvPerClick),
   ];
   return (
     <Page
@@ -92,19 +99,34 @@ export default async function Funnel({ searchParams }: { searchParams: Promise<{
       </div>
       <Section title="CAC by campaign (Appendix C)">
         <Table
-          head={['Campaign (utm_campaign)', 'Ad spend', 'Taste buyers', 'New subscribers', 'Media CAC / Taste', 'Free-preview COGS', 'Taste contribution', 'Effective subscriber CAC']}
+          head={['Campaign (utm_campaign)', 'Ad spend', 'Taste buyers', 'New subscribers', 'Media CAC / Taste', 'Free-preview COGS', 'Taste contribution', 'Effective subscriber CAC', 'Payback']}
           rows={[...d0.cac.rows.map(cacRow), ...(d0.cac.rows.length > 1 ? [cacRow(d0.cac.total).map((c, i) => (i === 0 ? <strong key="t">all campaigns</strong> : c))] : [])]}
           empty="No ad spend or attributed buyers in this window. Import ad spend below."
         />
-        <p className="ak-small ak-muted">Effective subscriber CAC = (paid media + free-preview COGS − Taste contribution) ÷ new subscribers, floored at zero. Spend matches visitors by their first landing view’s utm_campaign; payment fees use the finance.payment_fee_* settings.</p>
+        <p className="ak-small ak-muted">Payback = effective subscriber CAC ÷ a new subscriber’s monthly contribution (plan price − payment fee − their last 30 days of provider cost). Effective subscriber CAC = (paid media + free-preview COGS − Taste contribution) ÷ new subscribers, floored at zero. Spend matches visitors by their first landing view’s utm_campaign; payment fees use the finance.payment_fee_* settings.</p>
+      </Section>
+      <Section title="Impressions → clicks → landing views (standard §7)">
+        <Table
+          head={['Campaign', 'Impressions', 'CPM', 'Clicks', 'CTR', 'CPC', 'Landing views', 'LPV / click']}
+          rows={[...d0.cac.rows.map(acqRow), ...(d0.cac.rows.length > 1 ? [acqRow(d0.cac.total).map((c, i) => (i === 0 ? <strong key="t">all campaigns</strong> : c))] : [])]}
+          empty="No ad spend in this window."
+        />
+        <p className="ak-small ak-muted">Impressions and clicks come from the imported Ads Manager export (columns impressions, clicks); CPM and CPC use only the spend on rows that reported them. Landing views are unique visitors whose landing view carried the campaign’s utm_campaign.</p>
+      </Section>
+      <Section title="By ad (creative ID)">
+        <Table
+          head={['Source', 'Campaign', 'Ad id', 'Spend', 'Impressions', 'CPM', 'Clicks', 'CTR', 'CPC']}
+          rows={d0.byAd.map((a) => [a.source, a.campaign || '—', <Mono key="a">{a.adId}</Mono>, money(a.spendMicros, 0), a.impressions ?? '—', optMoney(a.cpmMicros), a.clicks ?? '—', a.ctr == null ? '—' : pct(a.ctr), optMoney(a.cpcMicros)])}
+          empty="No imported rows carry an ad id in this window."
+        />
       </Section>
       <Section title="Ad spend imports">
         {staffCan(s.roles, 'adspend.manage') ? (
           <div className="ak-panel" style={{ maxWidth: 720 }}>
-            <p className="ak-small ak-muted" style={{ marginTop: 0 }}>Paste a CSV exported from Ads Manager: a header with date (YYYY-MM-DD), campaign and spend (USD), plus source and ad_id when you have them. Re-importing a day replaces it.</p>
+            <p className="ak-small ak-muted" style={{ marginTop: 0 }}>Paste a CSV exported from Ads Manager: a header with date (YYYY-MM-DD), campaign and spend (USD), plus source, ad_id, impressions and clicks when you have them. Re-importing a day replaces it.</p>
             <ActForm action="adspend.import" submit="Import ad spend" fields={[
               { name: 'source', label: 'Source for rows without one (e.g. meta, tiktok)', placeholder: 'meta' },
-              { name: 'csv', label: 'CSV', type: 'textarea', required: true, placeholder: 'date,campaign,ad_id,spend\n2026-09-20,texture-launch,120201,84.20' },
+              { name: 'csv', label: 'CSV', type: 'textarea', required: true, placeholder: 'date,campaign,ad_id,spend,impressions,clicks\n2026-09-20,texture-launch,120201,84.20,21000,310' },
               { name: 'reason', label: 'Note (optional)' },
             ]} />
           </div>

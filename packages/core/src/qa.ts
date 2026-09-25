@@ -64,6 +64,7 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     token: i.token,
     task: 'qa.fidelity',
     subject: { type: 'scene', id: i.sceneId },
+    inputRefs: { sceneId: i.sceneId, attempt: i.attempt, kind: i.frameBytes ? 'frame' : 'render' },
     template: 'fidelity',
     content: [
       ...(await Promise.all(i.referenceBytes.slice(0, 2).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 768) })))),
@@ -181,6 +182,7 @@ export async function qaImpliedClaims(ctx: TenantContext, token: string, project
     token,
     task: 'qa.implied_claims',
     subject: { type: 'project', id: projectId },
+    inputRefs: { projectId, scenes: c.scenes.length, frames: Math.min(4, c.frames.length) },
     template: 'implied-claims',
     content: [
       ...(await Promise.all(c.frames.slice(0, 4).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 640) })))),
@@ -223,6 +225,7 @@ export async function qaContinuity(ctx: TenantContext, token: string, projectId:
     token,
     task: 'qa.continuity',
     subject: { type: 'project', id: projectId },
+    inputRefs: { projectId, sceneIds: frames.slice(0, 6).map((f) => f.sceneId) },
     template: 'continuity',
     content: [
       ...(await Promise.all(frames.slice(0, 6).map(async (f) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(f.bytes, 640) })))),

@@ -1,8 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
-import { assertStaff, decideApproval, decideOwnershipTransfer, lookupInvite, startBreakGlass } from '@arkiv/core';
+import { assertStaff, decideApproval, decideOwnershipTransfer, lookupInvite, Queues, startBreakGlass } from '@arkiv/core';
 import { MockStripe, setBillingGateway } from '@arkiv/billing';
+import { acceptStaffInvite, staffLogin, totp, viewStaffInvite } from '@arkiv/auth';
 import { devOutbox, REDACTED_LINK, sendEmail } from '@arkiv/email';
 import { DataRequestKind, newId, type StaffRole } from '@arkiv/shared';
 import { ACTIONS, type ActionName } from './actions';
@@ -25,22 +26,44 @@ async function act(s: StaffUser, action: ActionName, input: Record<string, unkno
 beforeEach(truncateAll);
 afterAll(closeAll);
 
-describe('staff.create (plan 05 §0.5, §23)', () => {
-  it('creates the account without roles and routes the requested roles through four-eyes', async () => {
+describe('staff.invite (plan 05 §0.5, §23)', () => {
+  it('emails a single-use link, routes the requested roles through four-eyes, and the invitee sets both factors', async () => {
     const sa = await staff(['SUPER_ADMIN'], 'Founder A');
     const sa2 = await staff(['SUPER_ADMIN'], 'Founder B');
-    await expect(act(sa, 'staff.create', { email: 'new@arkiv.test', name: 'New Person', password: 'correct horse battery staple', roles: 'SUPER_ADMIN,FINANCE' })).rejects.toThrow();
-    await expect(act(sa, 'staff.create', { email: 'new@arkiv.test', name: 'New Person', password: 'correct horse battery staple', roles: 'WIZARD', reason: 'hiring' })).rejects.toThrow(/Unknown role/);
-    const r = await act(sa, 'staff.create', { email: 'new@arkiv.test', name: 'New Person', password: 'correct horse battery staple', roles: 'super_admin, finance', reason: 'second founder joining' });
+    await expect(act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'SUPER_ADMIN,FINANCE' })).rejects.toThrow();
+    await expect(act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'WIZARD', reason: 'hiring' })).rejects.toThrow(/Unknown role/);
+    devOutbox.length = 0;
+    const r = await act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'super_admin, finance', reason: 'second founder joining' });
     expect(r.status).toBe('pending');
-    expect(String(r.message)).toMatch(/pending approval/);
-    const [u] = await ownerPool()`select id, roles from staff_users where email = 'new@arkiv.test'`;
-    expect(u!.roles).toEqual([]);
+    expect(String(r.message)).toMatch(/Invite emailed.*pending approval/);
+    expect(String(r.message)).not.toMatch(/secret/i); // the inviter never sees a factor
+    const [u] = await ownerPool()`select id, roles, active from staff_users where email = 'new@arkiv.test'`;
+    expect(u).toMatchObject({ roles: [], active: false });
+    const mail = devOutbox.find((m) => m.template === 'staff_invite' && m.to === 'new@arkiv.test');
+    const token = /\/invite\/([A-Za-z0-9_-]+)/.exec(mail!.html)![1]!;
+    const [log] = await ownerPool()`select data from email_log where template = 'staff_invite'`;
+    expect((log!.data as { url: string }).url).toBe(REDACTED_LINK);
+    // A second invite for the same person is refused; a resend replaces the link.
+    await expect(act(sa, 'staff.invite', { email: 'new@arkiv.test', name: 'New Person', roles: 'SUPPORT', reason: 'again' })).rejects.toThrow(/open invite/);
+    await act(sa, 'staff.invite_resend', { staffId: u!.id });
+    const mail2 = devOutbox.filter((m) => m.template === 'staff_invite').at(-1)!;
+    const token2 = /\/invite\/([A-Za-z0-9_-]+)/.exec(mail2.html)![1]!;
+    expect(token2).not.toBe(token);
+    await expect(viewStaffInvite(token)).rejects.toThrow(/expired or was already used/);
+    // The invitee enrols their own authenticator and password.
+    const v = await viewStaffInvite(token2);
+    expect(v.email).toBe('new@arkiv.test');
+    await expect(acceptStaffInvite(token2, 'correct horse battery staple', '000000')).rejects.toThrow(/code doesn’t match/);
+    await acceptStaffInvite(token2, 'correct horse battery staple', totp(v.totpSecret));
+    await expect(acceptStaffInvite(token2, 'correct horse battery staple', totp(v.totpSecret))).rejects.toThrow(/already used/);
+    expect(await staffLogin('new@arkiv.test', 'correct horse battery staple', totp(v.totpSecret), {})).toBeTruthy();
     // The creator can't approve their own request; another SUPER_ADMIN can.
     await expect(decideApproval(sa, r.approvalId as string, true)).rejects.toThrow(/own request/);
     await decideApproval(sa2, r.approvalId as string, true);
-    const [after] = await ownerPool()`select roles from staff_users where id = ${u!.id}`;
-    expect(after!.roles).toEqual(['SUPER_ADMIN', 'FINANCE']);
+    const [after] = await ownerPool()`select roles, active from staff_users where id = ${u!.id}`;
+    expect(after).toMatchObject({ roles: ['SUPER_ADMIN', 'FINANCE'], active: true });
+    // Staff don't confirm their own roles in the access review.
+    await expect(act(sa, 'staff.confirm_roles', { staffId: sa.staffId })).rejects.toThrow(/Another SUPER_ADMIN/);
   });
 });
 
@@ -90,15 +113,17 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
     const eng = await staff(['ENGINEERING']);
     const task = 'creative_director.storyboard';
     try {
-      await expect(act(eng, 'route.update', { task: 'tts.voiceover', rolloutPct: '5', model: 'speech-2.8-turbo', reason: 'cheaper voice' })).rejects.toThrow(/No golden dataset covers tts\.voiceover/);
-      await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing compliance\.scan eval for creative_director\.storyboard · claude-opus-5-5 · storyboard@1\.1\.0/);
+      // A route no benchmark covers can't be changed.
+      await ownerPool()`insert into model_routes (task, provider, model, prompt_version) select 'video.unbenchmarked', provider, model, prompt_version from model_routes where task = 'video.scene'`;
+      await expect(act(eng, 'route.update', { task: 'video.unbenchmarked', rolloutPct: '5', reason: 'no benchmark yet' })).rejects.toThrow(/No golden dataset covers video\.unbenchmarked/);
+      await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing storyboard\.compliant eval for creative_director\.storyboard · claude-opus-5-5 · storyboard@1\.1\.0/);
       // A passing run of the dataset for some other candidate doesn't count.
-      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@9.9.9', 'claude-opus-5-5', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@9.9.9', 'claude-opus-5-5', 'storyboard.compliant', 'passed', ${eng.staffId})`;
       await expect(act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' })).rejects.toThrow(/Run a passing/);
       // eval.run records the run for the candidate and queues it for the worker.
       await act(eng, 'eval.run', { task, promptVersion: 'storyboard@1.1.0', reason: 'candidate' });
       const [run] = await ownerPool()`select id, task, model, prompt_version, dataset, status from eval_runs where prompt_version = 'storyboard@1.1.0'`;
-      expect(run).toMatchObject({ task, model: 'claude-opus-5-5', dataset: 'compliance.scan', status: 'queued' });
+      expect(run).toMatchObject({ task, model: 'claude-opus-5-5', dataset: 'storyboard.compliant', status: 'queued' });
       expect(await ownerPool()`select 1 from ops_commands where kind = 'eval.run' and payload->>'evalRunId' = ${run!.id as string}`).toHaveLength(1);
       await ownerPool()`update eval_runs set status = 'passed' where id = ${run!.id}`; // the worker's verdict
       const r = await act(eng, 'route.update', { task, rolloutPct: '5', promptVersion: 'storyboard@1.1.0', reason: 'tighter hooks' });
@@ -113,10 +138,11 @@ describe('route.update and eval.run (plan 05 §10–11)', () => {
       const [c3] = await ownerPool()`select canary from model_routes where task = ${task}`;
       expect(c3!.canary).toBeNull();
       // A candidate model the Cost Governor can't price is refused even with a passing eval.
-      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.2.0', 'unpriced-model', 'compliance.scan', 'passed', ${eng.staffId})`;
+      await ownerPool()`insert into eval_runs (task, prompt_version, model, dataset, status, created_by) values (${task}, 'storyboard@1.2.0', 'unpriced-model', 'storyboard.compliant', 'passed', ${eng.staffId})`;
       await expect(act(eng, 'route.update', { task, rolloutPct: '5', model: 'unpriced-model', reason: 'try it' })).rejects.toThrow(/No published rate for anthropic\/unpriced-model/);
     } finally {
       await ownerPool()`update model_routes set canary = null`;
+      await ownerPool()`delete from model_routes where task = 'video.unbenchmarked'`;
     }
   });
 
@@ -199,6 +225,44 @@ describe('privacy.create (plan 05 §21)', () => {
     for (const kind of DataRequestKind) await act(c, 'privacy.create', { kind, requesterEmail: 'person@example.com', workspaceId: t.workspaceId });
     const rows = await ownerPool()`select kind from data_requests order by kind`;
     expect(rows.map((r) => r.kind)).toEqual([...DataRequestKind].sort());
+  });
+
+  it('runs each tool from the request it answers, and tells the tenant when review text is erased', async () => {
+    const c = await staff(['COMPLIANCE']);
+    const sa = await staff(['SUPER_ADMIN']);
+    const t = await makeTenant();
+    const sku = await makeSku(t.workspaceId);
+    const req = async (kind: string, workspaceId: string | null = t.workspaceId) =>
+      (await ownerPool()`insert into data_requests (kind, requester_email, workspace_id, due_at) values (${kind}, 'person@example.com', ${workspaceId}, now() + interval '45 days') returning id`)[0]!.id as string;
+
+    // Export for an access request: queued, request in progress with a note.
+    const exp = await req('export');
+    await expect(act(c, 'privacy.run_export', { id: await req('delete_user') })).rejects.toThrow(/answers access \/ export/);
+    await expect(act(c, 'privacy.run_export', { id: await req('access', null) })).rejects.toThrow(/Set the workspace/);
+    await act(c, 'privacy.run_export', { id: exp });
+    const [o] = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and queue = ${Queues.exportWorkspace}`;
+    expect(o!.payload).toMatchObject({ dataRequestId: exp });
+    expect(await ownerPool()`select status, notes from data_requests where id = ${exp}`).toMatchObject([{ status: 'in_progress', notes: expect.stringMatching(/export queued/) }]);
+
+    // Purge for a workspace deletion request.
+    const del = await req('delete_workspace');
+    await act(sa, 'privacy.schedule_purge', { id: del, reason: 'verified owner by email' });
+    expect(await ownerPool()`select state from workspaces where id = ${t.workspaceId}`).toEqual([{ state: 'PURGE_SCHEDULED' }]);
+    expect(await ownerPool()`select status from data_requests where id = ${del}`).toEqual([{ status: 'in_progress' }]);
+
+    // Erasing review text: break-glass write, the request completes, and the owners get a notice.
+    await ownerPool()`insert into customer_signals (workspace_id, sku_id, source, text) values (${t.workspaceId}, ${sku}, 'review', 'Jo Bloggs from Leeds loves it'), (${t.workspaceId}, ${sku}, 'review', 'Great serum')`;
+    const erase = await req('delete_person_in_reviews');
+    await expect(act(sa, 'privacy.erase_reviews', { workspaceId: t.workspaceId, phrase: 'Jo Bloggs', requestId: erase, reason: 'verified by email' })).rejects.toThrow(/break-glass/i);
+    await startBreakGlass(sa, t.workspaceId, { reasonKind: 'compliance_review', reason: 'privacy request: erase review text', write: true, writeReason: 'delete a person’s review text' });
+    devOutbox.length = 0;
+    const r = await act(sa, 'privacy.erase_reviews', { workspaceId: t.workspaceId, phrase: 'Jo Bloggs', requestId: erase, reason: 'verified by email' });
+    expect(r.message).toMatch(/Deleted 1 review snippets/);
+    expect(await ownerPool()`select text from customer_signals where workspace_id = ${t.workspaceId}`).toEqual([{ text: 'Great serum' }]);
+    expect(await ownerPool()`select status from data_requests where id = ${erase}`).toEqual([{ status: 'completed' }]);
+    const notice = devOutbox.find((m) => m.template === 'review_text_erased');
+    expect(notice).toBeTruthy();
+    expect(notice!.html).not.toContain('Jo Bloggs');
   });
 });
 
@@ -525,6 +589,46 @@ describe('ad spend import (plan 05 §4 CAC)', () => {
     expect(rows).toEqual([{ date: '2026-09-20', spend_micros: 90_000_000 }, { date: '2026-09-21', spend_micros: 10_000_000 }]);
     expect(await ownerPool()`select 1 from admin_audit_log where action = 'adspend.import'`).toHaveLength(2);
     await expect(act(g, 'adspend.import', { csv: 'date,campaign,spend\nnot-a-date,x,1', source: 'meta' })).rejects.toThrow(/Line 2/);
+  });
+});
+
+describe('project.ceiling_override (standard §44 commercial policy)', () => {
+  it('needs FINANCE approval, only for a paid production stopped at its ceiling, then queues it again', async () => {
+    const ops = await staff(['OPS']);
+    const fin = await staff(['FINANCE']);
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const sku = await makeSku(t.workspaceId);
+    const p = newId();
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by, failure_code, failure_reason) values (${p}, ${t.workspaceId}, ${sku}, 'taste', 'NEEDS_USER_ACTION', 'test', 'entitlement', 'x')`;
+    await expect(act(ops, 'project.ceiling_override', { workspaceId: t.workspaceId, projectId: p, maxUsd: 12, reason: 'rates doubled' })).rejects.toThrow(/isn’t waiting on its cost ceiling/);
+    await ownerPool()`update projects set failure_code = 'gate_blocked' where id = ${p}`;
+    await expect(act(ops, 'project.ceiling_override', { workspaceId: t.workspaceId, projectId: p, maxUsd: 5, reason: 'rates doubled' })).rejects.toThrow(/above the standard ceiling/);
+    const r = await act(ops, 'project.ceiling_override', { workspaceId: t.workspaceId, projectId: p, maxUsd: 12, reason: 'rates doubled after purchase' });
+    expect(r.status).toBe('pending');
+    await decideApproval(fin, r.approvalId as string, true);
+    const [row] = await ownerPool()`select state, ceiling_override_micros from projects where id = ${p}`;
+    expect(row).toMatchObject({ state: 'STORYBOARD_APPROVED', ceiling_override_micros: 12_000_000 });
+    expect(await ownerPool()`select 1 from outbox where workspace_id = ${t.workspaceId} and queue = ${Queues.produceProject}`).toHaveLength(1);
+  });
+});
+
+describe('plan.price_schedule (plan 04 §3)', () => {
+  it('needs a second FINANCE approver, at least 30 days of notice, and notifies subscribers once approved', async () => {
+    const f1 = await staff(['FINANCE'], 'Fin A');
+    const f2 = await staff(['FINANCE'], 'Fin B');
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id) values (${t.workspaceId}, 'sub_ps', 'SCALE', 'active', gen_random_uuid())`;
+    const on = (d: number) => new Date(Date.now() + d * 86400_000).toISOString().slice(0, 10);
+    await expect(act(f1, 'plan.price_schedule', { plan: 'SCALE', price: 229, effectiveOn: on(20), reason: 'new pricing' })).rejects.toThrow(/at least 30 days/);
+    const r = await act(f1, 'plan.price_schedule', { plan: 'SCALE', price: 229, effectiveOn: on(35), stripePriceId: 'price_scale229', reason: 'new pricing' });
+    expect(r.status).toBe('pending');
+    expect(await ownerPool()`select 1 from plan_prices`).toHaveLength(0);
+    await expect(decideApproval(f1, r.approvalId as string, true)).rejects.toThrow(/own request/);
+    await decideApproval(f2, r.approvalId as string, true);
+    const [v] = await ownerPool()`select plan_code, price_micros, stripe_price_id from plan_prices`;
+    expect(v).toMatchObject({ plan_code: 'SCALE', price_micros: 229_000_000, stripe_price_id: 'price_scale229' });
+    const [n] = await ownerPool()`select old_price_micros, new_price_micros from price_change_notices where workspace_id = ${t.workspaceId}`;
+    expect(n).toMatchObject({ old_price_micros: 199_000_000, new_price_micros: 229_000_000 });
   });
 });
 

@@ -219,7 +219,9 @@ export type ApprovalAction =
   | 'staff.roles'
   | 'claim.unblock'
   | 'claim.approve_override'
-  | 'stripe.assign';
+  | 'stripe.assign'
+  | 'plan.price_schedule'
+  | 'project.ceiling_override';
 
 type Executor = (payload: Record<string, unknown>, ctx: { requester: Staff; approver: Staff }) => Promise<unknown>;
 const executors = new Map<ApprovalAction, Executor>();
@@ -252,6 +254,8 @@ const APPROVER_ROLE: Record<ApprovalAction, StaffRole> = {
   'claim.unblock': 'COMPLIANCE',
   'claim.approve_override': 'COMPLIANCE',
   'stripe.assign': 'FINANCE',
+  'plan.price_schedule': 'FINANCE',
+  'project.ceiling_override': 'FINANCE',
 };
 
 /** Run now if under threshold, otherwise file an approval request. */
@@ -952,6 +956,8 @@ export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
   const switched = tx`exists (select 1 from jsonb_array_elements(case when jsonb_typeof(p.qa_report->'checks') = 'array' then p.qa_report->'checks' else '[]'::jsonb end) c
                               where c->'data' ? 'techniqueSwitch')`;
   const sample = tx`(p.state = 'COMPLETE' and abs(hashtext(p.id::text)) % 50 = 0)`;
+  // §44: a provider's safety filter declined a scene (false positive or not, a human looks at why).
+  const moderated = tx`exists (select 1 from events e where e.workspace_id = p.workspace_id and e.type = 'PROVIDER_MODERATION_REJECTED' and e.refs->>'projectId' = p.id::text)`;
   // The customer said the delivered ad was "Not right?" (plan 03 P10, standard §48): a human looks at it.
   const rejected = tx`exists (select 1 from project_feedback f where f.workspace_id = p.workspace_id and f.project_id = p.id)`;
   const rejectedAs = tx`(select f.diagnosis from project_feedback f where f.workspace_id = p.workspace_id and f.project_id = p.id order by f.created_at desc limit 1)`;
@@ -959,6 +965,7 @@ export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
     select p.id, p.workspace_id, p.state, p.qa_report, p.updated_at,
            -- A switch explains the earlier hard fails in the same report, so it is named first.
            case when ${rejected} then 'customer: not right (' || ${rejectedAs} || ')'
+                when ${moderated} then 'provider moderation (alternative shot used)'
                 when ${failedTwice} and ${switched} then 'failed QA twice (technique switched)'
                 when ${switched} then 'technique switched'
                 when ${hard} then 'hard fidelity fail'
@@ -967,5 +974,5 @@ export function qaQueueSql(tx: Tx, opts: { includeTest?: boolean } = {}) {
     from projects p
     where not exists (select 1 from qa_reviews r where r.project_id = p.id)
       and (${!!opts.includeTest} or p.workspace_id not in (select id from workspaces where is_test))
-      and (${rejected} or ${hard} or ${failedTwice} or ${switched} or ${sample})`;
+      and (${rejected} or ${moderated} or ${hard} or ${failedTwice} or ${switched} or ${sample})`;
 }

@@ -2,6 +2,7 @@ import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { formatDate, formatDateTime, formatTime } from '@arkiv/shared/format';
 import { requestTz } from '@/lib/prefs';
+import { KeyTable } from './keys';
 
 export const money = (micros: number | string | null | undefined, d = 2) => `$${(Number(micros ?? 0) / 1e6).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
 /** Dates are stored in UTC and shown in the console timezone (plan 05 §1), or an explicit one. */
@@ -43,12 +44,12 @@ export function Section({ title, children, right }: { title: string; children: R
 export function Table({ head, rows, empty = 'Nothing here.' }: { head: ReactNode[]; rows: ReactNode[][]; empty?: string }) {
   if (!rows.length) return <p className="ak-small ak-muted">{empty}</p>;
   return (
-    <div className="ak-scroll-x">
+    <KeyTable tall={rows.length > 25}>
       <table className="ak-table">
         <thead><tr>{head.map((h, i) => <th key={i}>{h}</th>)}</tr></thead>
         <tbody>{rows.map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j}>{c}</td>)}</tr>)}</tbody>
       </table>
-    </div>
+    </KeyTable>
   );
 }
 

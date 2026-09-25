@@ -18,7 +18,7 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, currentPeriodKey, type LedgerUnit } from './ledger';
 import { setting } from './settings';
-import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type ProviderQueueState, type Route, type TaskUnits } from './model-gateway';
+import { generateImage, generateVideo, lineFor, linkJobOutput, partnerFor, route, synthesizeVoice, type ProviderQueueState, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
@@ -302,18 +302,53 @@ async function planRun(
   scenes: SceneRow[],
   versions: VersionRow[],
   imagery: Awaited<ReturnType<typeof productImagery>>,
-): Promise<{ routes: ProductionRoutes; rates: Map<string, RateTable>; plan: ProductionPlan }> {
+  opts: { apply?: boolean } = {},
+): Promise<{ routes: ProductionRoutes; rates: Map<string, RateTable>; plan: ProductionPlan; replanned: string[] }> {
   const routes = await productionRoutes(tx, ws);
   const rates = await loadRates(tx);
   const ownPlates = new Set(versions.filter((v) => v.kind === 'frame' && v.lineage?.projectId === projectId && v.status === 'accepted' && v.lineage?.plateAssetId).map((v) => v.scene_id));
   const wantsPlate = (s: SceneRow) => s.production_mode === 'STRICT_COMPOSITE' && s.purpose !== 'cta' && !!imagery.cutout?.keyed && !!routes.plate && !ownPlates.has(s.id);
   const voChars = scenes.reduce((n, s) => n + ((s.spoken_line as string | null)?.trim().length ?? 0), 0);
-  const plan = planProduction(scenes, voChars, routes, rates, {
-    reuse: new Set(reusableRenders(scenes, versions).keys()),
-    plates: scenes.filter(wantsPlate).length,
-    ceilingMicros: CEILING_PURPOSES.includes(purpose) ? COST_LIMITS.CREATIVE_TEST_CEILING : null,
-  });
-  return { routes, rates, plan };
+  // The class ceiling, or a staff-approved override of it for this project (§44 commercial policy; cost-governor.ts).
+  const [ov] = await tx`select ceiling_override_micros from projects where id = ${projectId} and workspace_id = ${ws}`;
+  const ceilingMicros = CEILING_PURPOSES.includes(purpose) ? Math.max(COST_LIMITS.CREATIVE_TEST_CEILING, Number(ov?.ceiling_override_micros ?? 0)) : null;
+  const reuse = new Set(reusableRenders(scenes, versions).keys());
+  const planFor = (rows: SceneRow[]) => planProduction(rows, voChars, routes, rates, { reuse, plates: rows.filter(wantsPlate).length, ceilingMicros });
+  let plan = planFor(scenes);
+  // §44 "Model price doubles": a paid promise whose plan no longer fits its class ceiling at today's rates (the
+  // rates rose after the storyboard was approved) is re-planned within it first — the lowest-priority generated
+  // shots become the exact product on a generated setting (hybrid) — rather than stopping the ad. Renders already
+  // accepted are kept. The merchant sees why on the scene (planner_reason).
+  const replanned: string[] = [];
+  if (ceilingMicros != null && estimate(rates, plan.lines).totalMicros > ceilingMicros) {
+    const facts = { transparency: null, referenceViews: 0, keyedCutout: !!imagery.cutout?.keyed, videoAvailable: true, remixFootage: false };
+    const planned = scenes.map((sc) => ({ mode: (reuse.has(sc.id) ? 'STRICT_COMPOSITE' : sc.production_mode) as ProductionMode, reason: '' }));
+    const withModes = (modes: readonly ProductionMode[]) => scenes.map((sc, i) => (reuse.has(sc.id) ? sc : { ...sc, production_mode: modes[i]! }));
+    const fitted = fitCeiling(
+      scenes.map((sc) => ({ purpose: sc.purpose, durationMs: sc.duration_ms, productionMode: sc.production_mode })),
+      planned,
+      (modes) => estimate(rates, planFor(withModes(modes)).lines).totalMicros,
+      ceilingMicros,
+      facts,
+    );
+    fitted.forEach((f, i) => {
+      const sc = scenes[i]!;
+      if (reuse.has(sc.id) || f.mode === sc.production_mode) return;
+      replanned.push(sc.id);
+      if (opts.apply) {
+        sc.production_mode = f.mode;
+        (sc as SceneRow & { planner_reason?: string }).planner_reason = f.reason;
+      }
+    });
+    if (replanned.length) plan = planFor(opts.apply ? scenes : withModes(fitted.map((f) => f.mode)));
+    if (opts.apply) {
+      for (const id of replanned) {
+        const sc = scenes.find((x) => x.id === id)!;
+        await tx`update scenes set production_mode = ${sc.production_mode}, planner_reason = ${(sc as SceneRow & { planner_reason?: string }).planner_reason ?? null} where id = ${id} and workspace_id = ${ws}`;
+      }
+    }
+  }
+  return { routes, rates, plan, replanned };
 }
 
 /** Load what planRun needs for a project's current storyboard (null when there is none yet). */
@@ -598,7 +633,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   let plan: ProductionPlan;
   try {
     ({ auth, routes, plan } = await withTenant(ws, async (tx) => {
-      const { routes, plan } = await planRun(tx, ws, projectId, purpose, scenes, versions, imagery);
+      const { routes, plan, replanned } = await planRun(tx, ws, projectId, purpose, scenes, versions, imagery, { apply: true });
       const [cur] = p.authorization_id ? await tx`select id, status from cost_authorizations where id = ${p.authorization_id} for update` : [];
       let a: { authorizationId: string; token: string } | null = null;
       if (cur?.status === 'active') {
@@ -631,7 +666,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       } else {
         await tx`update projects set authorization_id = ${a.authorizationId} where id = ${projectId}`;
       }
-      await step(tx, ws, projectId, 'prepare', 'done', `${scenes.length} scenes planned`);
+      await step(tx, ws, projectId, 'prepare', 'done', replanned.length ? `${scenes.length} scenes planned · ${replanned.length} shot${replanned.length === 1 ? '' : 's'} now use your exact product on a generated setting to stay within this ad’s cost limit` : `${scenes.length} scenes planned`);
       await beat(tx, ws, projectId, a.authorizationId);
       return { auth: a, routes, plan };
     }));
@@ -640,7 +675,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     if (e instanceof DomainError && e.code === 'CONFLICT') return 'skipped';
     if (e instanceof DomainError && (e.code === 'PAYMENT_REQUIRED' || e.code === 'GATE_BLOCKED')) {
       // A Cost Governor refusal is written for the customer (what to do next); the code says which kind it is.
-      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason: e.message, code: e.code === 'PAYMENT_REQUIRED' ? 'entitlement' : 'gate_blocked' }));
+      // A paid ad stopped at its class ceiling (provider rates rose after purchase, even after re-planning): our team
+      // decides (a staff-approved override, §44 commercial policy); the customer is told plainly, never charged again.
+      const atCeiling = e.code === 'GATE_BLOCKED' && CEILING_PURPOSES.includes(purpose) && (e.details as { ceilingMicros?: number } | undefined)?.ceilingMicros != null;
+      const reason = atCeiling ? 'Producing this ad now costs more than we planned. Our team is on it and will get it made — you won’t be charged again. Try again later, or contact support.' : e.message;
+      await withTenant(ws, (tx) => transition(tx, ctx, projectId, 'NEEDS_USER_ACTION', { reason, code: e.code === 'PAYMENT_REQUIRED' ? 'entitlement' : 'gate_blocked' }));
       return 'failed';
     }
     // Anomaly hold / open circuit / unpriceable route before anything was reserved: pause and try again later.
@@ -694,9 +733,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         withTenant(ws, async (tx) => {
           const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: sku.id as string, source: 'composed', lineage: { sceneId: s.id, projectId, technique, ...lineage } });
           const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'frame'`;
-          const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, qa, status, lineage)
+          // A generated plate's provider job (§41), with its cost, on the version it produced.
+          const jobId = (lineage.plateJobId as string | undefined) ?? null;
+          const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, qa, status, lineage, provider_job_id, cost_micros)
                                  values (${ws}, ${s.id}, ${v!.v}, 'frame', ${a.id}, ${technique}, ${tx.json(qa as never)}, 'accepted',
-                                         ${tx.json({ projectId, ...lineage } as never)})
+                                         ${tx.json({ projectId, ...lineage } as never)}, ${jobId},
+                                         coalesce((select actual_micros from provider_jobs where id = ${jobId} and workspace_id = ${ws}), 0))
                                  returning id`;
           return { assetId: a.id, versionId: row!.id as string };
         });
@@ -740,6 +782,23 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
        * (§25, §44): the exact product from the merchant's own photo — itself QA-checked — never a reused
        * generated frame.
        */
+      /** A render the provider's safety filter declined: a failed scene version (moderation) and an event for staff. */
+      const recordModeration = async (s: SceneRow, attempt: number, e: ProviderError) =>
+        withTenant(ws, async (tx) => {
+          const [job] = await tx`select id from provider_jobs where workspace_id = ${ws} and subject_type = 'scene' and subject_id = ${s.id} and task like 'video.%' and status = 'failed'
+                                 order by created_at desc limit 1`;
+          const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
+          const qa = [{ check: 'visual', pass: false, hard: false, detail: `provider moderation: ${e.message.slice(0, 200)}`, data: { moderation: true } }];
+          await tx`insert into scene_versions (workspace_id, scene_id, version, kind, technique, qa, status, input_hash, lineage, provider_job_id)
+                   values (${ws}, ${s.id}, ${v!.v}, 'render', 'generative', ${tx.json(qa as never)}, 'failed', ${hashes.get(s.id)!},
+                           ${tx.json({ attempt, moderation: true, provider: e.provider, providerJobId: (job?.id as string) ?? null } as never)}, ${(job?.id as string) ?? null})`;
+          if (job) {
+            await emit(tx, ctx, 'PROVIDER_MODERATION_REJECTED', { type: 'scene', id: s.id }, { projectId, provider: e.provider, attempt, error: e.message.slice(0, 200) }, {
+              projectId, skuId: sku.id as string, storyboardId: sb!.id as string, providerJobId: job.id as string, authorizationId: auth.authorizationId,
+            });
+          }
+        });
+
       const exactFallback = async (s: SceneRow, n: number, why: string): Promise<Slot> => {
         await withTenant(ws, (tx) => step(tx, ws, projectId, 'accuracy', 'active', 'Using your exact product photo for this shot'));
         const prior = fallbackFrame(s.id);
@@ -782,6 +841,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         });
         let why = 'repeated QA failure';
         let lastFailure = 'QA';
+        // A provider already declined these exact inputs (§44): a resumed run doesn't ask again.
+        if (versions.some((v) => v.scene_id === s.id && v.kind === 'render' && v.status === 'failed' && v.lineage?.moderation === true && sameInputs(v, s))) return exactFallback(s, n, 'provider moderation');
         while (attempt < 2) {
           attempt++;
           // A pending render was paid for already (its repair, if it is one, drew on the reserve then).
@@ -823,7 +884,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
               const v0 = vid;
               assetId = await withTenant(ws, async (tx) => {
                 const a = await saveAsset(tx, ws, { bytes: v0.bytes, mime: 'video/mp4', kind: 'scene_render', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, attempt, providerJobId: v0.jobId, model: v0.modelVersion, promptVersion: v0.promptVersion, inputHash: hashes.get(s.id) } });
-                await tx`update provider_jobs set output_asset_id = ${a.id} where id = ${v0.jobId} and workspace_id = ${ws}`;
+                await linkJobOutput(tx, ws, v0.jobId, a.id);
                 return a.id;
               });
             }
@@ -836,10 +897,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             const saved = await withTenant(ws, async (tx) => {
               const a = { id: assetId };
               const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
-              const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage)
+              // §41: the render's job and cost on its version; a failed QA's first failing check is the repair reason.
+              const repairReason = ok ? null : (res.find((c) => !c.pass)?.detail ?? 'QA').slice(0, 200);
+              const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage, provider_job_id, cost_micros)
                                      values (${ws}, ${s.id}, ${v!.v}, 'render', ${a.id}, 'generative', ${vid.modelVersion ?? null}, ${vid.promptVersion},
                                              ${tx.json(res as never)}, ${ok ? 'accepted' : 'qa_failed'}, ${hashes.get(s.id)!},
-                                             ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null } as never)})
+                                             ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null, ...(repairReason ? { repairReason } : {}) } as never)},
+                                             ${vid.jobId}, coalesce((select actual_micros from provider_jobs where id = ${vid.jobId} and workspace_id = ${ws}), 0))
                                      returning id`;
               await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) }, {
                 projectId, skuId: sku.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null,
@@ -857,11 +921,14 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
             }
             lastFailure = res.find((c) => !c.pass)?.detail ?? 'QA';
           } catch (e) {
-            // Moderation (a policy false positive, §44) is answered like a QA failure: a compliant alternative shot.
+            // §44 moderation false positive: surfaced internally (a failed scene version + an event the QA queue
+            // lists), never resubmitted — not even reworded — and the scene becomes the compliant alternative shot
+            // (the exact product composite). Safety filters are never worked around.
             if (e instanceof ProviderError && e.kind === 'moderation') {
-              checks.push({ check: 'visual', pass: false, hard: false, detail: `Scene ${n}: provider moderation — using a compliant alternative shot` });
-              lastFailure = 'provider moderation';
-              continue;
+              await recordModeration(s, attempt, e);
+              checks.push({ check: 'visual', pass: false, hard: false, detail: `Scene ${n}: the video provider's safety filter declined this shot — using the exact product composite`, data: { moderation: true } });
+              why = 'provider moderation';
+              break;
             }
             // The authorization can't fund the repair (e.g. rates rose since planning): stop spending, switch technique.
             if (attempt === 2 && reserveExhausted(e)) {
@@ -890,8 +957,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           return still(s, n, { bytes: await withTenant(ws, (tx) => assetBytes(tx, prior.asset_id!)), assetId: prior.asset_id, versionId: prior.id, technique: prior.technique ?? 'exact_product_composite' });
         }
         try {
-          const img = await generateImage({ ctx, token: auth.token, task: PLATE_TASK, subject: { type: 'scene', id: s.id }, prompt: platePrompt(s), references: [], width: 1080, height: 1920, mockLabel: '' });
-          const plate = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: img.bytes, mime: img.mime, kind: 'storyboard_frame', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, projectId, plate: true, providerJobId: img.jobId, promptVersion: img.promptVersion } }));
+          const img = await generateImage({ ctx, token: auth.token, task: PLATE_TASK, subject: { type: 'scene', id: s.id }, inputRefs: { projectId, sceneId: s.id, skuId: sku.id }, prompt: platePrompt(s), references: [], width: 1080, height: 1920, mockLabel: '' });
+          const plate = await withTenant(ws, async (tx) => {
+            const a = await saveAsset(tx, ws, { bytes: img.bytes, mime: img.mime, kind: 'storyboard_frame', skuId: sku.id as string, source: 'generated', lineage: { sceneId: s.id, projectId, plate: true, providerJobId: img.jobId, promptVersion: img.promptVersion } });
+            await linkJobOutput(tx, ws, img.jobId, a.id);
+            return a;
+          });
           const fb = (await exactProductFrame(imagery, { purpose: s.purpose, plate: { assetId: plate.id, bytes: img.bytes } }))!;
           const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, frameBytes: fb.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt: 1 });
           if (!res.every((c) => c.pass)) {
@@ -900,7 +971,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           }
           checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: exact product on a generated setting — ${c.detail}` })));
           platedScenes.add(s.id);
-          const saved = await saveFrame(s, fb.bytes, fb.technique, fb.lineage, res);
+          const saved = await saveFrame(s, fb.bytes, fb.technique, { ...fb.lineage, plateJobId: img.jobId }, res);
           return still(s, n, { bytes: fb.bytes, ...saved, technique: fb.technique });
         } catch (e) {
           if (e instanceof LeaseLost || e instanceof ProductionCancelled) throw e;
@@ -1015,8 +1086,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         });
         if (!clip) {
           try {
-            const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'scene', id: s.id }, text, voice });
-            const a = await withTenant(ws, (tx) => saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId: sku.id as string, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, sceneId: s.id, textHash } }));
+            const vo = await synthesizeVoice({ ctx, token: auth.token, task: 'tts.voiceover', subject: { type: 'scene', id: s.id }, inputRefs: { projectId, sceneId: s.id, textHash }, text, voice });
+            const a = await withTenant(ws, async (tx) => {
+              const saved = await saveAsset(tx, ws, { bytes: vo.bytes, mime: 'audio/mpeg', kind: 'voiceover', skuId: sku.id as string, source: 'generated', lineage: { providerJobId: vo.jobId, provider: vo.provider, task: vo.task, projectId, sceneId: s.id, textHash } });
+              await linkJobOutput(tx, ws, vo.jobId, saved.id);
+              return saved;
+            });
             clip = { id: a.id, bytes: vo.bytes };
           } catch (e) {
             if (isProviderOutage(e)) throw new ProviderOutage('tts.voiceover', e);
@@ -1152,6 +1227,14 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
+        // §41 final acceptance: the provider jobs whose output is in the delivered creative (its scene versions and
+        // voice clips).
+        const versionIds = manifest.scenes.map((m) => m.versionId).filter((x): x is string => !!x);
+        const clipIds = segments.map((sg) => sg.clipAssetId).filter(Boolean);
+        await tx`update provider_jobs j set final_accepted_at = now()
+                 where j.workspace_id = ${ws} and j.final_accepted_at is null
+                   and (j.id in (select v.provider_job_id from scene_versions v where v.workspace_id = ${ws} and v.id = any(${versionIds}::uuid[]) and v.provider_job_id is not null)
+                        or j.output_asset_id = any(${clipIds}::uuid[]))`;
         await step(tx, ws, projectId, 'platforms', 'done', 'TikTok · Reels 9:16 · Feed 4:5 · Square');
         await transition(tx, ctx, projectId, 'COMPLETE');
         await settle(tx, ctx, auth.authorizationId, 'consumed');

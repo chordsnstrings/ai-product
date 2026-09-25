@@ -10,6 +10,7 @@ import type { CompositionManifest } from './composition';
 import { authorize } from './cost-governor';
 import { available, append } from './ledger';
 import { generateVideo } from './model-gateway';
+import { qaQueueSql } from './admin';
 import { approveForProduction, blockedLines, cancelProduction, failProduction, finishAfterEdit, produceProject, reopenForEdit, resumableAfterEdit, retryProduction } from './production';
 import { clearSettingsCache } from './settings';
 import { customerReason } from './projects';
@@ -147,6 +148,89 @@ describe('provider deliverable contract (§48 wrong duration/resolution/format: 
     expect(await ownerPool()`select 1 from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'qa.fidelity' and subject_id = ${first!.id}`).toHaveLength(1);
     const m = await manifestOf(r.projectId);
     expect(m.scenes[0]!.technique).toBe('exact_product_composite');
+  }, 300_000);
+});
+
+describe('provider moderation (§44 "model moderation false positive": edge-44-06)', () => {
+  afterEach(() => setProviders(undefined));
+  it('never resubmits a declined shot: records it for staff and uses the exact product composite', async () => {
+    // Only the video provider's safety filter declines the marked shot (the LLM checks see an ordinary scene).
+    class Moderating extends MockVideo {
+      override async submit(req: Parameters<MockVideo['submit']>[0]) {
+        return super.submit(req.prompt.includes('ZZMODERATED') ? { ...req, prompt: `${req.prompt} [[fail:moderation]]` } : req);
+      }
+    }
+    setProviders({ llm: new MockLlm(), image: new MockImage(), video: new Moderating(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const r = await storyboardReady();
+    await ownerPool()`update scenes set production_mode = 'GENERATIVE_INTERACTION', visual_plan = visual_plan || ' ZZMODERATED'
+                      where storyboard_id = ${r.storyboardId} and purpose <> 'cta' and position = (select min(position) from scenes where storyboard_id = ${r.storyboardId} and purpose <> 'cta')`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const [sc] = await ownerPool()`select id from scenes where storyboard_id = ${r.storyboardId} and visual_plan like '%ZZMODERATED%'`;
+    const jobs = await ownerPool()`select id, status from provider_jobs where subject_id = ${sc!.id} and task like 'video.%'`;
+    expect(jobs).toHaveLength(1); // asked once, never again with a reworded prompt
+    expect(jobs[0]!.status).toBe('failed');
+    const [v] = await ownerPool()`select status, lineage, qa from scene_versions where scene_id = ${sc!.id} and kind = 'render'`;
+    expect(v).toMatchObject({ status: 'failed', lineage: { moderation: true, providerJobId: jobs[0]!.id } });
+    const [e] = await ownerPool()`select refs from events where workspace_id = ${r.t.workspaceId} and type = 'PROVIDER_MODERATION_REJECTED'`;
+    expect(e!.refs).toMatchObject({ sceneId: sc!.id, projectId: r.projectId, providerJobId: jobs[0]!.id });
+    const m = await manifestOf(r.projectId);
+    expect(m.scenes.find((s) => s.sceneId === sc!.id)).toMatchObject({ kind: 'still', technique: 'exact_product_composite' });
+    const queue = await withAdmin((tx) => tx`${qaQueueSql(tx, { includeTest: true })}`);
+    expect(queue.find((q) => q.id === r.projectId)?.why).toBe('provider moderation (alternative shot used)');
+
+    // §41: every accepted render carries its job (output linked, cost recorded), and the jobs whose output is in the
+    // delivered ad are marked finally accepted; the declined job is not.
+    const renders = await ownerPool()`select v.status, v.provider_job_id, v.cost_micros, j.output_asset_id = v.asset_id as linked, j.final_accepted_at is not null as final, j.moderation_status
+                                      from scene_versions v join provider_jobs j on j.id = v.provider_job_id where v.workspace_id = ${r.t.workspaceId} and v.kind = 'render'`;
+    expect(renders.filter((x) => x.status === 'accepted').length).toBeGreaterThan(0);
+    for (const x of renders.filter((y) => y.status === 'accepted')) expect(x).toMatchObject({ linked: true, final: true, moderation_status: 'passed' });
+    expect(renders.filter((x) => x.status === 'accepted').every((x) => Number(x.cost_micros) > 0)).toBe(true);
+    expect(renders.find((x) => x.status === 'failed')).toMatchObject({ final: false, moderation_status: 'rejected' });
+  }, 300_000);
+});
+
+describe('rates rose after the customer paid (§44 "model price doubles": edge-44-07)', () => {
+  it('re-plans within the ceiling instead of stopping the paid ad, and says why on the scene', async () => {
+    const r = await storyboardReady();
+    await ownerPool()`update scenes set production_mode = 'GENERATIVE_INTERACTION' where storyboard_id = ${r.storyboardId} and purpose not in ('cta', 'product_reveal')`;
+    await approve(r);
+    try {
+      // Video now costs four times as much: the approved plan no longer fits the Creative Test ceiling.
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        select provider, model, 2, unit, jsonb_build_object('per_second_720p', (rates->>'per_second_720p')::bigint * 4, 'per_second_1080p', (rates->>'per_second_1080p')::bigint * 4),
+                               now() - interval '1 minute', 'published'
+                        from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 1`;
+      expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+      const scenes = await ownerPool()`select production_mode, planner_reason from scenes where storyboard_id = ${r.storyboardId} and purpose not in ('cta', 'product_reveal')`;
+      const hybrid = scenes.filter((s) => s.production_mode === 'HYBRID');
+      expect(hybrid.length).toBeGreaterThan(0);
+      expect(hybrid.every((s) => /cost limit/.test(s.planner_reason as string))).toBe(true);
+      const [a] = await produceAuth(r.projectId);
+      expect(a!.estimate.totalMicros).toBeLessThanOrEqual(COST_LIMITS.CREATIVE_TEST_CEILING);
+      const [p] = await ownerPool()`select state from projects where id = ${r.projectId}`;
+      expect(p!.state).toBe('COMPLETE');
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where provider = 'byteplus' and model = 'dreamina-seedance-2-5' and version = 2`;
+    }
+  }, 300_000);
+
+  it('when even the re-plan is over the ceiling, the paid ad waits for staff (plainly worded, nothing charged again)', async () => {
+    const r = await storyboardReady();
+    await approve(r);
+    const [cur] = await ownerPool()`select provider, model, unit, rates from provider_rate_tables where provider = 'anthropic' and status = 'published' order by version desc limit 1`;
+    try {
+      await ownerPool()`insert into provider_rate_tables (provider, model, version, unit, rates, effective_from, status)
+                        values (${cur!.provider as string}, ${cur!.model as string}, 900, ${cur!.unit as string},
+                                ${ownerPool().json(Object.fromEntries(Object.entries(cur!.rates as Record<string, number>).map(([k, v]) => [k, v * 1000])))}, now() - interval '1 minute', 'published')`;
+      expect(await produceProject(r.ctx, r.projectId)).toBe('failed');
+      const [p] = await ownerPool()`select state, failure_code, failure_reason from projects where id = ${r.projectId}`;
+      expect(p).toMatchObject({ state: 'NEEDS_USER_ACTION', failure_code: 'gate_blocked' });
+      expect(p!.failure_reason).toMatch(/won’t be charged again/);
+      expect(await withTenant(r.t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1); // the purchase is intact
+    } finally {
+      await ownerPool()`delete from provider_rate_tables where version = 900`;
+    }
   }, 300_000);
 });
 

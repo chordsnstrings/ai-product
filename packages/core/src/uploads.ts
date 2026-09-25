@@ -14,7 +14,7 @@ import { actorString } from './context';
 import { allowKey } from './allowlist';
 import { hit } from './rate-limit';
 import { quarantineKey, storage } from './storage';
-import { holdForReview, nameReviewFlags } from './vision';
+import { holdForReview, uploadReviewFlags } from './vision';
 
 /**
  * Upload pipeline (plan 02 §3 layer 4; standard §48 malicious uploads):
@@ -209,7 +209,7 @@ export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string
     const v = await validateMedia(raw);
     const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind: u.kind as AssetKind, skuId, source: 'upload', origin: { ...origin, uploadId, declaredMime: u.declared_mime } });
     // Same review as a direct upload: media named as a before/after or showing children waits for compliance.
-    if (REVIEWABLE_KINDS.has(u.kind as AssetKind)) await holdForReview(tx, [{ assetId: asset.id, flags: { ...nameReviewFlags(JSON.stringify(origin)), sources: ['name'] } }]);
+    if (REVIEWABLE_KINDS.has(u.kind as AssetKind)) await holdForReview(tx, [{ assetId: asset.id, flags: uploadReviewFlags(origin) }]);
     await tx`update uploads set status = 'accepted', asset_id = ${asset.id} where id = ${uploadId}`;
     await storage().delete(u.quarantine_key as string);
     return { assetId: asset.id, replayed: false };
@@ -231,11 +231,9 @@ export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind:
   await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, undefined, { subject: [allowKey.ws(ctx.workspaceId)] });
   const v = await validateMedia(raw);
   const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });
-  // Merchant media named as a before/after or showing children waits for compliance review (plan 05 §14).
-  if (REVIEWABLE_KINDS.has(kind)) {
-    const named = nameReviewFlags(JSON.stringify(origin));
-    await holdForReview(tx, [{ assetId: asset.id, flags: { ...named, sources: ['name'] } }]);
-  }
+  // Merchant media named or declared as a before/after, or showing children, waits for compliance review (plan 05
+  // §14, standard §43). A declared before/after carries the merchant's provenance/permission attestation.
+  if (REVIEWABLE_KINDS.has(kind)) await holdForReview(tx, [{ assetId: asset.id, flags: uploadReviewFlags(origin) }]);
   return asset;
 }
 

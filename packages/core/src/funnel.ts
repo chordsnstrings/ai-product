@@ -1,5 +1,6 @@
 import { globalTx, type Tx } from '@arkiv/db';
-import { DomainError, type EventType } from '@arkiv/shared';
+import { DomainError, type EventType, type PlanCode } from '@arkiv/shared';
+import { currentPlanPrices } from './plan-prices';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
@@ -244,6 +245,21 @@ export interface CacRow {
   mediaCacPerTaste: number | null;
   /** Appendix C: (paid media + free-preview COGS − Taste contribution) ÷ new subscribers, floored at zero. */
   effectiveSubscriberCac: number | null;
+  // Standard §7 acquisition stages (from the Ads Manager export: impressions, clicks; ours: landing views).
+  impressions: number;
+  clicks: number;
+  /** Unique visitors whose landing view carried this utm_campaign, in the window. */
+  landingViews: number;
+  /** Spend per thousand impressions (only over rows that reported impressions). */
+  cpmMicros: number | null;
+  ctr: number | null;
+  cpcMicros: number | null;
+  /** Landing views per click: how many paid clicks reach the page (§7 "LPV"). */
+  lpvPerClick: number | null;
+  /** New subscribers' monthly contribution: plan price − payment fee − their last 30 days of provider cost. */
+  subscriberMonthlyContributionMicros: number | null;
+  /** §6 payback: effective subscriber CAC ÷ monthly contribution per subscriber, in months. */
+  paybackMonths: number | null;
 }
 
 /**
@@ -260,7 +276,22 @@ export async function cacByCampaign(tx: Tx, opts: { days: number; includeTest?: 
                     where type = 'LP_VIEWED' and visitor_id is not null order by visitor_id, at),
     ws_campaign as (select distinct on (f.workspace_id) f.workspace_id, ft.campaign from funnel_events f join first_touch ft on ft.visitor_id = f.visitor_id
                     where f.workspace_id is not null ${testFilter(tx, opts.includeTest, 'f.workspace_id')} order by f.workspace_id, f.at)`;
-  const spend = await tx`select lower(trim(campaign)) as campaign, sum(spend_micros)::bigint as micros from ad_spend where date > current_date - ${days}::int group by 1`;
+  const spend = await tx`select lower(trim(campaign)) as campaign, sum(spend_micros)::bigint as micros,
+                                coalesce(sum(impressions), 0)::bigint as impressions, coalesce(sum(spend_micros) filter (where impressions is not null), 0)::bigint as impression_spend,
+                                coalesce(sum(clicks), 0)::bigint as clicks, coalesce(sum(spend_micros) filter (where clicks is not null), 0)::bigint as click_spend
+                         from ad_spend where date > current_date - ${days}::int group by 1`;
+  const views = await tx`select lower(trim(coalesce(utm->>'utm_campaign', ''))) as campaign, count(distinct visitor_id)::int as n from funnel_events
+                         where type = 'LP_VIEWED' and visitor_id is not null and at > now() - make_interval(days => ${days}) group by 1`;
+  // New subscribers' monthly contribution (plan price net of the payment fee, less their recent provider cost).
+  const planPrices = await currentPlanPrices(tx);
+  const subscribers = await tx`
+    with ${attributed},
+    started as (select distinct f.workspace_id from funnel_events f where f.type = 'SUBSCRIPTION_STARTED' and f.at > now() - make_interval(days => ${days}))
+    select wc.campaign, s.plan_code,
+           coalesce((select sum(l.amount) from ledger_entries l where l.workspace_id = wc.workspace_id and l.type = 'PROVIDER_COST_RECORDED'
+                     and l.created_at > now() - interval '30 days'), 0)::bigint as cogs30
+    from ws_campaign wc join started st on st.workspace_id = wc.workspace_id
+    join lateral (select plan_code from subscriptions s where s.workspace_id = wc.workspace_id order by s.created_at desc limit 1) s on true`;
   const buyers = await tx`
     with ${attributed}
     select wc.campaign,
@@ -285,10 +316,30 @@ export async function cacByCampaign(tx: Tx, opts: { days: number; includeTest?: 
   const by = new Map<string, CacRow>();
   const row = (campaign: string) => {
     let r = by.get(campaign);
-    if (!r) by.set(campaign, (r = { campaign, spendMicros: 0, tasteBuyers: 0, subscribers: 0, previewCogsMicros: 0, tasteContributionMicros: 0, mediaCacPerTaste: null, effectiveSubscriberCac: null }));
+    if (!r) by.set(campaign, (r = { ...EMPTY_CAC, campaign }));
     return r;
   };
-  for (const s of spend) row(s.campaign as string).spendMicros += Number(s.micros);
+  const extra = new Map<string, { impressionSpend: number; clickSpend: number; contribution: number; contributors: number }>();
+  const ex = (campaign: string) => {
+    let e = extra.get(campaign);
+    if (!e) extra.set(campaign, (e = { impressionSpend: 0, clickSpend: 0, contribution: 0, contributors: 0 }));
+    return e;
+  };
+  for (const s of spend) {
+    const r = row(s.campaign as string);
+    r.spendMicros += Number(s.micros);
+    r.impressions += Number(s.impressions);
+    r.clicks += Number(s.clicks);
+    ex(r.campaign).impressionSpend += Number(s.impression_spend);
+    ex(r.campaign).clickSpend += Number(s.click_spend);
+  }
+  for (const v of views) row(v.campaign as string).landingViews += Number(v.n);
+  for (const s of subscribers) {
+    const price = planPrices[s.plan_code as PlanCode] ?? 0;
+    const e = ex(s.campaign as string);
+    e.contribution += price - Math.round((price * fee.bps) / 10000) - fee.fixedMicros - Number(s.cogs30);
+    e.contributors += 1;
+  }
   for (const b of buyers) {
     const r = row(b.campaign as string);
     r.tasteBuyers += Number(b.taste);
@@ -299,19 +350,36 @@ export async function cacByCampaign(tx: Tx, opts: { days: number; includeTest?: 
     r.tasteContributionMicros += Number(m.contribution);
     r.previewCogsMicros += Number(m.preview_cogs);
   }
-  const finish = (r: CacRow): CacRow => ({
-    ...r,
-    mediaCacPerTaste: r.tasteBuyers ? Math.round(r.spendMicros / r.tasteBuyers) : null,
-    effectiveSubscriberCac: r.subscribers ? Math.max(0, Math.round((r.spendMicros + r.previewCogsMicros - r.tasteContributionMicros) / r.subscribers)) : null,
-  });
-  const rows = [...by.values()].filter((r) => r.spendMicros || r.tasteBuyers || r.subscribers).map(finish).sort((a, b) => b.spendMicros - a.spendMicros);
+  const finish = (r: CacRow, e = extra.get(r.campaign) ?? { impressionSpend: 0, clickSpend: 0, contribution: 0, contributors: 0 }): CacRow => {
+    const effectiveSubscriberCac = r.subscribers ? Math.max(0, Math.round((r.spendMicros + r.previewCogsMicros - r.tasteContributionMicros) / r.subscribers)) : null;
+    const monthly = e.contributors ? Math.round(e.contribution / e.contributors) : null;
+    return {
+      ...r,
+      mediaCacPerTaste: r.tasteBuyers ? Math.round(r.spendMicros / r.tasteBuyers) : null,
+      effectiveSubscriberCac,
+      cpmMicros: r.impressions ? Math.round((e.impressionSpend / r.impressions) * 1000) : null,
+      ctr: r.impressions && r.clicks ? r.clicks / r.impressions : null,
+      cpcMicros: r.clicks ? Math.round(e.clickSpend / r.clicks) : null,
+      lpvPerClick: r.clicks ? r.landingViews / r.clicks : null,
+      subscriberMonthlyContributionMicros: monthly,
+      paybackMonths: effectiveSubscriberCac != null && monthly != null && monthly > 0 ? Math.round((effectiveSubscriberCac / monthly) * 10) / 10 : null,
+    };
+  };
+  const rows = [...by.values()].filter((r) => r.spendMicros || r.tasteBuyers || r.subscribers).map((r) => finish(r)).sort((a, b) => b.spendMicros - a.spendMicros);
+  const kept = new Set(rows.map((r) => r.campaign));
+  const sum = [...extra.entries()].filter(([c]) => kept.has(c)).map(([, e]) => e)
+    .reduce((t, e) => ({ impressionSpend: t.impressionSpend + e.impressionSpend, clickSpend: t.clickSpend + e.clickSpend, contribution: t.contribution + e.contribution, contributors: t.contributors + e.contributors }), { impressionSpend: 0, clickSpend: 0, contribution: 0, contributors: 0 });
   const total = finish(
-    rows.reduce((t, r) => ({ ...t, spendMicros: t.spendMicros + r.spendMicros, tasteBuyers: t.tasteBuyers + r.tasteBuyers, subscribers: t.subscribers + r.subscribers, previewCogsMicros: t.previewCogsMicros + r.previewCogsMicros, tasteContributionMicros: t.tasteContributionMicros + r.tasteContributionMicros }), {
-      campaign: 'all campaigns', spendMicros: 0, tasteBuyers: 0, subscribers: 0, previewCogsMicros: 0, tasteContributionMicros: 0, mediaCacPerTaste: null, effectiveSubscriberCac: null,
-    } as CacRow),
+    rows.reduce((t, r) => ({ ...t, spendMicros: t.spendMicros + r.spendMicros, tasteBuyers: t.tasteBuyers + r.tasteBuyers, subscribers: t.subscribers + r.subscribers, previewCogsMicros: t.previewCogsMicros + r.previewCogsMicros, tasteContributionMicros: t.tasteContributionMicros + r.tasteContributionMicros, impressions: t.impressions + r.impressions, clicks: t.clicks + r.clicks, landingViews: t.landingViews + r.landingViews }), { ...EMPTY_CAC, campaign: 'all campaigns' }),
+    sum,
   );
   return { rows, total };
 }
+
+const EMPTY_CAC: CacRow = {
+  campaign: '', spendMicros: 0, tasteBuyers: 0, subscribers: 0, previewCogsMicros: 0, tasteContributionMicros: 0, mediaCacPerTaste: null, effectiveSubscriberCac: null,
+  impressions: 0, clicks: 0, landingViews: 0, cpmMicros: null, ctr: null, cpcMicros: null, lpvPerClick: null, subscriberMonthlyContributionMicros: null, paybackMonths: null,
+};
 
 export interface AdSpendRow {
   date: string;
@@ -319,6 +387,32 @@ export interface AdSpendRow {
   campaign: string;
   adId: string;
   spendMicros: number;
+  /** From the export when it has the column (standard §7 impression → CPM, click → CTR / CPC). */
+  impressions?: number | null;
+  clicks?: number | null;
+}
+
+/**
+ * Spend by ad (creative ID) over the window: the §7 "Ad impression | CPM, creative ID" and "Click | CTR, CPC" view,
+ * for ads whose export carried an ad id.
+ */
+export async function adSpendByAd(tx: Tx, opts: { days: number; limit?: number }) {
+  const rows = await tx`select source, lower(trim(campaign)) as campaign, ad_id, sum(spend_micros)::bigint as micros,
+                               sum(impressions)::bigint as impressions, sum(clicks)::bigint as clicks,
+                               coalesce(sum(spend_micros) filter (where impressions is not null), 0)::bigint as impression_spend,
+                               coalesce(sum(spend_micros) filter (where clicks is not null), 0)::bigint as click_spend
+                        from ad_spend where date > current_date - ${opts.days}::int and ad_id <> ''
+                        group by 1, 2, 3 order by 4 desc limit ${opts.limit ?? 50}`;
+  return rows.map((r) => {
+    const impressions = r.impressions == null ? null : Number(r.impressions);
+    const clicks = r.clicks == null ? null : Number(r.clicks);
+    return {
+      source: r.source as string, campaign: r.campaign as string, adId: r.ad_id as string, spendMicros: Number(r.micros), impressions, clicks,
+      cpmMicros: impressions ? Math.round((Number(r.impression_spend) / impressions) * 1000) : null,
+      ctr: impressions && clicks != null ? clicks / impressions : null,
+      cpcMicros: clicks ? Math.round(Number(r.click_spend) / clicks) : null,
+    };
+  });
 }
 
 /** Split one CSV line, honouring double-quoted fields ("a, b" and "" escapes). */
@@ -360,6 +454,8 @@ export function parseAdSpendCsv(text: string, defaultSource?: string | null): Ad
   const iCampaign = col('campaign', 'utm_campaign', 'campaign_name');
   const iSource = col('source', 'platform', 'utm_source');
   const iAd = col('ad_id', 'ad', 'utm_id', 'creative_id');
+  const iImpr = col('impressions', 'impr');
+  const iClicks = col('clicks', 'link_clicks', 'clicks_all');
   if (iDate < 0 || iSpend < 0 || iCampaign < 0) throw new DomainError('INVALID', 'The header needs date, spend and campaign columns.');
   if (iSource < 0 && !defaultSource?.trim()) throw new DomainError('INVALID', 'Add a source column or choose the source for the whole file.');
   if (lines.length > 20_001) throw new DomainError('INVALID', 'Import at most 20,000 rows at a time.');
@@ -371,7 +467,15 @@ export function parseAdSpendCsv(text: string, defaultSource?: string | null): Ad
     if (!Number.isFinite(spend) || spend < 0) throw new DomainError('INVALID', `Line ${n + 2}: spend must be a positive amount in USD.`);
     const source = (iSource >= 0 ? c[iSource] : defaultSource)?.trim().toLowerCase() ?? '';
     if (!source) throw new DomainError('INVALID', `Line ${n + 2}: source is missing.`);
-    return { date, source: source.slice(0, 40), campaign: (c[iCampaign] ?? '').slice(0, 200), adId: (iAd >= 0 ? c[iAd] ?? '' : '').slice(0, 100), spendMicros: Math.round(spend * 1e6) };
+    const count = (i: number, what: string) => {
+      if (i < 0) return undefined;
+      const raw = (c[i] ?? '').replace(/[,\s]/g, '');
+      if (raw === '') return null;
+      const v = Number(raw);
+      if (!Number.isInteger(v) || v < 0) throw new DomainError('INVALID', `Line ${n + 2}: ${what} must be a whole number.`);
+      return v;
+    };
+    return { date, source: source.slice(0, 40), campaign: (c[iCampaign] ?? '').slice(0, 200), adId: (iAd >= 0 ? c[iAd] ?? '' : '').slice(0, 100), spendMicros: Math.round(spend * 1e6), impressions: count(iImpr, 'impressions'), clicks: count(iClicks, 'clicks') };
   });
 }
 
@@ -382,18 +486,21 @@ export async function importAdSpend(tx: Tx, input: AdSpendRow[], by: { staffId: 
   for (const r of input) {
     const key = JSON.stringify([r.date, r.source, r.campaign, r.adId]);
     const prev = merged.get(key);
-    merged.set(key, prev ? { ...prev, spendMicros: prev.spendMicros + r.spendMicros } : { ...r });
+    const add = (a: number | null | undefined, b: number | null | undefined) => (a == null && b == null ? null : (a ?? 0) + (b ?? 0));
+    merged.set(key, prev ? { ...prev, spendMicros: prev.spendMicros + r.spendMicros, impressions: add(prev.impressions, r.impressions), clicks: add(prev.clicks, r.clicks) } : { ...r });
   }
   const rows = [...merged.values()];
   let n = 0;
   for (let i = 0; i < rows.length; i += 1000) {
     const chunk = rows.slice(i, i + 1000);
     const r = await tx`
-      insert into ad_spend (date, source, campaign, ad_id, spend_micros, import_batch, imported_by)
-      select d::date, s, c, a, m, ${by.batchId}::uuid, ${by.staffId}::uuid
+      insert into ad_spend (date, source, campaign, ad_id, spend_micros, impressions, clicks, import_batch, imported_by)
+      select d::date, s, c, a, m, i, k, ${by.batchId}::uuid, ${by.staffId}::uuid
       from unnest(${chunk.map((x) => x.date)}::text[], ${chunk.map((x) => x.source)}::text[], ${chunk.map((x) => x.campaign)}::text[],
-                  ${chunk.map((x) => x.adId)}::text[], ${chunk.map((x) => x.spendMicros)}::bigint[]) as t(d, s, c, a, m)
-      on conflict (date, source, campaign, ad_id) do update set spend_micros = excluded.spend_micros, import_batch = excluded.import_batch, imported_by = excluded.imported_by`;
+                  ${chunk.map((x) => x.adId)}::text[], ${chunk.map((x) => x.spendMicros)}::bigint[],
+                  ${chunk.map((x) => (x.impressions == null ? null : String(x.impressions)))}::bigint[], ${chunk.map((x) => (x.clicks == null ? null : String(x.clicks)))}::bigint[]) as t(d, s, c, a, m, i, k)
+      on conflict (date, source, campaign, ad_id) do update set spend_micros = excluded.spend_micros, impressions = excluded.impressions, clicks = excluded.clicks,
+        import_batch = excluded.import_batch, imported_by = excluded.imported_by`;
     n += r.count;
   }
   return n;

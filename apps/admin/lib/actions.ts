@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { withAdmin } from '@arkiv/db';
-import { assertFreshReauth, createStaff, deprovisionStaff, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
+import { assertFreshReauth, deprovisionStaff, inviteStaff, resendStaffInvite, STAFF_INVITE_HOURS, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
   deleteUser,
   actOnBehalf,
@@ -62,6 +62,7 @@ import {
   requestOpsCommand,
   requestOrExecute,
   retryProjectProduction,
+  retryProduction,
   scheduleTenantPurge,
   SETTING_DEFAULTS,
   setTenantFlags,
@@ -82,10 +83,13 @@ import {
   RATE_PROVIDERS,
   RATE_UNITS,
   validateRateTable,
+  notifyPriceChanges,
+  PRICE_NOTICE_DAYS,
+  schedulePlanPrice,
 } from '@arkiv/core';
 import { applySubscriptionCoupon, billingGateway, processStripeEvent, refundPayment, staffChangePlan, submitDisputeEvidence } from '@arkiv/billing';
 import { canResendTemplate, isTemplateName, sendEmail, templateSamples, type TemplateName } from '@arkiv/email';
-import { DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, RefundReason, StaffRole } from '@arkiv/shared';
+import { COST_LIMITS, DataRequestKind, DomainError, env, LandingPrimaryMetric, newId, PlanCode, RefundReason, StaffRole } from '@arkiv/shared';
 import type { StaffUser } from './staff';
 import { tenantFilters } from './tenants-query';
 
@@ -134,6 +138,33 @@ registerExecutor('stripe.assign', async (p, { approver }) => {
   return { outcome: await processStripeEvent(e.id as string) };
 });
 
+// Plan 04 §3 price change (four-eyes, FINANCE approves): the version is stored and every live subscriber of the plan
+// is sent notice in the same transaction; the worker applies it at each subscriber's first renewal on/after the date.
+registerExecutor('plan.price_schedule', async (p, { approver }) =>
+  withAdmin(async (tx) => {
+    const r = await schedulePlanPrice(tx, approver, { plan: p.plan as PlanCode, priceMicros: Number(p.priceMicros), stripePriceId: (p.stripePriceId as string | null) ?? null, effectiveFrom: new Date(p.effectiveFrom as string), reason: p.reason as string });
+    const notices = await notifyPriceChanges(tx);
+    return { ...r, notices: notices.length };
+  }),
+);
+
+// §44 "Model price doubles": a paid production the Cost Governor refused at its class ceiling (rates rose after the
+// customer paid, and re-planning within the ceiling wasn't enough) is honoured at a loss up to an approved amount.
+registerExecutor('project.ceiling_override', async (p, { approver }) => {
+  const ws = p.workspaceId as string;
+  const projectId = p.projectId as string;
+  await withAdmin(async (tx) => {
+    const [pr] = await tx`select state, failure_code, ceiling_override_micros from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+    if (!pr) throw new DomainError('NOT_FOUND', 'Project not found');
+    if (pr.state !== 'NEEDS_USER_ACTION' || pr.failure_code !== 'gate_blocked') throw new DomainError('CONFLICT', 'This production isn’t waiting on its cost ceiling.');
+    await tx`update projects set ceiling_override_micros = ${Number(p.maxMicros)} where id = ${projectId} and workspace_id = ${ws}`;
+    await audit(tx, approver, 'project.ceiling_override', { type: 'project', id: projectId }, { workspaceId: ws, reason: p.reason as string, before: { ceiling_override_micros: pr.ceiling_override_micros ?? null }, after: { ceiling_override_micros: Number(p.maxMicros) } });
+    // The approved production runs again: it re-reserves through the Cost Governor, now under the override.
+    await retryProduction(tx, await staffTenantCtx(tx, approver, ws), projectId);
+  });
+  return { message: 'Override applied; the production is queued again.' };
+});
+
 /** "support, ops" → ['SUPPORT','OPS']; unknown names are rejected rather than silently dropped. */
 function parseRoles(raw: string): StaffRole[] {
   const roles = [...new Set(raw.split(',').map((r) => r.trim().toUpperCase()).filter(Boolean))];
@@ -162,6 +193,25 @@ async function sendUserLoginLink(s: StaffUser, userId: string, why: string, veri
   await requestMagicLink({ email: u.email as string, purpose: 'login' });
   await withAdmin((tx) => audit(tx, s, verification ? 'user.resend_verification' : 'user.send_login_link', { type: 'user', id: userId }, { reason: why }));
   return { message: verification ? 'Verification link sent; opening it confirms the address.' : 'Sign-in link sent to the user’s inbox (valid 15 minutes).' };
+}
+
+/** The invite email: a single-use link to the console's invite page (never stored in the email log). */
+async function sendStaffInvite(s: StaffUser, email: string, name: string, token: string, inviteId: string) {
+  await sendEmail('staff_invite', email, { name, inviterName: s.name, url: `${env().ADMIN_URL}/invite/${token}`, expiresIn: `${STAFF_INVITE_HOURS} hours` }, { idempotencyKey: `staff-invite:${inviteId}` });
+}
+
+/** An open data request of the given kinds, with the workspace it concerns (plan 05 §21 per-request tools). */
+async function openDataRequest(tx: Parameters<Parameters<typeof withAdmin>[0]>[0], id: string, kinds: DataRequestKind[], workspaceId?: string) {
+  const [r] = await tx`select kind, status, workspace_id from data_requests where id = ${id} for update`;
+  if (!r) throw new DomainError('NOT_FOUND', 'Request not found');
+  if (!['open', 'in_progress'].includes(r.status as string)) throw new DomainError('CONFLICT', 'This request is already closed.');
+  if (!kinds.includes(r.kind as DataRequestKind)) throw new DomainError('CONFLICT', `This tool answers ${kinds.join(' / ')} requests, not ${r.kind as string}.`);
+  if (!r.workspace_id) throw new DomainError('INVALID', 'Set the workspace on the request first.');
+  if (workspaceId && r.workspace_id !== workspaceId) throw new DomainError('INVALID', 'That request is about a different workspace.');
+  return { kind: r.kind as DataRequestKind, workspaceId: r.workspace_id as string };
+}
+async function noteDataRequest(tx: Parameters<Parameters<typeof withAdmin>[0]>[0], id: string, note: string) {
+  await tx`update data_requests set status = 'in_progress', notes = concat_ws(' · ', notes, ${note}::text) where id = ${id}`;
 }
 
 /** Customer-app link inside the workspace (plan 02 M11): email buttons land on the page they name. */
@@ -509,6 +559,26 @@ export const ACTIONS = {
       }),
   }),
 
+  /* ── Plan prices (plan 04 §3) ── */
+  'plan.price_schedule': a({
+    perm: 'billing.manage',
+    reauth: true,
+    schema: z.object({
+      plan: z.enum(PlanCode),
+      price: z.coerce.number().positive().max(10_000),
+      stripePriceId: z.string().trim().regex(/^price_[A-Za-z0-9]+$/, 'Stripe price ids look like price_1Nx…').optional().or(z.literal('')),
+      effectiveOn: z.string().date('Use a date like 2026-11-01'),
+      reason,
+    }),
+    run: async (s, i) => {
+      const effectiveFrom = new Date(`${i.effectiveOn}T00:00:00Z`);
+      if (effectiveFrom.getTime() < Date.now() + PRICE_NOTICE_DAYS * 86400_000) throw new DomainError('INVALID', `Choose a date at least ${PRICE_NOTICE_DAYS} days from today, so every subscriber gets notice first.`);
+      if (billingGateway().live && !i.stripePriceId) throw new DomainError('INVALID', 'Create the new price in Stripe first and paste its price id.');
+      const r = await requestOrExecute(s, 'plan.price_schedule', { plan: i.plan, priceMicros: Math.round(i.price * 1_000_000), stripePriceId: i.stripePriceId || null, effectiveFrom: effectiveFrom.toISOString() }, i.reason);
+      return { ...r, message: r.status === 'pending' ? 'Price change requested; it is scheduled (and subscribers are notified) once FINANCE approves.' : 'Price change scheduled; subscribers are notified.' };
+    },
+  }),
+
   /* ── Providers & routes ── */
   // Opening a circuit may carry staff's estimate of when it closes: customers whose ads are queued behind it see
   // it as the ETA (plan 03 P9 "plus an ETA if known"). Closing clears it.
@@ -661,7 +731,7 @@ export const ACTIONS = {
         [task, model, promptVersion, dataset] = [routeTask, i.model || (route.model as string), i.promptVersion || (route.prompt_version as string), ds];
         assertCandidatePrompt(route.prompt_version as string, promptVersion);
         // Model runs are priced before dispatch like any call: the candidate needs a published rate.
-        if (DATASETS[ds]?.kind === 'model') await assertPublishedRate(routeTask, model);
+        if (DATASETS[ds]?.kind !== 'rules') await assertPublishedRate(routeTask, model);
       } else {
         if (!i.dataset || !DATASETS[i.dataset]) throw new DomainError('INVALID', 'Unknown dataset');
         [task, model, promptVersion, dataset] = [i.dataset, 'deterministic', 'rules', i.dataset];
@@ -720,6 +790,20 @@ export const ACTIONS = {
       if (!jobIds.length) throw new DomainError('NOT_FOUND', 'No failed jobs of that class on this queue.');
       await requestOpsCommand(s, 'job.bulk_retry', { queue: i.queue, errorClass: i.errorClass, jobIds }, i.reason);
       return { message: `Retry of ${jobIds.length} job${jobIds.length === 1 ? '' : 's'} queued (held workspaces are skipped).` };
+    },
+  }),
+  // §44: request the ceiling override for a paid production stopped at its class ceiling (FINANCE approves).
+  'project.ceiling_override': a({
+    perm: 'jobs.manage',
+    reauth: true,
+    schema: z.object({ workspaceId: uuid, projectId: uuid, maxUsd: z.coerce.number().positive().max((COST_LIMITS.CREATIVE_TEST_CEILING / 1_000_000) * 3), reason }),
+    run: async (s, i) => {
+      const maxMicros = Math.round(i.maxUsd * 1_000_000);
+      if (maxMicros <= COST_LIMITS.CREATIVE_TEST_CEILING) throw new DomainError('INVALID', `An override is above the standard ceiling (${(COST_LIMITS.CREATIVE_TEST_CEILING / 1_000_000).toFixed(2)} USD).`);
+      const [pr] = await withAdmin((tx) => tx`select state, failure_code from projects where id = ${i.projectId} and workspace_id = ${i.workspaceId}`);
+      if (!pr || pr.state !== 'NEEDS_USER_ACTION' || pr.failure_code !== 'gate_blocked') throw new DomainError('CONFLICT', 'This production isn’t waiting on its cost ceiling.');
+      const r = await requestOrExecute(s, 'project.ceiling_override', { workspaceId: i.workspaceId, projectId: i.projectId, maxMicros }, i.reason);
+      return { ...r, message: r.status === 'pending' ? 'Override requested; production retries once FINANCE approves.' : 'Override applied; production retries.' };
     },
   }),
   'job.cancel': a({ perm: 'jobs.manage', schema: z.object({ queue: z.string(), jobId: z.string(), workspaceId: uuid.optional(), reason }), run: (s, i) => requestOpsCommand(s, 'job.cancel', i, i.reason).then(() => ({ message: 'Cancel queued' })) }),
@@ -859,12 +943,12 @@ export const ACTIONS = {
   }),
   'asset.review': a({
     perm: 'claims.review',
-    schema: z.object({ workspaceId: uuid, assetId: uuid, verdict: z.enum(['approved', 'rejected']), reason }),
+    schema: z.object({ workspaceId: uuid, assetId: uuid, verdict: z.enum(['approved', 'rejected']), permissionRef: z.string().trim().max(200).optional(), reason }),
     run: async (s, i) => {
       const r = await withAdmin(async (tx) => {
         // Looking at the media is looking at tenant content: break-glass first (plan 05 §0.3).
         await assertBreakGlass(tx, s, i.workspaceId, `media review ${i.assetId}`);
-        return reviewAsset(tx, s, i.workspaceId, i.assetId, i.verdict, i.reason);
+        return reviewAsset(tx, s, i.workspaceId, i.assetId, i.verdict, i.reason, { permissionRef: i.permissionRef });
       });
       const url = appUrl(await workspaceSlug(i.workspaceId), r.skuId ? `/products/${r.skuId}` : '/products');
       const note = i.verdict === 'approved' ? 'Our team checked it and it can be used in your ads.' : 'Our team checked it: it shows a before/after comparison or a person who may be under 18, which we can’t use in ads. Your other photos are unaffected.';
@@ -1240,24 +1324,66 @@ export const ACTIONS = {
       const done = u ? await deleteUser(u.id as string, { by: 'staff' }) : { workspaces: 0 };
       await withAdmin(async (tx) => {
         const note = u ? `Account deleted (${done.workspaces} workspace memberships removed).` : 'No account with this email.';
-        await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${note}) where id = ${i.id}`;
+        await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${note}::text) where id = ${i.id}`;
         await audit(tx, s, 'privacy.delete_user', { type: 'data_request', id: i.id }, { reason: i.reason, after: { userId: (u?.id as string) ?? null, ...done } });
       });
       return { message: u ? 'Account deleted.' : 'No account with this email — request completed.' };
     },
   }),
   'privacy.update': a({ perm: 'privacy.manage', schema: z.object({ id: uuid, status: z.enum(['in_progress', 'completed', 'rejected']), notes: z.string().max(1000).optional() }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select status, notes, workspace_id from data_requests where id = ${i.id} for update`; if (!b) throw new DomainError('NOT_FOUND', 'Request not found'); await tx`update data_requests set status = ${i.status}, notes = coalesce(${i.notes ?? null}, notes), completed_at = case when ${i.status} in ('completed','rejected') then now() end where id = ${i.id}`; await audit(tx, s, 'privacy.update', { type: 'data_request', id: i.id }, { workspaceId: (b.workspace_id as string) ?? null, before: { status: b.status, notes: b.notes }, after: { status: i.status, notes: i.notes ?? b.notes } }); }) }),
+  // Plan 05 §21 tools, run from the request they answer: each one moves the request along and notes what was done.
+  'privacy.run_export': a({
+    perm: 'privacy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, reason: z.string().trim().max(500).optional() }),
+    run: (s, i) =>
+      withAdmin(async (tx) => {
+        const r = await openDataRequest(tx, i.id, ['access', 'export']);
+        await enqueue(tx, r.workspaceId, Queues.exportWorkspace, { requestedBy: { kind: 'staff', id: s.staffId }, requestedAt: new Date().toISOString(), dataRequestId: i.id }, { singletonKey: `export:${r.workspaceId}` });
+        await noteDataRequest(tx, i.id, `Workspace export queued by ${s.name}; the download link goes to the workspace owners.`);
+        await audit(tx, s, 'privacy.run_export', { type: 'data_request', id: i.id }, { workspaceId: r.workspaceId, reason: i.reason ?? null });
+        return { message: 'Export queued; the request is now in progress.' };
+      }),
+  }),
+  'privacy.schedule_purge': a({
+    perm: 'privacy.manage',
+    reauth: true,
+    schema: z.object({ id: uuid, reason }),
+    run: async (s, i) => {
+      const r = await withAdmin((tx) => openDataRequest(tx, i.id, ['delete_workspace']));
+      await scheduleTenantPurge(s, r.workspaceId, `data request ${i.id.slice(0, 8)}: ${i.reason}`);
+      await withAdmin(async (tx) => {
+        await noteDataRequest(tx, i.id, `Purge scheduled by ${s.name}; the purge certificate completes this request.`);
+        await audit(tx, s, 'privacy.schedule_purge', { type: 'data_request', id: i.id }, { workspaceId: r.workspaceId, reason: i.reason });
+      });
+      return { message: 'Purge scheduled (grace period first); the request is now in progress.' };
+    },
+  }),
+  // §21 "find and delete a specific person's review text across a tenant (break-glass + tenant notice)".
   'privacy.erase_reviews': a({
     perm: 'privacy.manage',
     reauth: true,
-    schema: z.object({ workspaceId: uuid, phrase: z.string().min(4).max(200), reason }),
-    run: (s, i) =>
-      withAdmin(async (tx) => {
+    schema: z.object({ workspaceId: uuid, phrase: z.string().min(4).max(200), requestId: uuid.optional(), reason }),
+    run: async (s, i) => {
+      const deleted = await withAdmin(async (tx) => {
         await assertBreakGlass(tx, s, i.workspaceId, 'erase a person’s review text', true);
-        const del = await tx`delete from customer_signals where workspace_id = ${i.workspaceId} and text ilike ${'%' + i.phrase.replace(/[%_]/g, '') + '%'} returning id`;
-        await audit(tx, s, 'privacy.erase_reviews', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { deleted: del.length } });
-        return { message: `Deleted ${del.length} review snippets. Themes refresh on the next clustering run.` };
-      }),
+        if (i.requestId) await openDataRequest(tx, i.requestId, ['delete_person_in_reviews'], i.workspaceId);
+        const del = await tx`delete from customer_signals where workspace_id = ${i.workspaceId} and text ilike ${'%' + i.phrase.replace(/[%_\\]/g, '') + '%'} returning id`;
+        await audit(tx, s, 'privacy.erase_reviews', { type: 'workspace', id: i.workspaceId }, { workspaceId: i.workspaceId, reason: i.reason, after: { deleted: del.length, requestId: i.requestId ?? null } });
+        if (i.requestId) {
+          await tx`update data_requests set status = 'completed', completed_at = now(), notes = concat_ws(' · ', notes, ${`Deleted ${del.length} review snippets (${s.name}); owners notified.`}::text) where id = ${i.requestId}`;
+        }
+        return del.length;
+      });
+      // The tenant is told what was removed from their workspace and why (never whose text it was).
+      const [w] = await withAdmin((tx) => tx`select name from workspaces where id = ${i.workspaceId}`);
+      const url = appUrl(await workspaceSlug(i.workspaceId), '/settings/access-log');
+      const reference = i.requestId ? `Privacy request ${i.requestId.slice(0, 8)}` : i.reason.slice(0, 80);
+      for (const to of await ownerEmails(i.workspaceId)) {
+        await sendEmail('review_text_erased', to, { workspaceName: (w?.name as string) ?? 'your workspace', deleted, reference, url }, { idempotencyKey: `review-erase:${i.workspaceId}:${i.requestId ?? i.phrase}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      }
+      return { message: `Deleted ${deleted} review snippets; the workspace owners were notified. Themes refresh on the next clustering run.` };
+    },
   }),
 
   /* ── Taxonomy ── */
@@ -1280,25 +1406,45 @@ export const ACTIONS = {
   }),
 
   /* ── Staff ── */
-  // Invite staff: the account starts with no roles; the requested roles go through four-eyes like any role
-  // change (plan 05 §0.5, §23), so one SUPER_ADMIN can't mint another privileged account alone.
-  'staff.create': a({
+  // Invite staff (§23): an emailed single-use link; the invitee sets their own password and enrols their
+  // authenticator, so the inviter never holds either factor. The account starts without roles and the requested
+  // roles go through four-eyes like any role change (§0.5), so one SUPER_ADMIN can't mint a privileged account alone.
+  'staff.invite': a({
     perm: 'staff.manage',
     reauth: true,
-    schema: z.object({ email: z.string().email(), name: z.string().min(2), password: z.string().min(14), roles: z.string(), reason }),
+    schema: z.object({ email: z.string().email(), name: z.string().trim().min(2).max(120), roles: z.string(), reason }),
     run: async (s, i) => {
       const roles = parseRoles(i.roles);
       if (!roles.length) throw new DomainError('INVALID', `Pick at least one role (${StaffRole.join(', ')}).`);
-      const r = await createStaff({ email: i.email, name: i.name, password: i.password, roles: [] });
-      await withAdmin((tx) => audit(tx, s, 'staff.create', { type: 'staff', id: r.staffId }, { reason: i.reason, after: { email: i.email, requestedRoles: roles } }));
+      const r = await withAdmin(async (tx) => {
+        const inv = await inviteStaff(tx, { email: i.email, name: i.name, createdBy: s.staffId });
+        await audit(tx, s, 'staff.invite', { type: 'staff', id: inv.staffId }, { reason: i.reason, after: { email: i.email.toLowerCase(), requestedRoles: roles, expiresAt: inv.expiresAt.toISOString() } });
+        return inv;
+      });
+      await sendStaffInvite(s, i.email, i.name, r.token, r.inviteId);
       const grant = await requestOrExecute(s, 'staff.roles', { staffId: r.staffId, roles }, i.reason);
       const pending = grant.status === 'pending' ? ` Roles (${roles.join(', ')}) are pending approval by another SUPER_ADMIN (approval ${grant.approvalId.slice(0, 8)}).` : '';
-      return { status: grant.status, approvalId: grant.status === 'pending' ? grant.approvalId : null, message: `Created without roles.${pending} Give them this authenticator secret once, in person: ${r.totpSecret}` };
+      return { status: grant.status, approvalId: grant.status === 'pending' ? grant.approvalId : null, message: `Invite emailed to ${i.email} (valid ${STAFF_INVITE_HOURS} hours).${pending}` };
+    },
+  }),
+  'staff.invite_resend': a({
+    perm: 'staff.manage',
+    reauth: true,
+    schema: z.object({ staffId: uuid, reason: z.string().trim().max(500).optional() }),
+    run: async (s, i) => {
+      const r = await withAdmin(async (tx) => {
+        const inv = await resendStaffInvite(tx, i.staffId, s.staffId);
+        const [u] = await tx`select name from staff_users where id = ${i.staffId}`;
+        await audit(tx, s, 'staff.invite_resend', { type: 'staff', id: i.staffId }, { reason: i.reason ?? null, after: { expiresAt: inv.expiresAt.toISOString() } });
+        return { ...inv, name: u!.name as string };
+      });
+      await sendStaffInvite(s, r.email, r.name, r.token, r.inviteId);
+      return { message: `New invite link emailed to ${r.email}; earlier links no longer work.` };
     },
   }),
   'staff.roles': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, roles: z.string(), reason }), run: (s, i) => requestOrExecute(s, 'staff.roles', { staffId: i.staffId, roles: parseRoles(i.roles) }, i.reason) }),
   'staff.deprovision': a({ perm: 'staff.manage', reauth: true, schema: z.object({ staffId: uuid, reason }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'You can’t deprovision yourself.'); const [b] = await tx`select email, roles, active from staff_users where id = ${i.staffId}`; if (!b) throw new DomainError('NOT_FOUND', 'Staff member not found'); await deprovisionStaff(tx, i.staffId); await audit(tx, s, 'staff.deprovision', { type: 'staff', id: i.staffId }, { reason: i.reason, before: b, after: { active: false } }); }) }),
-  'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { const [b] = await tx`select roles, roles_confirmed_at from staff_users where id = ${i.staffId}`; await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }, { before: b ?? null, after: { roles_confirmed_at: 'now' } }); }) }),
+  'staff.confirm_roles': a({ perm: 'staff.manage', schema: z.object({ staffId: uuid }), run: (s, i) => withAdmin(async (tx) => { if (i.staffId === s.staffId) throw new DomainError('CONFLICT', 'Another SUPER_ADMIN confirms your roles (quarterly access review).'); const [b] = await tx`select roles, roles_confirmed_at from staff_users where id = ${i.staffId}`; await tx`update staff_users set roles_confirmed_at = now() where id = ${i.staffId}`; await audit(tx, s, 'staff.confirm_roles', { type: 'staff', id: i.staffId }, { before: b ?? null, after: { roles_confirmed_at: 'now' } }); }) }),
   // §23 "require passkey": the staff member must already have one, or they'd be locked out.
   'staff.require_passkey': a({
     perm: 'staff.manage',

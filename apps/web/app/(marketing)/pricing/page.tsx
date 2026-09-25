@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { globalTx } from '@arkiv/db';
-import { publicOneOffPrices } from '@arkiv/core';
+import { currentPlanPrices, publicOneOffPrices } from '@arkiv/core';
 import { PLANS, formatUsd, type PlanCode } from '@arkiv/shared';
 import { MarketingShell } from '@/components/marketing';
 import { currentPlanFor } from '@/lib/pricing';
@@ -20,12 +20,14 @@ const ORDER = ['LAUNCH', 'GROWTH', 'SCALE'] as const;
 export default async function Pricing() {
   const user = await currentUser();
   const oneOff = await globalTx((tx) => publicOneOffPrices(tx));
+  // Plan 04 §3: a scheduled price version is what's sold from its effective date.
+  const prices = await globalTx((tx) => currentPlanPrices(tx));
   const memberships = user
     ? (await userWorkspaces(user.userId)).map((w) => ({ workspace_id: w.workspace_id as string, slug: w.slug as string, plan_code: (w.plan_code as string | null) ?? null, role: w.role as string, state: w.state as string }))
     : [];
   const current = user ? currentPlanFor(memberships, user.lastWorkspaceId ?? null) : null;
   const billing = current ? `/w/${current.slug}/settings/billing` : null;
-  const perTest = (code: PlanCode) => PLANS[code].priceMicros / PLANS[code].creativeTestsPerMonth;
+  const perTest = (code: PlanCode) => prices[code] / PLANS[code].creativeTestsPerMonth;
   const rank = (code: PlanCode) => ORDER.indexOf(code as (typeof ORDER)[number]);
   return (
     <div className="ak-marketing">
@@ -59,7 +61,7 @@ export default async function Pricing() {
                     {mine ? <span className="ak-chip ak-chip--ok">Your plan</span> : pick ? <span className="ak-chip ak-chip--dec">Recommended</span> : null}
                   </div>
                   <p style={{ margin: 0 }}>
-                    <span className="ak-price">{formatUsd(p.priceMicros, 0)}</span>
+                    <span className="ak-price">{formatUsd(prices[code], 0)}</span>
                     <span className="ak-muted"> / month</span>
                   </p>
                   <table className="ak-meta">
@@ -95,7 +97,7 @@ export default async function Pricing() {
                 </tr>
               </thead>
               <tbody>
-                <tr><th scope="row">Price</th>{ORDER.map((c) => <td key={c}>{formatUsd(PLANS[c].priceMicros, 0)}/mo</td>)}<td>{formatUsd(oneOff.standaloneMicros, 0)} once</td></tr>
+                <tr><th scope="row">Price</th>{ORDER.map((c) => <td key={c}>{formatUsd(prices[c], 0)}/mo</td>)}<td>{formatUsd(oneOff.standaloneMicros, 0)} once</td></tr>
                 <tr><th scope="row">Creative Tests a month</th>{ORDER.map((c) => <td key={c}>{PLANS[c].creativeTestsPerMonth}</td>)}<td>1 ad</td></tr>
                 <tr><th scope="row">Per test</th>{ORDER.map((c) => <td key={c}>≈ {formatUsd(perTest(c), 0)}</td>)}<td>{formatUsd(oneOff.standaloneMicros, 0)}</td></tr>
                 <tr><th scope="row">Hook variants per test</th>{ORDER.map((c) => <td key={c}>Up to 3 opening hooks</td>)}<td>1 hook</td></tr>

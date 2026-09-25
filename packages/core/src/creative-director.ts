@@ -47,6 +47,8 @@ export function verifiedIngredients(facts: Awaited<ReturnType<typeof currentFact
 
 /** Ingredient-led creative (education, explanation) needs a sourced ingredient list (§42). */
 export const isIngredientLed = (p: Pick<Proposal, 'angle' | 'proofMechanism'>) => p.angle === 'INGREDIENT_EDUCATION' || p.proofMechanism === 'INGREDIENT_EXPLANATION';
+/** §43 "Before/after images": require provenance/permission and separate policy review; no generated outcome imagery. */
+export const BEFORE_AFTER_REASON = 'before/after needs your own permissioned images and a separate policy review';
 export const UNVERIFIED_INGREDIENTS_REASON = 'ingredient creative needs your ingredient list (add it to unlock ingredient tests)';
 
 /**
@@ -134,6 +136,33 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   // Terms the brand never shows or says: an extra blocking list for concepts, hooks and storyboard lines (§16).
   const prohibited = prohibitedTerms(brand?.brain.prohibited);
   return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, phrases, prohibited, brandBrainVersionId: brand?.versionId ?? null };
+}
+
+type ContextPacket = Awaited<ReturnType<typeof buildContext>>['packet'];
+
+/**
+ * The context packet as model content (§48 "treat all imported web/store/customer text as untrusted data ...
+ * delimit it in model context"). What Arkiv decided itself — packet ids, claim statuses, coverage, learnings,
+ * the merchant's Brand Brain, the objective — is the trusted packet; everything read from the product page, the
+ * store or customer reviews (product name, category, size, shade, variant titles, texture, format, ingredients,
+ * claim wordings, theme labels) goes in untrusted parts, so instructions hidden in it stay data. Claims are still
+ * gated by gateProposal / normalizePlan whatever the model answers.
+ */
+export function contextPacketParts(packet: ContextPacket): ContentPart[] {
+  const { product, claims, customerThemes, ...rest } = packet;
+  const { factIds, ingredientsUnverified, price, ...imported } = product;
+  const trusted = {
+    ...rest,
+    product: { factIds, ingredientsUnverified, price, facts: 'untrusted_source product_facts' },
+    claims: { APPROVED_IDS: claims.APPROVED.map((c) => c.id), wordings: 'untrusted_source claims_vault — use only the APPROVED wordings' },
+    customerThemes: customerThemes.map((t) => ({ id: t.id, type: t.type, prevalence: t.prevalence, n: t.n, label: 'untrusted_source customer_themes' })),
+  };
+  return [
+    { type: 'text', text: `Context packet (JSON; text imported from the product page, store and reviews is in the untrusted sources that follow):\n${JSON.stringify(trusted)}` },
+    { type: 'untrusted', sourceId: 'product_facts', text: JSON.stringify(imported) },
+    { type: 'untrusted', sourceId: 'claims_vault', text: JSON.stringify(claims) },
+    { type: 'untrusted', sourceId: 'customer_themes', text: JSON.stringify(customerThemes.map((t) => ({ id: t.id, label: t.label }))) },
+  ];
 }
 
 export interface CustomerPhrase {
@@ -236,7 +265,10 @@ export function gateProposal(
   if (claimBlocked) reasons.push('strategy relies on a blocked claim');
   const brandBanned = [p.bodyStrategy, p.hypothesis].map((t) => prohibitedIn(t, prohibited)).find(Boolean);
   if (brandBanned) reasons.push(`strategy uses “${brandBanned}”, which the brand never shows or says`);
-  const blockedStrategy = claimBlocked || !!brandBanned;
+  // §43 before/after: needs provenance, permission and a separate policy review — never a generated concept.
+  const beforeAfter = p.proofMechanism === 'BEFORE_AFTER_RESTRICTED';
+  if (beforeAfter) reasons.push(BEFORE_AFTER_REASON);
+  const blockedStrategy = claimBlocked || !!brandBanned || beforeAfter;
   const droppedClaims: string[] = [];
   const cleanClaims = p.claimWordings.filter((w) => {
     const ok = approved.some((a) => a.toLowerCase().includes(w.toLowerCase()) || w.toLowerCase().includes(a.toLowerCase()));
@@ -293,7 +325,7 @@ export async function generateConcepts(run: ConceptRun) {
   const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names, phrases, prohibited } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
   const phrasePart = customerPhrasesPart(phrases);
   const content: ContentPart[] = [
-    { type: 'text', text: `Context packet (JSON):\n${JSON.stringify(packet)}` },
+    ...contextPacketParts(packet),
     ...(phrasePart ? [phrasePart] : []),
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
   ];
@@ -307,6 +339,7 @@ export async function generateConcepts(run: ConceptRun) {
       token: run.token,
       task: 'creative_director.concepts',
       subject: { type: 'project', id: run.projectId },
+      inputRefs: { skuId: run.skuId, projectId: run.projectId, batch: run.batch, attempt, brandBrainVersionId, packetIds: [...packetIds] },
       template: 'concepts',
       content,
       schema: ConceptSet,
@@ -408,9 +441,10 @@ export async function planStoryboard(run: StoryboardRun): Promise<{ plan: Storyb
       token: run.token,
       task: 'creative_director.storyboard',
       subject: { type: 'project', id: run.projectId },
+      inputRefs: { skuId: run.skuId, projectId: run.projectId, conceptId: run.conceptId, attempt, brandBrainVersionId, packetIds: productContext.rationaleIds ? Object.values(productContext.rationaleIds).flat() : [] },
       template: 'storyboard',
       content: [
-        { type: 'text', text: `Context packet:\n${JSON.stringify(packet)}` },
+        ...contextPacketParts(packet),
         ...(customerPhrasesPart(phrases) ? [customerPhrasesPart(phrases)!] : []),
         { type: 'text', text: `Approved concept:\n${JSON.stringify(concept)}` },
         ...(attempt ? [{ type: 'text' as const, text: `The previous storyboard failed the claims check: ${(lastErr as Error).message}. Use only approved or neutral wording.` }] : []),

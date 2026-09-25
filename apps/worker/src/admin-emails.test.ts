@@ -27,6 +27,21 @@ describe('queued staff-initiated emails (plan 05 §2.2, §17)', () => {
     expect(devOutbox.filter((x) => x.template === 'intervention')).toHaveLength(2);
   });
 
+  it('sends the price-change notice (plan 04 §3) to owners, and not once it has applied', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const [s] = await ownerPool()`insert into subscriptions (workspace_id, stripe_subscription_id, plan_code, status, consent_record_id) values (${t.workspaceId}, 'sub_pc', 'GROWTH', 'active', gen_random_uuid()) returning id`;
+    const [v] = await ownerPool()`insert into plan_prices (plan_code, price_micros, effective_from, reason, created_by) values ('GROWTH', 129000000, now() + interval '31 days', 'repricing', gen_random_uuid()) returning id`;
+    const [n] = await ownerPool()`insert into price_change_notices (workspace_id, subscription_id, plan_price_id, plan_code, old_price_micros, new_price_micros, effective_from)
+                                  values (${t.workspaceId}, ${s!.id}, ${v!.id}, 'GROWTH', 99000000, 129000000, now() + interval '31 days') returning id`;
+    await sendQueuedEmail(ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), { template: 'price_change_notice', noticeId: n!.id }, 'job-pc');
+    const [mail] = devOutbox.filter((x) => x.template === 'price_change_notice');
+    expect(mail).toMatchObject({ to: t.email, data: { planName: 'Growth', oldPrice: '$99', newPrice: '$129' } });
+    expect((mail!.data as { url: string }).url).toMatch(new RegExp(`/w/${t.slug}/settings/billing$`));
+    await ownerPool()`update price_change_notices set applied_at = now() where id = ${n!.id}`;
+    await sendQueuedEmail(ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID'), { template: 'price_change_notice', noticeId: n!.id }, 'job-pc2');
+    expect(devOutbox.filter((x) => x.template === 'price_change_notice')).toHaveLength(1);
+  });
+
   it('tells the new and previous owners after a confirmed ownership transfer', async () => {
     const t = await makeTenant();
     const [n] = await ownerPool()`insert into users (email) values ('new-owner@brand.com') returning id`;

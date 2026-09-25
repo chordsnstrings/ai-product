@@ -1,9 +1,9 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, clusterFreeText, day30ReviewDelivery, RETENTION_POINTS, retentionCohorts, RISK_PLAYBOOKS, staffCan, type RetentionDimension } from '@arkiv/core';
+import { auditView, clusterFreeText, day30ReviewDelivery, RETENTION_POINTS, retentionCohorts, retentionTargets, RISK_PLAYBOOKS, staffCan, type RetentionDimension } from '@arkiv/core';
 import type { RiskIndicator } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
-import { ago, d, dt, FilterChip, Mono, Page, pct, Section, Table } from '@/components/ui';
+import { ago, d, dt, FilterChip, Grid, Kpi, Mono, Page, pct, Section, Table } from '@/components/ui';
 import { consolePrefs } from '@/lib/prefs';
 import { notTest } from '@/lib/sql';
 import { requireStaff } from '@/lib/staff';
@@ -38,6 +38,8 @@ export default async function Retention({ searchParams }: { searchParams: Promis
     // Plan 05 §17: W1/W4/M2/M3 retention by plan, acquisition page or ad account connected.
     retention: await retentionCohorts(tx, { by, days: 180, includeTest: prefs.includeTest }),
     day30: await day30ReviewDelivery(tx, { days: 90, includeTest: prefs.includeTest }),
+    // Standard §10 internal retention targets.
+    targets: await retentionTargets(tx, { includeTest: prefs.includeTest }),
   }));
   // Free-text answers from the cancel flow, clustered into themes (deterministic; no model spend).
   const themes = clusterFreeText(d0.reasons.flatMap((r) => (r.details as string[]) ?? []));
@@ -46,6 +48,21 @@ export default async function Retention({ searchParams }: { searchParams: Promis
   const started = (f: Record<string, unknown>) => ((f.interventions as { at: string }[]) ?? []).map((x) => x.at).sort().at(-1) ?? null;
   return (
     <Page title="Retention & customer success" sub={today ? <>Indicators raised today ({prefs.tz}). <Link href="/retention">Show all open indicators</Link></> : 'Churn-risk board: indicators with evidence and a mapped value intervention.'}>
+      <Section title="Retention targets (standard §10)">
+        <Grid min={220}>
+          {d0.targets.map((t) => (
+            <Kpi
+              key={t.key}
+              label={t.label}
+              value={t.value == null ? '—' : t.unit === 'tests' ? t.value.toFixed(1) : pct(t.value, 0)}
+              sub={`target ${t.direction === 'min' ? '>' : '<'} ${t.unit === 'tests' ? `${t.target} tests` : pct(t.target, 0)} · n = ${t.n}`}
+              alert={t.alert}
+              alertText={t.direction === 'min' ? 'Below target' : 'Above target'}
+            />
+          ))}
+        </Grid>
+        <p className="ak-small ak-muted">Operating targets, not industry standards. Customers who started paying in the last 180 days; per-project measures over 90 days. A miss is a question — recommendations, trust, output quality or integration value — not a cue to add generation features.</p>
+      </Section>
       <Table head={['Workspace', 'Plan', 'Indicator', 'Evidence', 'Since', 'Playbook', '']} rows={d0.flags.map((f) => [
         <Link key="w" href={`/tenants/${f.workspace_id}?tab=risk`}>{f.name as string}</Link>, (f.plan_code as string)?.toLowerCase() ?? '—', pb(f.indicator)?.label ?? (f.indicator as string),
         <Mono key="e">{JSON.stringify(f.evidence).slice(0, 100)}</Mono>, ago(f.raised_at), <span key="p" className="ak-small">{pb(f.indicator)?.intervention ?? '—'}</span>,

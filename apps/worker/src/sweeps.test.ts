@@ -169,3 +169,21 @@ describe('sync-integrations sweep (§28 scheduled reconciliation; integ-27, x-ra
     expect(sweeps['integration-token-expiry']!.cron).toMatch(/^\d+ \d+ \* \* \*$/);
   });
 });
+
+describe('quarterly access review (plan 05 §23)', () => {
+  it('removes roles not re-confirmed 14 days after the review fell due, ends sessions and audits it', async () => {
+    const [lapsed] = await ownerPool()`insert into staff_users (email, name, password_hash, roles, roles_confirmed_at) values ('lapsed@arkiv.test', 'L', 'x', ${['SUPPORT', 'OPS']}, now() - interval '105 days') returning id`;
+    const [due] = await ownerPool()`insert into staff_users (email, name, password_hash, roles, roles_confirmed_at) values ('due@arkiv.test', 'D', 'x', ${['SUPPORT']}, now() - interval '95 days') returning id`;
+    await ownerPool()`insert into staff_sessions (staff_id, token_hash, expires_at) values (${lapsed!.id}, 'h1', now() + interval '1 hour'), (${due!.id}, 'h2', now() + interval '1 hour')`;
+    expect(await sweeps['staff-access-review']!.run()).toBe(1);
+    const rows = await ownerPool()`select u.email, u.roles, u.active, (select count(*) from staff_sessions s where s.staff_id = u.id and s.revoked_at is null)::int as live
+                                   from staff_users u where u.email in ('lapsed@arkiv.test', 'due@arkiv.test') order by u.email`;
+    expect(rows.map((r) => ({ ...r }))).toEqual([
+      { email: 'due@arkiv.test', roles: ['SUPPORT'], active: true, live: 1 }, // still inside the 14-day grace
+      { email: 'lapsed@arkiv.test', roles: [], active: true, live: 0 },
+    ]);
+    const [a] = await ownerPool()`select staff_id, before, after from admin_audit_log where action = 'staff.access_review_removed' and target_id = ${lapsed!.id as string}`;
+    expect(a).toMatchObject({ staff_id: null, before: { roles: ['SUPPORT', 'OPS'] }, after: { roles: [] } });
+    expect(await sweeps['staff-access-review']!.run()).toBe(0);
+  });
+});

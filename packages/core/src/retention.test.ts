@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withAdmin } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId } from '@arkiv/shared';
 import { clusterFreeText } from './customer-language';
-import { day30ReviewDelivery, retentionCohorts } from './retention';
+import { day30ReviewDelivery, retentionCohorts, retentionTargets } from './retention';
 
 beforeEach(truncateAll);
 afterAll(closeAll);
@@ -92,5 +92,46 @@ describe('cancellation free-text themes (plan 05 §17)', () => {
       ['Other', 1],
     ]);
     expect(r[0]!.examples).toEqual(['Too expensive for us right now', 'Budget got cut']);
+  });
+});
+
+describe('internal retention targets (standard §10)', () => {
+  const at = (daysAgo: number) => new Date(Date.now() - daysAgo * 86400_000);
+  /** A paid, delivered ad for the workspace; exported or not. */
+  async function delivered(ws: string, exported: boolean) {
+    const sku = await makeSku(ws);
+    const p = newId();
+    await ownerPool()`insert into projects (id, workspace_id, sku_id, kind, state, created_by) values (${p}, ${ws}, ${sku}, 'taste', 'COMPLETE', 'test')`;
+    if (!exported) return;
+    const [a] = await ownerPool()`insert into assets (workspace_id, sku_id, kind, storage_key, mime, bytes, checksum_sha256, source, lineage)
+                                  values (${ws}, ${sku}, 'final_export', ${`k/${p}`}, 'video/mp4', 1, 'x', 'generated', ${ownerPool().json({ projectId: p })}) returning id`;
+    await ownerPool()`insert into events (workspace_id, type, subject_type, subject_id, actor, payload) values (${ws}, 'ASSET_EXPORTED', 'asset', ${a!.id}, 'user:x', '{}')`;
+  }
+  const tests = async (ws: string, n: number, daysAgo: number) => {
+    for (let i = 0; i < n; i++) {
+      await ownerPool()`insert into ledger_entries (workspace_id, type, unit, amount, actor, idempotency_key, created_at)
+                        values (${ws}, 'CREDIT_CONSUMED', 'creative_test', -1, 'system:x', ${`t:${ws}:${i}`}, ${at(daysAgo)})`;
+    }
+  };
+
+  it('measures each target over the right customers and flags misses', async () => {
+    // A: Growth for 40 days, meta connected on day 3, three tests in the first month, first ad exported.
+    const a = await customer('GROWTH', 40, null);
+    await ownerPool()`insert into integrations (workspace_id, provider, external_account_id, status, scopes, created_at) values (${a}, 'meta', 'act_a', 'active', '{ads_read}', ${at(37)})`;
+    await tests(a, 3, 30);
+    await delivered(a, true);
+    // B: Growth from 70 days ago, ended 65 days in (so retained at month 2, churned in the last 30 days), one test.
+    const b = await customer('GROWTH', 70, 65);
+    await tests(b, 1, 60);
+    await delivered(b, false);
+    const t = Object.fromEntries((await withAdmin((tx) => retentionTargets(tx))).map((x) => [x.key, x]));
+    expect(t.first_export).toMatchObject({ value: 0.5, n: 2, target: 0.8, alert: true });
+    expect(t.performance_source).toMatchObject({ value: 0.5, n: 2, alert: true });
+    expect(t.growth_tests).toMatchObject({ value: 2, n: 2, target: 3, alert: true, unit: 'tests' });
+    expect(t.month2_retention).toMatchObject({ value: 1, n: 1, alert: false });
+    expect(t.monthly_churn).toMatchObject({ value: 0.5, n: 2, target: 0.05, direction: 'max', alert: true });
+    // Nothing delivered or produced in 90 days: no value, no alert.
+    expect(t.first_render).toMatchObject({ value: null, alert: false });
+    expect(t.repeated_fidelity).toMatchObject({ value: null, alert: false });
   });
 });

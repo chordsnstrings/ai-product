@@ -135,7 +135,16 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
   const est = await estimateCost(tx, input.lines);
 
   // 1. Ceiling per purpose (standard §5 V1.1 Creative Test ceiling; free preview cap per SKU).
-  const ceiling = await ceilingFor(tx, input.purpose);
+  let ceiling = await ceilingFor(tx, input.purpose);
+  // §44 "active customer promises handled by commercial policy": a paid production that no longer fits its class
+  // ceiling at today's rates (even after re-planning) runs at a loss only with a staff-approved override (four-eyes,
+  // FINANCE) recorded on the project; the markup floor is then waived for it.
+  let override: Micros | null = null;
+  if (ceiling !== null && PER_TEST_PURPOSES.has(input.purpose) && input.projectId) {
+    const [pr] = await tx`select ceiling_override_micros from projects where id = ${input.projectId} and workspace_id = ${ctx.workspaceId}`;
+    override = pr?.ceiling_override_micros != null ? Number(pr.ceiling_override_micros) : null;
+    if (override != null) ceiling = Math.max(ceiling, override);
+  }
   if (ceiling !== null) {
     let prior = 0;
     if (input.purpose === 'free_preview' && ctx.workspaceState === 'PROVISIONAL') {
@@ -209,7 +218,7 @@ export async function authorize(tx: Tx, ctx: TenantContext, input: AuthorizeInpu
   }
   if (input.entitlement && input.entitlement.amount > 0) {
     margin = await marginDecision(tx, plan, input.entitlement.unit, input.entitlement.amount, input.projectId ?? null, est.totalMicros);
-    if (!margin.ok) {
+    if (!margin.ok && override == null) {
       throw new DomainError('GATE_BLOCKED', 'This plan costs more than the markup floor allows for its entitlement', { ...margin, purpose: input.purpose, reason: 'markup_floor' });
     }
   }
@@ -337,6 +346,16 @@ export async function consumeAuthorization(
     });
   }
   return { authorizationId: a.id as string, projectId: (a.project_id as string) ?? null };
+}
+
+/**
+ * The rate table versions an authorization was priced on (provider/model → version). The Model Gateway prices each
+ * call under it at those versions (§44 "active customer promises handled by commercial policy"): a rate change after
+ * the promise was made never makes an in-flight job unaffordable; the real cost is still booked at today's rates.
+ */
+export async function authorizationRateVersions(tx: Tx, token: string): Promise<Record<string, number>> {
+  const [a] = await tx`select rate_table_versions from cost_authorizations where token_hash = ${hashToken(token)}`;
+  return ((a?.rate_table_versions as Record<string, number> | null) ?? {}) as Record<string, number>;
 }
 
 /** Return unused expected cost when a call finishes cheaper than estimated (or fails before spend). */

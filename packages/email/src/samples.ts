@@ -37,6 +37,8 @@ export function templateSamples(appUrl: string): { [K in TemplateName]: Template
     day30_review: { productName: 'Dew Serum', tested: 6, actionable: 2, url: `${w}/products/sample/review` },
     rights_expired: { productName: 'Dew Serum', files: 2, expiredOn: 'Sep 24, 2026', url: `${w}/products/sample?tab=assets` },
     production_delayed: { productName: 'Dew Serum', minutes: 24, url: `${appUrl}/produce/sample` },
+    staff_invite: { name: 'Riley', inviterName: 'Sam', url: `${appUrl}/invite/sample`, expiresIn: '48 hours' },
+    review_text_erased: { workspaceName: 'Sample Brand', deleted: 3, reference: 'Privacy request 2291', url: `${w}/settings/access-log` },
     staff_break_glass: { staffName: 'Sam (Arkiv support)', reason: 'Support ticket #812: export failed', when: 'Sep 24, 14:02 UTC', url: `${w}/settings/access-log` },
     ownership_transfer_confirm: { workspaceName: 'Sample Brand', newOwner: 'jordan@example.com', reason: 'Founder handing over the account', url: `${appUrl}/ownership/sample`, expiresIn: '72 hours' },
     intervention: { label: 'Your ad is ready', headline: 'Upload your ad to Meta in 2 minutes', body: 'Your finished ad is waiting. Here’s the fastest way to get it live.', cta: 'Show me how', url: `${w}/this-week` },

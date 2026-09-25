@@ -69,9 +69,9 @@ export async function processOpsCommands(boss: PgBoss): Promise<number> {
           if (!info) throw new Error(`unknown dataset ${p.dataset}`);
           await withSystem((tx) => tx`update eval_runs set status = 'running' where id = ${p.evalRunId!} and status = 'queued'`);
           const cases = await withSystem((tx) => loadCases(tx, p.dataset!));
-          // Model datasets run the candidate template × model through the gateway; rules datasets the deterministic engines.
+          // Model and media datasets run the candidate through the gateway; rules datasets the deterministic engines.
           const r =
-            info.kind === 'model'
+            info.kind !== 'rules'
               ? await runModelEval({ evalRunId: p.evalRunId!, dataset: p.dataset!, task: p.task!, model: p.model!, promptVersion: p.promptVersion!, cases })
               : runDeterministicEval(p.dataset!, cases);
           await withSystem((tx) => tx`update eval_runs set status = ${r.passed ? 'passed' : 'failed'}, cases = ${r.cases}, score = ${r.score},

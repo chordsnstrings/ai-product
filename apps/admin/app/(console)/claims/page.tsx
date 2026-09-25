@@ -18,7 +18,7 @@ export default async function Claims() {
   const s = await requireStaff('claims.review');
   const d0 = await withAdmin(async (tx) => {
     await audit(tx, s, 'content.view', { type: 'queue', id: 'claims' }, { reason: 'compliance review queues' });
-    const media = await tx`select a.id, a.workspace_id, a.kind, a.mime, a.review_flags, a.created_at, a.origin->>'filename' as filename, w.name, k.name as sku_name, k.catalogue_no
+    const media = await tx`select a.id, a.workspace_id, a.kind, a.mime, a.review_flags, a.created_at, a.origin->>'filename' as filename, a.origin->'beforeAfter' as attestation, w.name, k.name as sku_name, k.catalogue_no
                            from assets a join workspaces w on w.id = a.workspace_id left join skus k on k.id = a.sku_id and k.workspace_id = a.workspace_id
                            where a.review_status = 'pending' and a.deleted_at is null order by a.created_at limit 50`;
     // Media is tenant content: a preview only where this staff member holds break-glass on the workspace.
@@ -110,10 +110,14 @@ export default async function Claims() {
           return [
             ago(m.created_at), <Link key="w" href={`/tenants/${m.workspace_id}`}>{m.name as string}</Link>, m.sku_name ? `${String(m.catalogue_no).padStart(3, '0')} ${m.sku_name as string}` : '—',
             <span key="k" className="ak-small">{m.kind as string}{m.filename ? ` · ${m.filename as string}` : ''}</span>,
-            <span key="f" className="ak-small">{[f.beforeAfter ? 'before/after' : null, f.possibleMinor ? 'possible minor' : null].filter(Boolean).join(', ')} <span className="ak-muted">({(f.sources ?? []).join(', ')})</span></span>,
+            <span key="f" className="ak-small">
+              {[f.beforeAfter ? 'before/after' : null, f.possibleMinor ? 'possible minor' : null].filter(Boolean).join(', ')} <span className="ak-muted">({(f.sources ?? []).join(', ')})</span>
+              {f.beforeAfter ? <><br />{m.attestation ? 'Merchant attested: consent · unretouched · same conditions' : <span style={{ color: 'var(--risk)' }}>No permission attestation: approve only with a written-permission reference</span>}</> : null}
+            </span>,
             preview ? <img key="p" src={preview} alt="held media" style={{ width: 120, border: '1px solid var(--rule)' }} /> : <Link key="p" href={`/tenants/${m.workspace_id}`} className="ak-small">open break-glass</Link>,
             <ActForm key="d" inline action="asset.review" extra={{ workspaceId: m.workspace_id, assetId: m.id }} submit="Decide" fields={[
               { name: 'verdict', label: 'Verdict', type: 'select', options: [{ value: 'rejected', label: 'Reject (never used)' }, { value: 'approved', label: 'Approve for use' }] },
+              ...(f.beforeAfter && !m.attestation ? [{ name: 'permissionRef', label: 'Written permission (ticket / email ref)' }] : []),
               { name: 'reason', label: 'Reason', required: true },
             ]} />,
           ];

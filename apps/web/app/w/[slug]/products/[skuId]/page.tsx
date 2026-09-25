@@ -244,6 +244,19 @@ export default async function Product({ params, searchParams }: { params: Promis
                 { name: 'adId', label: 'Ad ID (optional)' },
                 ...(d.otherSkus.length ? [{ name: 'secondarySkuIds', label: 'Other products shown in this ad', type: 'checkboxes' as const, options: d.otherSkus, checked: [], hint: 'Results and learnings stay with this product.' }] : []),
                 { name: 'minors', label: 'People in this ad', type: 'checkboxes', options: [{ value: 'yes', label: 'Someone under 18 appears' }], checked: [], hint: 'We check rights and platform policy before this footage can be used.' },
+                {
+                  name: 'beforeAfter',
+                  label: 'Before/after footage',
+                  type: 'checkboxes',
+                  checked: [],
+                  hint: 'Before/after is reviewed by our compliance team before any ad uses it. We never generate before/after results.',
+                  options: [
+                    { value: 'before_after', label: 'This video shows a before/after comparison' },
+                    { value: 'consent', label: 'The person shown gave written permission for ads' },
+                    { value: 'unretouched', label: 'The images are unretouched' },
+                    { value: 'same_conditions', label: 'Before and after were taken under the same lighting, angle and conditions' },
+                  ],
+                },
               ]} />
             </div>
           ) : null}

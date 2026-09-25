@@ -25,6 +25,7 @@ import {
   dismissRecommendation,
   enqueue,
   importHistoricalCreative,
+  beforeAfterAttestation,
   importSignals,
   ingestBytes,
   ingestObservations,
@@ -130,9 +131,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         // §48: the other products the ad shows, and whether people under 18 appear in it.
         const secondarySkuIds = z.array(uuid).max(10).parse(form.getAll('secondarySkuIds'));
         const minorsPresent = form.getAll('minors').includes('yes');
+        // §43: a before/after is declared with its provenance/permission attestation and goes to policy review.
+        const beforeAfter = beforeAfterAttestation(form.getAll('beforeAfter').map(String));
         const id = await t((tx) =>
-          once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, file: fileIdentity(file) }, async () => {
-            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
+          once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, beforeAfter: !!beforeAfter, file: fileIdentity(file) }, async () => {
+            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name, ...(beforeAfter ? { beforeAfter } : {}) })).id : null;
             return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId, secondarySkuIds, minorsPresent });
           }),
         );

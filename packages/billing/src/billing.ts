@@ -28,6 +28,7 @@ import {
   type TenantContext,
 } from '@arkiv/core';
 import { randomUUID } from 'node:crypto';
+import { currentStripePrice, subscriptionStripePrice } from './price-changes';
 import type Stripe from 'stripe';
 import { billingGateway, priceIdFor, type MockStripe } from './gateway';
 import { applySucceededRefund, recordChargeRefund } from './refunds';
@@ -46,12 +47,11 @@ import { applySucceededRefund, recordChargeRefund } from './refunds';
  * on the 29th–31st renews on the last day of shorter months.
  */
 export const AUTO_RENEW_TEXT_VERSION = 'auto-renew@2026-09-24';
-export function autoRenewText(plan: PlanCode, now = new Date()) {
-  const p = PLANS[plan];
+export function autoRenewText(plan: PlanCode, now = new Date(), priceMicros: number = PLANS[plan].priceMicros) {
   const day = now.getUTCDate();
   const suffix = day % 10 === 1 && day !== 11 ? 'st' : day % 10 === 2 && day !== 12 ? 'nd' : day % 10 === 3 && day !== 13 ? 'rd' : 'th';
   const when = day > 28 ? `on the ${day}${suffix} of each month (the last day of shorter months)` : `on the ${day}${suffix} of each month`;
-  return `${formatUsd(p.priceMicros, 0)}/month plus applicable sales tax, charged today and ${when} until you cancel. Cancel online anytime in Settings → Billing.`;
+  return `${formatUsd(priceMicros, 0)}/month plus applicable sales tax, charged today and ${when} until you cancel. Cancel online anytime in Settings → Billing.`;
 }
 
 async function ensureCustomer(tx: Tx, ctx: TenantContext, email: string): Promise<string> {
@@ -160,10 +160,12 @@ export async function recordAutoRenewConsent(
   assertCan(ctx, 'billing.manage');
   assertCanSubscribe(ctx);
   if (!input.agreed) throw new DomainError('INVALID', 'Please tick the box to agree to the recurring charge.');
-  const text = autoRenewText(input.plan);
+  // The price the customer agrees to is the one sold today (plan 04 §3: a scheduled change applies from its date).
+  const { priceMicros } = await currentStripePrice(tx, input.plan);
+  const text = autoRenewText(input.plan, new Date(), priceMicros);
   const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)
                        values (${ctx.workspaceId}, ${input.userId}, 'auto_renew', ${AUTO_RENEW_TEXT_VERSION}, ${text},
-                               ${tx.json({ plan: input.plan, priceMicros: PLANS[input.plan].priceMicros })}, ${input.ip ?? null}, ${input.userAgent ?? null})
+                               ${tx.json({ plan: input.plan, priceMicros })}, ${input.ip ?? null}, ${input.userAgent ?? null})
                        returning id`;
   return c!.id as string;
 }
@@ -175,14 +177,17 @@ export async function startSubscriptionCheckout(tx: Tx, ctx: TenantContext, plan
   if (await isFlagOn(tx, 'kill.checkout')) throw new DomainError('UNAVAILABLE', 'Checkout is paused for a few minutes for maintenance.');
   const [consent] = await tx`select id, context from consent_records where id = ${consentId} and kind = 'auto_renew' and created_at > now() - interval '30 minutes'`;
   if (!consent || (consent.context as { plan: string }).plan !== plan) throw new DomainError('INVALID', 'Please confirm the recurring charge again.');
+  const price = await currentStripePrice(tx, plan);
+  // The price changed between the consent and the checkout: the customer confirms the new amount first.
+  if (Number((consent.context as { priceMicros?: number }).priceMicros ?? price.priceMicros) !== price.priceMicros) throw new DomainError('INVALID', 'The plan price has changed. Please confirm the recurring charge again.');
   const [active] = await tx`select id from subscriptions where status in ('active','trialing','past_due')`;
   if (active) throw new DomainError('CONFLICT', 'You already have a plan. Change it from Settings → Billing.');
   const customerId = await ensureCustomer(tx, ctx, user.email);
   const session = await billingGateway().createCheckout({
     mode: 'subscription',
     customerId,
-    priceId: priceIdFor(plan),
-    amountCents: microsToCents(PLANS[plan].priceMicros),
+    priceId: price.priceId,
+    amountCents: microsToCents(price.priceMicros),
     productName: `${PLANS[plan].name} · ${PLANS[plan].creativeTestsPerMonth} Creative Tests / month`,
     metadata: { workspace_id: ctx.workspaceId, plan, consent_record_id: consentId },
     expiresAt: new Date(Date.now() + 60 * 60_000),
@@ -248,10 +253,14 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   if (s.status === 'past_due') throw new DomainError('CONFLICT', 'Your last payment failed. Update your card first; then you can change plan.');
   const from = s.plan_code as PlanCode;
   const subId = s.stripe_subscription_id as string;
+  // The price this subscription is billed at on its own plan (a notified price change it already moved to counts),
+  // and the price a plan it moves to is sold at today.
+  const ownPrice = () => subscriptionStripePrice(tx, { id: s.id as string, workspaceId: ctx.workspaceId, planCode: from, createdAt: s.created_at as string });
+  const toPrice = async () => (await currentStripePrice(tx, to)).priceId ?? `price_${to}`;
   const pending = (s.pending_plan_code as PlanCode | null) ?? null;
   if (from === to) {
     if (!pending) return { effective: 'none' as const };
-    await billingGateway().changeSubscriptionPrice(subId, priceIdFor(from) ?? `price_${from}`, false);
+    await billingGateway().changeSubscriptionPrice(subId, await ownPrice(), false);
     await tx`update subscriptions set pending_plan_code = null, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
     await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from, to: from, effective: 'kept', withdrawn: pending });
     return { effective: 'kept' as const };
@@ -260,8 +269,8 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   if (upgrade) {
     // Stripe holds the scheduled lower price: put the current one back first, so the proration charges the
     // difference from what the customer actually pays.
-    if (pending) await billingGateway().changeSubscriptionPrice(subId, priceIdFor(from) ?? `price_${from}`, false);
-    await billingGateway().changeSubscriptionPrice(subId, priceIdFor(to) ?? `price_${to}`, true);
+    if (pending) await billingGateway().changeSubscriptionPrice(subId, await ownPrice(), false);
+    await billingGateway().changeSubscriptionPrice(subId, await toPrice(), true);
     await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
     await tx`update workspaces set plan_code = ${to} where id = ${ctx.workspaceId}`;
     // Pro-rata extra Creative Tests for the rest of this period (rounded up).
@@ -278,7 +287,7 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
     return { effective: 'now' as const, extraTests: extra };
   }
   if (pending === to) return { effective: 'period_end' as const, on: s.current_period_end as string };
-  await billingGateway().changeSubscriptionPrice(subId, priceIdFor(to) ?? `price_${to}`, false);
+  await billingGateway().changeSubscriptionPrice(subId, await toPrice(), false);
   await tx`update subscriptions set pending_plan_code = ${to}, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { from, to, effective: 'period_end' });
   return { effective: 'period_end' as const, on: s.current_period_end as string };
@@ -297,9 +306,10 @@ export async function staffChangePlan(tx: Tx, ctx: TenantContext, to: PlanCode, 
   const [s] = await tx`select plan_code from subscriptions where workspace_id = ${ctx.workspaceId} and status = 'active' order by created_at desc limit 1`;
   if (!s) throw new DomainError('NOT_FOUND', 'No active plan to change.');
   if (s.plan_code === to) throw new DomainError('CONFLICT', `Already on ${PLANS[to].name}.`);
+  const { priceMicros } = await currentStripePrice(tx, to);
   const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context)
-                       values (${ctx.workspaceId}, null, 'auto_renew', ${AUTO_RENEW_TEXT_VERSION}, ${autoRenewText(to)},
-                               ${tx.json({ plan: to, priceMicros: PLANS[to].priceMicros, from: s.plan_code as string, via: 'staff', staffId: consent.staffId, reference: consent.reference.trim() })})
+                       values (${ctx.workspaceId}, null, 'auto_renew', ${AUTO_RENEW_TEXT_VERSION}, ${autoRenewText(to, new Date(), priceMicros)},
+                               ${tx.json({ plan: to, priceMicros, from: s.plan_code as string, via: 'staff', staffId: consent.staffId, reference: consent.reference.trim() })})
                        returning id`;
   const r = await changePlan(tx, ctx, to);
   return { ...r, consentRecordId: c!.id as string };

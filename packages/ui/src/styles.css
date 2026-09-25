@@ -298,6 +298,10 @@ button.ak-chip { cursor: pointer; }
 .ak-dense { font-size: 13px; }
 .ak-dense .ak-table td, .ak-dense .ak-table th { padding-top: 7px; padding-bottom: 7px; }
 .ak-scroll-x { overflow-x: auto; }
+/* Staff console tables (plan 05 keyboard-first): long tables scroll inside their box so the sticky header stays in view; the keyboard row cursor is visible. */
+.ak-keytable thead th { z-index: 1; }
+.ak-keytable tbody tr:focus { outline: 2px solid var(--ink); outline-offset: -2px; }
+.ak-keytable tbody tr:focus td { background: var(--paper-sunk); }
 
 /* ── Banners ── */
 .ak-banner { padding: var(--space-3) var(--space-4); border: 1px solid var(--rule-strong); background: var(--paper-raised); font-size: 14px; }

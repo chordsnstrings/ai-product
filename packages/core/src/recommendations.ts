@@ -4,7 +4,7 @@ import { assertCan } from './authz';
 import { classifyClaim } from './compliance';
 import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
-import { buildContext, customerPhrasesPart, gateProposal, isIngredientLed, UNVERIFIED_INGREDIENTS_REASON } from './creative-director';
+import { buildContext, contextPacketParts, customerPhrasesPart, gateProposal, isIngredientLed, UNVERIFIED_INGREDIENTS_REASON } from './creative-director';
 import { emit } from './events';
 import { stockState } from './stock';
 import { meaningfulCoverage } from './genome';
@@ -370,9 +370,10 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
         token: auth.token,
         task: 'creative_director.recommendations',
         subject: { type: 'sku', id: skuId },
+        inputRefs: { skuId, week, candidateSet: b, packetIds: [...packetIds] },
         template: 'recommendations',
         content: [
-          { type: 'text', text: `Context packet:\n${JSON.stringify(packet)}` },
+          ...contextPacketParts(packet),
           ...(phrasePart ? [phrasePart] : []),
           ...(stockPart ? [stockPart] : []),
           { type: 'text', text: `Weekly planning (${week}). Basis: ${sc.basis}. SKU maturity: ${sc.maturity}. Candidate set ${b} of 2 — make these different from set 1.` },
