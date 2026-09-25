@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
-import { MockImage, MockLlm, MockTts, MockVideo, setProviders, type LlmJsonRequest, type LlmJsonResult } from '@arkiv/providers';
+import { MockImage, MockLlm, MockTts, MockVideo, ProviderError, setProviders, type LlmJsonRequest, type LlmJsonResult } from '@arkiv/providers';
 import { analyzeProduct, startPreview } from './analysis';
 import { generateStoryboard, selectConcept } from './storyboard';
 import { ctxFor, productPhoto } from './testing';
@@ -41,7 +41,24 @@ async function storyboard() {
   return { t, frames, status: sb!.status as string, projectId };
 }
 
+/** An inspector that errors on every frame. */
+class BrokenInspectorLlm extends MockLlm {
+  override async json<T>(req: LlmJsonRequest<T>): Promise<LlmJsonResult<T>> {
+    if (/product-accuracy inspector/.test(req.system)) throw new ProviderError('anthropic', 'malformed inspection', false, 'invalid');
+    return super.json(req);
+  }
+}
+
 describe('storyboard frame fidelity', () => {
+  it('an inspector error does not stall the storyboard: the deterministic checks judge the frame', async () => {
+    setProviders({ llm: new BrokenInspectorLlm(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
+    const { frames, status } = await storyboard();
+    expect(status).toBe('ready');
+    const judged = frames.filter((f) => f.technique === 'generated' || (f.lineage as { fidelityFallback?: boolean }).fidelityFallback);
+    expect(judged.length).toBeGreaterThan(0);
+    for (const f of judged) expect((f.qa as { data?: { inspector?: string } }[])[0]!.data).toMatchObject({ inspector: 'not run' });
+  }, 120_000);
+
   it('a generated frame that passes is shown, with its check kept', async () => {
     const { frames, status } = await storyboard();
     expect(status).toBe('ready');

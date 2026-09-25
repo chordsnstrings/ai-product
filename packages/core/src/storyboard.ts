@@ -1,5 +1,7 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, FREE_EXPLORATION } from '@arkiv/shared';
+import { COST_LIMITS, DomainError, FREE_EXPLORATION } from '@arkiv/shared';
+import { logger } from '@arkiv/shared/log';
+import { ProviderError } from '@arkiv/providers';
 import { compositeProduct, productionBackdrop } from '@arkiv/media';
 import { assetBytes, saveAsset } from './assets';
 import { assertCan } from './authz';
@@ -8,7 +10,7 @@ import { classifyClaim, isFirstPersonTestimonial, scanCreativeText, showsSynthet
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
 import type { TenantContext } from './context';
 import { cutoutState, segmentCutout, wantsSegmentation } from './cutout';
-import { authorize, authorizeOrTakeOver, settle } from './cost-governor';
+import { authorize, authorizeOrTakeOver, estimateCost, settle } from './cost-governor';
 import { allowedClaimTexts, planStoryboard } from './creative-director';
 import { emit } from './events';
 import { projectVisitor, recordFunnel } from './funnel';
@@ -16,17 +18,39 @@ import type { StoryboardPlan } from './intel-schemas';
 import { CUTOUT_TASK, generateImage, routedLines } from './model-gateway';
 import { currentQuote, issueTasteOffer } from './offers';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
-import { fidelityThresholds } from './fidelity';
+import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, fidelityThresholds } from './fidelity';
 import { planSteps, step } from './progress';
 import { planStoryboardScenes, sceneClaimIds } from './production';
 import { transition } from './projects';
-import { qaClaims, qaScene, type CheckResult } from './qa';
+import { qaClaims, qaScene, type CheckResult, type SceneQaInput } from './qa';
 import { ensureVariantImage, referenceAssetIds } from './sku-variants';
 import { stockState } from './stock';
 import { toDataUrl } from './vision';
 
 const FRAME = { width: 1080, height: 1920 };
 const MAX_GENERATED_FRAMES = 2;
+const sbLog = logger('storyboard');
+/**
+ * Product fidelity of a generated storyboard frame: the scene QA (deterministic signals plus the inspector) when the
+ * inspection is funded; the deterministic shade/count signals against the cut-out alone when it isn't, or when the
+ * inspector fails (a storyboard never stalls on a QA provider error). No cut-out and no inspection: nothing to judge.
+ */
+async function checkFrame(inspect: boolean, input: SceneQaInput): Promise<CheckResult[] | null> {
+  if (inspect) {
+    try {
+      return await qaScene(input);
+    } catch (e) {
+      if (!(e instanceof ProviderError) && !(e instanceof DomainError)) throw e;
+      sbLog.warn('frame inspection failed; deterministic checks only', { sceneId: input.sceneId, err: e });
+    }
+  }
+  const cutout = input.fingerprint.cutout;
+  if (!cutout) return null;
+  const det = await fidelitySignals(input.frameBytes!, cutout, input.fingerprint.thresholds ?? DEFAULT_FIDELITY_THRESHOLDS);
+  const pass = det.failures.length === 0;
+  return [{ check: 'product_fidelity', pass, hard: !pass, detail: pass ? 'Product matches reference (deterministic checks)' : `Product identity mismatch: ${det.failures.map((f) => f.detail).join('; ')}`, data: { deterministic: det, inspector: 'not run' } }];
+}
+
 /** A frame inspection: two reference photos and the frame at 768 px, plus the fingerprint text; a short JSON answer. */
 const FRAME_QA_TOKENS = { input: 4_000, output: 600 };
 /** Free "Change picture" redraws per storyboard before a purchase (plan 03 P7). */
@@ -93,22 +117,19 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
 
   // The frames are where the product cut-out is first used: a photo keying couldn't cut out cleanly gets one
   // background-removal try here, priced into this storyboard's authorization (plan 06 Phase 1 #6).
-  const { auth, segment } = await withTenant(ws, async (tx) => {
+  const { auth, segment, inspect } = await withTenant(ws, async (tx) => {
     const segment = wantsSegmentation(await cutoutState(tx, skuId));
-    const auth = await authorize(tx, ctx, {
-      purpose: 'storyboard',
-      projectId,
-      skuId,
-      lines: await routedLines(tx, ws, [
-        { task: 'creative_director.storyboard', kind: 'llm', inputTokens: 5_000, outputTokens: 2_500 },
-        { task: 'image.storyboard_frame', kind: 'image', images: MAX_GENERATED_FRAMES },
-        // One product-fidelity inspection per generated frame (plan 06 Phase 2 D4), before the customer sees it.
-        ...Array.from({ length: MAX_GENERATED_FRAMES }, () => ({ task: 'qa.fidelity', kind: 'llm' as const, inputTokens: FRAME_QA_TOKENS.input, outputTokens: FRAME_QA_TOKENS.output })),
-        ...(segment ? [{ task: CUTOUT_TASK, kind: 'image' as const, images: 1 }] : []),
-      ]),
-      idempotencyKey: `storyboard:${storyboardId}`,
-    });
-    return { auth, segment };
+    const base = await routedLines(tx, ws, [
+      { task: 'creative_director.storyboard', kind: 'llm', inputTokens: 5_000, outputTokens: 2_500 },
+      { task: 'image.storyboard_frame', kind: 'image', images: MAX_GENERATED_FRAMES },
+      ...(segment ? [{ task: CUTOUT_TASK, kind: 'image' as const, images: 1 }] : []),
+    ]);
+    // One product-fidelity inspection per generated frame (plan 06 Phase 2 D4), when it fits the storyboard's cost
+    // cap; otherwise (e.g. a background removal is also needed) the deterministic checks alone judge the frames.
+    const inspections = await routedLines(tx, ws, Array.from({ length: MAX_GENERATED_FRAMES }, () => ({ task: 'qa.fidelity', kind: 'llm' as const, inputTokens: FRAME_QA_TOKENS.input, outputTokens: FRAME_QA_TOKENS.output })));
+    const inspect = (await estimateCost(tx, [...base, ...inspections])).totalMicros <= COST_LIMITS.STORYBOARD_CAP;
+    const auth = await authorize(tx, ctx, { purpose: 'storyboard', projectId, skuId, lines: inspect ? [...base, ...inspections] : base, idempotencyKey: `storyboard:${storyboardId}` });
+    return { auth, segment, inspect };
   });
   try {
     await withTenant(ws, (tx) => step(tx, ws, storyboardId, 'plan', 'active'));
@@ -195,8 +216,8 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
         if (technique === 'generated') {
           // The model drew the product itself: check it before the customer sees it (plan 06 Phase 2 D4; §54 rule
           // 4). A frame that fails is replaced by the exact-product composite, and the check is kept with it.
-          qa = await qaScene({ ctx, token: auth.token, sceneId: s.id as string, sceneText: s.visual_plan as string, frameBytes: bytes, referenceBytes: fidelity.referenceBytes, fingerprint: fidelity.fingerprint, planText: s.visual_plan as string, attempt: 1 });
-          const failed = qa.find((c) => !c.pass && (c.check === 'product_fidelity' || c.hard));
+          qa = await checkFrame(inspect, { ctx, token: auth.token, sceneId: s.id as string, sceneText: s.visual_plan as string, frameBytes: bytes, referenceBytes: fidelity.referenceBytes, fingerprint: fidelity.fingerprint, planText: s.visual_plan as string, attempt: 1 });
+          const failed = qa?.find((c) => !c.pass && (c.check === 'product_fidelity' || c.hard));
           if (failed) {
             const fb = await exactProductFrame(imagery, { purpose: s.purpose as string });
             bytes = fb?.bytes ?? (await productionBackdrop('9x16', imagery.palette));

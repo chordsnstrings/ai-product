@@ -385,8 +385,9 @@ describe('paid output is kept before QA (standard §39: arch-17)', () => {
   afterEach(() => setProviders(undefined));
 
   it('a render whose QA errored is stored, and a retry judges it instead of paying for another', async () => {
-    setProviders({ llm: new QaErrorsOnce(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
     const r = await storyboardReady();
+    // Installed after the storyboard: its frame inspections are not the production QA under test.
+    setProviders({ llm: new QaErrorsOnce(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
     await approve(r);
     await expect(produceProject(r.ctx, r.projectId)).rejects.toThrow(/malformed inspection/);
     expect((await ownerPool()`select state from projects where id = ${r.projectId}`)[0]!.state).toBe('PROVIDER_FAILED');
