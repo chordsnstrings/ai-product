@@ -601,14 +601,17 @@ export const ACTIONS = {
   'route.pin': a({
     perm: 'routes.manage',
     reauth: true,
-    schema: z.object({ task: z.string(), version: z.string().trim().max(120).optional(), reason }),
+    // driftPolicy (§48): on a returned-version drift, 'alert' raises the alert and queues the golden-set eval; 'hold'
+    // also stops dispatch on the route until staff re-pin and close its circuit.
+    schema: z.object({ task: z.string(), version: z.string().trim().max(120).optional(), driftPolicy: z.enum(['alert', 'hold']).optional(), reason }),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        const [b] = await tx`select pinned_model_version from model_routes where task = ${i.task}`;
+        const [b] = await tx`select pinned_model_version, drift_policy from model_routes where task = ${i.task}`;
         if (!b) throw new DomainError('NOT_FOUND', 'Unknown route');
         const version = i.version || null;
-        await tx`update model_routes set pinned_model_version = ${version}, updated_at = now() where task = ${i.task}`;
-        await audit(tx, s, 'route.pin', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: { pinned_model_version: version } });
+        const policy = i.driftPolicy ?? (b.drift_policy as string);
+        await tx`update model_routes set pinned_model_version = ${version}, drift_policy = ${policy}, updated_at = now() where task = ${i.task}`;
+        await audit(tx, s, 'route.pin', { type: 'route', id: i.task }, { reason: i.reason, before: b, after: { pinned_model_version: version, drift_policy: policy } });
         return { message: version ? `Pinned ${i.task} to ${version}.` : `Unpinned ${i.task}.` };
       }),
   }),

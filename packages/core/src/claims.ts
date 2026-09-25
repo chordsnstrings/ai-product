@@ -1,4 +1,5 @@
 import type { Tx } from '@arkiv/db';
+import { weakenLearnings } from './experiment-state';
 import { DomainError, ExportFormat, normalizeClaimPlatforms, normalizeMarkets, platformsFor, RENDERABLE_CLAIM_STATUSES, type ClaimStatus } from '@arkiv/shared';
 import { assertCan } from './authz';
 import { classifyClaim, type SuggestedStatus } from './compliance';
@@ -167,8 +168,12 @@ export async function approveClaim(
 
 export async function blockClaim(tx: Tx, ctx: TenantContext, claimId: string, reason: string) {
   if (ctx.actor.kind !== 'staff') assertCan(ctx, 'claim.approve');
+  const [before] = await tx`select sku_id, status from claims where id = ${claimId}`;
   await tx`update claims set status = 'BLOCKED', block_reason = ${reason}, reviewed_at = now(), approved_by = ${actorString(ctx)} where id = ${claimId}`;
   await emit(tx, ctx, 'CLAIM_BLOCKED', { type: 'claim', id: claimId }, { reason });
+  // §21: a claim the SKU's ads could use is withdrawn — the context its learnings came from changed; they weaken
+  // and get revalidated.
+  if (before?.sku_id && ['VERIFIED', 'VERIFIED_WITH_QUALIFIER'].includes(before.status as string)) await weakenLearnings(tx, ctx, before.sku_id as string, 'an approved claim was blocked');
 }
 
 export async function restrictClaim(tx: Tx, ctx: TenantContext, claimId: string, reason: string) {

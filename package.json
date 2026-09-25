@@ -13,6 +13,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "db:migrate": "pnpm --filter @arkiv/db migrate",
+    "db:migrate:dry": "pnpm --filter @arkiv/db migrate:dry",
     "db:reset": "pnpm --filter @arkiv/db reset",
     "db:seed": "pnpm --filter @arkiv/db seed",
     "dev:web": "pnpm --filter @arkiv/web dev",

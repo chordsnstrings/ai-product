@@ -25,6 +25,9 @@ import {
   retireSupersededRates,
   sweepExpiredAuthorizations,
   sweepExpiringEvidence,
+  sweepExpiredRights,
+  sweepStaleLearnings,
+  sweepDelayedProductions,
   sweepLandingGalleryRights,
   sweepOfferGuardrails,
   sweepProvisional,
@@ -173,6 +176,10 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       return rows.length;
     },
   },
+  // Standard §21: actionable learnings not revalidated in 60 days weaken (weekly) and are proposed for revalidation.
+  'learning-revalidation': { cron: '45 5 * * 1', run: () => withSystem((tx) => sweepStaleLearnings(tx)) },
+  // Plan 03 P9 edge: a production past 20 minutes gets one proactive email to the owners and a Pulse alert.
+  'production-delays': { cron: '*/5 * * * *', run: () => withSystem(async (tx) => (await sweepDelayedProductions(tx)).length) },
   // Plan 03 P3: an analysis with no progress for 10 minutes (worker lost, job expired) is failed honestly: the
   // SKU waits for the merchant with what was found, instead of "analyzing" forever. System role: every
   // predicate is tied to the SKU's own workspace.
@@ -237,6 +244,9 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   'circuit-breaker': { cron: '* * * * *', run: () => withSystem(async (tx) => { const changed = await evaluateCircuits(tx); return changed.length ? changed : 0; }) },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
+  // Standard §48: creator usage rights that ended are reported once (event + email); the files already stay out of
+  // new production (usableAssetIds), their history and results are kept.
+  'asset-rights-expiry': { cron: '10 6 * * *', run: () => withSystem((tx) => sweepExpiredRights(tx)) },
   // Plan 05 §5: an example asset whose rights expire is removed from every landing page's gallery (Pulse alert).
   'landing-gallery-rights': { cron: '12 * * * *', run: () => withSystem(async (tx) => { const changed = await sweepLandingGalleryRights(tx); return changed.length ? changed : 0; }) },
   // Plan 05 §6: a pricing experiment whose guardrail (refund, dispute or support rate) degrades past its threshold stops.

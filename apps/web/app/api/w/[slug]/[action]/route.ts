@@ -37,6 +37,7 @@ import {
   proposeClaim,
   Queues,
   removeMember,
+  replaceAsset,
   revokeCreatorPack,
   requestExport,
   saveIntegration,
@@ -50,13 +51,13 @@ import {
 } from '@arkiv/core';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
-import { CSV_PLATFORMS, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
+import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
 const uuid = z.string().uuid();
 const PLAN = z.enum(['LAUNCH', 'GROWTH', 'SCALE']);
-const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative']);
+const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative', 'asset-replace']);
 
 /**
  * Workspace-scoped mutations (plan 03 Part B). Every action resolves membership from the session (layer 1),
@@ -84,9 +85,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const platform = z.enum(CSV_PLATFORMS, { error: 'Choose whether this export is from Meta or TikTok.' }).parse(form.get('platform'));
                 // The day column is in the ad account's reporting timezone (§47); the uploader can name it.
         const tz = z.string().trim().max(64).regex(/^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+)*$/).optional().parse((form.get('timezone') as string | null) || undefined) ?? null;
-        const rows = parsePerformanceCsv(await file.text(), platform, { timezone: tz });
+        // §48: organic or affiliate delivery is kept in its own measurement context, never mixed with paid.
+        const source = z.enum(CSV_SOURCES).default('paid').parse((form.get('source') as string | null) || undefined);
+        const rows = parsePerformanceCsv(await file.text(), platform, { timezone: tz, source });
         if (!rows.length) throw new DomainError('INVALID', 'No rows found. Export “Ad name, Day, Spend, Impressions, Clicks, Purchases” from Ads Manager.');
-        const r = await t((tx) => once(tx, { platform, tz, file: fileIdentity(file), rows: rows.length }, () => ingestObservations(tx, ctx, null, rows)));
+        const r = await t((tx) => once(tx, { platform, tz, source, file: fileIdentity(file), rows: rows.length }, () => ingestObservations(tx, ctx, null, rows)));
         return json({ ok: true, ...r });
       }
       case 'evidence': {
@@ -109,6 +112,14 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         );
         return json({ ok: true });
       }
+      case 'asset-replace': {
+        // §48: replacement footage for a file whose creator rights ended; the old file is kept for history.
+        assertCan(ctx, 'sku.edit');
+        const assetId = uuid.parse(form.get('assetId'));
+        if (!(file instanceof File) || !file.size) throw new DomainError('INVALID', 'Choose the replacement file.');
+        const r = await t((tx) => once(tx, { assetId, file: fileIdentity(file) }, async () => replaceAsset(tx, ctx, assetId, Buffer.from(await file.arrayBuffer()), file.name)));
+        return json({ ok: true, ...r });
+      }
       case 'import-creative': {
         // A past ad (copy + optional video) → genome extraction (standard §6 cold start).
         const skuId = uuid.parse(form.get('skuId'));
@@ -116,10 +127,13 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         assertCan(ctx, 'sku.create');
         const platform = (form.get('platform') as 'meta' | 'tiktok') || null;
         const adId = (form.get('adId') as string) || null;
+        // §48: the other products the ad shows, and whether people under 18 appear in it.
+        const secondarySkuIds = z.array(uuid).max(10).parse(form.getAll('secondarySkuIds'));
+        const minorsPresent = form.getAll('minors').includes('yes');
         const id = await t((tx) =>
-          once(tx, { skuId, copy, platform, adId, file: fileIdentity(file) }, async () => {
+          once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, file: fileIdentity(file) }, async () => {
             const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name })).id : null;
-            return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId });
+            return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId, secondarySkuIds, minorsPresent });
           }),
         );
         return json({ ok: true, creativeId: id });
@@ -131,6 +145,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     /* ── This Week ── */
     case 'rec-accept': {
       const { id } = await body(req, z.object({ id: uuid }));
+      // Authorise before looking the recommendation up: a Viewer gets 403, not "already handled".
+      assertCan(ctx, 'experiment.create');
       const r = await t((tx) =>
         once(tx, { id }, async () => {
           const [rec] = await tx`select * from recommendations where id = ${id} and status = 'open' for update`;
@@ -390,6 +406,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       return json({ ok: true });
     case 'delete': {
       const { confirm } = await body(req, z.object({ confirm: z.string() }));
+      assertCan(ctx, 'workspace.delete');
       if (confirm !== slug) throw new DomainError('INVALID', `Type ${slug} to confirm.`);
       await t((tx) => scheduleDeletion(tx, ctx));
       return json({ ok: true });

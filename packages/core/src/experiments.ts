@@ -1,10 +1,11 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
+import { assertAssetUsable, creativeSourceAssets } from './asset-rights';
+import { DomainError, isPaidContext, measurementContextPlatform, newId, type ExperimentState, type MeasurementContext, type SignalState } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
-import { confoundRunning, LIVE_STATES, recordExperimentApproval, setExperimentState } from './experiment-state';
+import { confoundRunning, CONTEXT_CHANGE_KINDS, LIVE_STATES, recordExperimentApproval, setExperimentState, weakenLearnings } from './experiment-state';
 import { authorizeFromQuote, renderQuote } from './render-quotes';
 import { available, lockEntitlement } from './ledger';
 import type { Proposal } from './intel-schemas';
@@ -30,7 +31,7 @@ import {
   type VariantEvidence,
 } from './statistics';
 
-export { setExperimentState, EXPERIMENT_NEXT, canExperimentTransition, onMaterialProductChange } from './experiment-state';
+export { setExperimentState, EXPERIMENT_NEXT, canExperimentTransition, onMaterialProductChange, weakenLearnings, sweepStaleLearnings, CONTEXT_CHANGE_KINDS, LEARNING_REVALIDATION_DAYS } from './experiment-state';
 
 /**
  * Experiment Engine (§20) + learning (§21). CONTROLLED experiments change a limited set of variables and keep
@@ -102,6 +103,9 @@ async function insertExperiment(
   input: { skuId: string; proposal: Proposal; projectId: string; recommendationId?: string | null; slot?: 'EXPLOIT' | 'EXPAND' | 'EXPLORE' | null; controlCreativeId?: string | null },
 ) {
   const p = input.proposal;
+  // §48: an ad whose creator rights ended (or that is frozen or held) can't be re-run as a control — the merchant is
+  // told why and offered replacement footage; its past results are untouched.
+  if (input.controlCreativeId) await assertAssetUsable(tx, await creativeSourceAssets(tx, input.controlCreativeId), 'Your current ad');
   const declared = p.primaryVariable;
   const primaryVariable = input.controlCreativeId ? declared : 'hook';
   const controlled = declared === 'hook' || !!input.controlCreativeId;
@@ -562,7 +566,9 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
     }
   }
 
-  const primary = summary.filter((s) => s.metric === e.primary_metric);
+  // The test's state and its learnings come from paid delivery only: organic and affiliate results are stored and
+  // shown as their own panels, never read as a paid comparison (§48).
+  const primary = summary.filter((s) => s.metric === e.primary_metric && isPaidContext(s.context));
   const best = primary.find((s) => s.state === 'ACTIONABLE') ?? primary.find((s) => s.state === 'DIRECTIONAL') ?? primary.find((s) => s.state === 'INCONCLUSIVE');
   let resultState: ExperimentState = agg.length ? 'GATHERING_SIGNAL' : (e.state as ExperimentState);
   if (best) resultState = best.state as ExperimentState;
@@ -747,6 +753,8 @@ export async function markConfounder(
            values (${ctx.workspaceId}, ${input.skuId ?? null}, ${input.kind}, ${input.startsAt}, ${input.endsAt ?? null}, ${input.note ?? null},
                    'merchant', ${actorString(ctx)})`;
   await confoundRunning(tx, ctx, input.skuId ?? null, input.kind);
+  // §21: a price or offer change is a change of context — the learnings it touches weaken and get revalidated.
+  if (CONTEXT_CHANGE_KINDS.has(input.kind)) await weakenLearnings(tx, ctx, input.skuId ?? null, `${input.kind.replace('_', ' ')} marked by the merchant`);
 }
 
 /**
@@ -764,6 +772,7 @@ export async function decideConfounder(tx: Tx, ctx: TenantContext, confounderId:
   await tx`update confounders set status = ${to}, decided_at = now(), decided_by = ${actorString(ctx)} where id = ${confounderId}`;
   if (to === 'active') {
     await confoundRunning(tx, ctx, (c.sku_id as string | null) ?? null, c.kind as string);
+    if (CONTEXT_CHANGE_KINDS.has(c.kind as string)) await weakenLearnings(tx, ctx, (c.sku_id as string | null) ?? null, `${String(c.kind).replace('_', ' ')} confirmed`);
   } else {
     // Dismissed: the tests it touched are read again without it.
     const exps = await tx`select id from experiments where (${(c.sku_id as string | null) ?? null}::uuid is null or sku_id = ${(c.sku_id as string | null) ?? null}::uuid)

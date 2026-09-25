@@ -99,7 +99,8 @@ describe('learnings revise with corrected data', () => {
     await withTenant(x.t.workspaceId, (tx) => markConfounder(tx, x.ctx, { skuId: x.skuId, kind: 'offer_change', startsAt: day(0) }));
     await x.compute();
     const [after] = await x.learnings();
-    expect(after).toMatchObject({ id: l!.id, state: 'ACTIONABLE', confounded: true });
+    // The offer change is also a change of context (§21): the learning weakens and is scheduled for revalidation.
+    expect(after).toMatchObject({ id: l!.id, state: 'WEAKENING', confounded: true });
     expect(await x.learnings()).toHaveLength(1);
   });
 });
@@ -126,5 +127,25 @@ describe('CSV imports stay per platform (§48 "never average into one universal 
       { scope_platform: 'meta', measurement_context: 'MERCHANT_IMPORTED_META', do_not_generalize_to: ['tiktok', 'other_skus'], leader_variant_id: x.variants[1]!.id },
       { scope_platform: 'tiktok', measurement_context: 'MERCHANT_IMPORTED_TIKTOK', do_not_generalize_to: ['meta', 'other_skus'], leader_variant_id: x.variants[2]!.id },
     ]);
+  });
+});
+
+describe('organic and affiliate delivery (§48 no paid-spend context)', () => {
+  it('a CSV of organic posts gets its own context and never picks a paid winner or creates a learning', async () => {
+    const x = await runningExperiment();
+    const head = 'Day,Ad name,Ad ID,Impressions,Link clicks,Amount spent (USD),Purchases,3-second video plays,Video plays at 75%';
+    const lines = [head];
+    for (let d = 1; d <= 6; d++) x.variants.forEach((v, i) => lines.push(`${day(d + 1)},Serum ${v.code},post-${i},4000,48,0,1,2400,${Math.round(2400 * [0.1, 0.32, 0.1][i]!)}`));
+    const rows = parsePerformanceCsv(lines.join('\n'), 'meta', { source: 'organic' });
+    expect(new Set(rows.map((r) => r.measurementContext))).toEqual(new Set(['META_ORGANIC']));
+    expect(parsePerformanceCsv(lines.join('\n'), 'meta', { source: 'affiliate' })[0]!.measurementContext).toBe('META_AFFILIATE');
+    await withTenant(x.t.workspaceId, (tx) => ingestObservations(tx, x.ctx, null, rows));
+    const r = await x.compute();
+    // Stored and shown as its own panel …
+    const ctxs = await ownerPool()`select distinct measurement_context from experiment_results where experiment_id = ${x.experimentId}`;
+    expect(ctxs.map((c) => c.measurement_context)).toEqual(['META_ORGANIC']);
+    // … but it does not move the paid test or teach a paid learning.
+    expect(r.state).toBe('GATHERING_SIGNAL');
+    expect(await x.learnings()).toHaveLength(0);
   });
 });

@@ -1,6 +1,22 @@
-import { defineConfig } from 'vitest/config';
+import { defineConfig, type Plugin } from 'vitest/config';
+
+/**
+ * The Next apps import their own modules as `@/…` (tsconfig paths, one per app). Resolve it against the app that
+ * holds the importing file, so route handlers can be exercised in tests (tests/…/roles and apps/*).
+ */
+const appAlias: Plugin = {
+  name: 'arkiv-app-alias',
+  enforce: 'pre',
+  async resolveId(id, importer) {
+    if (!id.startsWith('@/') || !importer) return null;
+    const app = /^(.*\/apps\/[^/]+)\//.exec(importer)?.[1];
+    if (!app) return null;
+    return (await this.resolve(`${app}/${id.slice(2)}`, importer, { skipSelf: true }))?.id ?? null;
+  },
+};
 
 export default defineConfig({
+  plugins: [appAlias],
   test: {
     include: ['packages/**/*.test.ts', 'apps/**/*.test.ts', 'tests/unit/**/*.test.ts', 'tests/chaos/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/.next/**'],

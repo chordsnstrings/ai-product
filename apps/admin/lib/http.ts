@@ -1,17 +1,18 @@
 import { NextResponse } from 'next/server';
 import type { z } from 'zod';
 import { DomainError, env, httpStatusFor } from '@arkiv/shared';
-import { logger, setLogService } from '@arkiv/shared/log';
+import { setLogService } from '@arkiv/shared/log';
+import { reportError, setTraceService } from '@arkiv/shared/trace';
 
 setLogService('admin');
-const log = logger('api');
+setTraceService('admin');
 
 export const json = (data: unknown, status = 200) => NextResponse.json(data, { status });
 
 export function errorResponse(e: unknown) {
   if (e instanceof DomainError) return json({ error: e.message, code: e.code, details: e.details ?? null }, httpStatusFor(e));
   const id = crypto.randomUUID();
-  log.error('request failed', { ref: id, err: e });
+  reportError(e, { msg: 'request failed', ref: id });
   return json({ error: `Unexpected error (ref ${id.slice(0, 8)})`, code: 'INTERNAL', ref: id }, 500);
 }
 

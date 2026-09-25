@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { globalTx, withSystem, withTenant, type Tx } from '@arkiv/db';
-import { csvContext, DomainError, env, FREE_EXPLORATION, newId, type CsvPlatform } from '@arkiv/shared';
+import { csvContext, DomainError, env, FREE_EXPLORATION, newId, type CsvPlatform, type CsvSource } from '@arkiv/shared';
 import { logger } from '@arkiv/shared/log';
 import {
   ConnectorError,
@@ -316,12 +316,17 @@ export async function ingestObservations(tx: Tx, ctx: TenantContext, integration
         ${placement}, ${tz}, ${rate}, ${reporting}, ${rate == null ? null : Math.round(o.spendMicros * rate)}, ${rate == null ? null : Math.round(o.purchaseValueMicros * rate)},
         ${o.adapterVersion ?? null})`;
     inserted++;
-    const [linked] = await tx`select variant_id from performance_observations where platform = ${o.platform} and ad_id = ${o.adId} and variant_id is not null limit 1`;
+    // The variant the ad was attributed to on or before this day (an ad edited on the platform moves to a new
+    // variant from the edit on, §48), else the earliest one it was ever linked to.
+    const [linked] = await tx`select variant_id, creative_id from performance_observations where platform = ${o.platform} and ad_id = ${o.adId} and variant_id is not null
+                              order by (date <= ${o.date}) desc, case when date <= ${o.date} then date end desc nulls last, date limit 1`;
     if (linked?.variant_id) {
-      await tx`update performance_observations set variant_id = ${linked.variant_id} where platform = ${o.platform} and ad_id = ${o.adId} and variant_id is null`;
+      await tx`update performance_observations set variant_id = ${linked.variant_id}, creative_id = coalesce(creative_id, ${(linked.creative_id as string | null) ?? null})
+               where platform = ${o.platform} and ad_id = ${o.adId} and date = ${o.date} and variant_id is null`;
     } else {
       await autoLinkByCode(tx, o.platform, o.adId, o.adName);
     }
+    await detectDeliveryChange(tx, ctx, o);
   }
   if (inserted) {
     await emit(tx, ctx, 'PERFORMANCE_INGESTED', integrationId ? { type: 'integration', id: integrationId } : null, { inserted, revised });
@@ -330,6 +335,37 @@ export async function ingestObservations(tx: Tx, ctx: TenantContext, integration
     for (const e of exps) await enqueue(tx, ctx.workspaceId, Queues.computeResults, { experimentId: e.experiment_id, reason: 'new_data' }, { singletonKey: `results:${e.experiment_id}` });
   }
   return { inserted, revised };
+}
+
+/**
+ * §48 "Audience, bid strategy or optimization event changes mid-test: record the change as context/confounder; do
+ * not attribute the resulting performance shift solely to creative." When a test ad's optimization event or campaign
+ * type differs from its previous day's delivery, an automatic bid_change confounder covers the changeover day on
+ * the test's SKU (which marks and recomputes its running tests). One per ad and day.
+ */
+async function detectDeliveryChange(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, o: NormalizedObservation) {
+  if (!o.optimizationEvent && !o.campaignType) return;
+  const [prev] = await tx`
+    select o.optimization_event, o.campaign_type, e.sku_id from performance_observations o
+    join variants v on v.id = o.variant_id join experiments e on e.id = v.experiment_id
+    where o.platform = ${o.platform} and o.ad_id = ${o.adId} and o.measurement_context = ${o.measurementContext} and o.superseded_at is null
+      and o.date < ${o.date} and o.variant_id is not null
+    order by o.date desc limit 1`;
+  if (!prev) return;
+  const changed: string[] = [];
+  if (o.optimizationEvent && prev.optimization_event && prev.optimization_event !== o.optimizationEvent) changed.push(`optimization event ${prev.optimization_event as string} → ${o.optimizationEvent}`);
+  if (o.campaignType && prev.campaign_type && prev.campaign_type !== o.campaignType) changed.push(`campaign objective ${prev.campaign_type as string} → ${o.campaignType}`);
+  if (!changed.length) return;
+  const [seen] = await tx`select 1 from confounders where source = 'automatic' and kind = 'bid_change' and detail->>'adId' = ${o.adId} and detail->>'date' = ${o.date} limit 1`;
+  if (seen) return;
+  await recordAutomaticConfounder(tx, ctx, {
+    skuId: prev.sku_id as string,
+    kind: 'bid_change',
+    startsAt: o.date,
+    endsAt: 'P1D',
+    note: `Delivery changed on ad ${o.adId}: ${changed.join('; ')}`,
+    detail: { adId: o.adId, platform: o.platform, date: o.date, changed },
+  });
 }
 
 /** Consecutive transient failures (outages, dropped connections) before a connection is shown as degraded. */
@@ -511,7 +547,10 @@ export async function syncIntegration(ctx: TenantContext, integrationId: string,
     } else if (provider === 'shopify') {
       await syncShopifyProducts(ctx, integrationId, accountId, token);
     }
-    if (provider === 'meta' || provider === 'tiktok') await markPlatformDeletedCreatives(ctx, integrationId, provider, token, accountId);
+    if (provider === 'meta' || provider === 'tiktok') {
+      await markPlatformDeletedCreatives(ctx, integrationId, provider, token, accountId);
+      await detectPlatformEdits(ctx, integrationId, provider, token, accountId);
+    }
     await withTenant(ctx.workspaceId, async (tx) => {
       const [prev] = await tx`select status, stale_notified_at from integrations where id = ${integrationId} for update`;
       // The last day whose data is complete is yesterday in the account's timezone (today is still arriving).
@@ -567,6 +606,91 @@ async function markPlatformDeletedCreatives(ctx: TenantContext, integrationId: s
       else if (!deleted && c.source_deleted_at) await tx`update creatives set source_deleted_at = null where id = ${c.id}`;
     }
   });
+}
+
+/**
+ * §48 "Merchant edits a live creative outside the platform: detect a new creative/hash/version on next sync where
+ * possible; fork lineage and treat it as a new variant rather than mutating the experiment retrospectively." For each
+ * ad linked to a test variant, the creative the platform serves is remembered on the variant's creative; when a later
+ * sync sees a different one, the edit becomes its own creative (child of the original) and its own variant in the
+ * same experiment, and the ad's observations from the edit on are attributed to it. Best effort, like the status check.
+ */
+async function detectPlatformEdits(ctx: TenantContext, integrationId: string, provider: 'meta' | 'tiktok', token: string, accountId: string) {
+  const ads = await withTenant(ctx.workspaceId, (tx) => tx`select distinct ad_id from performance_observations
+                                                            where integration_id = ${integrationId} and platform = ${provider} and variant_id is not null limit 500`);
+  if (!ads.length) return;
+  let statuses: Map<string, { creativeRef?: string | null }>;
+  try {
+    statuses = provider === 'meta' ? await metaFetchAdStatuses(token, ads.map((a) => a.ad_id as string)) : await tiktokFetchAdStatuses(token, accountId, ads.map((a) => a.ad_id as string));
+  } catch (e) {
+    if (e instanceof ConnectorError && e.kind !== 'auth_revoked') {
+      log.warn('ad creative lookup failed', { integrationId, provider, kind: e.kind });
+      return;
+    }
+    throw e;
+  }
+  const refs = new Map([...statuses].filter(([, s]) => !!s.creativeRef).map(([id, s]) => [id, s.creativeRef!]));
+  if (refs.size) await withTenant(ctx.workspaceId, (tx) => recordAdCreativeRefs(tx, ctx, provider, refs));
+}
+
+const refHash = (ref: string) => createHash('sha256').update(ref).digest('hex').slice(0, 32);
+
+/**
+ * Remember (first sighting) or compare the platform creative each linked ad serves; a changed one forks a new
+ * creative + variant (see detectPlatformEdits). `since` is the first day attributed to the edit (default: today).
+ * Returns the variants created.
+ */
+export async function recordAdCreativeRefs(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, provider: 'meta' | 'tiktok', refs: Map<string, string>, since?: string): Promise<string[]> {
+  const created: string[] = [];
+  for (const [adId, ref] of refs) {
+    const key = `${provider}:${adId}`;
+    // The variant the ad is attributed to now (its most recent observation), and that variant's creative.
+    const [cur] = await tx`
+      select v.id as variant_id, v.experiment_id, v.label, v.code, v.genes, v.creative_id, c.sku_id, c.origin, c.genome, c.genome_version, c.ai_generated, c.synthetic_people,
+             c.platform_refs->'creative_refs'->>${key} as known
+      from performance_observations o join variants v on v.id = o.variant_id join creatives c on c.id = v.creative_id
+      where o.platform = ${provider} and o.ad_id = ${adId} and o.variant_id is not null and o.superseded_at is null
+      order by o.date desc limit 1`;
+    if (!cur) continue; // not a produced test variant (no creative to compare against)
+    if (!cur.known) {
+      await tx`update creatives set platform_refs = jsonb_set(platform_refs, '{creative_refs}', coalesce(platform_refs->'creative_refs', '{}'::jsonb) || ${tx.json({ [key]: ref } as never)}),
+                 content_hash = coalesce(content_hash, ${refHash(ref)}) where id = ${cur.creative_id}`;
+      continue;
+    }
+    if (cur.known === ref) continue;
+    // Edited on the platform: a new creative, child of the one the test made, with the new platform reference.
+    const [child] = await tx`
+      insert into creatives (workspace_id, sku_id, origin, parent_creative_id, genome, genome_version, final_asset_ids, platform_refs, content_hash, ai_generated, synthetic_people)
+      values (${ctx.workspaceId}, ${cur.sku_id}, ${cur.origin}, ${cur.creative_id}, ${tx.json((cur.genome ?? null) as never)}, ${cur.genome_version}, '{}',
+              ${tx.json({ [`${provider}_ad_ids`]: [adId], creative_refs: { [key]: ref }, editedOnPlatform: { from: cur.known, at: new Date().toISOString() } } as never)}, ${refHash(ref)},
+              ${!!cur.ai_generated}, ${!!cur.synthetic_people})
+      returning id`;
+    // Its own variant in the same experiment (never a retroactive change to the original's results).
+    const [n] = await tx`select count(*)::int as n from variants where experiment_id = ${cur.experiment_id}`;
+    let code = '';
+    for (let i = Number(n!.n); i < 26; i++) {
+      const c = `${(cur.code as string).slice(0, -1)}${String.fromCharCode(65 + i)}`;
+      const [taken] = await tx`select 1 from variants where code = ${c}`;
+      if (!taken) {
+        code = c;
+        break;
+      }
+    }
+    if (!code) continue;
+    const [v] = await tx`
+      insert into variants (workspace_id, experiment_id, label, code, role, creative_id, changed_variables, held_constant, genes)
+      values (${ctx.workspaceId}, ${cur.experiment_id}, ${`${cur.label as string} (edited on ${provider === 'meta' ? 'Meta' : 'TikTok'})`.slice(0, 200)}, ${code}, 'variant', ${child!.id},
+              ${['platform_edit']}, '{}', ${tx.json((cur.genes ?? {}) as never)})
+      returning id`;
+    const from = since ?? new Date().toISOString().slice(0, 10);
+    await tx`update performance_observations set variant_id = ${v!.id}, creative_id = ${child!.id}
+             where platform = ${provider} and ad_id = ${adId} and date >= ${from}`;
+    await emit(tx, ctx, 'CREATIVE_VERSIONED', { type: 'creative', id: child!.id as string }, { parentCreativeId: cur.creative_id as string, changedVariables: ['platform_edit'], variantId: v!.id as string, projectId: null },
+      { skuId: cur.sku_id as string, experimentId: cur.experiment_id as string, variantId: v!.id as string, projectId: null });
+    await enqueue(tx, ctx.workspaceId, Queues.computeResults, { experimentId: cur.experiment_id, reason: 'platform_edit' }, { singletonKey: `results:${cur.experiment_id as string}` });
+    created.push(v!.id as string);
+  }
+  return created;
 }
 
 /** Shopify is the canonical commerce source (§28): capture IDs and keep raw snapshots via facts provenance. */
@@ -829,7 +953,7 @@ export function csvAttributionWindow(v: string): string | null {
  * Currency column) or the uploader, never assumed (§47). Purchases are read only from a purchases column: Ads
  * Manager's "Results" counts whatever the campaign optimises for.
  */
-export function parsePerformanceCsv(csv: string, platform: CsvPlatform, opts: { timezone?: string | null; currency?: string | null } = {}): NormalizedObservation[] {
+export function parsePerformanceCsv(csv: string, platform: CsvPlatform, opts: { timezone?: string | null; currency?: string | null; source?: CsvSource } = {}): NormalizedObservation[] {
   const table = parseCsv(csv.trim());
   const head = (table.shift() ?? []).map((h) => h.trim().toLowerCase().replace(/\s+/g, ' '));
   const other: CsvPlatform = platform === 'meta' ? 'tiktok' : 'meta';
@@ -900,7 +1024,8 @@ export function parsePerformanceCsv(csv: string, platform: CsvPlatform, opts: { 
       attributionWindow: window ?? 'merchant_import',
       optimizationEvent: get(r, 'result type', 'optimization event') || null,
       campaignType: null,
-      measurementContext: csvContext(platform),
+      // Paid, organic or affiliate delivery each keep their own context (§48).
+      measurementContext: csvContext(platform, opts.source ?? 'paid'),
       // The day column is in the ad account's reporting timezone (§47); the uploader names it.
       sourceTimezone: get(r, 'timezone', 'time zone') || opts.timezone || null,
       adapterVersion: 'merchant-csv@2',

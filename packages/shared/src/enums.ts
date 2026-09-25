@@ -81,6 +81,12 @@ export const MeasurementContext = [
   // one result). Rows imported before the split carry the legacy 'MERCHANT_IMPORTED'.
   'MERCHANT_IMPORTED_META',
   'MERCHANT_IMPORTED_TIKTOK',
+  // Non-paid delivery the merchant imports (§48 "organic or affiliate creative has no paid-spend context"): kept in
+  // its own contexts, shown as separate evidence, never compared with paid CPA/ROAS or learned from as paid.
+  'META_ORGANIC',
+  'TIKTOK_ORGANIC',
+  'META_AFFILIATE',
+  'TIKTOK_AFFILIATE',
 ] as const; // §30
 export type MeasurementContext = (typeof MeasurementContext)[number];
 
@@ -92,12 +98,27 @@ export const MeasurementContextLabel: Record<MeasurementContext, string> = {
   SHOPIFY_BLENDED_ORDER: 'Shopify · blended orders',
   MERCHANT_IMPORTED_META: 'Meta · imported by you (CSV)',
   MERCHANT_IMPORTED_TIKTOK: 'TikTok · imported by you (CSV)',
+  META_ORGANIC: 'Meta · organic (imported)',
+  TIKTOK_ORGANIC: 'TikTok · organic (imported)',
+  META_AFFILIATE: 'Meta · affiliate / creator (imported)',
+  TIKTOK_AFFILIATE: 'TikTok · affiliate / creator (imported)',
 };
+
+/** What a merchant's CSV reports: paid ads, organic posts, or affiliate/creator posts (§48). */
+export const CSV_SOURCES = ['paid', 'organic', 'affiliate'] as const;
+export type CsvSource = (typeof CSV_SOURCES)[number];
+
+/** Contexts with no paid-spend attribution: separate evidence, never a paid comparison or a paid learning (§48). */
+export const NON_PAID_CONTEXTS: ReadonlySet<string> = new Set(['META_ORGANIC', 'TIKTOK_ORGANIC', 'META_AFFILIATE', 'TIKTOK_AFFILIATE']);
+export const isPaidContext = (context: string) => !NON_PAID_CONTEXTS.has(context);
 
 /** Ad platforms a merchant can import a CSV export from. */
 export const CSV_PLATFORMS = ['meta', 'tiktok'] as const;
 export type CsvPlatform = (typeof CSV_PLATFORMS)[number];
-export const csvContext = (platform: CsvPlatform): MeasurementContext => (platform === 'tiktok' ? 'MERCHANT_IMPORTED_TIKTOK' : 'MERCHANT_IMPORTED_META');
+export const csvContext = (platform: CsvPlatform, source: CsvSource = 'paid'): MeasurementContext =>
+  source === 'organic' ? (platform === 'tiktok' ? 'TIKTOK_ORGANIC' : 'META_ORGANIC')
+  : source === 'affiliate' ? (platform === 'tiktok' ? 'TIKTOK_AFFILIATE' : 'META_AFFILIATE')
+  : platform === 'tiktok' ? 'MERCHANT_IMPORTED_TIKTOK' : 'MERCHANT_IMPORTED_META';
 
 /** The platform a context's numbers come from; 'blended' spans platforms (Shopify orders, legacy CSV imports). */
 export function measurementContextPlatform(context: string): 'meta' | 'tiktok' | 'blended' {
@@ -110,6 +131,10 @@ export function measurementContextPlatform(context: string): 'meta' | 'tiktok' |
 export const MeasurementContextCaveat: Partial<Record<MeasurementContext, string>> = {
   TIKTOK_GMV_MAX_TOTAL: 'GMV Max totals include organic and affiliate sales, so they are not comparable to paid-only ROAS.',
   SHOPIFY_BLENDED_ORDER: 'Blended store orders include every channel; they are not attributed to a single ad.',
+  META_ORGANIC: 'Organic reach and views are useful evidence, but not comparable to paid-ad CPA or ROAS, and not used to pick a paid winner.',
+  TIKTOK_ORGANIC: 'Organic reach and views are useful evidence, but not comparable to paid-ad CPA or ROAS, and not used to pick a paid winner.',
+  META_AFFILIATE: 'Affiliate and creator sales have no paid spend behind them: useful evidence, not comparable to paid-ad CPA or ROAS.',
+  TIKTOK_AFFILIATE: 'Affiliate and creator sales (GMV) have no paid spend behind them: useful evidence, not comparable to paid-ad CPA or ROAS.',
 };
 
 export function measurementContextLabel(context: string): string {

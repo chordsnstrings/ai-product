@@ -125,6 +125,31 @@ describe('QA repair reserve and technique switch (§5, §6, §25, §44: arch-22,
   }, 300_000);
 });
 
+describe('provider deliverable contract (§48 wrong duration/resolution/format: edge-48-19)', () => {
+  it('a clip shorter than requested fails before QA, is retried from the reserve, then replaced by the exact product', async () => {
+    const r = await storyboardReady();
+    const [first] = await ownerPool()`select id from scenes where storyboard_id = ${r.storyboardId} and purpose <> 'cta' order by position limit 1`;
+    await ownerPool()`update scenes set production_mode = case when id = ${first!.id} then 'GENERATIVE_INTERACTION' else 'HYBRID' end,
+                      visual_plan = case when id = ${first!.id} then visual_plan || ' [[mock:short_clip]]' else visual_plan end
+                      where storyboard_id = ${r.storyboardId} and purpose <> 'cta'`;
+    await approve(r);
+    expect(await produceProject(r.ctx, r.projectId)).toBe('complete');
+    const renders = await ownerPool()`select status, qa from scene_versions where scene_id = ${first!.id} and kind = 'render' order by version`;
+    expect(renders.map((v) => v.status)).toEqual(['qa_failed', 'qa_failed']);
+    for (const v of renders) {
+      const qa = v.qa as { check: string; pass: boolean; hard: boolean; detail: string }[];
+      // Only the contract was judged: no fidelity inspection is paid for on a wrong deliverable.
+      expect(qa).toHaveLength(1);
+      expect(qa[0]).toMatchObject({ check: 'platform', pass: false, hard: true });
+      expect(qa[0]!.detail).toMatch(/instead of 5s/);
+    }
+    // The one fidelity inspection of this scene is the exact-product fallback's.
+    expect(await ownerPool()`select 1 from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'qa.fidelity' and subject_id = ${first!.id}`).toHaveLength(1);
+    const m = await manifestOf(r.projectId);
+    expect(m.scenes[0]!.technique).toBe('exact_product_composite');
+  }, 300_000);
+});
+
 describe('renders kill switch (§44 "preserve reservation": prod-10)', () => {
   it('reserves the place, pauses without dispatching, and resumes once the switch is off', async () => {
     const r = await storyboardReady();
@@ -360,8 +385,9 @@ describe('paid output is kept before QA (standard §39: arch-17)', () => {
   afterEach(() => setProviders(undefined));
 
   it('a render whose QA errored is stored, and a retry judges it instead of paying for another', async () => {
-    setProviders({ llm: new QaErrorsOnce(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
     const r = await storyboardReady();
+    // Installed after the storyboard: its frame inspections are not the production QA under test.
+    setProviders({ llm: new QaErrorsOnce(), image: new MockImage(), video: new MockVideo(), tts: new MockTts('minimax'), ttsFallback: new MockTts('byteplus-speech'), wireModel: (m) => m });
     await approve(r);
     await expect(produceProject(r.ctx, r.projectId)).rejects.toThrow(/malformed inspection/);
     expect((await ownerPool()`select state from projects where id = ${r.projectId}`)[0]!.state).toBe('PROVIDER_FAILED');

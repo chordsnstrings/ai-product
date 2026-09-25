@@ -7,6 +7,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "migrate": "tsx src/cli.ts migrate",
+    "migrate:dry": "tsx src/cli.ts migrate --dry-run",
     "reset": "tsx src/cli.ts reset",
     "seed": "tsx src/cli.ts seed"
   },

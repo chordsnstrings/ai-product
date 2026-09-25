@@ -128,6 +128,9 @@ export function learningMatch(l: LearningSignal, p: Proposal): number {
 
 const STATE_WEIGHT: Record<string, number> = { ACTIONABLE: 1, DIRECTIONAL: 0.5, WEAKENING: 0.25 };
 
+/** The proposal re-tests what a WEAKENING learning found (its winning value), i.e. it would revalidate it (§21). */
+export const revalidates = (p: Proposal, s: Pick<ScoringContext, 'learnings'>) => s.learnings.some((l) => l.state === 'WEAKENING' && learningMatch(l, p) > 0);
+
 /**
  * Adjacent historical signal (§20 "evidence from related genes after shrinkage, not raw winner cloning"): around a
  * neutral 0.4, Σ state weight × confidence × shrunk effect × signed gene similarity, clamped to [0, 1].
@@ -200,7 +203,9 @@ export function scoreProposal(p: Proposal, s: ScoringContext): Scored {
     adjacentSignal: adjacentSignal(s.learnings, p),
     coverageGap: coverageGap(p, s),
     fatigueNeed: s.fatiguingAngles.has(p.angle) ? 0.9 : s.fatiguingAngles.size ? 0.5 : 0.2,
-    learnability: p.primaryVariable === 'hook' ? 1 : p.riskProfile === 'exploratory' ? 0.45 : 0.75,
+    // §21 WEAKENING "schedule validation": a proposal that re-tests a weakening learning's winning value is a
+    // revalidation, and as learnable as a hook test.
+    learnability: p.primaryVariable === 'hook' || revalidates(p, s) ? 1 : p.riskProfile === 'exploratory' ? 0.45 : 0.75,
     feasibility: Math.min(1, s.fidelityConfidence * (p.estimatedGenerationClass === 'generative_short' ? 0.85 : 1) + 0.1),
     platformFit: NATIVE_ANGLES.has(p.angle) ? 1 : 0.55,
     cogsEfficiency: COGS_SCORE[p.estimatedGenerationClass],
@@ -428,6 +433,10 @@ export async function refreshProposals(tx: Tx, skuId: string, scored: readonly S
     from experiments e join variants v on v.id = (e.fatigue->>'winnerVariantId')::uuid and v.workspace_id = e.workspace_id
     where e.sku_id = ${skuId} and (e.fatigue->>'fatigued')::boolean is true and e.state not in ('INVALIDATED','ARCHIVED')
       and v.creative_id is not null
+      -- §48: a winner whose files can no longer be used (rights expired or frozen, held, deleted) can't be the control.
+      and not exists (select 1 from creatives c join assets a on a.id = any(c.final_asset_ids) and a.workspace_id = c.workspace_id
+                      where c.id = v.creative_id and (a.rights_expires_at <= now() or a.rights_frozen_at is not null
+                            or a.review_status in ('pending','rejected') or a.deleted_at is not null))
       and not exists (select 1 from recommendations r where r.control_creative_id = v.creative_id and r.status in ('open','accepted')
                         and r.created_at > now() - interval '21 days')
     order by e.created_at desc limit 2`;

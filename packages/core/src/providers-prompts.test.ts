@@ -6,6 +6,7 @@ import { MockImage, MockLlm, MockTts, MockVideo, setProviders, type LlmJsonReque
 import { newId } from '@arkiv/shared';
 import { circuitTrips, evaluateCircuits, CIRCUIT_BREAKER } from './circuits';
 import { authorize } from './cost-governor';
+import { evalDatasetFor } from './evals';
 import { llmJson, routedLines, routedPrompt, versionDrift } from './model-gateway';
 import { findPrompt, latestPrompt, parsePromptRef, PROMPT_TEMPLATES, promptRef } from './prompts';
 import { clearSettingsCache } from './settings';
@@ -14,8 +15,8 @@ import { ctxFor } from './testing';
 /** Plan 05 §10–§11: automatic circuit breaker, version drift alerts, and the prompt registry the gateway routes by. */
 async function restore() {
   await ownerPool()`update model_routes set canary = null, circuit_open = false, circuit_until = null, circuit_auto = false, circuit_reason = null,
-                      circuit_changed_at = null, pinned_model_version = null`;
-  await ownerPool()`update model_routes set prompt_version = 'fidelity@1.1.0' where task = 'qa.fidelity'`;
+                      circuit_changed_at = null, pinned_model_version = null, drift_policy = 'alert'`;
+  await ownerPool()`update model_routes set prompt_version = 'fidelity@1.2.0' where task = 'qa.fidelity'`;
   await ownerPool()`delete from platform_settings where key like 'circuit.%'`;
   clearSettingsCache();
 }
@@ -146,6 +147,38 @@ describe('version drift (plan 05 §10, standard §48)', () => {
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toMatchObject({ subject_type: 'route', subject_id: 'qa.fidelity', details: { pinned: 'claude-pinned-1', returned: 'claude-pinned-2' } });
   });
+
+  it('a new drift queues the route’s golden-set run as the system, and a hold policy stops dispatch', async () => {
+    const llm = new RecordingLlm();
+    install(llm);
+    const t = await makeTenant();
+    await ownerPool()`update model_routes set pinned_model_version = 'vendor-pinned-1', drift_policy = 'hold' where task = 'extract.product_facts'`;
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
+    const extract = () => llmJson({ ctx, token, task: 'extract.product_facts', template: 'extract-product', content: [{ type: 'text', text: 'Serum' }], schema: z.object({ ok: z.boolean() }), mock: () => ({ ok: true }), maxTokens: 300 });
+    llm.version = 'vendor-pinned-2';
+    await extract();
+    const [run] = await ownerPool()`select task, dataset, status, created_by from eval_runs`;
+    expect(run).toMatchObject({ task: 'extract.product_facts', dataset: evalDatasetFor('extract.product_facts'), status: 'queued', created_by: null });
+    const [cmd] = await ownerPool()`select kind, requested_by, payload from ops_commands`;
+    expect(cmd).toMatchObject({ kind: 'eval.run', requested_by: null, payload: { trigger: 'version_drift', returned: 'vendor-pinned-2', task: 'extract.product_facts' } });
+    const [route] = await ownerPool()`select circuit_open, circuit_auto, circuit_reason from model_routes where task = 'extract.product_facts'`;
+    expect(route).toMatchObject({ circuit_open: true, circuit_auto: false, circuit_reason: expect.stringMatching(/version drift/) });
+    // Held: the next call on the route is refused before anything is dispatched.
+    await expect(extract()).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+    expect(await ownerPool()`select 1 from ops_commands`).toHaveLength(1);
+  });
+
+  it('with the default alert policy a drift does not hold the route', async () => {
+    const llm = new RecordingLlm();
+    install(llm);
+    const t = await makeTenant();
+    await ownerPool()`update model_routes set pinned_model_version = 'vendor-pinned-1' where task = 'qa.fidelity'`;
+    const { ctx, token } = await tokenFor(t.workspaceId, t.userId);
+    llm.version = 'vendor-pinned-2';
+    await inspect(ctx, token);
+    await inspect(ctx, token);
+    expect((await ownerPool()`select circuit_open from model_routes where task = 'qa.fidelity'`)[0]!.circuit_open).toBe(false);
+  });
 });
 
 describe('prompt registry (plan 05 §11)', () => {
@@ -168,7 +201,7 @@ describe('prompt registry (plan 05 §11)', () => {
     await inspect(ctx, token);
     await ownerPool()`update model_routes set prompt_version = 'fidelity@1.0.0' where task = 'qa.fidelity'`;
     const r = await inspect(ctx, token);
-    expect(llm.systems[0]).toBe(findPrompt('fidelity@1.1.0')!.text);
+    expect(llm.systems[0]).toBe(findPrompt('fidelity@1.2.0')!.text);
     expect(llm.systems[1]).toBe(findPrompt('fidelity@1.0.0')!.text);
     expect(r.promptVersion).toBe('fidelity@1.0.0');
   });

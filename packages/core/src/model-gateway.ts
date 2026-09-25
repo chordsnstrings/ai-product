@@ -21,6 +21,7 @@ import {
   type VideoPoll,
 } from '@arkiv/providers';
 import { logger } from '@arkiv/shared/log';
+import { withSpan } from '@arkiv/shared/trace';
 import type { z } from 'zod';
 import { raiseAlert } from './alerts';
 import { saveAsset } from './assets';
@@ -165,20 +166,25 @@ function withTimeout<T>(p: Promise<T>, ms: number, provider: string): Promise<T>
 }
 
 /** A provider request under the registry's policy: per-request timeout and bounded transient retries. */
-const request = <T>(started: { route: Route; policy: ProviderPolicy; billed?: BilledUnits[] }, fn: () => Promise<T>) =>
-  withTransientRetry(
-    async () => {
-      try {
-        return await withTimeout(fn(), started.policy.timeoutMs, started.route.provider);
-      } catch (e) {
-        // An attempt that failed after the provider billed it (partial provider billing) is booked on the job,
-        // whether or not a retry then succeeds.
-        noteBilled(started, e);
-        throw e;
-      }
-    },
-    started.policy.retryAttempts,
-    started.policy.retryBackoffMs,
+const request = <T>(started: { route: Route; policy: ProviderPolicy; billed?: BilledUnits[]; jobId?: string }, fn: () => Promise<T>): Promise<T> =>
+  // One client span per provider request (plan 06 Phase 0 D10): task, provider, model and provider job.
+  withSpan(`provider ${started.route.task}`, { 'arkiv.task': started.route.task, 'arkiv.provider': started.route.provider, 'arkiv.model': started.route.model, 'arkiv.provider_job_id': started.jobId },
+    () =>
+      withTransientRetry(
+        async () => {
+          try {
+            return await withTimeout(fn(), started.policy.timeoutMs, started.route.provider);
+          } catch (e) {
+            // An attempt that failed after the provider billed it (partial provider billing) is booked on the job,
+            // whether or not a retry then succeeds.
+            noteBilled(started, e);
+            throw e;
+          }
+        },
+        started.policy.retryAttempts,
+        started.policy.retryBackoffMs,
+      ),
+    { kind: 'client' },
   );
 
 /** Record what a failed attempt was billed for (see BilledUnits), once per error. */
@@ -359,18 +365,49 @@ export function versionDrift(pinned: string | null | undefined, returned: string
   return returned !== pinned && returned !== `${pinned}-mock`;
 }
 
-/** One open Pulse alert per route (a repeat is a no-op until staff resolve it); raised as the system. */
+/**
+ * One open Pulse alert per route (a repeat is a no-op until staff resolve it); raised as the system. A new drift
+ * also goes through the regression policy before the changed version is trusted (§48 "route changed versions
+ * through regression/canary policy"): the route's golden-set eval is queued for the model it now serves, and a
+ * route whose drift policy is 'hold' stops dispatching (its circuit opens, manually closed by staff) until then.
+ */
 async function raiseVersionDrift(r: Pick<Route, 'task' | 'provider' | 'pinnedVersion'>, returned: string, jobId: string) {
   gatewayLog.warn('provider version drift', { task: r.task, pinned: r.pinnedVersion, returned, providerJobId: jobId });
-  await withSystem((tx) =>
-    raiseAlert(tx, {
+  await withSystem(async (tx) => {
+    const alertId = await raiseAlert(tx, {
       kind: 'version_drift',
       severity: 'risk',
       subject: { type: 'route', id: r.task },
       message: `${r.provider} answered ${r.task} with ${returned}, not the pinned ${r.pinnedVersion}. Check output quality, then re-pin or roll back.`,
       details: { provider: r.provider, pinned: r.pinnedVersion, returned, providerJobId: jobId },
-    }),
-  );
+    });
+    if (alertId) await driftFollowUp(tx, r.task, returned);
+  });
+}
+
+/** The regression step for a newly drifted route: queue its golden-set eval, and hold dispatch when policy says so. */
+export async function driftFollowUp(tx: Tx, task: string, returned: string): Promise<{ evalRunId: string | null; held: boolean }> {
+  const [route] = await tx`select model, prompt_version, drift_policy from model_routes where task = ${task}`;
+  if (!route) return { evalRunId: null, held: false };
+  // Loaded lazily: the eval runner calls back into this gateway.
+  const { evalDatasetFor } = await import('./evals');
+  const dataset = evalDatasetFor(task);
+  let evalRunId: string | null = null;
+  if (dataset) {
+    const [run] = await tx`insert into eval_runs (task, prompt_version, model, dataset, status, created_by)
+                           values (${task}, ${route.prompt_version as string}, ${route.model as string}, ${dataset}, 'queued', null) returning id`;
+    evalRunId = run!.id as string;
+    await tx`insert into ops_commands (kind, payload, requested_by, reason)
+             values ('eval.run', ${tx.json({ dataset, evalRunId, task, model: route.model, promptVersion: route.prompt_version, trigger: 'version_drift', returned } as never)}, null,
+                     ${`automatic: provider answered with ${returned}`.slice(0, 300)})`;
+  }
+  const held = route.drift_policy === 'hold';
+  if (held) {
+    await tx`update model_routes set circuit_open = true, circuit_auto = false, circuit_until = null,
+               circuit_reason = ${`version drift: provider answered with ${returned}; held until staff re-pin and close`.slice(0, 300)}, circuit_changed_at = now(), updated_at = now()
+             where task = ${task}`;
+  }
+  return { evalRunId, held };
 }
 
 async function closeJob(
@@ -645,6 +682,18 @@ export interface VideoCall extends CallMeta {
   pollMs?: number;
   /** Called while waiting on the provider (at most once a minute) so the caller can keep its run lease alive. */
   heartbeat?: () => Promise<void>;
+  /**
+   * Called when the provider's reported state changes (queued → running) or its ETA moves by a minute or more, so
+   * the caller can show the truthful wait (§48 "very long provider queue: expose truthful queued state/ETA").
+   */
+  onQueue?: (q: ProviderQueueState) => Promise<void>;
+}
+
+/** What the provider says about a submitted task while it waits (§48). */
+export interface ProviderQueueState {
+  status: 'queued' | 'running';
+  position: number | null;
+  etaAt: Date | null;
 }
 
 /**
@@ -675,6 +724,7 @@ async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider =
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
     let res: VideoPoll;
     let beat = Date.now();
+    let shown: { status: string; etaMin: number | null } | null = null;
     for (;;) {
       if (call.heartbeat && Date.now() - beat > 60_000) {
         beat = Date.now();
@@ -689,6 +739,15 @@ async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider =
       res = await request(started, () => video.poll(requestId!));
       lastMeta = res.rawMeta ?? lastMeta;
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
+      // Record what the provider says about the wait — never resubmit because it is slow (§48).
+      const etaAt = res.etaSeconds != null ? new Date(Date.now() + res.etaSeconds * 1000) : null;
+      const etaMin = etaAt ? Math.ceil((etaAt.getTime() - Date.now()) / 60_000) : null;
+      if (!shown || shown.status !== res.status || shown.etaMin !== etaMin) {
+        shown = { status: res.status, etaMin };
+        const q: ProviderQueueState = { status: res.status, position: res.queuePosition ?? null, etaAt };
+        await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set poll_status = ${q.status}, provider_eta_at = ${etaAt}, queue_position = ${q.position} where id = ${started.jobId}`);
+        await call.onQueue?.(q).catch((e) => gatewayLog.warn('queue update failed', { jobId: started.jobId, error: (e as Error).message }));
+      }
       if (Date.now() > deadline) {
         await video.cancel(requestId).catch(() => {});
         throw new ProviderError(started.route.provider, 'video generation timed out', true, 'timeout');

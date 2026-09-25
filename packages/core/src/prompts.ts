@@ -126,6 +126,14 @@ count. In "labelTextRead" copy the label text you can read on the generated fram
 legible), so a reviewer can compare it with the reference label. Flag deformed hands or faces, unnatural skin
 changes, and anything implying a medical result.`;
 
+const FIDELITY_1_2 = `You are a strict product-accuracy inspector. Compare the generated frame with the reference product photos.
+Report whether it is the same product: label text, closure (dropper/pump/cap), package shape, colour, product
+count. The colour of the product itself (serum, cream, tint or shade) must match the reference colour given:
+set "colorMatches" false when the packaging or the product's own colour is materially different. In
+"labelTextRead" copy the label text you can read on the generated frame, verbatim (null if none is legible).
+Flag deformed hands or faces, unnatural skin changes, and anything implying a medical result. Set
+"apparentMinorPresent" true if any person in the frame could appear to be under 18.`;
+
 const IMPLIED_CLAIMS_1_0 = `You review a complete skincare ad (script, on-screen text and scene descriptions) for implied claims.
 Flag anything that implies treating a condition, changing skin structure, guaranteed results, or
 before/after outcomes, even if no single sentence says it outright.`;
@@ -317,6 +325,16 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     variables: { references: 'reference product photos', frame: 'the generated frame', fingerprint: 'reference label text and closure' },
     outputSchema: 'FidelityCheck',
     changelog: 'Returns the label text read on the frame, for the QA review label-OCR diff (plan 05 §13).',
+    author: AUTHOR,
+    date: '2026-09-24',
+  },
+  {
+    name: 'fidelity',
+    version: '1.2.0',
+    text: FIDELITY_1_2,
+    variables: { references: 'reference product photos', frame: 'the generated frame', fingerprint: 'reference label text, closure and colours (packaging and the product itself)' },
+    outputSchema: 'FidelityCheck',
+    changelog: 'Checks the product’s own colour against the reference and flags people who may appear under 18 (standard §48).',
     author: AUTHOR,
     date: '2026-09-24',
   },

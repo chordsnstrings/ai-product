@@ -49,6 +49,8 @@ export function mockExtraction(input: { name?: string; description?: string; tex
     texture: /lightweight|weightless/i.test(all) ? 'lightweight, fast-absorbing' : format === 'cream' ? 'rich cream' : null,
     keyIngredients,
     labelText: input.labelText !== undefined ? input.labelText : (input.name ?? null),
+    // Test hook: a page naming "[[liquid:amber]]" reads the product's own colour.
+    liquidColor: /\[\[liquid:([a-z ]{2,20})\]\]/.exec(all)?.[1] ?? null,
     packaging: { type: packaging, closure: packaging === 'dropper_bottle' ? 'dropper' : packaging === 'pump_bottle' ? 'pump' : 'cap', transparent: false, colors: ['white'] },
     claimsFound: claimSentences,
     missingEvidence: [!input.ingredients ? 'Full ingredient list (INCI)' : null, !input.sizeText ? 'Product size' : null].filter(Boolean) as string[],

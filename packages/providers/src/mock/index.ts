@@ -109,6 +109,8 @@ export class MockVideo implements VideoProvider {
   constructor(
     private readonly latencyMs = 50,
     readonly name = 'byteplus',
+    /** Simulated time a task waits in the provider's queue before it starts rendering (reported as 'queued'). */
+    private readonly queueMs = 0,
   ) {}
 
   async submit(req: VideoRequest): Promise<{ providerRequestId: string }> {
@@ -127,7 +129,9 @@ export class MockVideo implements VideoProvider {
     if (t.status === 'cancelled' || t.status === 'failed' || t.status === 'succeeded') {
       return { status: t.status, bytes: t.bytes, error: t.error, modelVersion: `${t.req.model}-mock`, outputSeconds: t.status === 'succeeded' || injected(t.req.prompt) === 'partial' ? t.req.seconds : undefined };
     }
-    if (Date.now() - t.createdAt < this.latencyMs) return { status: 'running' };
+    const waited = Date.now() - t.createdAt;
+    if (waited < this.queueMs) return { status: 'queued', queuePosition: 3, etaSeconds: Math.ceil((this.queueMs + this.latencyMs - waited) / 1000) };
+    if (waited < this.queueMs + this.latencyMs) return { status: 'running', etaSeconds: Math.ceil((this.queueMs + this.latencyMs - waited) / 1000) };
     const fail = injected(t.req.prompt);
     if (fail === 'render' || fail === 'moderation') {
       t.status = 'failed';
@@ -146,7 +150,9 @@ export class MockVideo implements VideoProvider {
       const { writeFile } = await import('node:fs/promises');
       await writeFile(png, await placeholderFrame(t.req.mockLabel ?? t.req.prompt.slice(0, 80), aspect, 2));
       const out = path.join(dir, 'v.mp4');
-      await stillToClip(png, t.req.seconds * 1000, aspect, out, 'push');
+      // Test hook: `[[mock:short_clip]]` returns a clip half as long as requested (§48 wrong-duration deliverable).
+      const ms = /\[\[mock:short_clip\]\]/.test(t.req.prompt) ? t.req.seconds * 500 : t.req.seconds * 1000;
+      await stillToClip(png, ms, aspect, out, 'push');
       return readFile(out);
     });
     t.status = 'succeeded';

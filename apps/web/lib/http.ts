@@ -3,10 +3,11 @@ import type { z } from 'zod';
 import { globalTx, type Tx } from '@arkiv/db';
 import { idempotent, isFlagOn, type ClientFingerprint } from '@arkiv/core';
 import { DomainError, env, httpStatusFor } from '@arkiv/shared';
-import { currentRequestId, logger, setLogService, withLogContext } from '@arkiv/shared/log';
+import { currentRequestId, setLogService, withLogContext } from '@arkiv/shared/log';
+import { reportError, setTraceService, withSpan } from '@arkiv/shared/trace';
 
 setLogService('web');
-const log = logger('api');
+setTraceService('web');
 
 /** A caller-supplied request id is kept only when it looks like one (it ends up in logs and responses). */
 export function requestIdFrom(req: Request): string {
@@ -36,7 +37,7 @@ export function errorResponse(e: unknown) {
   }
   // The ref the customer sees is the request id every log line of this request (and its jobs) carries (§34).
   const id = currentRequestId() ?? crypto.randomUUID();
-  log.error('request failed', { err: e });
+  reportError(e, { msg: 'request failed' });
   return json({ error: 'Something went wrong on our side. Please try again.', code: 'INTERNAL', ref: id }, 500);
 }
 
@@ -58,7 +59,8 @@ export function assertSameOrigin(req: Request) {
 export function route<C = { params: Promise<Record<string, string>> }>(fn: (req: Request, ctx: C) => Promise<Response>) {
   return async (req: Request, ctx: C) => {
     const requestId = requestIdFrom(req);
-    return withLogContext({ requestId, method: req.method, path: new URL(req.url).pathname }, async () => {
+    const path = new URL(req.url).pathname;
+    return withLogContext({ requestId, method: req.method, path }, () => withSpan(`${req.method} ${path}`, { 'http.request.method': req.method, 'url.path': path, 'arkiv.request_id': requestId }, async (span) => {
       let res: Response;
       try {
         assertSameOrigin(req);
@@ -74,8 +76,9 @@ export function route<C = { params: Promise<Record<string, string>> }>(fn: (req:
       } catch {
         /* immutable response (e.g. a redirect); the id is still in the logs */
       }
+      span.setAttribute('http.response.status_code', res.status);
       return res;
-    });
+    }, { kind: 'server' }));
   };
 }
 

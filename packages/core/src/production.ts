@@ -18,14 +18,15 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, currentPeriodKey, type LedgerUnit } from './ledger';
 import { setting } from './settings';
-import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type Route, type TaskUnits } from './model-gateway';
+import { generateImage, generateVideo, lineFor, partnerFor, route, synthesizeVoice, type ProviderQueueState, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
 import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
-import { qaClaims, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
+import { GENOME_VERSION_SQL } from './creatives';
+import { qaClaims, qaClipContract, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -497,6 +498,13 @@ const VIDEO_PRODUCT_VIEWS = 3;
  * The render prompt: the scene, then how to use the references — the first image is the scene's storyboard frame,
  * the others are the exact product, which must not change (label text, shape, closure, colours).
  */
+/** The scenes step's detail while a render waits on the provider (§48): its queue state and ETA, when known. */
+export function queueDetail(q: ProviderQueueState, scene: number, now = Date.now()): string {
+  const min = q.etaAt ? Math.max(1, Math.ceil((q.etaAt.getTime() - now) / 60_000)) : null;
+  if (q.status === 'queued') return `Waiting in the video queue${q.position != null ? ` (position ${q.position})` : ''}${min != null ? ` · ~${min} min` : ''}`;
+  return `Rendering scene ${scene}${min != null ? ` · ~${min} min` : ''}`;
+}
+
 export function videoPrompt(s: Record<string, unknown>, attempt: number, productRefs: number): string {
   const product = productRefs
     ? `The first reference image is the scene's storyboard frame; the other ${productRefs} reference images show the exact product. Keep the product identical to those product images: the same label text, shape, closure and colours.`
@@ -671,6 +679,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       labelText: (fp?.label_text as string) ?? null,
       closure: (fp?.closure as string) ?? null,
       dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
+      liquidColor: (fp?.liquid_color as string | null) ?? null,
       thresholds: fidelityThresholds(fp?.thresholds),
       cutout: imagery.cutout?.keyed ? imagery.cutout.bytes : null,
     };
@@ -806,6 +815,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                 ratio: '9:16',
                 mockLabel: `${s.purpose} · ${(s.visual_plan as string).slice(0, 60)}`,
                 heartbeat,
+                // §48 "very long provider queue": the progress shows the provider's truthful wait, not a stalled bar.
+                onQueue: (q) => withTenant(ws, (tx) => step(tx, ws, projectId, 'scenes', 'active', queueDetail(q, n))),
               });
               // Paid output goes to our own storage before anything else can fail (§39 "every output is copied to
               // owned object storage immediately"): a crash or a QA error never loses a render we paid for.
@@ -816,7 +827,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                 return a.id;
               });
             }
-            const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, videoBytes: vid.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt });
+            // §48: the deliverable contract (duration, resolution, format) is checked before QA accepts the clip. A
+            // wrong deliverable is a repairable failure — recorded on the scene version and counted as an attempt —
+            // and is not worth a fidelity inspection.
+            const contract = await qaClipContract(vid.bytes, { seconds, resolution: '720p', ratio: '9:16' });
+            const res = contract.pass ? await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, videoBytes: vid.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt }) : [contract];
             const ok = res.every((c) => c.pass);
             const saved = await withTenant(ws, async (tx) => {
               const a = { id: assetId };
@@ -832,7 +847,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
               });
               return { assetId: a.id, versionId: row!.id as string };
             });
-            checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n}: ${c.detail}` })));
+            // A wrong provider clip is repaired here (retry, then the exact product); in the final report it is a
+            // record of that repair, not a failure of the delivered export's platform contract.
+            checks.push(...res.map((c) => ({ ...c, ...(c === contract ? { hard: false } : {}), detail: `Scene ${n}: ${c.detail}` })));
             if (ok) {
               const file = path.join(dir, `scene-${n}.mp4`);
               await writeFile(file, vid.bytes);
@@ -1131,7 +1148,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
-            1, ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
+            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;

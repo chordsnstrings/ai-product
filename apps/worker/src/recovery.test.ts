@@ -34,6 +34,12 @@ function routeExists(pathname: string, dir = webApp): boolean {
 
 async function abandoned(opts: { hoursAgo?: number } = {}) {
   const t = await makeTenant({ state: 'ACTIVE_FREE' });
+  // Marketing email waits out the workspace's quiet hours (plan 05 §18): put the workspace where it is midday now,
+  // so these tests don't depend on the time of day they run at.
+  let d = 12 - new Date().getUTCHours();
+  if (d > 14) d -= 24;
+  if (d < -12) d += 24;
+  await ownerPool()`update workspaces set timezone = ${d === 0 ? 'UTC' : d > 0 ? `Etc/GMT-${d}` : `Etc/GMT+${-d}`} where id = ${t.workspaceId}`;
   const skuId = await makeSku(t.workspaceId);
   const projectId = newId();
   const updated = new Date(Date.now() - (opts.hoursAgo ?? 1) * 3600_000);

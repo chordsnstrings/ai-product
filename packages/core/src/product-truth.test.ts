@@ -216,3 +216,23 @@ describe('merchant confirmation (§13, §16 merchant_confirmed)', () => {
     expect((await events(skuId, 'PRODUCT_FACT_CHANGED')).filter((e) => (e.payload as { confirmed?: boolean }).confirmed)).toHaveLength(2);
   });
 });
+
+describe('source precedence (standard §51 "unit tests for ... source precedence")', () => {
+  it('a non-material key shows the highest-precedence source, whatever order the readings arrived in', async () => {
+    const { t, ctx, skuId } = await sku();
+    // texture is not material: disagreeing sources are kept without a dispute, and precedence decides what shows.
+    const order = [
+      { key: 'texture', valueText: 'gel', sourceType: 'vision' as const, sourceId: 'v', state: 'INFERRED' as const },
+      { key: 'texture', valueText: 'light lotion', sourceType: 'shopify' as const, sourceId: 's', state: 'OBSERVED' as const },
+      { key: 'texture', valueText: 'watery serum', sourceType: 'product_page' as const, sourceId: 'p', state: 'OBSERVED' as const },
+    ];
+    for (const f of order) await withTenant(t.workspaceId, (tx) => recordFacts(tx, ctx, skuId, [f]));
+    let facts = await withTenant(t.workspaceId, (tx) => currentFacts(tx, skuId));
+    expect(facts.texture!.value.valueText).toBe('light lotion'); // shopify (80) > product_page (50) > vision (30)
+    expect(await events(skuId, 'PRODUCT_CONFLICT_DETECTED')).toHaveLength(0);
+    // The merchant's own decision outranks every source.
+    await withTenant(t.workspaceId, (tx) => decideFact(tx, ctx, skuId, 'texture', { text: 'silky gel-cream' }));
+    facts = await withTenant(t.workspaceId, (tx) => currentFacts(tx, skuId));
+    expect(facts.texture!.value.valueText).toBe('silky gel-cream');
+  });
+});

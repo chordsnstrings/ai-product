@@ -121,6 +121,9 @@ export const EventType = [
   'ASSET_EXPORTED',
   // Standard §40: a customer deleted an uploaded file (bytes purged unless retained for evidence/delivery).
   'ASSET_DELETED',
+  // Standard §48: creator usage rights on a file ended (no new production; history kept), and the replacement upload.
+  'ASSET_RIGHTS_EXPIRED',
+  'ASSET_REPLACED',
   // Standard §7 "Ad account connected — Meta/TikTok connection rate".
   'AD_ACCOUNT_CONNECTED',
   'SUBSCRIPTION_STARTED',
@@ -346,6 +349,8 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   ASSET_WATCHED: 'asset',
   ASSET_EXPORTED: 'asset',
   ASSET_DELETED: 'asset',
+  ASSET_RIGHTS_EXPIRED: 'asset',
+  ASSET_REPLACED: 'asset',
   AD_ACCOUNT_CONNECTED: 'integration',
   SUBSCRIPTION_STARTED: 'subscription',
 };

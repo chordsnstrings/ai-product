@@ -139,13 +139,58 @@ export async function onMaterialProductChange(tx: Tx, ctx: Pick<TenantContext, '
   const what = kind === 'price_change' ? 'price changed' : 'promotion (compare-at price) changed';
   // The changeover itself is the confounded period: readings either side of it are not one comparable test.
   await recordAutomaticConfounder(tx, ctx, { skuId, kind, endsAt: 'P1D', note: `${what} in product facts`, detail: { key } });
+  await weakenLearnings(tx, ctx, skuId, what);
+}
+
+/** Confounder kinds that change the context a learning was learned in (§21 "context, offer or market changes"). */
+export const CONTEXT_CHANGE_KINDS: ReadonlySet<string> = new Set(['price_change', 'offer_change']);
+
+/**
+ * Weaken the directional and actionable learnings of a SKU (or, with `skuId` null, of the whole workspace) because
+ * the context they were learned in changed (§21 WEAKENING "reduce weight and schedule validation"): each moves to
+ * WEAKENING with a history entry and LEARNING_WEAKENED. Recommendations then propose revalidating them. Returns the
+ * learnings weakened. The workspace is named explicitly, so this is also safe from a system transaction.
+ */
+export async function weakenLearnings(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, skuId: string | null, reason: string, opts: { states?: readonly string[] } = {}): Promise<string[]> {
+  const states = [...(opts.states ?? ['DIRECTIONAL', 'ACTIONABLE'])];
   const now = new Date().toISOString();
-  const ls = await tx`select id, state from learnings where sku_id = ${skuId} and state in ('DIRECTIONAL','ACTIONABLE') for update`;
+  const ls = await tx`select id, state, sku_id from learnings where workspace_id = ${ctx.workspaceId} and (${skuId}::uuid is null or sku_id = ${skuId}::uuid)
+                      and state = any(${states}) for update`;
   for (const l of ls) {
-    await tx`update learnings set state = 'WEAKENING', last_revalidated_at = now(),
-               history = history || ${tx.json([{ at: now, from: l.state, to: 'WEAKENING', reason: what }] as never)} where id = ${l.id}`;
-    await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { from: l.state, to: 'WEAKENING', reason: what }, { skuId });
+    await tx`update learnings set state = 'WEAKENING',
+               history = history || ${tx.json([{ at: now, from: l.state, to: 'WEAKENING', reason }] as never)} where id = ${l.id} and workspace_id = ${ctx.workspaceId}`;
+    await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { from: l.state, to: 'WEAKENING', reason }, { skuId: l.sku_id as string });
   }
+  return ls.map((l) => l.id as string);
+}
+
+/** An ACTIONABLE learning not revalidated for this long is weakened and scheduled for validation (§21). */
+export const LEARNING_REVALIDATION_DAYS = 60;
+
+/**
+ * Weekly (system role): actionable learnings that no new evidence has revalidated within LEARNING_REVALIDATION_DAYS
+ * move to WEAKENING, so ranking stops leaning on them fully and a revalidation test is proposed. Every predicate names
+ * the row's own workspace (system_rw sees every tenant).
+ */
+export async function sweepStaleLearnings(tx: Tx): Promise<number> {
+  const stale = await tx`select l.workspace_id, l.sku_id from learnings l
+                         where l.state = 'ACTIONABLE' and coalesce(l.last_revalidated_at, l.created_at) < now() - make_interval(days => ${LEARNING_REVALIDATION_DAYS})
+                         group by l.workspace_id, l.sku_id limit 500`;
+  let n = 0;
+  for (const s of stale) {
+    const ctx = { workspaceId: s.workspace_id as string, actor: { kind: 'system' as const, id: 'learning-revalidation' } };
+    const ids = await tx`select id from learnings where workspace_id = ${ctx.workspaceId} and sku_id = ${s.sku_id as string} and state = 'ACTIONABLE'
+                         and coalesce(last_revalidated_at, created_at) < now() - make_interval(days => ${LEARNING_REVALIDATION_DAYS})`;
+    if (!ids.length) continue;
+    const now = new Date().toISOString();
+    for (const l of ids) {
+      await tx`update learnings set state = 'WEAKENING', history = history || ${tx.json([{ at: now, from: 'ACTIONABLE', to: 'WEAKENING', reason: `not revalidated in ${LEARNING_REVALIDATION_DAYS} days` }] as never)}
+               where id = ${l.id} and workspace_id = ${ctx.workspaceId}`;
+      await emit(tx, ctx, 'LEARNING_WEAKENED', { type: 'learning', id: l.id as string }, { from: 'ACTIONABLE', to: 'WEAKENING', reason: 'revalidation due' }, { skuId: s.sku_id as string });
+      n++;
+    }
+  }
+  return n;
 }
 
 /**

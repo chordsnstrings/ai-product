@@ -119,6 +119,7 @@ export default async function Providers() {
               <ActForm action="route.pin" submit="🔐 Pin version" fields={[
                 { name: 'task', label: 'Route', type: 'select', options: d0.routes.map((r) => r.task as string) },
                 { name: 'version', label: 'Provider version (empty = unpin)' },
+                { name: 'driftPolicy', label: 'If the provider answers with another version', type: 'select', options: [{ value: 'alert', label: 'Alert + run the golden set' }, { value: 'hold', label: 'Also hold the route until re-pinned' }] },
                 { name: 'reason', label: 'Reason', required: true },
               ]} />
             </div>

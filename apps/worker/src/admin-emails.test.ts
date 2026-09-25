@@ -90,3 +90,22 @@ describe('integration emails (plan 03 A10, plan 05 §16, plan 02 §3 layer 8)', 
     expect(devOutbox.filter((x) => x.template === 'shop_transfer_request')).toHaveLength(1);
   });
 });
+
+describe('§48 rights expiry and P9 production delay emails', () => {
+  it('rights_expired links to the product’s files; production_delayed goes only while still producing', async () => {
+    const t = await makeTenant({ state: 'ACTIVE_PAID' });
+    const skuId = await makeSku(t.workspaceId, 'Dew Serum');
+    const ctx = ctxFor(t.workspaceId, t.userId, 'OWNER', 'ACTIVE_PAID');
+    await sendQueuedEmail(ctx, { template: 'rights_expired', skuId, assetIds: ['a', 'b'], expiredOn: 'Sep 24, 2026' }, 'job-r');
+    const r = devOutbox.filter((x) => x.template === 'rights_expired');
+    expect(r).toHaveLength(1);
+    expect(r[0]!.data).toMatchObject({ productName: 'Dew Serum', files: 2, url: expect.stringMatching(new RegExp(`/w/${t.slug}/products/${skuId}\\?tab=assets$`)) });
+
+    const [p] = await ownerPool()`insert into projects (workspace_id, sku_id, kind, state, created_by, entitlement_unit) values (${t.workspaceId}, ${skuId}, 'taste', 'RENDERING', 'test', 'taste') returning id`;
+    await sendQueuedEmail(ctx, { template: 'production_delayed', projectId: p!.id, minutes: 24 }, 'job-d1');
+    expect(devOutbox.filter((x) => x.template === 'production_delayed').map((x) => x.data)).toEqual([expect.objectContaining({ productName: 'Dew Serum', minutes: 24 })]);
+    await ownerPool()`update projects set state = 'COMPLETE' where id = ${p!.id}`;
+    await sendQueuedEmail(ctx, { template: 'production_delayed', projectId: p!.id, minutes: 24 }, 'job-d2');
+    expect(devOutbox.filter((x) => x.template === 'production_delayed')).toHaveLength(1);
+  });
+});

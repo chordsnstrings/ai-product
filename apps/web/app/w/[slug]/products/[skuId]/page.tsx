@@ -37,8 +37,11 @@ export default async function Product({ params, searchParams }: { params: Promis
     const fps = await tx`select version, created_at from visual_fingerprints where sku_id = ${skuId} order by version desc`;
     const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
-    const assets = await tx`select id, kind, mime, created_at, source from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
-    const imported = await tx`select id, genome, platform_refs, created_at, source_deleted_at from creatives where sku_id = ${skuId} and origin = 'imported' order by created_at desc limit 20`;
+    const assets = await tx`select id, kind, mime, created_at, source, rights_expires_at <= now() as rights_expired, review_status from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
+    const imported = await tx`select c.id, c.genome, c.platform_refs, c.secondary_sku_ids, c.created_at, c.source_deleted_at,
+                                   exists (select 1 from assets a where a.id = any(c.final_asset_ids) and a.rights_expires_at <= now()) as rights_expired
+                            from creatives c where c.sku_id = ${skuId} and c.origin = 'imported' order by c.created_at desc limit 20`;
+    const otherSkus = await tx`select id, name from skus where id <> ${skuId} and status <> 'archived' order by catalogue_no limit 50`;
     return {
       sku,
       facts,
@@ -47,8 +50,9 @@ export default async function Product({ params, searchParams }: { params: Promis
       themes,
       signalCount: signals[0]!.n as number,
       cutout: fp?.cutout_asset_id ? await assetUrl(tx, fp.cutout_asset_id as string) : null,
-      assets: await Promise.all(assets.map(async (a) => ({ id: a.id as string, kind: a.kind as string, mime: a.mime as string, created_at: a.created_at as string, url: String(a.mime).startsWith('image/') ? await assetUrl(tx, a.id as string) : null }))),
+      assets: await Promise.all(assets.map(async (a) => ({ id: a.id as string, kind: a.kind as string, mime: a.mime as string, created_at: a.created_at as string, rightsExpired: !!a.rights_expired, reviewStatus: (a.review_status as string | null) ?? null, url: String(a.mime).startsWith('image/') ? await assetUrl(tx, a.id as string) : null }))),
       imported,
+      otherSkus: otherSkus.map((s) => ({ value: s.id as string, label: s.name as string })),
     };
   });
   if (!d) return denyPage('sku', skuId, w);
@@ -205,7 +209,15 @@ export default async function Product({ params, searchParams }: { params: Promis
           {d.assets.map((a) => (
             <figure key={a.id as string} className="ak-frame" style={{ margin: 0 }}>
               <div className="ak-well" style={{ aspectRatio: '1' }}>{a.url ? <img src={a.url} alt={String(a.kind)} style={{ objectFit: 'contain', width: '100%', height: '100%' }} /> : <span className="ak-index">{String(a.mime)}</span>}</div>
-              <figcaption className="ak-index">{String(a.kind).replace(/_/g, ' ')} · {formatDate(a.created_at as string)}</figcaption>
+              <figcaption className="ak-index">
+                {String(a.kind).replace(/_/g, ' ')} · {formatDate(a.created_at as string)}
+                {/* §48: expired creator rights — kept for history and results, not used for new ads. */}
+                {a.rightsExpired ? <strong> · Rights expired: not used in new ads</strong> : null}
+                {a.reviewStatus === 'pending' ? ' · Waiting for compliance review' : a.reviewStatus === 'rejected' ? ' · Not approved for use' : null}
+              </figcaption>
+              {canEdit && a.rightsExpired ? (
+                <ActionForm slug={slug} action="asset-replace" multipart extra={{ assetId: a.id }} submit="Replace footage" fields={[{ name: 'file', label: 'Replacement file', type: 'file', accept: a.kind.includes('footage') || a.kind === 'historical_creative' ? 'video/mp4,video/quicktime' : 'image/*', required: true }]} />
+              ) : null}
               {canEdit && DELETABLE_KINDS.has(a.kind) ? (
                 <ActionButton slug={slug} action="asset-delete" variant="text" danger body={{ assetId: a.id }} confirm="Delete this file? It disappears from Arkiv. Evidence behind an approved claim and delivered ads are kept for our records.">Delete</ActionButton>
               ) : null}
@@ -219,7 +231,7 @@ export default async function Product({ params, searchParams }: { params: Promis
           <div>
             {d.imported.length === 0 ? <p className="ak-muted">Import past ads so recommendations start from what you’ve already tried.</p> : d.imported.map((c) => {
               const g = (c.genome ?? {}) as { angle?: string; hookMechanism?: string; treatment?: string };
-              return <div key={c.id as string} className="ak-index-row"><span>{String((c.platform_refs as { copy?: string }).copy ?? '').slice(0, 90)}</span><span className="ak-index">{g.angle ? `${g.angle} · ${g.hookMechanism}` : 'analysing…'}{c.source_deleted_at ? ' · Deleted on platform' : ''}</span></div>;
+              return <div key={c.id as string} className="ak-index-row"><span>{String((c.platform_refs as { copy?: string }).copy ?? '').slice(0, 90)}</span><span className="ak-index">{g.angle ? `${g.angle} · ${g.hookMechanism}` : 'analysing…'}{c.source_deleted_at ? ' · Deleted on platform' : ''}{(c.secondary_sku_ids as string[] | null)?.length ? ` · also shows ${(c.secondary_sku_ids as string[]).length} other product${(c.secondary_sku_ids as string[]).length === 1 ? '' : 's'}` : ''}{(c.platform_refs as { minorsDeclared?: boolean }).minorsDeclared ? ' · under-18 review' : ''}{c.rights_expired ? ' · Rights expired: results kept, not reused' : ''}</span></div>;
             })}
           </div>
           {canEdit ? (
@@ -230,6 +242,8 @@ export default async function Product({ params, searchParams }: { params: Promis
                 { name: 'file', label: 'Video (optional)', type: 'file', accept: 'video/mp4,video/quicktime' },
                 { name: 'platform', label: 'Platform', type: 'select', options: [{ value: '', label: '—' }, { value: 'meta', label: 'Meta' }, { value: 'tiktok', label: 'TikTok' }] },
                 { name: 'adId', label: 'Ad ID (optional)' },
+                ...(d.otherSkus.length ? [{ name: 'secondarySkuIds', label: 'Other products shown in this ad', type: 'checkboxes' as const, options: d.otherSkus, checked: [], hint: 'Results and learnings stay with this product.' }] : []),
+                { name: 'minors', label: 'People in this ad', type: 'checkboxes', options: [{ value: 'yes', label: 'Someone under 18 appears' }], checked: [], hint: 'We check rights and platform policy before this footage can be used.' },
               ]} />
             </div>
           ) : null}

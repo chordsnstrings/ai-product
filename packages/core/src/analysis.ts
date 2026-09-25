@@ -412,9 +412,9 @@ export async function analyzeProduct(ctx: TenantContext, skuId: string, projectI
       const [v] = await tx`select coalesce(max(version), 0) + 1 as v from visual_fingerprints where sku_id = ${skuId}`;
       await tx`update visual_fingerprints set active = false where sku_id = ${skuId}`;
       await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text, brand_text,
-                 package_type, closure, dominant_colors, transparency, thresholds)
+                 package_type, closure, dominant_colors, liquid_color, transparency, thresholds)
                values (${ws}, ${skuId}, ${v!.v}, ${[...usable, ...(await usableAssetIds(tx, photoIds.slice(3)))]}, ${c.id}, ${x.labelText}, ${x.brand}, ${x.packaging.type}, ${x.packaging.closure},
-                 ${tx.json(colors)}, ${x.packaging.transparent ? 'transparent' : 'opaque'},
+                 ${tx.json(colors)}, ${x.liquidColor?.trim() || null}, ${x.packaging.transparent ? 'transparent' : 'opaque'},
                  ${tx.json({ ...DEFAULT_FIDELITY_THRESHOLDS, labelMustMatch: !!x.labelText } as never)})`;
       await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: cut.keyed, technique: cut.technique });
       await step(tx, ws, skuId, 'fingerprint', 'done', `${x.packaging.type.replace('_', ' ')}${x.packaging.closure ? ` · ${x.packaging.closure}` : ''}`);

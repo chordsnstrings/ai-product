@@ -1,10 +1,19 @@
 import { env } from '@arkiv/shared';
-import { migrate, resetDatabase, setDevRolePasswords, setRolePasswords } from './migrate';
+import { dryRunMigrations, migrate, resetDatabase, setDevRolePasswords, setRolePasswords } from './migrate';
 
 const cmd = process.argv[2];
 const url = env().DATABASE_URL;
 
 async function main() {
+  if (cmd === 'migrate' && process.argv.includes('--dry-run')) {
+    // Plan 06 Phase 0 D2: apply every pending migration in one transaction, report timings and lock-heavy DDL,
+    // roll back. Exits non-zero when a migration fails.
+    const r = await dryRunMigrations(url, console.log);
+    const heavy = r.files.reduce((n, f) => n + f.lockHeavy.length, 0);
+    console.log(`dry run: ${r.files.length} pending migration(s) applied and rolled back; ${heavy} lock-heavy statement(s) to review`);
+    if (r.failed) throw new Error(`migration ${r.failed.name} failed: ${r.failed.error}`);
+    return;
+  }
   if (cmd === 'reset') {
     if (env().NODE_ENV === 'production') throw new Error('refusing to reset in production');
     await resetDatabase(url);
