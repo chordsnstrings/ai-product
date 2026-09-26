@@ -2,7 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
-import { probe, withTempDir, extractFrames, ASPECT_SIZE, type Aspect } from '@arkiv/media';
+import { probe, withTempDir, extractFrames, ASPECT_SIZE, boxInside, contrastRatio, safeRect, type Aspect, type PlacedText } from '@arkiv/media';
 import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
 import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, labelTextSimilarity, type FidelityThresholds } from './fidelity';
@@ -326,8 +326,11 @@ export async function qaClipContract(bytes: Buffer, want: ClipContract): Promise
   };
 }
 
-/** Platform + audio contract for one export (§25 checks 4–5; §48 wrong duration/format). */
-export async function qaExport(file: string, aspect: Aspect, expectedMs: number): Promise<CheckResult[]> {
+/**
+ * Platform + audio contract for one export (§25 checks 4–5; §48 wrong duration/format), and — given the composer's
+ * layout — safe-zone placement and caption readability. `expectedMs` is the storyboard's timeline length.
+ */
+export async function qaExport(file: string, aspect: Aspect, expectedMs: number, layout?: readonly PlacedText[]): Promise<CheckResult[]> {
   const p = await probe(file);
   const { w, h } = ASPECT_SIZE[aspect];
   const sizeOk = p.width === w && p.height === h;
@@ -343,8 +346,63 @@ export async function qaExport(file: string, aspect: Aspect, expectedMs: number)
       data: { aspect, ...p },
     },
     { check: 'audio', pass: p.hasAudio, hard: !p.hasAudio, detail: p.hasAudio ? 'Audio track present, loudness normalized' : 'Missing audio track' },
+    ...(layout ? qaLayout(aspect, layout) : []),
   ];
 }
+
+/** Captions are set at least this share of the frame width (legible on a phone at arm's length). */
+export const CAPTION_MIN_FONT_SHARE = 0.035;
+/** WCAG AA contrast for text against its plate. */
+export const TEXT_MIN_CONTRAST = 4.5;
+/** Reading speed above which a caption is on screen too briefly to read (characters per second). */
+export const CAPTION_MAX_CPS = 17;
+
+/**
+ * Safe-zone placement and caption readability (§25 platform check): every text element the composer placed —
+ * overlays, spoken captions, the end card's name, price, CTA and disclosure — sits inside the aspect's safe zone,
+ * is set large enough and contrasts with its plate. Those are hard failures (a CTA under the platform's buttons is a
+ * broken ad). A caption that goes by faster than people read is reported, not blocking.
+ */
+export function qaLayout(aspect: Aspect, layout: readonly PlacedText[]): CheckResult[] {
+  const safe = safeRect(aspect);
+  const { w } = ASPECT_SIZE[aspect];
+  const label = (p: PlacedText) => (p.kind === 'end_card' ? `end card ${p.role}` : p.kind === 'caption' ? `caption “${p.text.slice(0, 40)}”` : `${p.role} text “${p.text.slice(0, 40)}”`);
+  const cps = (p: PlacedText) => p.text.length / ((p.endMs - p.startMs) / 1000);
+  const outside = layout.filter((p) => !boxInside(p.box, safe));
+  const small = layout.filter((p) => (p.kind === 'caption' || p.kind === 'overlay') && p.fontSize < w * CAPTION_MIN_FONT_SHARE);
+  const lowContrast = layout.filter((p) => HEX6.test(p.ink) && HEX6.test(p.plate) && contrastRatio(p.ink, p.plate) < TEXT_MIN_CONTRAST);
+  const fast = layout.filter((p) => p.kind === 'caption' && p.endMs > p.startMs && cps(p) > CAPTION_MAX_CPS);
+  const readable = !small.length && !lowContrast.length;
+  const ratio = aspect.replace('x', ':');
+  return [
+    {
+      check: 'platform',
+      pass: !outside.length,
+      hard: outside.length > 0,
+      detail: outside.length ? `Outside the ${ratio} safe zone: ${outside.map(label).join('; ')}` : `${layout.length} text elements inside the ${ratio} safe zone`,
+      data: { aspect, safeZone: safe, outside: outside.map((p) => ({ kind: p.kind, role: p.role, box: p.box })) },
+    },
+    {
+      check: 'platform',
+      pass: readable && !fast.length,
+      hard: !readable,
+      detail: !readable
+        ? `Hard to read: ${[...small.map((p) => `${label(p)} set at ${p.fontSize}px`), ...lowContrast.map((p) => `${label(p)} has low contrast`)].join('; ')}`
+        : fast.length
+          ? `Captions go by quickly: ${fast.map((p) => `${label(p)} at ${cps(p).toFixed(0)} characters/s`).join('; ')}`
+          : 'Captions and on-screen text large enough, high contrast and at a readable pace',
+      data: {
+        aspect,
+        minFontPx: Math.ceil(w * CAPTION_MIN_FONT_SHARE),
+        small: small.map((p) => ({ role: p.role, fontSize: p.fontSize })),
+        lowContrast: lowContrast.map((p) => ({ role: p.role, contrast: Math.round(contrastRatio(p.ink, p.plate) * 100) / 100 })),
+        fast: fast.map((p) => ({ text: p.text, cps: Math.round(cps(p) * 10) / 10 })),
+      },
+    },
+  ];
+}
+const HEX6 = /^#[0-9a-f]{6}$/i;
+
 
 /** What a final export records about how it was made (standard §25.7 "metadata/lineage is complete"). */
 export interface ExportProvenance {

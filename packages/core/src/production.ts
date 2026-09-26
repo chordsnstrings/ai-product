@@ -1286,7 +1286,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // The SRT (the same cues in every format) is its own downloadable asset (plan 06 Phase 3 #6).
       const captionsAsset = await withTenant(ws, (tx) => saveCaptions(tx, ws, sku.id as string, outs[0]!.srt, { projectId, storyboardId: sb.id }));
       for (const o of outs) {
-        checks.push(...(await qaExport(o.file, o.aspect, totalMs)));
+        checks.push(...(await qaExport(o.file, o.aspect, totalMs, o.layout)));
         const bytes = await readFile(o.file);
         const a = await withTenant(ws, (tx) =>
           saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captionsAsset.id, storyboardId: sb.id, disclosure, provenance } }),

@@ -1,7 +1,7 @@
 import { writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ffmpeg, probe, withTempDir } from './ffmpeg';
-import { ASPECT_SIZE, captionOverlay, endCard, type Aspect } from './render';
+import { ASPECT_SIZE, captionLayout, captionOverlay, endCard, endCardLayout, type Aspect, type TextLayout } from './render';
 
 const FPS = 30;
 const sec = (ms: number) => (ms / 1000).toFixed(3);
@@ -221,11 +221,23 @@ export interface ComposeSpec {
   metadata?: Record<string, string>;
 }
 
+/** A text element the composer placed on an export, and when it is on screen (platform QA, §25). */
+export interface PlacedText extends TextLayout {
+  kind: 'overlay' | 'caption' | 'end_card';
+  /** What the element is, e.g. the end card's 'cta' or 'note'. */
+  role: string;
+  text: string;
+  startMs: number;
+  endMs: number;
+}
+
 export interface ComposedOutput {
   aspect: Aspect;
   file: string;
   durationMs: number;
   srt: string;
+  /** Every text element placed on this export: checked against the safe zone and for readability. */
+  layout: PlacedText[];
 }
 
 /**
@@ -243,6 +255,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
       const clips: string[] = [];
       const overlays: TimedOverlay[] = [];
       const cues: Cue[] = [];
+      const layout: PlacedText[] = [];
       let t = 0;
       const spoken = (spec.captions ?? []).filter((c) => c.text.trim());
       for (const [i, s] of spec.scenes.entries()) {
@@ -253,8 +266,10 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
         if (s.overlayText) {
           const png = path.join(dir, `ov-${i}.png`);
           // With spoken captions in the lower safe area, on-screen text moves to the top.
-          await writeFile(png, await captionOverlay(s.overlayText, aspect, { position: i === 0 || spoken.length ? 'upper' : 'lower' }));
+          const position = i === 0 || spoken.length ? 'upper' : 'lower';
+          await writeFile(png, await captionOverlay(s.overlayText, aspect, { position }));
           overlays.push({ png, startMs: t, endMs: t + s.durationMs });
+          layout.push({ ...captionLayout(s.overlayText, aspect, { position }), kind: 'overlay', role: `scene ${i + 1}`, text: s.overlayText, startMs: t, endMs: t + s.durationMs });
           if (!spoken.length) cues.push({ startMs: t, endMs: t + s.durationMs, text: s.overlayText });
         }
         t += s.durationMs;
@@ -263,6 +278,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
         const png = path.join(dir, `cap-${i}.png`);
         await writeFile(png, await captionOverlay(c.text, aspect, { position: 'lower', style: 'caption' }));
         overlays.push({ png, startMs: c.startMs, endMs: c.endMs });
+        layout.push({ ...captionLayout(c.text, aspect, { position: 'lower', style: 'caption' }), kind: 'caption', role: 'caption', text: c.text, startMs: c.startMs, endMs: c.endMs });
         cues.push(c);
       }
       if (spec.endCard) {
@@ -271,6 +287,10 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
         const clip = path.join(dir, 'end.mp4');
         await stillToClip(png, spec.endCard.durationMs, aspect, clip, 'none');
         clips.push(clip);
+        const l = endCardLayout({ ...spec.endCard, aspect });
+        for (const [role, el] of [['name', l.name], ['price', l.price], ['cta', l.cta], ['note', l.note]] as const) {
+          if (el) layout.push({ ...el, kind: 'end_card', role, text: el.lines.join(' '), startMs: t, endMs: t + spec.endCard.durationMs });
+        }
         t += spec.endCard.durationMs;
       }
       const joined = path.join(dir, 'joined.mp4');
@@ -279,7 +299,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
       await overlayTimed(joined, overlays, withOv);
       const out = path.join(outDir, `final-${aspect}.mp4`);
       await finalizeAudio(withOv, spec.voiceover ?? null, t, out, spec.metadata);
-      results.push({ aspect, file: out, durationMs: t, srt: toSrt(cues) });
+      results.push({ aspect, file: out, durationMs: t, srt: toSrt(cues), layout });
     });
   }
   return results;

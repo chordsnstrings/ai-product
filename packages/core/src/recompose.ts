@@ -196,7 +196,7 @@ async function saveVersion(
   next = { ...next, composer: COMPOSER_VERSION };
   return withTempDir(async (dir) => {
     const outs = await composeFromManifest(ws, next, dir);
-    for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, next.durationMs)));
+    for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, next.durationMs, o.layout)));
     const bad = checks.filter((c) => !c.pass && c.hard);
     if (bad.length) throw new Error(`recomposition failed final QA: ${bad.map((c) => c.detail).join('; ').slice(0, 300)}`);
     return withTenant(ws, async (tx) => {

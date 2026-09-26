@@ -161,7 +161,7 @@ async function buildHookVersion(
   // The version is the master's footage with a re-voiced hook: it carries the master's AI-content disclosure (§40).
   const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: versionManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(versionManifest.disclosure) }, dir);
   const checks: CheckResult[] = [integrity];
-  for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, versionManifest.durationMs)));
+  for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, versionManifest.durationMs, o.layout)));
   if (checks.some((c) => !c.pass && c.hard)) return { ok: false, reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) };
   return { ok: true, outs, manifest: versionManifest, changed, integrity };
 }
