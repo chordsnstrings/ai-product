@@ -191,6 +191,23 @@ export function verifyShopifyQuery(query: Record<string, string>): boolean {
   return safeEqual(hmacHex(env().SHOPIFY_API_SECRET ?? 'dev', msg), hmac);
 }
 
+/** How old a Shopify app-launch request may be (its `timestamp`), in seconds. */
+export const SHOPIFY_LAUNCH_MAX_AGE_S = 300;
+
+/**
+ * An install or launch that starts in Shopify (App Store, or the app in the merchant's admin) opens our app URL with
+ * `shop`, `timestamp` and `hmac` (plan 06 Phase 5 #1 "Shopify app"). The shop is trusted only when the HMAC verifies,
+ * the domain is a myshopify.com shop, and the request is recent (a captured URL can't be replayed later).
+ */
+export function verifyShopifyLaunch(query: Record<string, string>, now = Date.now()): { shop: string } | null {
+  const shop = (query.shop ?? '').toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop)) return null;
+  const ts = Number(query.timestamp);
+  if (!Number.isFinite(ts) || now / 1000 - ts > SHOPIFY_LAUNCH_MAX_AGE_S || ts - now / 1000 > 60) return null;
+  if (!verifyShopifyQuery(query)) return null;
+  return { shop };
+}
+
 /** Verify a webhook (base64 HMAC over the raw body). */
 export function verifyShopifyWebhook(rawBody: string | Buffer, header: string | null): boolean {
   if (!header) return false;
@@ -1029,3 +1046,82 @@ export const CONNECTOR_POLICY: Record<ConnectorProvider, ConnectorPolicy> = {
   // TikTok permissions are granted per app in the TikTok developer portal, not requested per authorization.
   tiktok: { label: 'TikTok', freshnessHours: 48, requestedScopes: [] },
 };
+
+// ───────────── Token revocation at the platform (plan 02 §7 purge step 1; §47 disconnect) ─────────────
+
+/** How long a revoke call may take: it runs while the connection's row is being closed. */
+const REVOKE_TIMEOUT_MS = 8_000;
+
+/**
+ * Shopify: an app's access is withdrawn by deleting its API permission for the shop (the same as an uninstall).
+ * 401/403/404 mean the token already stopped working, which is the outcome we want.
+ */
+export async function shopifyRevoke(shop: string, token: string): Promise<void> {
+  if (isShopifyDemo(shop)) return;
+  const r = await platformFetch('shopify', `https://${shop}/admin/api_permissions/current.json`, {
+    method: 'DELETE',
+    headers: { 'X-Shopify-Access-Token': token },
+    signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+  });
+  if (r.ok || r.status === 401 || r.status === 403 || r.status === 404) return;
+  throw new ConnectorError('shopify', httpErrorKind(r.status) ?? 'invalid', `revoke failed (HTTP ${r.status})`);
+}
+
+/** Meta: DELETE /me/permissions removes every permission the user gave this app. Error 190 = already invalid. */
+export async function metaRevoke(token: string): Promise<void> {
+  const r = await platformFetch('meta', `${META_API}/me/permissions?${new URLSearchParams({ access_token: token })}`, { method: 'DELETE', signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS) });
+  const j = await platformJson<{ success?: boolean; error?: MetaError }>('meta', r);
+  if (j.success || j.error?.code === 190) return;
+  throw new ConnectorError('meta', j.error ? metaErrorKind(j.error, r.status) : 'invalid', `revoke failed: ${j.error?.message ?? `HTTP ${r.status}`}`.slice(0, 300));
+}
+
+/** TikTok Business: /oauth2/revoke_token/ with the app credentials. Revoked/expired-token codes count as done. */
+export async function tiktokRevoke(token: string): Promise<void> {
+  const e = env();
+  const r = await platformFetch('tiktok', `${TIKTOK_API}/oauth2/revoke_token/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: e.TIKTOK_APP_ID, secret: e.TIKTOK_APP_SECRET, access_token: token }),
+    signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+  });
+  const j = await platformJson<{ code: number; message?: string }>('tiktok', r);
+  if (j.code === 0 || tiktokErrorKind(j.code) === 'auth_revoked') return;
+  throw new ConnectorError('tiktok', tiktokErrorKind(j.code), `revoke failed: ${j.message ?? j.code}`.slice(0, 300));
+}
+
+/** Withdraws a stored token at its platform. `account` is the connection's external id (the shop for Shopify). */
+export interface TokenRevoker {
+  revoke(provider: ConnectorProvider, token: string, account: string): Promise<void>;
+}
+
+export const liveTokenRevoker: TokenRevoker = {
+  async revoke(provider, token, account) {
+    if (provider === 'shopify') return shopifyRevoke(account, token);
+    if (provider === 'meta') return metaRevoke(token);
+    return tiktokRevoke(token);
+  },
+};
+
+/** PROVIDERS_MODE=mock and tests: records what would have been revoked and calls nothing. */
+export function mockTokenRevoker(fail?: (provider: ConnectorProvider, account: string) => boolean): TokenRevoker & { calls: { provider: ConnectorProvider; token: string; account: string }[] } {
+  const calls: { provider: ConnectorProvider; token: string; account: string }[] = [];
+  return {
+    calls,
+    async revoke(provider, token, account) {
+      calls.push({ provider, token, account });
+      if (fail?.(provider, account)) throw new ConnectorError(provider, 'network', 'mock revoke failure');
+    },
+  };
+}
+
+let tokenRevokerOverride: TokenRevoker | null = null;
+let mockRevoker: TokenRevoker | null = null;
+/** The live revoker, or the recording mock in PROVIDERS_MODE=mock (tests can inject their own). */
+export function tokenRevoker(): TokenRevoker {
+  if (tokenRevokerOverride) return tokenRevokerOverride;
+  if (env().PROVIDERS_MODE === 'mock') return (mockRevoker ??= mockTokenRevoker());
+  return liveTokenRevoker;
+}
+export function setTokenRevoker(r: TokenRevoker | null) {
+  tokenRevokerOverride = r;
+}

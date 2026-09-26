@@ -6,6 +6,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { enqueue, Queues } from './outbox';
+import { revokeAtPlatform } from './performance';
 import { setting } from './settings';
 import { storage } from './storage';
 import { transitionWorkspace } from './workspaces';
@@ -112,6 +113,15 @@ export async function purgeWorkspace(workspaceId: string, opts: { stripeSubscrip
     // Stripe subscriptions ended before the purge (the worker does it: core can't call Stripe) are on the certificate.
     const counts: Record<string, number> = { stripe_subscriptions_cancelled: opts.stripeSubscriptionsCancelled?.length ?? 0 };
     const undeletable: string[] = [];
+    // Plan 02 §7 purge step 1: every stored token is revoked at its platform before the rows go. One that can't be
+    // revoked (platform unreachable) is named on the certificate; the purge carries on.
+    const tokens = await tx`select provider, external_account_id, token_enc from integrations where workspace_id = ${workspaceId} and token_enc is not null`;
+    counts.integration_tokens_revoked = 0;
+    for (const i of tokens) {
+      const r = await revokeAtPlatform(i.provider as string, i.token_enc as string, i.external_account_id as string);
+      if (r.ok) counts.integration_tokens_revoked++;
+      else undeletable.push(`${i.provider as string} access for ${i.external_account_id as string} not revoked at the platform: ${r.error}`);
+    }
     await tx`delete from shopify_shops where workspace_id = ${workspaceId}`;
     // Golden cases built (with consent) from this tenant's production output go with the tenant.
     await tx`delete from golden_cases where source_workspace_id = ${workspaceId}`;
