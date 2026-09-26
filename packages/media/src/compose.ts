@@ -1,7 +1,7 @@
 import { writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ffmpeg, probe, withTempDir } from './ffmpeg';
-import { ASPECT_SIZE, captionOverlay, endCard, type Aspect } from './render';
+import { ffmpeg, ffmpegReport, probe, withTempDir } from './ffmpeg';
+import { ASPECT_SIZE, captionLayout, captionOverlay, endCard, endCardLayout, type Aspect, type TextLayout } from './render';
 
 const FPS = 30;
 const sec = (ms: number) => (ms / 1000).toFixed(3);
@@ -182,6 +182,41 @@ export async function extractFrames(video: string, count: number, dir: string): 
   return outs;
 }
 
+/** Mean loudness (dBFS, ffmpeg volumedetect) of a file's audio between two times; -Infinity when silent. */
+export async function audioLevel(file: string, startMs: number, endMs: number): Promise<number> {
+  const { stderr } = await ffmpegReport(['-ss', sec(startMs), '-t', sec(Math.max(1, endMs - startMs)), '-i', file, '-vn', '-af', 'volumedetect', '-f', 'null', '-']);
+  const m = /mean_volume:\s*(-?[\d.]+|-inf) dB/.exec(stderr);
+  return !m || m[1] === '-inf' ? -Infinity : Number(m[1]);
+}
+
+/** Mean luma of every frame of a video (ffmpeg signalstats YAVG, 0–255), on a small scaled copy. */
+export async function lumaSeries(video: string): Promise<number[]> {
+  const { stdout } = await ffmpeg(['-i', video, '-vf', 'scale=160:-2,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-', '-an', '-f', 'null', '-']);
+  return [...stdout.matchAll(/lavfi\.signalstats\.YAVG=([\d.]+)/g)].map((m) => Number(m[1]));
+}
+
+/**
+ * Flicker from a luma series: brightness that goes one way and straight back on the next frame. For each frame the
+ * smaller of two consecutive, opposite-signed changes counts (a single cut or a steady fade counts nothing); the
+ * score is their mean over the clip, in luma levels.
+ */
+export function flickerScore(series: readonly number[]): number {
+  if (series.length < 3) return 0;
+  let sum = 0;
+  for (let i = 2; i < series.length; i++) {
+    const a = series[i - 1]! - series[i - 2]!;
+    const b = series[i]! - series[i - 1]!;
+    if (a * b < 0) sum += Math.min(Math.abs(a), Math.abs(b));
+  }
+  return sum / (series.length - 2);
+}
+
+/** Temporal statistics of a clip for visual QA (§25.2 flicker): frame count, mean luma and the flicker score. */
+export async function frameDiffStats(video: string): Promise<{ frames: number; meanLuma: number; flicker: number }> {
+  const s = await lumaSeries(video);
+  return { frames: s.length, meanLuma: s.length ? s.reduce((a, b) => a + b, 0) / s.length : 0, flicker: flickerScore(s) };
+}
+
 export interface Cue {
   startMs: number;
   endMs: number;
@@ -221,12 +256,31 @@ export interface ComposeSpec {
   metadata?: Record<string, string>;
 }
 
+/** A text element the composer placed on an export, and when it is on screen (platform QA, §25). */
+export interface PlacedText extends TextLayout {
+  kind: 'overlay' | 'caption' | 'end_card';
+  /** What the element is, e.g. the end card's 'cta' or 'note'. */
+  role: string;
+  text: string;
+  startMs: number;
+  endMs: number;
+}
+
 export interface ComposedOutput {
   aspect: Aspect;
   file: string;
   durationMs: number;
   srt: string;
+  /** Every text element placed on this export: checked against the safe zone and for readability. */
+  layout: PlacedText[];
 }
+
+/**
+ * Version of the composer (timeline, overlays, captions, end card, audio finish). Recorded in every export's
+ * provenance and composition manifest (§24 reproducible composition); bump it when the output of the same manifest
+ * would change.
+ */
+export const COMPOSER_VERSION = 'composer@2026.09';
 
 /** Deterministic composition from scene versions (§24): same inputs → same timeline. */
 export async function composeAd(spec: ComposeSpec, outDir: string): Promise<ComposedOutput[]> {
@@ -236,6 +290,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
       const clips: string[] = [];
       const overlays: TimedOverlay[] = [];
       const cues: Cue[] = [];
+      const layout: PlacedText[] = [];
       let t = 0;
       const spoken = (spec.captions ?? []).filter((c) => c.text.trim());
       for (const [i, s] of spec.scenes.entries()) {
@@ -246,8 +301,10 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
         if (s.overlayText) {
           const png = path.join(dir, `ov-${i}.png`);
           // With spoken captions in the lower safe area, on-screen text moves to the top.
-          await writeFile(png, await captionOverlay(s.overlayText, aspect, { position: i === 0 || spoken.length ? 'upper' : 'lower' }));
+          const position = i === 0 || spoken.length ? 'upper' : 'lower';
+          await writeFile(png, await captionOverlay(s.overlayText, aspect, { position }));
           overlays.push({ png, startMs: t, endMs: t + s.durationMs });
+          layout.push({ ...captionLayout(s.overlayText, aspect, { position }), kind: 'overlay', role: `scene ${i + 1}`, text: s.overlayText, startMs: t, endMs: t + s.durationMs });
           if (!spoken.length) cues.push({ startMs: t, endMs: t + s.durationMs, text: s.overlayText });
         }
         t += s.durationMs;
@@ -256,6 +313,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
         const png = path.join(dir, `cap-${i}.png`);
         await writeFile(png, await captionOverlay(c.text, aspect, { position: 'lower', style: 'caption' }));
         overlays.push({ png, startMs: c.startMs, endMs: c.endMs });
+        layout.push({ ...captionLayout(c.text, aspect, { position: 'lower', style: 'caption' }), kind: 'caption', role: 'caption', text: c.text, startMs: c.startMs, endMs: c.endMs });
         cues.push(c);
       }
       if (spec.endCard) {
@@ -264,6 +322,10 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
         const clip = path.join(dir, 'end.mp4');
         await stillToClip(png, spec.endCard.durationMs, aspect, clip, 'none');
         clips.push(clip);
+        const l = endCardLayout({ ...spec.endCard, aspect });
+        for (const [role, el] of [['name', l.name], ['price', l.price], ['cta', l.cta], ['note', l.note]] as const) {
+          if (el) layout.push({ ...el, kind: 'end_card', role, text: el.lines.join(' '), startMs: t, endMs: t + spec.endCard.durationMs });
+        }
         t += spec.endCard.durationMs;
       }
       const joined = path.join(dir, 'joined.mp4');
@@ -272,7 +334,7 @@ export async function composeAd(spec: ComposeSpec, outDir: string): Promise<Comp
       await overlayTimed(joined, overlays, withOv);
       const out = path.join(outDir, `final-${aspect}.mp4`);
       await finalizeAudio(withOv, spec.voiceover ?? null, t, out, spec.metadata);
-      results.push({ aspect, file: out, durationMs: t, srt: toSrt(cues) });
+      results.push({ aspect, file: out, durationMs: t, srt: toSrt(cues), layout });
     });
   }
   return results;

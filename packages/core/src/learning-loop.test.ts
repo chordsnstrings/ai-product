@@ -84,6 +84,14 @@ describe('learning loop (Phases 4–5)', () => {
     // Variants reuse the master's media, so they carry its AI-content disclosure (standard §40).
     const flags = await ownerPool()`select ai_generated, synthetic_people from creatives where parent_creative_id = ${proj!.final_creative_id}`;
     expect(flags.every((f) => f.ai_generated === true && f.synthetic_people === true)).toBe(true);
+    // …and the master's provenance (§25.7), with their own voice clips and composer.
+    const pv = await ownerPool()`select a.lineage->'provenance' as pv, a.lineage->>'variantId' as variant from creatives c join assets a on a.id = any(c.final_asset_ids)
+                                 where c.parent_creative_id = ${proj!.final_creative_id}`;
+    const [masterPv] = await ownerPool()`select a.lineage->'provenance' as pv from creatives c join assets a on a.id = c.final_asset_ids[1] where c.id = ${proj!.final_creative_id}`;
+    expect(pv.length).toBeGreaterThan(0);
+    for (const r of pv) {
+      expect(r.pv).toMatchObject({ authorizationId: (masterPv!.pv as { authorizationId: string }).authorizationId, sceneVersionIds: (masterPv!.pv as { sceneVersionIds: string[] }).sceneVersionIds, composer: expect.stringMatching(/^composer@/) });
+    }
 
     const variants = await withTenant(t.workspaceId, (tx) => tx`select v.id, v.code, v.label, v.creative_id, v.platform_assets, c.final_asset_ids from variants v join creatives c on c.id = v.creative_id where v.experiment_id = ${experimentId} order by v.code`);
     expect(variants).toHaveLength(3);

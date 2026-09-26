@@ -3,7 +3,7 @@ import { closeAll, ownerPool, withAdmin } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId } from '@arkiv/shared';
 import { qaQueueSql } from './admin';
-import { labelDiff, qaCalibration, reviewedChecks } from './qa-metrics';
+import { checkScores, labelDiff, qaCalibration, reviewedChecks } from './qa-metrics';
 
 /** Plan 05 §13: QA review queue, label-OCR diff, and precision/recall against human verdicts. */
 beforeEach(truncateAll);
@@ -71,5 +71,24 @@ describe('label OCR diff', () => {
     ]);
     expect(labelDiff('Dew', null)).toEqual([{ word: 'Dew', status: 'missing' }]);
     expect(labelDiff('glow serum', 'GLOW Serum')).toEqual([{ word: 'GLOW', status: 'same' }, { word: 'Serum', status: 'same' }]);
+  });
+});
+
+describe('per-check scores (plan 05 §13 review screen)', () => {
+  it('lists each measured score of a check against its threshold', () => {
+    const fid = checkScores({
+      check: 'product_fidelity',
+      data: { labelSimilarity: 0.71, paletteDistance: 12.34567, thresholds: { labelSimilarityMin: 0.8, paletteDistanceMax: 70, regionColorMax: 60, matchMin: 0.8 }, deterministic: { matchScore: 0.93, regionColorDelta: 75 } },
+    });
+    expect(fid).toEqual([
+      { name: 'label similarity', value: 0.71, limit: 0.8, better: 'higher', ok: false },
+      { name: 'palette distance', value: 12.346, limit: 70, better: 'lower', ok: true },
+      { name: 'region colour shift', value: 75, limit: 60, better: 'lower', ok: false },
+      { name: 'product match', value: 0.93, limit: 0.8, better: 'higher', ok: true },
+    ]);
+    expect(checkScores({ check: 'visual', data: { flicker: 9.5, flickerMax: 2 } })).toEqual([{ name: 'flicker', value: 9.5, limit: 2, better: 'lower', ok: false }]);
+    // Older reports without scores show none.
+    expect(checkScores({ check: 'product_fidelity', data: { sameProduct: true } })).toEqual([]);
+    expect(checkScores({ check: 'claims' })).toEqual([]);
   });
 });

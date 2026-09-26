@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { keyBackground, placeholderFrame, stillToClip, toneAudio, withTempDir, type Aspect } from '@arkiv/media';
+import { ffmpeg, keyBackground, placeholderFrame, stillToClip, toneAudio, withTempDir, type Aspect } from '@arkiv/media';
 import type {
   ImageProvider,
   ImageRequest,
@@ -153,6 +153,12 @@ export class MockVideo implements VideoProvider {
       // Test hook: `[[mock:short_clip]]` returns a clip half as long as requested (§48 wrong-duration deliverable).
       const ms = /\[\[mock:short_clip\]\]/.test(t.req.prompt) ? t.req.seconds * 500 : t.req.seconds * 1000;
       await stillToClip(png, ms, aspect, out, 'push');
+      // Test hook: `[[mock:flicker]]` returns a clip whose brightness pulses frame to frame (§25.2 flicker).
+      if (/\[\[mock:flicker\]\]/.test(t.req.prompt)) {
+        const flick = path.join(dir, 'flicker.mp4');
+        await ffmpeg(['-i', out, '-vf', "eq=brightness='if(mod(n,2),-0.3,0)':eval=frame,format=yuv420p", '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', flick]);
+        return readFile(flick);
+      }
       return readFile(out);
     });
     t.status = 'succeeded';

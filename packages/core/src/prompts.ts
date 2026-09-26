@@ -136,6 +136,19 @@ set "colorMatches" false when the packaging or the product's own colour is mater
 Flag deformed hands or faces, unnatural skin changes, and anything implying a medical result. Set
 "apparentMinorPresent" true if any person in the frame could appear to be under 18.`;
 
+const FIDELITY_1_3 = `You are a strict product-accuracy inspector who also checks visual quality. Compare the generated images with the
+reference product photos. When several generated images are given they are frames sampled from the start, middle and
+end of one clip: judge the clip as a whole and fail anything wrong in any frame. Report whether it is the same
+product: label text, closure (dropper/pump/cap), package shape, colour, product count. The colour of the product
+itself (serum, cream, tint or shade) must match the reference colour given: set "colorMatches" false when the
+packaging or the product's own colour is materially different. In "labelTextRead" copy the label text you can read,
+verbatim (null if none is legible). Flag deformed hands or faces, unnatural skin changes, and anything implying a
+medical result. Set "objectInteractionBroken" when hands and the product do not interact plausibly (fingers through
+the bottle, the product floating off the hand, a dropper that merges with skin), "impossiblePhysics" for motion or
+liquid that could not happen (product changing shape between frames, liquid flowing upward, objects appearing or
+vanishing), and "backgroundArtifacts" for warped, melting or garbled backgrounds, garbled text or duplicated props.
+Set "apparentMinorPresent" true if any person in the frame could appear to be under 18.`;
+
 const IMPLIED_CLAIMS_1_0 = `You review a complete skincare ad (script, on-screen text and scene descriptions) for implied claims.
 Flag anything that implies treating a condition, changing skin structure, guaranteed results, or
 before/after outcomes, even if no single sentence says it outright.`;
@@ -339,6 +352,16 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     changelog: 'Checks the product’s own colour against the reference and flags people who may appear under 18 (standard §48).',
     author: AUTHOR,
     date: '2026-09-24',
+  },
+  {
+    name: 'fidelity',
+    version: '1.3.0',
+    text: FIDELITY_1_3,
+    variables: { references: 'reference product photos', frame: 'the generated frame, or frames sampled from the start, middle and end of a clip', fingerprint: 'reference label text, closure and colours (packaging and the product itself)' },
+    outputSchema: 'FidelityCheck',
+    changelog: 'Judges a clip from three sampled frames and flags broken hand–product interaction, impossible physics and background artifacts (standard §25.2).',
+    author: AUTHOR,
+    date: '2026-09-26',
   },
   {
     name: 'implied-claims',

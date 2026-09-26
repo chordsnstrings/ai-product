@@ -399,7 +399,10 @@ describe('strict product composites (§23: prod-02) and Claim IDs per scene (§2
     expect(blocked[0]!.platforms.length).toBeGreaterThan(0);
     expect(await withTenant(r.t.workspaceId, (tx) => available(tx, 'taste'))).toBe(1);
     const renders = async () => (await ownerPool()`select count(*)::int as n from provider_jobs where workspace_id = ${r.t.workspaceId} and task = 'video.scene'`)[0]!.n as number;
-    const rendered = await renders();
+    // The claims gate runs before the reservation (§25 "stop expensive loops"): no footage paid for, nothing reserved.
+    expect(await renders()).toBe(0);
+    expect((await ownerPool()`select count(*)::int as n from cost_authorizations where project_id = ${r.projectId} and idempotency_key like 'produce:%'`)[0]!.n).toBe(0);
+    expect((p!.qa_report as { stage?: string }).stage).toBe('pre_spend');
 
     // A way forward (surf-35): back to the storyboard, fix the line, finish — no new checkout, same credit.
     await expect(withTenant(r.t.workspaceId, (tx) => finishAfterEdit(tx, r.ctx, r.projectId))).rejects.toMatchObject({ code: 'CONFLICT' });
@@ -419,11 +422,11 @@ describe('strict product composites (§23: prod-02) and Claim IDs per scene (§2
     await withTenant(r.t.workspaceId, async (tx) => {
       expect(await available(tx, 'taste')).toBe(0);
       const [n] = await tx`select count(*) filter (where type = 'CREDIT_CONSUMED')::int as consumed, count(*) filter (where type = 'CREDIT_RELEASED')::int as released from ledger_entries`;
-      expect(n).toMatchObject({ consumed: 1, released: 1 });
+      expect(n).toMatchObject({ consumed: 1, released: 0 });
       const [pu] = await tx`select count(*)::int as n from purchases where project_id = ${r.projectId}`;
       expect(pu!.n).toBe(1); // no second checkout
     });
-    expect(await renders()).toBe(rendered); // accepted renders were reused: fixing words costs no new footage
+    expect(await renders()).toBeGreaterThan(0);
   }, 240_000);
 
   it('a claims block before any storyboard approval has nothing to reopen', async () => {
@@ -539,8 +542,11 @@ describe('whole-creative QA (standard §43 implied claims, §44/§48 continuity:
     await withTenant(r.t.workspaceId, async (tx) => {
       const [p] = await tx`select state, failure_code, qa_report from projects where id = ${r.projectId}`;
       expect(p).toMatchObject({ state: 'BLOCKED_COMPLIANCE', failure_code: 'claims_blocked' });
-      const report = p!.qa_report as { impliedClaims: { impliedClaims: { basis: string; severity: string }[] }; checks: { check: string; pass: boolean; detail: string }[] };
-      expect(report.impliedClaims.impliedClaims).toEqual([expect.objectContaining({ basis: 'combined', severity: 'block' })]);
+      // The compliance queue lists the flags as an array (admin claims page: jsonb_array_length).
+      const report = p!.qa_report as { impliedClaims: { basis: string; severity: string }[]; checks: { check: string; pass: boolean; detail: string }[] };
+      expect(report.impliedClaims).toEqual([expect.objectContaining({ basis: 'combined', severity: 'block' })]);
+      const [queued] = await tx`select jsonb_array_length(qa_report->'impliedClaims') as n from projects where id = ${r.projectId}`;
+      expect(queued!.n).toBe(1);
       expect(report.checks.find((c) => c.check === 'claims' && !c.pass)!.detail).toMatch(/^Implied claim: Scene \d+: The pictures imply/);
       expect(await available(tx, 'taste')).toBe(1); // released: the customer is not charged for a blocked ad
       const [job] = await tx`select task, status from provider_jobs where task = 'qa.implied_claims'`;

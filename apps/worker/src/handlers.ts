@@ -19,6 +19,8 @@ import {
   regenerateFrame,
   Queues,
   recomposeProject,
+  applyDeliveredTextEdit,
+  type TextEdits,
   syncIntegration,
   syncShopifyProduct,
   transferSku,
@@ -101,7 +103,9 @@ export const handlers: Record<string, Handler> = {
     return r;
   },
   [Queues.hookVariants]: (ctx, d) => produceHookVariants(ctx, d.projectId as string),
-  [Queues.recomposeProject]: (ctx, d) => recomposeProject(ctx, d.projectId as string),
+  // A price/size change (no payload) or the merchant's edit of a delivered ad's words (edits).
+  [Queues.recomposeProject]: (ctx, d) =>
+    d.edits ? applyDeliveredTextEdit(ctx, d.projectId as string, d.edits as TextEdits, (d.baseCreativeId as string | null) ?? null) : recomposeProject(ctx, d.projectId as string),
   [Queues.recoveryConcept]: (ctx, d) => draftRecoveryConcept(ctx, d.projectId as string),
   // Core can't import billing, so the guarantee refund (queued by failProduction) runs here.
   [Queues.refundPurchase]: (ctx, d) => refundProjectPurchase(ctx, d.purchaseId as string, String(d.reason ?? 'guarantee')),

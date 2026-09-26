@@ -3,9 +3,9 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
 import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProductionMode, type ProjectState } from '@arkiv/shared';
-import { brandAccent, captionCues, composeAd, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { brandAccent, captionCues, composeAd, COMPOSER_VERSION, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
-import { assetBytes, saveAsset, verifyAssetIntegrity } from './assets';
+import { assetBytes, saveAsset, saveCaptions, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
 import { brandBrainFor } from './brand';
 import { classifyClaim, showsSyntheticPeople, syntheticTestimonials, type LineMapping } from './compliance';
@@ -26,7 +26,8 @@ import { toDataUrl } from './vision';
 import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { GENOME_VERSION_SQL } from './creatives';
-import { qaClaims, qaClipContract, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
+import { setExperimentState } from './experiment-state';
+import { assertLineageComplete, qaClaims, qaClipContract, type ExportProvenance, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, qaVoiceTrack, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -54,7 +55,7 @@ export const CONTINUITY_TASK = 'qa.continuity';
 /** Frames of the finished 9:16 export the implied-claim scan looks at. */
 const IMPLIED_FRAMES = 3;
 /** A voice-over may run this far past the end of the ad before the export is refused (never cut mid-word). */
-const VO_OVERFLOW_TOLERANCE_MS = 250;
+export const VO_OVERFLOW_TOLERANCE_MS = 250;
 
 type SceneRow = Record<string, unknown> & { id: string; production_mode: string; duration_ms: number; purpose: string };
 
@@ -94,6 +95,10 @@ export function sceneClaimIds(lines: (string | null | undefined)[], mapping: rea
   return [...new Set(mapping.filter((m) => own.has(m.line) && m.status === 'claim' && m.claimId).map((m) => m.claimId!))];
 }
 
+/** Input tokens of one render inspection: two reference photos and three sampled frames (qa.ts RENDER_QA_FRAMES). */
+export const RENDER_QA_TOKENS = 8_000;
+/** Input tokens of one still inspection: two reference photos and the frame. */
+export const STILL_QA_TOKENS = 5_000;
 /** Generated seconds for one render of a scene (whole seconds, at least the model minimum). */
 export const genSeconds = (durationMs: number) => Math.max(MIN_GEN_SECONDS, Math.ceil(durationMs / 1000));
 
@@ -182,7 +187,7 @@ export function planProduction(
   voiceChars: number,
   routes: ProductionRoutes,
   rates: Map<string, RateTable>,
-  opts: { reuse?: ReadonlySet<string>; plates?: number; ceilingMicros?: Micros | null } = {},
+  opts: { reuse?: ReadonlySet<string>; plates?: number; ceilingMicros?: Micros | null; stillChecks?: number } = {},
 ): ProductionPlan {
   const generative = scenes.filter((s) => s.production_mode === 'GENERATIVE_INTERACTION' && !opts.reuse?.has(s.id)).map((s) => s.id);
   const seconds = Object.fromEntries(generative.map((id) => [id, genSeconds(scenes.find((x) => x.id === id)!.duration_ms)])) as Record<string, number>;
@@ -201,10 +206,12 @@ export function planProduction(
   ];
   const tail = (reserve: number): CostLine[] => {
     const repairs = generative.length ? Math.min(generative.length, Math.floor((reserve + 1e-6) / shortest)) : 0;
-    const inspections = 2 * generative.length + repairs + plates + 1;
+    // A render is inspected from three sampled frames (RENDER_QA_FRAMES) and two references; a still from one frame.
+    const renderInspections = 2 * generative.length + repairs;
+    const stillInspections = plates + 1 + (opts.stillChecks ?? 0);
     return [
       ...voice(),
-      dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
+      dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: RENDER_QA_TOKENS * renderInspections + STILL_QA_TOKENS * stillInspections, outputTokens: 800 * (renderInspections + stillInspections) }),
       ...review(),
       ...(plates && routes.plate ? [dearerLine(routes.plate, rates, { kind: 'image', images: plates })] : []),
       { kind: 'media', outputs: 1 },
@@ -274,7 +281,23 @@ export function renderInputHash(s: SceneRow): string {
     .digest('hex');
 }
 
-type VersionRow = { id: string; scene_id: string; version: number; kind: string; asset_id: string | null; status: string; technique: string | null; input_hash: string | null; lineage: Record<string, unknown> };
+type VersionRow = { id: string; scene_id: string; version: number; kind: string; asset_id: string | null; status: string; technique: string | null; input_hash: string | null; lineage: Record<string, unknown>; qa?: unknown };
+
+/**
+ * A still the model drew the product in (a storyboard frame with technique 'generated') that has no passing
+ * product-fidelity check on record: production inspects it before it can be composed (§25 every output passes
+ * product checks; plan 03 P7 edge case).
+ */
+export function uncheckedGeneratedStill(v: Pick<VersionRow, 'technique' | 'qa'> | undefined): boolean {
+  if (!v || v.technique !== 'generated') return false;
+  const checks = Array.isArray(v.qa) ? (v.qa as CheckResult[]) : [];
+  return !checks.some((c) => c.check === 'product_fidelity' && c.pass);
+}
+
+/** Scenes composed as a still whose current frame needs that inspection. */
+function stillsToInspect(scenes: SceneRow[], versions: VersionRow[]): number {
+  return scenes.filter((s) => s.production_mode !== 'GENERATIVE_INTERACTION' && s.production_mode !== 'STRICT_COMPOSITE' && uncheckedGeneratedStill(versions.find((v) => v.id === s.current_version_id))).length;
+}
 
 /** Accepted renders a run may reuse instead of rendering again: a locked scene keeps its render; otherwise the inputs must be unchanged. */
 function reusableRenders(scenes: SceneRow[], versions: VersionRow[]): Map<string, VersionRow> {
@@ -313,7 +336,7 @@ async function planRun(
   const [ov] = await tx`select ceiling_override_micros from projects where id = ${projectId} and workspace_id = ${ws}`;
   const ceilingMicros = CEILING_PURPOSES.includes(purpose) ? Math.max(COST_LIMITS.CREATIVE_TEST_CEILING, Number(ov?.ceiling_override_micros ?? 0)) : null;
   const reuse = new Set(reusableRenders(scenes, versions).keys());
-  const planFor = (rows: SceneRow[]) => planProduction(rows, voChars, routes, rates, { reuse, plates: rows.filter(wantsPlate).length, ceilingMicros });
+  const planFor = (rows: SceneRow[]) => planProduction(rows, voChars, routes, rates, { reuse, plates: rows.filter(wantsPlate).length, ceilingMicros, stillChecks: stillsToInspect(rows, versions) });
   let plan = planFor(scenes);
   // §44 "Model price doubles": a paid promise whose plan no longer fits its class ceiling at today's rates (the
   // rates rose after the storyboard was approved) is re-planned within it first — the lowest-priority generated
@@ -356,7 +379,7 @@ export async function planProjectRun(tx: Tx, ws: string, projectId: string, purp
   const [p] = await tx`select storyboard_id, sku_id from projects where id = ${projectId} and workspace_id = ${ws}`;
   if (!p?.storyboard_id) return null;
   const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${ws} order by position`) as unknown as SceneRow[];
-  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                              where workspace_id = ${ws} and scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
   const run = await planRun(tx, ws, projectId, purpose, scenes, versions, await productImagery(tx, p.sku_id as string));
   return { ...run, storyboardId: p.storyboard_id as string, scenes };
@@ -367,12 +390,12 @@ export async function productionEstimate(tx: Tx, workspaceId: string, projectId:
   const [p] = await tx`select storyboard_id, sku_id, entitlement_unit from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
   if (!p?.storyboard_id) return null;
   const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${workspaceId} order by position`) as unknown as SceneRow[];
-  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+  const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                              where workspace_id = ${workspaceId} and scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
   const routes = await productionRoutes(tx, workspaceId);
   const rates = await loadRates(tx);
   const voChars = scenes.reduce((n, s) => n + ((s.spoken_line as string | null)?.trim().length ?? 0), 0);
-  const plan = planProduction(scenes, voChars, routes, rates, { reuse: new Set(reusableRenders(scenes, versions).keys()), ceilingMicros: COST_LIMITS.CREATIVE_TEST_CEILING });
+  const plan = planProduction(scenes, voChars, routes, rates, { reuse: new Set(reusableRenders(scenes, versions).keys()), ceilingMicros: COST_LIMITS.CREATIVE_TEST_CEILING, stillChecks: stillsToInspect(scenes, versions) });
   return estimate(rates, plan.lines).totalMicros;
 }
 
@@ -388,6 +411,8 @@ export async function approveForProduction(tx: Tx, ctx: TenantContext, projectId
   const [sb] = await tx`select status from storyboards where id = ${p.storyboard_id}`;
   if (sb?.status !== 'ready') throw new DomainError('CONFLICT', 'Storyboard is not ready yet.');
   await tx`update storyboards set status = 'approved', approved_at = now(), approved_by = ${ctx.actor.kind + ':' + ctx.actor.id} where id = ${p.storyboard_id}`;
+  // §24: each scene records its approval state (the storyboard is approved as a whole, scene by scene).
+  await tx`update scenes set approved_at = now(), approved_by = ${ctx.actor.kind + ':' + ctx.actor.id} where storyboard_id = ${p.storyboard_id} and workspace_id = ${ctx.workspaceId}`;
   await transition(tx, ctx, projectId, 'STORYBOARD_APPROVED', { patch: { entitlement_unit: unit, kind: unit === 'creative_test' ? 'creative_test' : unit } });
   await planSteps(tx, ctx.workspaceId, projectId, PRODUCTION_STEPS);
   await enqueue(tx, ctx.workspaceId, Queues.produceProject, { projectId, actor: ctx.actor }, { singletonKey: `produce:${projectId}`, priority: priorityFor(ctx, 'production') });
@@ -502,6 +527,31 @@ async function advance(tx: Tx, ctx: TenantContext, projectId: string, to: Projec
 }
 
 const RUNNABLE: readonly ProjectState[] = ['STORYBOARD_APPROVED', ...IN_PRODUCTION, 'NEEDS_USER_ACTION'];
+/** States from which the pre-spend claims gate can still stop a run (before scene QA and composition). */
+const PRE_SPEND_GATE: readonly ProjectState[] = ['STORYBOARD_APPROVED', 'RENDER_RESERVED', 'RENDERING', 'NEEDS_USER_ACTION'];
+
+/**
+ * The claims, testimonial and statement checks on an approved storyboard's lines (the same checks the run repeats
+ * after rendering, when the finished scenes are known), with no model call. Null when every line passes.
+ */
+export async function preSpendClaimsGate(
+  tx: Tx,
+  skuId: string,
+  scenes: readonly SceneRow[],
+  sb: Record<string, unknown> | undefined,
+  names: (string | null | undefined)[],
+  brandCta?: string | null,
+): Promise<{ checks: CheckResult[]; detail: string; statementMap: unknown } | null> {
+  const lines = [...scenes.flatMap((s) => [s.spoken_line, s.overlay_text]), sb?.hook_text, ((sb?.cta_text as string | null) ?? '').trim() || brandCta].filter(Boolean) as string[];
+  const claims = await claimsQaForExports(tx, skuId, lines, ASPECTS, { names });
+  const testimonials = testimonialCheck([...scenes]);
+  const mapping = ((claims.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? []) as LineMapping[];
+  const statementMap = mapStatements(lines, mapping, await factsForStatements(tx, skuId));
+  const statements = statementCheck(statementMap);
+  if (claims.pass && !testimonials && statements.pass) return null;
+  const checks = [claims, ...(testimonials ? [testimonials] : []), statements];
+  return { checks, statementMap, detail: [claims.pass ? null : claims.detail, testimonials?.detail, statements.pass ? null : statements.detail].filter(Boolean).join(' | ') };
+}
 
 /**
  * Produce an approved storyboard (render → QA → claims → voice → compose → final QA → deliver), resumably.
@@ -569,7 +619,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     const [sku] = await tx`select * from skus where id = ${p.sku_id}`;
     const [fp] = await tx`select * from visual_fingerprints where sku_id = ${p.sku_id} and active`;
     const [variant] = p.variant_id ? await tx`select * from variants where id = ${p.variant_id}` : [null];
-    const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage from scene_versions
+    const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                                where scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
     const brand = await brandBrainFor(tx, p.sku_id as string);
     return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
@@ -602,6 +652,27 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
   if (!RUNNABLE.includes(p.state as ProjectState) || sb?.status !== 'approved') return 'skipped';
   const unit = (p.entitlement_unit as Exclude<LedgerUnit, 'usd_micros'>) ?? 'taste';
   const purpose: Purpose = unit === 'creative_test' ? 'creative_test' : unit;
+  // 0. Claims gate before any spend (§25 "stop expensive loops", Launch Gate 3): a claim revoked, restricted or
+  //    narrowed since the storyboard was approved stops the ad here — deterministic, no model call, nothing reserved —
+  //    instead of after every scene was rendered. The merchant fixes the line and resumes (reopenForEdit).
+  if (PRE_SPEND_GATE.includes(p.state as ProjectState)) {
+    const gate = await withTenant(ws, (tx) => preSpendClaimsGate(tx, sku.id as string, scenes, sb, [sku.name as string, brand?.name ?? null], brand?.brain.cta));
+    if (gate) {
+      await withTenant(ws, async (tx) => {
+        const [cur] = await tx`select state, authorization_id from projects where id = ${projectId} and workspace_id = ${ws} for update`;
+        if (!cur || !PRE_SPEND_GATE.includes(cur.state as ProjectState)) return;
+        await step(tx, ws, projectId, 'claims', 'failed', 'A line needs changing before we can finish');
+        await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: `before production: ${gate.detail}`.slice(0, 1000), code: 'claims_blocked' });
+        await tx`update projects set qa_report = ${tx.json({ ...summarize(gate.checks), statementMap: gate.statementMap, stage: 'pre_spend' } as never)}, outage = null where id = ${projectId} and workspace_id = ${ws}`;
+        // A reservation held by a paused or interrupted run goes back: nothing more is spent on this storyboard.
+        if (cur.authorization_id) {
+          const [a] = await tx`select status from cost_authorizations where id = ${cur.authorization_id} and workspace_id = ${ws}`;
+          if (a?.status === 'active') await settle(tx, ctx, cur.authorization_id as string, 'released');
+        }
+      });
+      return 'failed';
+    }
+  }
   // The run's liveness: renews its lease (or stops, LeaseLost), records projects.heartbeat_at for the progress
   // view and keeps its reservation from expiring under it (§39).
   let authorizationId: string | null = (p.authorization_id as string | null) ?? null;
@@ -717,6 +788,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     const fingerprint = {
       labelText: (fp?.label_text as string) ?? null,
       closure: (fp?.closure as string) ?? null,
+      packageType: (fp?.package_type as string | null) ?? null,
       dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
       liquidColor: (fp?.liquid_color as string | null) ?? null,
       thresholds: fidelityThresholds(fp?.thresholds),
@@ -983,6 +1055,20 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         }
       };
 
+      /**
+       * A still composed as it was approved — unless the model drew the product in it and no passing product check is
+       * on record: it is inspected first, and a failing frame becomes the exact-product composite (plan 06 Phase 2
+       * #4 "exact-product composite for any frame failing fidelity").
+       */
+      const checkedStill = async (s: SceneRow, n: number): Promise<Slot> => {
+        const f = await frameOf(s, n);
+        if (!uncheckedGeneratedStill(versions.find((v) => v.id === f.versionId))) return still(s, n, f);
+        const res = await qaScene({ ctx, token: auth.token, sceneId: s.id, sceneText: s.visual_plan as string, frameBytes: f.bytes, referenceBytes: refs, fingerprint, planText: s.visual_plan as string, attempt: 1 });
+        if (hardFidelityFail(res)) return exactFallback(s, n, 'generated frame failed product QA');
+        checks.push(...res.map((c) => ({ ...c, detail: `Scene ${n} (generated still): ${c.detail}` })));
+        return still(s, n, f);
+      };
+
       const body = scenes.filter((s) => s.purpose !== 'cta');
       const ctaScene = scenes.find((s) => s.purpose === 'cta') ?? null;
       const slots: Slot[] = [];
@@ -991,7 +1077,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         await heartbeat();
         if (s.production_mode === 'GENERATIVE_INTERACTION') slots.push(await generative(s, n, await frameOf(s, n)));
         else if (s.production_mode === 'STRICT_COMPOSITE') slots.push(await strict(s, n));
-        else slots.push(await still(s, n, await frameOf(s, n)));
+        else slots.push(await checkedStill(s, n));
       }
 
       // Continuity of generated people across scenes (§44, §48): scenes that break it with the first become the
@@ -1151,6 +1237,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // The whole creative — script, on-screen text, hook, CTA and the finished pictures together — is scanned
       // for implied claims (§25 check 3, §43 "Visual implies a medical result"). An implied medical,
       // structure/function or before/after result blocks the ad like a blocked line.
+      let impliedReview: ImpliedFlag[] = [];
       if (routes.implied) {
         await heartbeat();
         const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
@@ -1168,11 +1255,12 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           throw e;
         }
         checks.push(implied);
+        impliedReview = impliedFlags(implied);
         if (!implied.pass) {
           await withTenant(ws, async (tx) => {
             await step(tx, ws, projectId, 'claims', 'failed', 'Something in the ad needs changing before we can finish');
             await transition(tx, ctx, projectId, 'BLOCKED_COMPLIANCE', { reason: FAILURE_COPY.claims_blocked, detail: implied.detail.slice(0, 500), code: 'claims_blocked' });
-            await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), impliedClaims: implied.data } as never)} where id = ${projectId}`;
+            await tx`update projects set qa_report = ${tx.json({ ...summarize(checks), impliedClaims: impliedFlags(implied) } as never)} where id = ${projectId}`;
             await settle(tx, ctx, auth.authorizationId, 'released');
           });
           return;
@@ -1192,6 +1280,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         ...(tokensSpoken ? { tokensSpoken } : {}),
         durationMs: totalMs,
         aspects: ASPECTS,
+        composer: COMPOSER_VERSION,
         genes: { angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment },
         disclosure,
       };
@@ -1200,16 +1289,26 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, (tx) => advance(tx, ctx, projectId, 'FINAL_QA'));
       const exportAssets: { aspect: Aspect; assetId: string }[] = [];
+      const provenance = await withTenant(ws, (tx) => exportProvenance(tx, ws, auth.authorizationId, manifest));
+      // The SRT (the same cues in every format) is its own downloadable asset (plan 06 Phase 3 #6).
+      const captionsAsset = await withTenant(ws, (tx) => saveCaptions(tx, ws, sku.id as string, outs[0]!.srt, { projectId, storyboardId: sb.id }));
+      // §25.4: the voice is audible wherever the script is voiced and the captions carry the voiced words (the
+      // audio is the same in every format, so the vertical export stands for all).
+      const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
+      checks.push(await qaVoiceTrack(vertical.file, segments, vertical.srt));
       for (const o of outs) {
-        checks.push(...(await qaExport(o.file, o.aspect, totalMs)));
+        checks.push(...(await qaExport(o.file, o.aspect, totalMs, o.layout)));
         const bytes = await readFile(o.file);
         const a = await withTenant(ws, (tx) =>
-          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, storyboardId: sb.id, disclosure } }),
+          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captionsAsset.id, storyboardId: sb.id, disclosure, provenance } }),
         );
         exportAssets.push({ aspect: o.aspect, assetId: a.id });
       }
       const integrity = await withTenant(ws, async (tx) => Promise.all(exportAssets.map((e) => verifyAssetIntegrity(tx, e.assetId))));
       checks.push({ check: 'asset_integrity', pass: integrity.every(Boolean), hard: !integrity.every(Boolean), detail: integrity.every(Boolean) ? 'Files stored in our storage; checksums verified' : 'Checksum mismatch' });
+      // …and each export can be accounted for: authorization, rates, scene versions, models, claims, voice, composer.
+      const lineageChecks = await withTenant(ws, (tx) => Promise.all(exportAssets.map((e) => assertLineageComplete(tx, e.assetId, { spoken: segments.length > 0 }))));
+      checks.push(lineageChecks.find((c) => !c.pass) ?? lineageChecks[0]!);
       checks.push(await withTenant(ws, (tx) => masterIntegrity(tx, variant, manifest)));
       const report = summarize(checks.filter((c) => !(c.check === 'visual' && /provider/.test(c.detail)) || !c.pass));
       const hardFinal = checks.filter((c) => ['platform', 'audio', 'asset_integrity', 'experiment_integrity'].includes(c.check)).some((c) => !c.pass && c.hard);
@@ -1220,13 +1319,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, async (tx) => {
         const [cr] = await tx`
-          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people)
+          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, captions_asset_id)
           values (${ws}, ${sku.id}, 'generated', ${projectId},
             ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
-            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople})
+            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople}, ${captionsAsset.id})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
-        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
+        await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap, ...(impliedReview.length ? { impliedClaims: impliedReview } : {}) } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;
         // §41 final acceptance: the provider jobs whose output is in the delivered creative (its scene versions and
         // voice clips).
         const versionIds = manifest.scenes.map((m) => m.versionId).filter((x): x is string => !!x);
@@ -1262,6 +1361,33 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     await withTenant(ws, (tx) => failProduction(tx, ctx, projectId, (e as Error).message, { checks }));
     throw e;
   }
+}
+
+/**
+ * The provenance every final export records (§25.7): the authorization and rate tables it was priced on, the scene
+ * versions composed and the model/prompt version of each generated one, the Claim IDs, the voice clips and composer.
+ */
+export async function exportProvenance(tx: Tx, ws: string, authorizationId: string, manifest: CompositionManifest): Promise<ExportProvenance> {
+  const [a] = await tx`select rate_table_versions from cost_authorizations where id = ${authorizationId} and workspace_id = ${ws}`;
+  const sceneVersionIds = manifest.scenes.map((m) => m.versionId).filter((x): x is string => !!x);
+  // The version's own record, else its provider job's (the model the provider reported, the prompt it was sent).
+  const rows = await tx`select v.id, v.kind, v.technique, v.provider_job_id,
+                               coalesce(v.model, j.model_version_returned, j.model) as model, coalesce(v.prompt_version, j.prompt_version) as prompt_version
+                        from scene_versions v left join provider_jobs j on j.id = v.provider_job_id and j.workspace_id = v.workspace_id
+                        where v.workspace_id = ${ws} and v.id = any(${sceneVersionIds}::uuid[])`;
+  // Generated by a model: a render, a frame the model drew, or an exact product on a generated setting (a plate job).
+  const generated = rows
+    .filter((r) => r.provider_job_id && (r.kind === 'render' || String(r.technique ?? '').startsWith('generated')))
+    .map((r) => ({ versionId: r.id as string, model: (r.model as string | null) ?? null, promptVersion: (r.prompt_version as string | null) ?? null }));
+  return {
+    authorizationId,
+    rateTableVersions: ((a?.rate_table_versions ?? {}) as Record<string, number>),
+    sceneVersionIds,
+    generated,
+    claimIds: [...new Set(manifest.scenes.flatMap((m) => m.claimIds ?? []))],
+    voiceClipIds: (manifest.voiceover?.segments ?? []).map((sg) => sg.clipAssetId),
+    composer: manifest.composer ?? null,
+  };
 }
 
 /** An outage is over once the stage it stopped gets through. */
@@ -1371,6 +1497,27 @@ export async function failProduction(tx: Tx, ctx: TenantContext, projectId: stri
                         and status = 'paid' and kind in ('taste','standalone') order by created_at desc limit 1`;
   if (pu) await enqueue(tx, ctx.workspaceId, Queues.refundPurchase, { projectId, purchaseId: pu.id, reason: 'guarantee' }, { singletonKey: `refund:${pu.id}`, priority: 20 });
   return true;
+}
+
+/** One implied-claim flag as the compliance queue lists it (qa_report.impliedClaims is an array of these). */
+export interface ImpliedFlag {
+  claim: string;
+  basis: 'text' | 'visual' | 'combined';
+  severity: 'block' | 'review';
+  scene: number | null;
+  text?: string;
+}
+
+/**
+ * The flags of a whole-creative implied-claim scan (§25 check 3): the reviewer's implications ('block' stops the ad,
+ * 'review' is borderline and goes to the compliance queue) and the deterministic signals (always 'block').
+ */
+export function impliedFlags(c: CheckResult): ImpliedFlag[] {
+  const d = (c.data ?? {}) as { impliedClaims?: ImpliedFlag[]; deterministic?: { text: string; claim: string }[] };
+  return [
+    ...(d.deterministic ?? []).map((x): ImpliedFlag => ({ claim: x.claim, basis: 'text', severity: 'block', scene: null, text: x.text })),
+    ...(d.impliedClaims ?? []).map((x): ImpliedFlag => ({ claim: x.claim, basis: x.basis, severity: x.severity, scene: x.scene ?? null })),
+  ];
 }
 
 /** A line that stopped production at the claims check, with why and a compliant alternative when one is known. */
@@ -1543,6 +1690,31 @@ export async function cancelProduction(tx: Tx, ctx: TenantContext, projectId: st
   if (await productionRunning(tx, ctx.workspaceId, projectId)) return { status: 'cancelling', decision };
   const done = await finalizeCancel(tx, ctx, projectId);
   return { status: done === 'REFUNDED' ? 'refunded' : 'cancelled', decision };
+}
+
+/**
+ * Archive an experiment (merchant "Archive"): its production, if one is still running or waiting, is cancelled first
+ * (standard §25 "Cancellation before dispatch | No charge | Release reserved entitlement"), so an archived test never
+ * keeps a produce job or a reserved Creative Test alive. What happens to the credit follows cancelDecision; a
+ * production past cancelling (delivered) is left as it is.
+ */
+export async function archiveExperiment(tx: Tx, ctx: TenantContext, experimentId: string): Promise<{ cancelled: { projectId: string; status: 'cancelled' | 'refunded' | 'cancelling'; message: string }[] }> {
+  assertCan(ctx, 'experiment.create');
+  const [e] = await tx`select id from experiments where id = ${experimentId} and workspace_id = ${ctx.workspaceId} for update`;
+  if (!e) throw new DomainError('NOT_FOUND', 'Experiment not found');
+  const projects = await tx`select distinct p.id from variants v join projects p on p.id = v.project_id and p.workspace_id = v.workspace_id
+                            where v.workspace_id = ${ctx.workspaceId} and v.experiment_id = ${experimentId}
+                              and p.state <> all(${['COMPLETE', 'CANCELLED', 'REFUNDED']}::text[]) and p.cancel_requested_at is null`;
+  const cancelled: { projectId: string; status: 'cancelled' | 'refunded' | 'cancelling'; message: string }[] = [];
+  for (const row of projects) {
+    const projectId = row.id as string;
+    if (!(await cancelDecision(tx, ctx.workspaceId, projectId)).allowed) continue;
+    const r = await cancelProduction(tx, ctx, projectId, { reason: 'experiment archived' });
+    cancelled.push({ projectId, status: r.status, message: r.decision.message });
+  }
+  // Cancelling the master may already have archived the experiment (syncExperimentWithProject).
+  await setExperimentState(tx, ctx, experimentId, 'ARCHIVED', 'archived by merchant');
+  return { cancelled };
 }
 
 /**

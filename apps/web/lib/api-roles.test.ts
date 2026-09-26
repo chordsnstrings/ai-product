@@ -142,6 +142,7 @@ const PROJECT_ACTIONS: [string, () => unknown][] = [
   ['reopen', () => ({})],
   ['cancel', () => ({})],
   ['recompose', () => ({})],
+  ['edit-text', () => ({ cta: 'Shop now' })],
   ['finish', () => ({})],
   ['variant', () => ({ variantId: null })],
   ['not-right', () => ({ reason: 'style' })],

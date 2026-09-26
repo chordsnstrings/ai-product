@@ -3,9 +3,9 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
 import { DomainError, platformAssets, platformsFor } from '@arkiv/shared';
-import { captionCues, composeAd, layoutVoice, probe, withTempDir, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { captionCues, composeAd, COMPOSER_VERSION, layoutVoice, probe, withTempDir, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { raiseAlert } from './alerts';
-import { assetBytes, saveAsset } from './assets';
+import { assetBytes, saveAsset, saveCaptions } from './assets';
 import { brandBrainFor } from './brand';
 import { scanCreativeText, scanPasses } from './compliance';
 import { diffCompositions, disclosureMetadata, type CompositionManifest, type VoiceSegment } from './composition';
@@ -20,7 +20,7 @@ import { linkJobOutput, synthesizeVoice } from './model-gateway';
 import { bonusHookDue } from './offers';
 import { enqueue, Queues } from './outbox';
 import { ASPECTS, productionRoutes, voiceLine } from './production';
-import { qaExperimentIntegrity, qaExport, type CheckResult } from './qa';
+import { qaExperimentIntegrity, qaExport, qaVoiceTrack, type CheckResult } from './qa';
 import { loadRates } from './rates';
 
 /** Hook variants ship every export the master does (plan 06 Phase 3 #6: 9:16 / 4:5 / 1:1). */
@@ -132,6 +132,7 @@ async function buildHookVersion(
     voiceover: manifest.voiceover && newSeg ? { ...manifest.voiceover, segments: segments.map((s) => (s === hookSeg ? newSeg! : s)) } : manifest.voiceover,
     captions: newSeg ? [...captionCues(hook, newSeg.startMs, newSeg.endMs), ...manifest.captions.filter((c) => !(c.startMs >= hookSeg!.startMs && c.endMs <= hookSeg!.endMs))].sort((a, b) => a.startMs - b.startMs) : manifest.captions,
     aspects: VARIANT_ASPECTS,
+    composer: COMPOSER_VERSION,
   };
   const changed = diffCompositions(manifest, versionManifest);
   const integrity = qaExperimentIntegrity(intended, { changed });
@@ -161,7 +162,8 @@ async function buildHookVersion(
   // The version is the master's footage with a re-voiced hook: it carries the master's AI-content disclosure (§40).
   const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: versionManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(versionManifest.disclosure) }, dir);
   const checks: CheckResult[] = [integrity];
-  for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, versionManifest.durationMs)));
+  for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, versionManifest.durationMs, o.layout)));
+  checks.push(await qaVoiceTrack(outs[0]!.file, versionManifest.voiceover?.segments ?? [], outs[0]!.srt));
   if (checks.some((c) => !c.pass && c.hard)) return { ok: false, reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) };
   return { ok: true, outs, manifest: versionManifest, changed, integrity };
 }
@@ -210,7 +212,7 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
         // Claim the variant first: an overlapping run that got here before us wins, and we write nothing.
         const [cur] = await tx`select creative_id from variants where id = ${v.id} for update`;
         if (!cur || cur.creative_id) return false;
-        const { ids, exported } = await saveHookExports(tx, ctx, p, built, { variantId: v.id as string });
+        const { ids, exported, captionsAssetId } = await saveHookExports(tx, ctx, p, built, { variantId: v.id as string });
         const creativeId = await versionCreative(tx, ctx, {
           skuId: p.sku_id as string,
           parentCreativeId: p.final_creative_id as string,
@@ -222,6 +224,7 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
           experimentId: p.experiment_id as string,
           variantId: v.id as string,
           storyboardId: (p.storyboard_id as string | null) ?? null,
+          captionsAssetId,
         });
         const [claimed] = await tx`update variants set creative_id = ${creativeId}, platform_assets = ${tx.json(platformAssets(exported) as never)} where id = ${v.id} and creative_id is null returning id`;
         if (!claimed) throw new Error(`variant ${v.id as string} was claimed concurrently`); // rolls back the creative and its assets
@@ -239,12 +242,24 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
 async function saveHookExports(tx: Tx, ctx: TenantContext, p: Record<string, unknown>, built: Extract<HookBuild, { ok: true }>, lineage: { variantId?: string; bonusFor?: string }) {
   const ids: string[] = [];
   const exported: { aspect: string; assetId: string }[] = [];
+  const srt = built.outs.find((o) => o.srt)?.srt ?? null;
+  const captions = srt ? await saveCaptions(tx, ctx.workspaceId, p.sku_id as string, srt, { projectId: p.id, ...lineage }) : null;
+  // The version's provenance (§25.7): the master export's (same footage, authorization and rates), with this
+  // version's voice clips, claims and composer.
+  const [master] = p.final_creative_id
+    ? await tx`select a.lineage->'provenance' as pv from creatives c join assets a on a.id = c.final_asset_ids[1] and a.workspace_id = c.workspace_id
+               where c.id = ${p.final_creative_id as string} and c.workspace_id = ${ctx.workspaceId}`
+    : [];
+  const m = built.manifest;
+  const provenance = master?.pv
+    ? { ...(master.pv as object), claimIds: [...new Set(m.scenes.flatMap((x) => x.claimIds ?? []))], voiceClipIds: (m.voiceover?.segments ?? []).map((sg) => sg.clipAssetId), composer: COMPOSER_VERSION }
+    : null;
   for (const o of built.outs) {
-    const a = await saveAsset(tx, ctx.workspaceId, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId: p.id, ...lineage, aspect: o.aspect, srt: o.srt, changed: built.changed } });
+    const a = await saveAsset(tx, ctx.workspaceId, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId: p.id, ...lineage, aspect: o.aspect, srt: o.srt, captionsAssetId: captions?.id ?? null, changed: built.changed, ...(provenance ? { provenance } : {}) } });
     ids.push(a.id);
     exported.push({ aspect: o.aspect, assetId: a.id });
   }
-  return { ids, exported };
+  return { ids, exported, captionsAssetId: captions?.id ?? null };
 }
 
 // ───────────── Offer bonus: an alternate opening hook (standard §7 bonus entitlements, §8) ─────────────
@@ -290,7 +305,7 @@ async function runBonusHook(ctx: TenantContext, projectId: string, holder: strin
     return withTenant(ws, async (tx) => {
       const [p] = await tx`select * from projects where id = ${projectId} for update`;
       if (!p || p.bonus_hook_creative_id) return false; // delivered by an overlapping run
-      const { ids } = await saveHookExports(tx, ctx, p, built, { bonusFor: projectId });
+      const { ids, captionsAssetId } = await saveHookExports(tx, ctx, p, built, { bonusFor: projectId });
       const creativeId = await versionCreative(tx, ctx, {
         skuId: p.sku_id as string,
         parentCreativeId: p.final_creative_id as string,
@@ -300,6 +315,7 @@ async function runBonusHook(ctx: TenantContext, projectId: string, holder: strin
         composition: built.manifest,
         changedVariables: built.changed.length ? built.changed : ['hook'],
         storyboardId: (p.storyboard_id as string | null) ?? null,
+        captionsAssetId,
       });
       // Delivered with the ad: the delivery page lists it beside the master's exports.
       await tx`update projects set bonus_hook_creative_id = ${creativeId} where id = ${projectId} and workspace_id = ${ws}`;
