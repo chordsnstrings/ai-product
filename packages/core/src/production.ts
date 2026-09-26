@@ -27,7 +27,7 @@ import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { GENOME_VERSION_SQL } from './creatives';
 import { setExperimentState } from './experiment-state';
-import { assertLineageComplete, qaClaims, qaClipContract, type ExportProvenance, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
+import { assertLineageComplete, qaClaims, qaClipContract, type ExportProvenance, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, qaVoiceTrack, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -1292,6 +1292,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       const provenance = await withTenant(ws, (tx) => exportProvenance(tx, ws, auth.authorizationId, manifest));
       // The SRT (the same cues in every format) is its own downloadable asset (plan 06 Phase 3 #6).
       const captionsAsset = await withTenant(ws, (tx) => saveCaptions(tx, ws, sku.id as string, outs[0]!.srt, { projectId, storyboardId: sb.id }));
+      // §25.4: the voice is audible wherever the script is voiced and the captions carry the voiced words (the
+      // audio is the same in every format, so the vertical export stands for all).
+      const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
+      checks.push(await qaVoiceTrack(vertical.file, segments, vertical.srt));
       for (const o of outs) {
         checks.push(...(await qaExport(o.file, o.aspect, totalMs, o.layout)));
         const bytes = await readFile(o.file);

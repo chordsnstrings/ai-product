@@ -2,7 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
-import { probe, withTempDir, extractFrames, frameDiffStats, ASPECT_SIZE, boxInside, contrastRatio, safeRect, type Aspect, type PlacedText } from '@arkiv/media';
+import { audioLevel, probe, withTempDir, extractFrames, frameDiffStats, ASPECT_SIZE, boxInside, contrastRatio, safeRect, type Aspect, type PlacedText } from '@arkiv/media';
 import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
 import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, labelTextSimilarity, type FidelityThresholds } from './fidelity';
@@ -540,3 +540,43 @@ export const summarize = (checks: CheckResult[]) => ({
   hardFail: checks.some((c) => !c.pass && c.hard),
   checks,
 });
+
+/** Mean loudness (dBFS) below which a stretch the voice-over should fill counts as silent. */
+export const VOICE_SILENCE_DB = -45;
+
+const words = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}%$.,]+/gu, ' ').replace(/[.,](?=\s|$)/g, '').trim().split(/\s+/).filter(Boolean);
+
+/** The caption text of an SRT, cue by cue. */
+export function srtTexts(srt: string): string[] {
+  return srt
+    .split(/\r?\n\r?\n/)
+    .map((b) => b.split(/\r?\n/).filter((l) => l.trim() && !/^\d+$/.test(l.trim()) && !/-->/.test(l)).join(' ').trim())
+    .filter(Boolean);
+}
+
+/**
+ * Audio/transcript QA without a speech-to-text pass (§25.4 "voice and captions match; no accidental claim
+ * mutation"): every stretch where the approved script is voiced is audible in the finished export (a clip that was
+ * dropped, cut short or lost in the mix leaves silence there), and the delivered captions carry exactly the voiced
+ * words, in order. The voiced words themselves are the approved lines the claims check scanned. A failure is hard.
+ */
+export async function qaVoiceTrack(file: string, segments: readonly { sceneId: string; text: string; startMs: number; endMs: number }[], srt: string): Promise<CheckResult> {
+  if (!segments.length) return { check: 'audio', pass: true, hard: false, detail: 'No voice-over in this ad', data: { segments: 0 } };
+  const levels = await Promise.all(segments.map((s) => audioLevel(file, s.startMs, s.endMs)));
+  const silent = segments.map((s, i) => ({ n: i + 1, sceneId: s.sceneId, level: levels[i]! })).filter((x) => !(x.level >= VOICE_SILENCE_DB));
+  const voiced = segments.flatMap((s) => words(s.text));
+  const captioned = srtTexts(srt).flatMap(words);
+  const captionsMatch = voiced.join(' ') === captioned.join(' ');
+  const problems = [
+    ...silent.map((x) => `the voice-over is missing in line ${x.n}`),
+    ...(captionsMatch ? [] : ['the captions don’t match the voiced script']),
+  ];
+  const pass = problems.length === 0;
+  return {
+    check: 'audio',
+    pass,
+    hard: !pass,
+    detail: pass ? `Voice-over audible in all ${segments.length} lines; captions match the voiced script` : `Voice-over: ${problems.join('; ')}`,
+    data: { segments: segments.length, levels: levels.map((l) => (Number.isFinite(l) ? l : null)), silent, captionsMatch, voicedWords: voiced.length, captionWords: captioned.length },
+  };
+}

@@ -1,8 +1,8 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { boxInside, captionLayout, composeAd, contrastRatio, endCardLayout, finalizeAudio, mapBox, placeholderFrame, productPlacement, safeRect, stillToClip, withTempDir } from '@arkiv/media';
-import { CAPTION_MAX_CPS, qaClipContract, qaExport, qaLayout, TEXT_MIN_CONTRAST } from './qa';
+import { boxInside, captionCues, captionLayout, composeAd, contrastRatio, endCardLayout, finalizeAudio, layoutVoice, mapBox, placeholderFrame, productPlacement, safeRect, stillToClip, toneAudio, withTempDir } from '@arkiv/media';
+import { CAPTION_MAX_CPS, qaClipContract, qaExport, qaLayout, qaVoiceTrack, srtTexts, TEXT_MIN_CONTRAST } from './qa';
 
 /** §48 "Provider returns wrong duration/resolution/format": the deliverable contract, per clip and per export. */
 async function clip(ms: number, aspect: '9x16' | '1x1', withAudio = false) {
@@ -101,5 +101,32 @@ describe('safe zones and caption readability (standard §25.5: prod-23)', () => 
       expect(checks.filter((c) => c.check === 'platform')).toHaveLength(3);
       expect(checks.filter((c) => !c.pass)).toEqual([]);
     });
+  });
+});
+
+describe('voice-over and captions (standard §25.4: prod-21)', () => {
+  it('passes an audible voice with matching captions; fails a silent voiced line or captions that drifted', async () => {
+    await withTempDir(async (dir) => {
+      const png = path.join(dir, 'f.png');
+      await writeFile(png, await placeholderFrame('voice', '9x16'));
+      const vo = path.join(dir, 'vo.mp3');
+      await toneAudio(1500, vo, 330);
+      const laid = path.join(dir, 'vo.wav');
+      await layoutVoice([{ file: vo, startMs: 0, tempo: 1 }], 4000, laid);
+      const text = 'Two drops, morning and night.';
+      const [out] = await composeAd({ scenes: [{ kind: 'still', file: png, durationMs: 4000 }], voiceover: laid, captions: captionCues(text, 0, 1500), aspects: ['9x16'] }, dir);
+      const seg = { sceneId: 's1', text, startMs: 0, endMs: 1500 };
+      expect(await qaVoiceTrack(out!.file, [seg], out!.srt)).toMatchObject({ check: 'audio', pass: true, detail: expect.stringMatching(/audible in all 1 lines; captions match/) });
+      // A line the manifest says is voiced where the export is silent: dropped or cut short in the mix.
+      const lost = await qaVoiceTrack(out!.file, [seg, { sceneId: 's2', text: 'Shop now.', startMs: 2500, endMs: 3500 }], `${out!.srt}\n3\n00:00:02,500 --> 00:00:03,500\nShop now.\n`);
+      expect(lost).toMatchObject({ pass: false, hard: true, detail: 'Voice-over: the voice-over is missing in line 2' });
+      // Captions that don't carry the voiced words (a qualifier dropped from the SRT).
+      const drift = await qaVoiceTrack(out!.file, [{ ...seg, text: 'Two drops, morning and night, for visibly calmer skin.' }], out!.srt);
+      expect(drift).toMatchObject({ pass: false, hard: true, detail: expect.stringMatching(/captions don’t match/) });
+      expect(await qaVoiceTrack(out!.file, [], out!.srt)).toMatchObject({ pass: true, detail: 'No voice-over in this ad' });
+    });
+  });
+  it('reads caption text out of an SRT', () => {
+    expect(srtTexts('1\n00:00:00,000 --> 00:00:01,000\nTwo drops\n\n2\n00:00:01,000 --> 00:00:02,000\nmorning and\nnight\n')).toEqual(['Two drops', 'morning and night']);
   });
 });

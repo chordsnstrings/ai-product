@@ -62,6 +62,9 @@ function run(bin: string, args: string[], timeoutMs = 300_000, opts: { untrusted
 export const ffmpeg = (args: string[], timeoutMs?: number) =>
   run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', ...args], timeoutMs);
 
+/** ffmpeg with its informational log on stderr, for filters that report there (volumedetect, astats). */
+export const ffmpegReport = (args: string[], timeoutMs?: number) => run(FFMPEG, ['-hide_banner', '-nostats', '-y', ...args], timeoutMs);
+
 export interface ProbeResult {
   durationMs: number;
   width: number | null;

@@ -20,7 +20,7 @@ import { step } from './progress';
 import { loadRates } from './rates';
 import { recordScriptVersion } from './storyboard';
 import { currentFacts } from './product-truth';
-import { qaExport, type CheckResult } from './qa';
+import { qaExport, qaVoiceTrack, type CheckResult } from './qa';
 import { factsForStatements, mapStatements, statementCheck } from './statements';
 
 /**
@@ -197,6 +197,8 @@ async function saveVersion(
   return withTempDir(async (dir) => {
     const outs = await composeFromManifest(ws, next, dir);
     for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, next.durationMs, o.layout)));
+    const vertical = outs.find((o) => o.aspect === '9x16') ?? outs[0]!;
+    checks.push(await qaVoiceTrack(vertical.file, next.voiceover?.segments ?? [], vertical.srt));
     const bad = checks.filter((c) => !c.pass && c.hard);
     if (bad.length) throw new Error(`recomposition failed final QA: ${bad.map((c) => c.detail).join('; ').slice(0, 300)}`);
     return withTenant(ws, async (tx) => {

@@ -1,6 +1,6 @@
 import { writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ffmpeg, probe, withTempDir } from './ffmpeg';
+import { ffmpeg, ffmpegReport, probe, withTempDir } from './ffmpeg';
 import { ASPECT_SIZE, captionLayout, captionOverlay, endCard, endCardLayout, type Aspect, type TextLayout } from './render';
 
 const FPS = 30;
@@ -180,6 +180,13 @@ export async function extractFrames(video: string, count: number, dir: string): 
     outs.push(out);
   }
   return outs;
+}
+
+/** Mean loudness (dBFS, ffmpeg volumedetect) of a file's audio between two times; -Infinity when silent. */
+export async function audioLevel(file: string, startMs: number, endMs: number): Promise<number> {
+  const { stderr } = await ffmpegReport(['-ss', sec(startMs), '-t', sec(Math.max(1, endMs - startMs)), '-i', file, '-vn', '-af', 'volumedetect', '-f', 'null', '-']);
+  const m = /mean_volume:\s*(-?[\d.]+|-inf) dB/.exec(stderr);
+  return !m || m[1] === '-inf' ? -Infinity : Number(m[1]);
 }
 
 /** Mean luma of every frame of a video (ffmpeg signalstats YAVG, 0–255), on a small scaled copy. */

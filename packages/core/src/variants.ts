@@ -20,7 +20,7 @@ import { linkJobOutput, synthesizeVoice } from './model-gateway';
 import { bonusHookDue } from './offers';
 import { enqueue, Queues } from './outbox';
 import { ASPECTS, productionRoutes, voiceLine } from './production';
-import { qaExperimentIntegrity, qaExport, type CheckResult } from './qa';
+import { qaExperimentIntegrity, qaExport, qaVoiceTrack, type CheckResult } from './qa';
 import { loadRates } from './rates';
 
 /** Hook variants ship every export the master does (plan 06 Phase 3 #6: 9:16 / 4:5 / 1:1). */
@@ -162,6 +162,7 @@ async function buildHookVersion(
   const outs = await composeAd({ scenes: inputs, voiceover: voPath, captions: versionManifest.captions, endCard, aspects: VARIANT_ASPECTS, metadata: disclosureMetadata(versionManifest.disclosure) }, dir);
   const checks: CheckResult[] = [integrity];
   for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, versionManifest.durationMs, o.layout)));
+  checks.push(await qaVoiceTrack(outs[0]!.file, versionManifest.voiceover?.segments ?? [], outs[0]!.srt));
   if (checks.some((c) => !c.pass && c.hard)) return { ok: false, reason: checks.filter((c) => !c.pass && c.hard).map((c) => c.detail).join('; ').slice(0, 300) };
   return { ok: true, outs, manifest: versionManifest, changed, integrity };
 }
