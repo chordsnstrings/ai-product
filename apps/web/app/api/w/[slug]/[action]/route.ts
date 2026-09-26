@@ -54,6 +54,8 @@ import {
   toBrain,
   refreshPackaging,
   approveFingerprintViews,
+  consumeMediaUpload,
+  uploadedFile,
   weekOf,
 } from '@arkiv/core';
 import { assertRecentLogin } from '@arkiv/auth';
@@ -95,7 +97,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
   // Multipart actions first (files). Each one is authorised by role, here or inside the core function.
   if (MULTIPART.has(action)) {
     const form = await req.formData();
-    const file = form.get('file');
+    // A file sent ahead through a resumable upload (plan 06 Phase 1 D3) arrives as `fileUploadId`: its quarantined
+    // bytes stand in for a posted file and go through the same validation, then leave quarantine once used.
+    const uploadId = typeof form.get('fileUploadId') === 'string' && uuid.safeParse(form.get('fileUploadId')).success ? (form.get('fileUploadId') as string) : null;
+    const uploaded = uploadId ? await t((tx) => uploadedFile(tx, ctx, uploadId)) : null;
+    const file = uploaded ? new File([new Uint8Array(uploaded.bytes)], uploaded.filename ?? 'upload', { type: uploaded.mime }) : form.get('file');
+    const res = await (async (): Promise<Response> => {
     switch (action) {
       case 'performance-csv': {
         assertCan(ctx, 'integration.manage');
@@ -194,13 +201,18 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const beforeAfter = beforeAfterAttestation(form.getAll('beforeAfter').map(String));
         const id = await t((tx) =>
           once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, beforeAfter: !!beforeAfter, file: fileIdentity(file) }, async () => {
-            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'creator_footage', skuId, { filename: file.name, ...(beforeAfter ? { beforeAfter } : {}) })).id : null;
+            // Stored as what it is — a past ad (§19 historical creative) — not as creator footage for new productions.
+            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'historical_creative', skuId, { filename: file.name, ...(beforeAfter ? { beforeAfter } : {}) })).id : null;
             return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId, secondarySkuIds, minorsPresent });
           }),
         );
         return json({ ok: true, creativeId: id });
       }
     }
+    throw new DomainError('NOT_FOUND', 'Unknown action');
+    })();
+    if (uploadId && res.ok) await t((tx) => consumeMediaUpload(tx, ctx, uploadId));
+    return res;
   }
 
   switch (action) {

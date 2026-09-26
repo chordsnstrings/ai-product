@@ -27,6 +27,7 @@ import {
   sweepExpiringEvidence,
   sweepExpiredRights,
   sweepStaleLearnings,
+  sweepStaleUploads,
   sweepDelayedProductions,
   sweepLandingGalleryRights,
   sweepOfferGuardrails,
@@ -256,6 +257,8 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   'circuit-breaker': { cron: '* * * * *', run: () => withSystem(async (tx) => { const changed = await evaluateCircuits(tx); return changed.length ? changed : 0; }) },
   'canary-guard': { cron: '*/15 * * * *', run: () => withSystem(async (tx) => { const rolled = await evaluateCanaries(tx); return rolled.length ? rolled : 0; }) },
   'sweep-evidence': { cron: '5 6 * * *', run: () => withSystem((tx) => sweepExpiringEvidence(tx)) },
+  // Plan 02 §3 layer 4: uploads started and never used leave quarantine after a day (parts aborted, objects deleted).
+  'sweep-stale-uploads': { cron: '35 * * * *', run: () => withSystem((tx) => sweepStaleUploads(tx)) },
   // Standard §48: creator usage rights that ended are reported once (event + email); the files already stay out of
   // new production (usableAssetIds), their history and results are kept.
   'asset-rights-expiry': { cron: '10 6 * * *', run: () => withSystem((tx) => sweepExpiredRights(tx)) },

@@ -5,6 +5,7 @@ import { useState, type ReactNode } from 'react';
 import { Banner, Button, Field as FormField, Input, Select, splitConfirm, Textarea } from '@arkiv/ui';
 import { api, confirmSheet, Sheet, toast, useSubmissionKey } from '@arkiv/ui/client';
 import { StepUp } from './profile';
+import { forgetUpload, RESUMABLE_TYPES, resumableUpload } from './resumable-upload';
 
 /** The server wants a recent sign-in first (plan 02 M14 step-up): offer the emailed confirmation link. */
 const needsStepUp = (e: unknown) => !!(e as { details?: { stepUp?: boolean } } | null)?.details?.stepUp;
@@ -77,6 +78,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [stepUp, setStepUp] = useState(false);
+  const [progress, setProgress] = useState<number | null>(null);
   // One key per submission: a doubled or retried submit of the same form returns the first answer (§39).
   const submission = useSubmissionKey();
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -86,8 +88,18 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
     setErr(null);
     try {
       let payload: unknown;
+      let sent: File | null = null;
       if (multipart) {
         for (const [k, v] of Object.entries(extra ?? {})) fd.set(k, String(v));
+        // Photos, video and PDFs go up first, straight to storage and resumably; the form then names the upload.
+        const f = fd.get('file');
+        if (f instanceof File && f.size > 0 && RESUMABLE_TYPES.test(f.type)) {
+          setProgress(0);
+          const uploadId = await resumableUpload(slug, f, setProgress);
+          fd.delete('file');
+          fd.set('fileUploadId', uploadId);
+          sent = f;
+        }
         payload = fd;
       } else {
         const o: Record<string, unknown> = { ...extra };
@@ -102,6 +114,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
       }
       const r = await api<{ next?: string }>(`/api/w/${slug}/${action}`, payload, 'POST', { idempotencyKey: submission.key() });
       submission.next();
+      if (sent) forgetUpload(slug, sent);
       (e.target as HTMLFormElement).reset();
       toast('Saved');
       onDone?.(r);
@@ -111,6 +124,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
       if (needsStepUp(x)) setStepUp(true);
       else setErr((x as Error).message);
     }
+    setProgress(null);
     setBusy(false);
   }
   return (
@@ -142,7 +156,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
       )}
       {stepUp ? <StepUp message="For your security, confirm it’s you first, then try again." /> : null}
       {err ? <Banner tone="risk">{err}</Banner> : null}
-      <div><Button type="submit" variant={danger ? 'danger' : 'primary'} disabled={busy}>{busy ? 'Saving…' : submit}</Button></div>
+      <div><Button type="submit" variant={danger ? 'danger' : 'primary'} disabled={busy}>{busy ? (progress != null && progress < 1 ? `Uploading ${Math.round(progress * 100)}%…` : 'Saving…') : submit}</Button></div>
     </form>
   );
 }

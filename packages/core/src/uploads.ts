@@ -40,7 +40,8 @@ const ALLOWED: Record<string, 'image' | 'video' | 'pdf'> = {
   'application/pdf': 'pdf',
 };
 
-export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, declaredMime: string, bytes: number) {
+/** A quarantined upload row (checked type and size, rate-limited); the bytes arrive by presigned PUT. */
+async function openUpload(tx: Tx, ctx: TenantContext, kind: AssetKind | typeof FORM_FILE, declaredMime: string, bytes: number) {
   assertCan(ctx, 'sku.edit');
   // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
   // still spends the budget, and the counter row is not locked across decoding and storage I/O.
@@ -52,7 +53,137 @@ export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, 
   const key = quarantineKey(ctx.workspaceId, id);
   await tx`insert into uploads (id, workspace_id, kind, status, quarantine_key, declared_mime, bytes, created_by)
            values (${id}, ${ctx.workspaceId}, ${kind}, 'pending', ${key}, ${declaredMime}, ${bytes}, ${actorString(ctx)})`;
+  return { id, key };
+}
+
+export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, declaredMime: string, bytes: number) {
+  const { id, key } = await openUpload(tx, ctx, kind, declaredMime, bytes);
   return { uploadId: id, putUrl: await storage().signedPutUrl(key, declaredMime), key };
+}
+
+// ───────────── Resumable uploads for workspace forms (plan 06 Phase 0 D7, Phase 1 D3) ─────────────
+
+/**
+ * The upload kind of a file a workspace form attaches (evidence, footage, a past ad, a packaging photo, a logo): the
+ * form's own action decides what asset it becomes once it has the validated bytes.
+ */
+export const FORM_FILE = 'form_file';
+/** Part size of a resumable upload (S3 multipart needs 5 MB or more for every part but the last). */
+export const UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+/** A started upload not completed and used within this long is removed from quarantine. */
+export const UPLOAD_TTL_HOURS = 24;
+
+export interface UploadParts {
+  uploadId: string;
+  partSize: number;
+  partCount: number;
+  /** Parts already stored (1-based), so a resumed upload sends only the rest. */
+  received: number[];
+  /** Presigned PUT URLs for the parts still missing (a single-part upload is PUT with its declared Content-Type). */
+  parts: { partNumber: number; url: string }[];
+}
+
+async function partsOf(u: { id: string; quarantine_key: string; multipart_id: string | null; part_size: number; part_count: number; declared_mime: string }): Promise<UploadParts> {
+  const received = u.multipart_id
+    ? (await storage().listParts(u.quarantine_key, u.multipart_id)).map((p) => p.partNumber)
+    : (await storage().exists(u.quarantine_key)) ? [1] : [];
+  const missing = Array.from({ length: u.part_count }, (_, i) => i + 1).filter((n) => !received.includes(n));
+  const parts = await Promise.all(
+    missing.map(async (partNumber) => ({ partNumber, url: u.multipart_id ? await storage().signedPartUrl(u.quarantine_key, u.multipart_id, partNumber) : await storage().signedPutUrl(u.quarantine_key, u.declared_mime, 3600) })),
+  );
+  return { uploadId: u.id, partSize: u.part_size, partCount: u.part_count, received, parts };
+}
+
+/**
+ * Start a resumable upload straight into quarantine (the bytes never pass through our servers or the 26 MB
+ * request cap). A file larger than one part goes up as a multipart upload, one presigned URL per part; a dropped
+ * connection resumes from the parts already stored (mediaUploadStatus).
+ */
+export async function startMediaUpload(tx: Tx, ctx: TenantContext, input: { mime: string; bytes: number; filename?: string | null }): Promise<UploadParts> {
+  const { id, key } = await openUpload(tx, ctx, FORM_FILE, input.mime, input.bytes);
+  const partCount = Math.max(1, Math.ceil(input.bytes / UPLOAD_PART_SIZE));
+  const multipartId = partCount > 1 ? await storage().startMultipart(key, input.mime) : null;
+  await tx`update uploads set multipart_id = ${multipartId}, part_size = ${UPLOAD_PART_SIZE}, part_count = ${partCount}, filename = ${input.filename?.slice(0, 200) ?? null}
+           where id = ${id} and workspace_id = ${ctx.workspaceId}`;
+  return partsOf({ id, quarantine_key: key, multipart_id: multipartId, part_size: UPLOAD_PART_SIZE, part_count: partCount, declared_mime: input.mime });
+}
+
+async function formUpload(tx: Tx, ctx: TenantContext, uploadId: string, lock = false) {
+  assertCan(ctx, 'sku.edit');
+  const [u] = lock
+    ? await tx`select * from uploads where id = ${uploadId} and workspace_id = ${ctx.workspaceId} and kind = ${FORM_FILE} for update`
+    : await tx`select * from uploads where id = ${uploadId} and workspace_id = ${ctx.workspaceId} and kind = ${FORM_FILE}`;
+  if (!u) throw new DomainError('NOT_FOUND', 'Upload not found. Please add the file again.');
+  return u as unknown as { id: string; status: string; quarantine_key: string; multipart_id: string | null; part_size: number; part_count: number; bytes: string | number; declared_mime: string; filename: string | null; reject_reason: string | null };
+}
+
+/** Where a started upload stands: the parts stored so far and fresh URLs for the rest (resume after a drop). */
+export async function mediaUploadStatus(tx: Tx, ctx: TenantContext, uploadId: string): Promise<UploadParts & { status: string }> {
+  const u = await formUpload(tx, ctx, uploadId);
+  if (u.status !== 'pending') return { uploadId, partSize: u.part_size, partCount: u.part_count, received: [], parts: [], status: u.status };
+  return { ...(await partsOf(u)), status: u.status };
+}
+
+/**
+ * Every part arrived: assemble them in quarantine. The stored size must be what was declared (a truncated or
+ * padded upload is refused and can be resumed). Completing twice is a no-op.
+ */
+export async function completeMediaUpload(tx: Tx, ctx: TenantContext, uploadId: string): Promise<{ uploadId: string; missing?: number[] }> {
+  const u = await formUpload(tx, ctx, uploadId, true);
+  if (u.status === 'quarantined') return { uploadId };
+  if (u.status !== 'pending') throw new DomainError('CONFLICT', u.reject_reason ?? 'This upload can’t be used any more. Please add the file again.');
+  if (u.multipart_id) {
+    const parts = await storage().listParts(u.quarantine_key, u.multipart_id);
+    const missing = Array.from({ length: u.part_count }, (_, i) => i + 1).filter((n) => !parts.some((p) => p.partNumber === n));
+    if (missing.length) return { uploadId, missing };
+    const size = parts.reduce((a, p) => a + p.size, 0);
+    if (size !== Number(u.bytes)) throw new DomainError('INVALID', 'The upload arrived incomplete. Please add the file again.', { expected: Number(u.bytes), got: size });
+    await storage().completeMultipart(u.quarantine_key, u.multipart_id);
+  } else if (!(await storage().exists(u.quarantine_key))) {
+    return { uploadId, missing: [1] };
+  }
+  await tx`update uploads set status = 'quarantined' where id = ${uploadId} and workspace_id = ${ctx.workspaceId}`;
+  return { uploadId };
+}
+
+/**
+ * The bytes of a completed form upload, for the form's action to validate and ingest like a posted file. The
+ * upload stays in quarantine until `consumeMediaUpload` (after the action succeeded), so a failed action can be
+ * retried without uploading again.
+ */
+export async function uploadedFile(tx: Tx, ctx: TenantContext, uploadId: string): Promise<{ bytes: Buffer; filename: string | null; mime: string }> {
+  const u = await formUpload(tx, ctx, uploadId);
+  if (u.status !== 'quarantined') throw new DomainError('CONFLICT', u.status === 'pending' ? 'The upload hasn’t finished yet.' : 'This upload was already used. Please add the file again.');
+  let bytes: Buffer;
+  try {
+    bytes = await storage().get(u.quarantine_key);
+  } catch {
+    throw new DomainError('CONFLICT', 'The upload expired. Please add the file again.');
+  }
+  return { bytes, filename: u.filename, mime: u.declared_mime };
+}
+
+/** The form's action used the upload: it leaves quarantine (the validated copy lives on as the asset). */
+export async function consumeMediaUpload(tx: Tx, ctx: TenantContext, uploadId: string) {
+  const [u] = await tx`update uploads set status = 'accepted' where id = ${uploadId} and workspace_id = ${ctx.workspaceId} and kind = ${FORM_FILE} and status = 'quarantined' returning quarantine_key`;
+  if (u) await storage().delete(u.quarantine_key as string).catch(() => {});
+}
+
+/**
+ * Uploads started more than UPLOAD_TTL_HOURS ago and never used (abandoned, or the browser gave up) leave
+ * quarantine: stored parts are aborted, the object is deleted, and the row is kept as rejected. System job: each
+ * row is written in its own workspace.
+ */
+export async function sweepStaleUploads(tx: Tx, limit = 200): Promise<number> {
+  const rows = await tx`select id, workspace_id, quarantine_key, multipart_id from uploads
+                        where status in ('pending', 'quarantined') and created_at < now() - make_interval(hours => ${UPLOAD_TTL_HOURS})
+                        order by created_at limit ${limit}`;
+  for (const r of rows) {
+    if (r.multipart_id) await storage().abortMultipart(r.quarantine_key as string, r.multipart_id as string).catch(() => {});
+    await storage().delete(r.quarantine_key as string).catch(() => {});
+    await tx`update uploads set status = 'rejected', reject_reason = 'expired before it was used' where id = ${r.id} and workspace_id = ${r.workspace_id}`;
+  }
+  return rows.length;
 }
 
 export interface ValidatedMedia {

@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile, stat, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { env } from '@arkiv/shared';
@@ -20,7 +20,19 @@ export interface Storage {
   signedGetUrl(key: string, ttlSeconds?: number, downloadName?: string): Promise<string>;
   /** Presigned PUT for direct browser uploads into quarantine. */
   signedPutUrl(key: string, contentType: string, ttlSeconds?: number): Promise<string>;
+  /**
+   * Resumable uploads (plan 06 Phase 1 D3): a large file is PUT in parts, each to its own presigned URL; parts
+   * already stored survive a dropped connection and are listed on resume; `completeMultipart` assembles them at `key`.
+   */
+  startMultipart(key: string, contentType: string): Promise<string>;
+  signedPartUrl(key: string, multipartId: string, partNumber: number, ttlSeconds?: number): Promise<string>;
+  listParts(key: string, multipartId: string): Promise<{ partNumber: number; size: number }[]>;
+  completeMultipart(key: string, multipartId: string): Promise<void>;
+  abortMultipart(key: string, multipartId: string): Promise<void>;
 }
+
+/** Where the local driver keeps the parts of a multipart upload until it is assembled. */
+export const localPartKey = (key: string, multipartId: string, partNumber: number) => `${key}.parts/${multipartId}/${String(partNumber).padStart(5, '0')}`;
 
 const sign = (payload: string) => createHmac('sha256', env().APP_SECRET).update(payload).digest('base64url');
 
@@ -82,6 +94,31 @@ class LocalStorage implements Storage {
   async signedPutUrl(key: string, _contentType: string, ttlSeconds = 900) {
     const exp = String(Math.floor(Date.now() / 1000) + ttlSeconds);
     return `${env().APP_URL}/api/files/upload?${new URLSearchParams({ key, exp, sig: sign(`put:${key}:${exp}`) })}`;
+  }
+  // Multipart emulation: each part is its own object under <key>.parts/<id>/, concatenated on completion.
+  async startMultipart() {
+    return randomBytes(12).toString('hex');
+  }
+  async signedPartUrl(key: string, multipartId: string, partNumber: number, ttlSeconds = 3600) {
+    return this.signedPutUrl(localPartKey(key, multipartId, partNumber), 'application/octet-stream', ttlSeconds);
+  }
+  async listParts(key: string, multipartId: string) {
+    const dir = this.file(`${key}.parts/${multipartId}`);
+    try {
+      const names = (await readdir(dir)).filter((n) => /^\d{5}$/.test(n)).sort();
+      return Promise.all(names.map(async (n) => ({ partNumber: Number(n), size: (await stat(path.join(dir, n))).size })));
+    } catch {
+      return [];
+    }
+  }
+  async completeMultipart(key: string, multipartId: string) {
+    const parts = await this.listParts(key, multipartId);
+    const bufs = await Promise.all(parts.map((p) => readFile(this.file(localPartKey(key, multipartId, p.partNumber)))));
+    await this.put(key, Buffer.concat(bufs));
+    await this.abortMultipart(key, multipartId);
+  }
+  async abortMultipart(key: string, multipartId: string) {
+    await rm(this.file(`${key}.parts/${multipartId}`), { recursive: true, force: true });
   }
 }
 
@@ -160,6 +197,41 @@ class S3Storage implements Storage {
     const { getSignedUrl } = await import('@aws-sdk/s3-request-presigner');
     return getSignedUrl(s3, new mod.PutObjectCommand({ Bucket: this.bucket, Key: key, ContentType: contentType }), { expiresIn: ttlSeconds });
   }
+  async startMultipart(key: string, contentType: string) {
+    const { s3, mod } = await this.clientP;
+    const r = await s3.send(new mod.CreateMultipartUploadCommand({ Bucket: this.bucket, Key: key, ContentType: contentType, ACL: 'private' }));
+    if (!r.UploadId) throw new Error('multipart upload not started');
+    return r.UploadId;
+  }
+  async signedPartUrl(key: string, multipartId: string, partNumber: number, ttlSeconds = 3600) {
+    const { s3, mod } = await this.clientP;
+    const { getSignedUrl } = await import('@aws-sdk/s3-request-presigner');
+    return getSignedUrl(s3, new mod.UploadPartCommand({ Bucket: this.bucket, Key: key, UploadId: multipartId, PartNumber: partNumber }), { expiresIn: ttlSeconds });
+  }
+  private async parts(key: string, multipartId: string) {
+    const { s3, mod } = await this.clientP;
+    const out: { PartNumber: number; ETag: string; Size: number }[] = [];
+    let marker: string | undefined;
+    do {
+      const r = await s3.send(new mod.ListPartsCommand({ Bucket: this.bucket, Key: key, UploadId: multipartId, PartNumberMarker: marker }));
+      for (const p of r.Parts ?? []) if (p.PartNumber && p.ETag) out.push({ PartNumber: p.PartNumber, ETag: p.ETag, Size: p.Size ?? 0 });
+      marker = r.IsTruncated ? r.NextPartNumberMarker : undefined;
+    } while (marker);
+    return out;
+  }
+  async listParts(key: string, multipartId: string) {
+    return (await this.parts(key, multipartId)).map((p) => ({ partNumber: p.PartNumber, size: p.Size }));
+  }
+  async completeMultipart(key: string, multipartId: string) {
+    const { s3, mod } = await this.clientP;
+    // The part ETags are read here, server side: the browser never needs to see (CORS-expose) them.
+    const parts = (await this.parts(key, multipartId)).sort((a, b) => a.PartNumber - b.PartNumber);
+    await s3.send(new mod.CompleteMultipartUploadCommand({ Bucket: this.bucket, Key: key, UploadId: multipartId, MultipartUpload: { Parts: parts.map((p) => ({ PartNumber: p.PartNumber, ETag: p.ETag })) } }));
+  }
+  async abortMultipart(key: string, multipartId: string) {
+    const { s3, mod } = await this.clientP;
+    await s3.send(new mod.AbortMultipartUploadCommand({ Bucket: this.bucket, Key: key, UploadId: multipartId }));
+  }
 }
 
 /**
@@ -201,6 +273,21 @@ class CountingStorage implements Storage {
   }
   signedPutUrl(key: string, contentType: string, ttlSeconds?: number) {
     return this.track('signedPutUrl', () => this.inner.signedPutUrl(key, contentType, ttlSeconds));
+  }
+  startMultipart(key: string, contentType: string) {
+    return this.track('startMultipart', () => this.inner.startMultipart(key, contentType));
+  }
+  signedPartUrl(key: string, multipartId: string, partNumber: number, ttlSeconds?: number) {
+    return this.track('signedPartUrl', () => this.inner.signedPartUrl(key, multipartId, partNumber, ttlSeconds));
+  }
+  listParts(key: string, multipartId: string) {
+    return this.track('listParts', () => this.inner.listParts(key, multipartId));
+  }
+  completeMultipart(key: string, multipartId: string) {
+    return this.track('completeMultipart', () => this.inner.completeMultipart(key, multipartId));
+  }
+  abortMultipart(key: string, multipartId: string) {
+    return this.track('abortMultipart', () => this.inner.abortMultipart(key, multipartId));
   }
 }
 

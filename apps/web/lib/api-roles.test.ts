@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { closeAll, ownerPool } from '@arkiv/db';
+import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId, type Role } from '@arkiv/shared';
 
@@ -133,6 +133,42 @@ describe('workspace API actions enforce the role matrix (plan 02 §1.1)', () => 
     expect(await call('MEMBER', `/api/w/${t.slug}/fact`, workspacePost, { slug: t.slug, action: 'fact' }, { skuId, key: 'size', value: '50 ml' })).toBe(200);
     expect(await call('ADMIN', `/api/w/${t.slug}/invite-revoke`, workspacePost, { slug: t.slug, action: 'invite-revoke' }, { id: u() })).toBe(200);
     expect(await call('OWNER', `/api/w/${t.slug}/rename`, workspacePost, { slug: t.slug, action: 'rename' }, { name: 'Renamed' })).toBe(200);
+  });
+});
+
+describe('forms with a resumably uploaded file (plan 06 Phase 1 D3)', () => {
+  it('uses the quarantined upload in place of a posted file, once, and only in its own workspace', async () => {
+    const { startMediaUpload, completeMediaUpload, storage } = await import('@arkiv/core');
+    const { productPhoto, ctxFor } = await import('@arkiv/core/testing');
+    const photo = await productPhoto();
+    const ctx = ctxFor(t.workspaceId, users.OWNER);
+    const up = await withTenant(t.workspaceId, (tx) => startMediaUpload(tx, ctx, { mime: 'image/jpeg', bytes: photo.length, filename: 'mood.jpg' }));
+    await storage().put(new URL(up.parts[0]!.url).searchParams.get('key')!, photo, 'image/jpeg');
+    await withTenant(t.workspaceId, (tx) => completeMediaUpload(tx, ctx, up.uploadId));
+    const send = () => call('MEMBER', `/api/w/${t.slug}/brand-reference`, workspacePost, { slug: t.slug, action: 'brand-reference' }, form({ brandId: t.brandId, fileUploadId: up.uploadId })());
+    expect(await send()).toBe(200);
+    const [a] = await ownerPool()`select kind, origin from assets where workspace_id = ${t.workspaceId} and kind = 'brand_reference'`;
+    expect(a!.origin).toMatchObject({ filename: 'mood.jpg' });
+    expect((await ownerPool()`select status from uploads where id = ${up.uploadId}`)[0]!.status).toBe('accepted');
+    expect(await send()).toBe(409); // used already
+    // Another workspace's member can't name it.
+    const other = await makeTenant();
+    who = { userId: other.userId, workspaceId: other.workspaceId };
+    const f = form({ brandId: other.brandId, fileUploadId: up.uploadId })();
+    const res = await workspacePost(new Request(`http://localhost/api/w/${other.slug}/brand-reference`, { method: 'POST', body: f }), { params: Promise.resolve({ slug: other.slug, action: 'brand-reference' }) } as never);
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('importing a past ad (standard §19)', () => {
+  it('stores its media as a historical creative, not as creator footage for new productions', async () => {
+    const { productPhoto } = await import('@arkiv/core/testing');
+    const f = form({ skuId, copy: 'The serum that sold out twice' })();
+    f.set('file', new File([new Uint8Array(await productPhoto())], 'old-ad.jpg', { type: 'image/jpeg' }));
+    expect(await call('MEMBER', `/api/w/${t.slug}/import-creative`, workspacePost, { slug: t.slug, action: 'import-creative' }, f)).toBe(200);
+    const [cr] = await ownerPool()`select final_asset_ids from creatives where workspace_id = ${t.workspaceId} and platform_refs->>'copy' = 'The serum that sold out twice'`;
+    const [a] = await ownerPool()`select kind from assets where id = ${(cr!.final_asset_ids as string[])[0]!}`;
+    expect(a!.kind).toBe('historical_creative');
   });
 });
 

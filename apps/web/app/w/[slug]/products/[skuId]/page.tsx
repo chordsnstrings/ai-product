@@ -55,7 +55,7 @@ export default async function Product({ params, searchParams }: { params: Promis
     const labelCrop = fp?.label_crop_asset_id ? await assetUrl(tx, fp.label_crop_asset_id as string) : null;
     const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
-    const assets = await tx`select id, kind, mime, created_at, source, rights_expires_at <= now() as rights_expired, review_status from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
+    const assets = await tx`select id, kind, mime, created_at, source, rights_expires_at <= now() as rights_expired, review_status from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage','historical_creative') order by created_at desc limit 48`;
     const imported = await tx`select c.id, c.genome, c.platform_refs, c.secondary_sku_ids, c.created_at, c.source_deleted_at,
                                    exists (select 1 from assets a where a.id = any(c.final_asset_ids) and a.rights_expires_at <= now()) as rights_expired
                             from creatives c where c.sku_id = ${skuId} and c.origin = 'imported' order by c.created_at desc limit 20`;
