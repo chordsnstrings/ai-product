@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { closeAll, globalTx, ownerPool, withTenant } from '@arkiv/db';
+import { closeAll, globalTx, ownerPool, withAdmin, withTenant } from '@arkiv/db';
 import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { parseMetaSignedRequest, verifyTiktokWebhook } from '@arkiv/integrations';
 import { resetEnvCache } from '@arkiv/shared';
@@ -72,6 +72,27 @@ describe('webhook receipts (standard §38: verify, deduplicate, persist raw, asy
     // Reinstalling from another workspace is possible now that the routing is released.
     const next = await connected('shopify', 'glow.myshopify.com');
     expect((await integration(next.id))!.status).toBe('active');
+  });
+
+  it('Shopify routing (plan 02 §8 item 7): only the mapped workspace changes, an unknown shop is unmatched, a replay is a no-op', async () => {
+    const mapped = await connected('shopify', 'glow.myshopify.com');
+    const bystander = await connected('shopify', 'calm.myshopify.com');
+    await ownerPool()`delete from outbox`;
+    expect(await receiveWebhook('shopify', 'r-1', 'products/update', '{"id":5}', { 'x-shopify-shop-domain': 'glow.myshopify.com' })).toBe(true);
+    expect(await receiveWebhook('shopify', 'r-1', 'products/update', '{"id":5}', { 'x-shopify-shop-domain': 'glow.myshopify.com' })).toBe(false); // replayed X-Shopify-Webhook-Id
+    await receiveWebhook('shopify', 'r-2', 'app/uninstalled', '{}', { 'x-shopify-shop-domain': 'stranger.myshopify.com' });
+    await receiveWebhook('shopify', 'r-3', 'products/update', '{"id":6}', { 'x-shopify-shop-domain': 'stranger.myshopify.com' });
+    expect(await processPendingWebhooks(deps())).toBe(3);
+    const jobs = await ownerPool()`select workspace_id from outbox where queue = 'sync-shopify-product'`;
+    expect(jobs.map((j) => j.workspace_id)).toEqual([mapped.t.workspaceId]);
+    expect((await integration(bystander.id))!.status).toBe('active');
+    expect((await integration(mapped.id))!.status).toBe('active');
+    const receipts = await ownerPool()`select delivery_id, status from webhook_receipts order by delivery_id`;
+    expect(receipts.map((r) => [r.delivery_id, r.status])).toEqual([['r-1', 'processed'], ['r-2', 'unmatched'], ['r-3', 'unmatched']]);
+    // Staff can read the unmatched queue; the drain doesn't pick unmatched deliveries up again.
+    expect(await processPendingWebhooks(deps())).toBe(0);
+    const staff = await withAdmin((tx) => tx`select headers->>'x-shopify-shop-domain' as shop from webhook_receipts where provider = 'shopify' and status = 'unmatched'`);
+    expect(staff.map((r) => r.shop)).toEqual(['stranger.myshopify.com', 'stranger.myshopify.com']);
   });
 
   it('Shopify: products/delete archives the SKU; shop/redact erases the shop’s raw payloads', async () => {

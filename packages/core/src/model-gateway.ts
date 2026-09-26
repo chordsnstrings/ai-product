@@ -31,6 +31,7 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { hashRequest } from './idempotency';
 import { findPrompt } from './prompts';
+import { providerCallbackUrl } from './provider-callbacks';
 import { actualCost, loadRates, loadRatesPinned, priceLine, promoSplit, type CostLine } from './rates';
 
 /**
@@ -743,14 +744,17 @@ async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider =
   const t0 = Date.now();
   let requestId: string | null = null;
   let lastMeta: RawMeta | undefined;
+  // The provider calls back when the task ends (when our app URL is public); this worker polls either way.
+  const callbackUrl = providerCallbackUrl(started.route.provider, started.jobId) ?? undefined;
   try {
     ({ providerRequestId: requestId } = await request(started, () =>
-      video.submit({ model: wire, prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel }),
+      video.submit({ model: wire, prompt: call.prompt, references: call.references, seconds: call.seconds, resolution: call.resolution, ratio: call.ratio, mockLabel: call.mockLabel, ...(callbackUrl ? { callbackUrl } : {}) }),
     ));
-    await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId} where id = ${started.jobId}`);
+    await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set provider_request_id = ${requestId}, last_polled_at = now() where id = ${started.jobId}`);
     const deadline = Date.now() + (call.timeoutMs ?? 15 * 60_000);
     let res: VideoPoll;
     let beat = Date.now();
+    let polledMark = Date.now();
     let shown: { status: string; etaMin: number | null } | null = null;
     for (;;) {
       if (call.heartbeat && Date.now() - beat > 60_000) {
@@ -765,6 +769,11 @@ async function videoOnce(call: VideoCall, p: ProviderSet, video: VideoProvider =
       }
       res = await request(started, () => video.poll(requestId!));
       lastMeta = res.rawMeta ?? lastMeta;
+      // This worker is alive and waiting: a callback arriving now is left to it (settleProviderCallback).
+      if (Date.now() - polledMark > POLL_MARK_MS) {
+        polledMark = Date.now();
+        await withTenant(call.ctx.workspaceId, (tx) => tx`update provider_jobs set last_polled_at = now() where id = ${started.jobId}`);
+      }
       if (res.status === 'succeeded' || res.status === 'failed' || res.status === 'cancelled') break;
       // Record what the provider says about the wait — never resubmit because it is slow (§48).
       const etaAt = res.etaSeconds != null ? new Date(Date.now() + res.etaSeconds * 1000) : null;
@@ -905,7 +914,8 @@ export async function reconcileProviderJobs(opts: { limit?: number } = {}): Prom
            provider_request_id, input_refs, raw_meta, created_at, created_at < now() - make_interval(hours => ${RECONCILE_RENDER_GIVE_UP_HOURS}) as expired
     from provider_jobs
     where status = 'dispatched'
-      and ((task like 'video.%' and created_at < now() - make_interval(mins => ${RECONCILE_RENDER_AFTER_MINUTES}))
+      and ((task like 'video.%' and created_at < now() - make_interval(mins => ${RECONCILE_RENDER_AFTER_MINUTES})
+            and (last_polled_at is null or last_polled_at < now() - make_interval(secs => ${LIVE_POLL_WINDOW_SECONDS})))
         or (task not like 'video.%' and created_at < now() - make_interval(mins => ${RECONCILE_CALL_AFTER_MINUTES})))
     order by created_at limit ${opts.limit ?? 100}`);
   if (!rows.length) return out;
@@ -914,8 +924,6 @@ export async function reconcileProviderJobs(opts: { limit?: number } = {}): Prom
     const ctx: TenantContext = { workspaceId: j.workspace_id as string, workspaceState: 'ACTIVE_PAID', role: 'OWNER', actor: { kind: 'system', id: 'provider-reconcile' }, requestId: 'provider-reconcile' };
     const meta = { ctx, task: j.task as string, subject: j.subject_type ? { type: j.subject_type as string, id: j.subject_id as string } : null };
     const started = { jobId: j.id as string, authorizationId: j.authorization_id as string, projectId: (j.project_id as string | null) ?? null, expected: Number(j.estimate_micros) };
-    const refs = (j.input_refs ?? {}) as { skuId?: string; inputHash?: string };
-    const planned = ((j.raw_meta ?? {}) as { planned?: CostLine }).planned;
     const latencyMs = null;
     if (!isRenderTask(j.task as string)) {
       if (await finish(meta, started, { ok: false, error: 'abandoned: the worker was lost during the call', errorKind: 'abandoned', latencyMs, actualMicros: started.expected })) out.failed++;
@@ -925,47 +933,150 @@ export async function reconcileProviderJobs(opts: { limit?: number } = {}): Prom
       if (await finish(meta, started, { ok: false, error: 'never acknowledged by the provider (worker lost before submit returned)', errorKind: 'abandoned', latencyMs })) out.failed++;
       continue;
     }
-    let res: VideoPoll | null = null;
-    try {
-      const adapter = adapterFor(p, 'video', j.provider as string);
-      if (!adapter) {
-        out.pending++; // no adapter for this provider in this process (configuration): leave it for one that has
-        continue;
-      }
-      res = await adapter.poll(j.provider_request_id as string);
-    } catch {
-      out.pending++; // provider unreachable right now: try again next sweep
-      continue;
-    }
-    if (res.status === 'succeeded' && res.bytes) {
-      const bytes = res.bytes;
-      const asset = await withTenant(ctx.workspaceId, (tx) =>
-        saveAsset(tx, ctx.workspaceId, {
-          bytes,
-          mime: 'video/mp4',
-          kind: 'scene_render',
-          skuId: refs.skuId ?? null,
-          source: 'generated',
-          lineage: { sceneId: j.subject_type === 'scene' ? j.subject_id : null, providerJobId: j.id, inputHash: refs.inputHash ?? null, reconciled: true, model: res!.modelVersion ?? null },
-        }),
-      );
-      const line = planned && planned.kind === 'video' ? ({ ...planned, seconds: res.outputSeconds ?? planned.seconds } as CostLine) : undefined;
-      const ok = await finish(meta, started, { ok: true, actualLine: line, actualMicros: line ? undefined : started.expected, modelVersion: res.modelVersion, rawMeta: res.rawMeta, outputAssetId: asset.id, latencyMs });
-      if (ok) out.succeeded++;
-      continue;
-    }
-    if (res.status === 'failed' || res.status === 'cancelled') {
-      // Seconds the provider generated before the task failed are billed: booked like a live call would.
-      const billed = planned && planned.kind === 'video' && res.outputSeconds ? { line: planned, billed: [{ seconds: res.outputSeconds }] } : {};
-      if (await finish(meta, { ...started, ...billed }, { ok: false, error: res.error ?? `video ${res.status}`, errorKind: /moderation/i.test(res.error ?? '') ? 'moderation' : 'server', latencyMs, rawMeta: res.rawMeta })) out.failed++;
-      continue;
-    }
-    if (j.expired) {
-      await adapterFor(p, 'video', j.provider as string)?.cancel(j.provider_request_id as string).catch(() => {});
-      if (await finish(meta, started, { ok: false, error: `still ${res.status} after ${RECONCILE_RENDER_GIVE_UP_HOURS}h; cancelled`, errorKind: 'timeout', latencyMs, rawMeta: res.rawMeta })) out.failed++;
-      continue;
-    }
-    out.pending++;
+    out[await settleOpenRender(j as unknown as OpenRender, p)]++;
   }
   return out;
+}
+
+/** A dispatched render job as the reconciler and the callback path read it (system role, explicit workspace). */
+interface OpenRender {
+  id: string;
+  workspace_id: string;
+  task: string;
+  provider: string;
+  subject_type: string | null;
+  subject_id: string | null;
+  project_id: string | null;
+  authorization_id: string;
+  estimate_micros: string | number;
+  provider_request_id: string;
+  input_refs: { skuId?: string; inputHash?: string } | null;
+  raw_meta: { planned?: CostLine } | null;
+  expired: boolean;
+}
+
+/** How long one process may hold a render it is settling before another may take it over (it crashed). */
+const SETTLE_CLAIM_MINUTES = 10;
+
+/**
+ * Settle one dispatched render from the provider's own answer (standard §35/§39: a duplicate callback, or a callback
+ * racing the reconciler, cannot copy the output twice or double-settle credits). The job is claimed first
+ * (settling_at), so only one process polls and copies its output; the close itself is guarded by status. A render
+ * still running is released for the next attempt; one past RECONCILE_RENDER_GIVE_UP_HOURS is cancelled.
+ */
+async function settleOpenRender(j: OpenRender, p: ProviderSet): Promise<'succeeded' | 'failed' | 'pending'> {
+  const ctx: TenantContext = { workspaceId: j.workspace_id, workspaceState: 'ACTIVE_PAID', role: 'OWNER', actor: { kind: 'system', id: 'provider-reconcile' }, requestId: 'provider-reconcile' };
+  const meta = { ctx, task: j.task, subject: j.subject_type ? { type: j.subject_type, id: j.subject_id as string } : null };
+  const started = { jobId: j.id, authorizationId: j.authorization_id, projectId: j.project_id ?? null, expected: Number(j.estimate_micros) };
+  const refs = j.input_refs ?? {};
+  const planned = (j.raw_meta ?? {}).planned;
+  const latencyMs = null;
+  const adapter = adapterFor(p, 'video', j.provider);
+  // No adapter for this provider in this process (configuration): leave it for one that has.
+  if (!adapter) return 'pending';
+  const [claimed] = await withTenant(ctx.workspaceId, (tx) => tx`
+    update provider_jobs set settling_at = now()
+    where id = ${j.id} and workspace_id = ${ctx.workspaceId} and status = 'dispatched'
+      and (settling_at is null or settling_at < now() - make_interval(mins => ${SETTLE_CLAIM_MINUTES}))
+    returning id`);
+  if (!claimed) return 'pending'; // settled already, or another process is on it
+  const release = () => withTenant(ctx.workspaceId, (tx) => tx`update provider_jobs set settling_at = null where id = ${j.id} and status = 'dispatched'`);
+  let res: VideoPoll;
+  try {
+    res = await adapter.poll(j.provider_request_id);
+  } catch {
+    await release();
+    return 'pending'; // provider unreachable right now: try again next sweep
+  }
+  if (res.status === 'succeeded' && res.bytes) {
+    const bytes = res.bytes;
+    const asset = await withTenant(ctx.workspaceId, (tx) =>
+      saveAsset(tx, ctx.workspaceId, {
+        bytes,
+        mime: 'video/mp4',
+        kind: 'scene_render',
+        skuId: refs.skuId ?? null,
+        source: 'generated',
+        lineage: { sceneId: j.subject_type === 'scene' ? j.subject_id : null, providerJobId: j.id, inputHash: refs.inputHash ?? null, reconciled: true, model: res.modelVersion ?? null },
+      }),
+    );
+    const line = planned && planned.kind === 'video' ? ({ ...planned, seconds: res.outputSeconds ?? planned.seconds } as CostLine) : undefined;
+    const ok = await finish(meta, started, { ok: true, actualLine: line, actualMicros: line ? undefined : started.expected, modelVersion: res.modelVersion, rawMeta: res.rawMeta, outputAssetId: asset.id, latencyMs });
+    return ok ? 'succeeded' : 'pending';
+  }
+  if (res.status === 'failed' || res.status === 'cancelled') {
+    // Seconds the provider generated before the task failed are billed: booked like a live call would.
+    const billed = planned && planned.kind === 'video' && res.outputSeconds ? { line: planned, billed: [{ seconds: res.outputSeconds }] } : {};
+    return (await finish(meta, { ...started, ...billed }, { ok: false, error: res.error ?? `video ${res.status}`, errorKind: /moderation/i.test(res.error ?? '') ? 'moderation' : 'server', latencyMs, rawMeta: res.rawMeta })) ? 'failed' : 'pending';
+  }
+  if (j.expired) {
+    await adapter.cancel(j.provider_request_id).catch(() => {});
+    return (await finish(meta, started, { ok: false, error: `still ${res.status} after ${RECONCILE_RENDER_GIVE_UP_HOURS}h; cancelled`, errorKind: 'timeout', latencyMs, rawMeta: res.rawMeta })) ? 'failed' : 'pending';
+  }
+  await release();
+  return 'pending';
+}
+
+/**
+ * A resumed production is about to render a scene: a render with exactly these inputs that the interrupted run
+ * submitted and never collected (still dispatched, nobody polling it) is waited on and collected instead of being
+ * paid for again (standard §35, §39; plan 06 Phase 3 D3 "resume from provider_jobs"). Returns true when an output
+ * was collected: it is then an unjudged scene_render asset of that scene and input hash, which the caller picks up.
+ * Gives up (false) when the provider failed it or it is still unfinished at the deadline (the reconciler owns it).
+ */
+export async function collectOpenRender(
+  workspaceId: string,
+  sceneId: string,
+  inputHash: string,
+  opts: { heartbeat?: () => Promise<void>; timeoutMs?: number; pollMs?: number } = {},
+): Promise<boolean> {
+  const [j] = await withTenant(workspaceId, (tx) => tx`
+    select id, workspace_id, task, provider, subject_type, subject_id, project_id, authorization_id, estimate_micros,
+           provider_request_id, input_refs, raw_meta, created_at < now() - make_interval(hours => ${RECONCILE_RENDER_GIVE_UP_HOURS}) as expired
+    from provider_jobs
+    where workspace_id = ${workspaceId} and status = 'dispatched' and task like 'video.%' and provider_request_id is not null
+      and input_refs->>'sceneId' = ${sceneId} and input_refs->>'inputHash' = ${inputHash}
+      and (last_polled_at is null or last_polled_at < now() - make_interval(secs => ${LIVE_POLL_WINDOW_SECONDS}))
+    order by created_at desc limit 1`);
+  if (!j) return false;
+  const p = await providers();
+  const deadline = Date.now() + (opts.timeoutMs ?? 15 * 60_000);
+  let beat = Date.now();
+  for (;;) {
+    const r = await settleOpenRender(j as unknown as OpenRender, p);
+    if (r !== 'pending') return r === 'succeeded';
+    if (Date.now() > deadline) return false;
+    if (opts.heartbeat && Date.now() - beat > 60_000) {
+      beat = Date.now();
+      await opts.heartbeat();
+    }
+    await sleep(opts.pollMs ?? (process.env.NODE_ENV === 'test' ? 20 : 5000));
+  }
+}
+
+/** A worker that polled within this long is still waiting on its render: a callback is left to it. */
+export const LIVE_POLL_WINDOW_SECONDS = 120;
+/** How often the waiting worker marks the job as polled. */
+const POLL_MARK_MS = 30_000;
+
+/**
+ * A provider called back about a render (stored and deduplicated as a webhook receipt; the callback is only a
+ * hint). The job must name the same provider task. When the worker that submitted it is still polling, it is left to
+ * that worker; otherwise (the worker died, or the job was never waited on) it is settled now from the provider's own
+ * answer, instead of waiting for the reconciler's next sweep. Runs as the system role: the job row is looked up by
+ * its id and then only ever written in its own workspace.
+ */
+export async function settleProviderCallback(provider: string, jobId: string, taskId: string): Promise<'settled' | 'left_to_worker' | 'pending' | 'ignored'> {
+  const [j] = await withSystem((tx) => tx`
+    select id, workspace_id, task, provider, subject_type, subject_id, project_id, authorization_id, estimate_micros,
+           provider_request_id, input_refs, raw_meta, status, created_at < now() - make_interval(hours => ${RECONCILE_RENDER_GIVE_UP_HOURS}) as expired,
+           last_polled_at > now() - make_interval(secs => ${LIVE_POLL_WINDOW_SECONDS}) as polled_recently
+    from provider_jobs where id = ${jobId} and provider = ${provider}`);
+  // Unknown job, another provider's task, or not a render: nothing to do.
+  if (!j || j.provider_request_id !== taskId || !isRenderTask(j.task as string)) return 'ignored';
+  await withTenant(j.workspace_id as string, (tx) => tx`update provider_jobs set callback_at = now() where id = ${jobId} and workspace_id = ${j.workspace_id}`);
+  if (j.status !== 'dispatched') return 'ignored'; // already settled: a duplicate or late callback changes nothing
+  if (j.polled_recently) return 'left_to_worker';
+  const r = await settleOpenRender(j as unknown as OpenRender, await providers());
+  return r === 'pending' ? 'pending' : 'settled';
 }

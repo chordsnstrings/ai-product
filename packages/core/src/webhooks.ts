@@ -3,13 +3,15 @@ import { logger } from '@arkiv/shared/log';
 import { shopifyGid } from '@arkiv/integrations';
 import { systemContext, type TenantContext } from './context';
 import { archiveShopifyProduct } from './performance';
+import { settleProviderCallback } from './model-gateway';
 import { emit } from './events';
 import { enqueue, Queues } from './outbox';
 import { rightsCaseFromEmail, type InboundEmail } from './rights';
 
 const log = logger('webhooks');
 
-export type WebhookProvider = 'shopify' | 'resend' | 'meta' | 'tiktok';
+/** Platforms that post to us; 'byteplus' is a video provider's render callback (provider-callbacks.ts). */
+export type WebhookProvider = 'shopify' | 'resend' | 'meta' | 'tiktok' | 'byteplus';
 
 /** A processing attempt older than this is presumed abandoned (crashed worker) and may be claimed again. */
 export const WEBHOOK_CLAIM_STALE_MINUTES = 5;
@@ -92,11 +94,16 @@ async function revokeAll(rows: { id: string; workspace_id: string }[], provider:
 
 /** Handlers that live outside core (the email package), passed in by the worker. */
 export interface WebhookDeps {
-  resendEvent: (evt: { type: string; data: { email_id?: string; to?: string[] } }) => Promise<void>;
+  /** One Resend event, with the delivery id (svix-id) it arrived under. */
+  resendEvent: (evt: { type: string; data: { email_id?: string; to?: string[] } }, deliveryId: string) => Promise<void>;
 }
 
-/** Handle one stored delivery. Returns 'ignored' for topics we acknowledge without acting on. */
-async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ignored'> {
+/**
+ * Handle one stored delivery. Returns 'ignored' for topics we acknowledge without acting on, and 'unmatched' for a
+ * Shopify delivery about a shop no workspace is connected to (plan 02 §8 item 7: it waits in the staff queue and
+ * changes no workspace).
+ */
+async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ignored' | 'unmatched'> {
   const body = r.payload ? (JSON.parse(r.payload) as Record<string, unknown>) : {};
   switch (r.provider) {
     case 'resend': {
@@ -105,12 +112,16 @@ async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ign
         const opened = await withSystem((tx) => rightsCaseFromEmail(tx, (body.data ?? {}) as InboundEmail));
         return opened ? 'processed' : 'ignored';
       }
-      await deps.resendEvent(body as { type: string; data: { email_id?: string; to?: string[] } });
+      await deps.resendEvent(body as { type: string; data: { email_id?: string; to?: string[] } }, r.delivery_id);
       return 'processed';
     }
     case 'shopify': {
       const shop = r.headers['x-shopify-shop-domain'] ?? '';
       const rows = shop ? await integrationsFor('shopify', { account: [shop] }) : [];
+      // Routing is by the shop the delivery names, and only to the workspaces connected to it: an unknown shop's
+      // uninstall or product change goes to the unmatched queue. shop/redact still erases what we kept for the
+      // shop, and customers/* requests are filed either way (the privacy clock runs regardless).
+      if (!rows.length && (r.topic === 'app/uninstalled' || r.topic.startsWith('products/'))) return 'unmatched';
       if (r.topic === 'app/uninstalled') {
         await revokeAll(rows, 'shopify', r.topic);
         return 'processed';
@@ -150,6 +161,16 @@ async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ign
       const rows = await integrationsFor('meta', { user: String(body.userId ?? '') });
       await revokeAll(rows, 'meta', r.topic);
       return 'processed';
+    }
+    case 'byteplus': {
+      // A render callback: re-fetch the task and settle it, unless the worker that submitted it is still waiting.
+      const cb = body as { jobId?: string; taskId?: string };
+      if (!cb.jobId || !cb.taskId) return 'ignored';
+      const outcome = await settleProviderCallback(r.provider, cb.jobId, cb.taskId);
+      // The provider said the task ended but it couldn't be settled yet (provider unreachable): retry the receipt
+      // with backoff; the reconciler's sweep is the fallback after that.
+      if (outcome === 'pending' && /^video\.(succeeded|failed|cancelled|expired)$/.test(r.topic)) throw new Error('render not settled yet');
+      return outcome === 'ignored' || outcome === 'left_to_worker' ? 'ignored' : 'processed';
     }
     case 'tiktok': {
       if (!/authoriz|revoke|deauth/i.test(r.topic)) return 'ignored';

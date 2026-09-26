@@ -188,7 +188,7 @@ export class SeedanceVideo implements VideoProvider {
     if (req.seed != null) flags.push(`--seed ${req.seed}`);
     const content: unknown[] = [{ type: 'text', text: `${req.prompt} ${flags.join(' ')}` }];
     for (const ref of req.references.slice(0, this.maxRefs)) content.push({ type: 'image_url', image_url: { url: ref }, role: 'reference_image' });
-    const r = await this.ark.call<{ id?: string }>(PROVIDER_API_PATHS.arkVideoTasks, 'POST', { model: req.model, content });
+    const r = await this.ark.call<{ id?: string }>(PROVIDER_API_PATHS.arkVideoTasks, 'POST', { model: req.model, content, ...(req.callbackUrl ? { callback_url: req.callbackUrl } : {}) });
     if (!r.id) throw schemaChanged('byteplus', 'video task without id');
     return { providerRequestId: r.id };
   }

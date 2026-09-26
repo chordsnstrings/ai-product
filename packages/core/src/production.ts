@@ -18,7 +18,7 @@ import { emit } from './events';
 import { isFlagOn } from './flags';
 import { append, currentPeriodKey, type LedgerUnit } from './ledger';
 import { setting } from './settings';
-import { generateImage, generateVideo, lineFor, linkJobOutput, partnerFor, route, synthesizeVoice, type ProviderQueueState, type Route, type TaskUnits } from './model-gateway';
+import { collectOpenRender, generateImage, generateVideo, lineFor, linkJobOutput, partnerFor, route, synthesizeVoice, type ProviderQueueState, type Route, type TaskUnits } from './model-gateway';
 import { enqueue, priorityFor, Queues } from './outbox';
 import { heartbeat as beat, planSteps, step } from './progress';
 import { referenceAssetIds } from './sku-variants';
@@ -904,6 +904,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         const seconds = genSeconds(s.duration_ms);
         // Attempts already spent on these inputs by an interrupted run count: a resume never grants an extra repair.
         let attempt = versions.filter((v) => v.scene_id === s.id && v.kind === 'render' && v.status === 'qa_failed' && sameInputs(v, s)).length;
+        // A render the interrupted run submitted with these inputs and never collected is collected now (the provider
+        // may still be rendering it) rather than submitted again.
+        await collectOpenRender(ws, s.id, hashes.get(s.id)!, { heartbeat });
         // A render already paid for with these inputs but never judged — the run crashed between the render and its
         // QA, or the reconciler collected it from the provider — is judged instead of paying for another (§35, §39).
         let pending = await withTenant(ws, async (tx) => {

@@ -6,6 +6,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { enqueue, Queues } from './outbox';
+import { revokeAtPlatform, tokenShared } from './performance';
 import { setting } from './settings';
 import { storage } from './storage';
 import { transitionWorkspace } from './workspaces';
@@ -41,7 +42,7 @@ export async function buildExport(ctx: TenantContext): Promise<{ assetId: string
       const rows = await tx.unsafe(`select * from ${t} order by 1`);
       files[`data/${t}.json`] = strToU8(JSON.stringify(rows, null, 2));
     }
-    const assets = await tx`select id, kind, storage_key, mime from assets where deleted_at is null and kind in ('product_photo','final_export','cutout','evidence_doc','creator_footage') limit 500`;
+    const assets = await tx`select id, kind, storage_key, mime from assets where deleted_at is null and kind in ('product_photo','final_export','cutout','evidence_doc','creator_footage','historical_creative') limit 500`;
     for (const a of assets) {
       try {
         files[`assets/${a.kind}/${a.id}.${String(a.mime).split('/')[1]}`] = new Uint8Array(await storage().get(a.storage_key as string));
@@ -112,6 +113,19 @@ export async function purgeWorkspace(workspaceId: string, opts: { stripeSubscrip
     // Stripe subscriptions ended before the purge (the worker does it: core can't call Stripe) are on the certificate.
     const counts: Record<string, number> = { stripe_subscriptions_cancelled: opts.stripeSubscriptionsCancelled?.length ?? 0 };
     const undeletable: string[] = [];
+    // Plan 02 §7 purge step 1: every stored token is revoked at its platform before the rows go. One that can't be
+    // revoked (platform unreachable) is named on the certificate; the purge carries on.
+    const tokens = await tx`select provider, external_account_id, token_enc, platform_user_id from integrations where workspace_id = ${workspaceId} and token_enc is not null`;
+    counts.integration_tokens_revoked = 0;
+    for (const i of tokens) {
+      // A login another workspace still uses (an agency connecting several brands) is not revoked for it.
+      const elsewhere = i.provider === 'shopify' ? [] : await tx`select token_enc, platform_user_id from integrations
+                                                                 where provider = ${i.provider} and workspace_id <> ${workspaceId} and token_enc is not null and status in ('active', 'degraded')`;
+      if (tokenShared(i as unknown as { token_enc: string; platform_user_id: string | null }, elsewhere as unknown as { token_enc: string | null; platform_user_id: string | null }[])) continue;
+      const r = await revokeAtPlatform(i.provider as string, i.token_enc as string, i.external_account_id as string);
+      if (r.ok) counts.integration_tokens_revoked++;
+      else undeletable.push(`${i.provider as string} access for ${i.external_account_id as string} not revoked at the platform: ${r.error}`);
+    }
     await tx`delete from shopify_shops where workspace_id = ${workspaceId}`;
     // Golden cases built (with consent) from this tenant's production output go with the tenant.
     await tx`delete from golden_cases where source_workspace_id = ${workspaceId}`;

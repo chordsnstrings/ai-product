@@ -171,13 +171,20 @@ export async function marketingPaused(t: Tx): Promise<boolean> {
 
 export interface ResendEvent {
   type: string;
+  created_at?: string;
   data: { email_id?: string; to?: string[]; bounce?: { type?: string } };
 }
 
-export async function handleResendEvent(evt: ResendEvent) {
+/**
+ * One Resend delivery event (standard §47 "Duplicate webhook"). The status only moves forward (queued → sent →
+ * delivered → opened → clicked; a bounce or complaint is final), so a late or repeated event can't regress it, and
+ * an event is appended to the log once per delivery id (Svix `svix-id`).
+ */
+export async function handleResendEvent(evt: ResendEvent, deliveryId?: string | null) {
   await globalTx(async (t) => {
     if (evt.data.email_id) {
-      await t`select email_log_event(${evt.data.email_id}, ${evt.type.replace('email.', '')}, ${t.json({ type: evt.type, at: new Date().toISOString() })})`;
+      const entry = { type: evt.type, at: evt.created_at ?? new Date().toISOString(), ...(deliveryId ? { id: deliveryId } : {}) };
+      await t`select email_log_event(${evt.data.email_id}, ${evt.type.replace('email.', '')}, ${t.json(entry)})`;
     }
     const hardBounce = evt.type === 'email.bounced' && !/transient|soft/i.test(evt.data.bounce?.type ?? '');
     if (evt.type === 'email.bounced' || evt.type === 'email.complained') {

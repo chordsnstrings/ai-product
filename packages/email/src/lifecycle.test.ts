@@ -40,6 +40,30 @@ describe('complaint-rate guard (plan 05 §18)', () => {
   });
 });
 
+describe('delivery events (standard §47 duplicate webhook)', () => {
+  it('only moves the status forward, keeps a bounce final and appends a redelivered event once', async () => {
+    await ownerPool()`insert into email_log (to_email, template, stream, idempotency_key, status, provider_id) values ('a@example.com', 'receipt', 'transactional', 'k-mono', 'sent', 'msg-mono')`;
+    const row = async () => (await ownerPool()`select status, events from email_log where provider_id = 'msg-mono'`)[0]!;
+    await handleResendEvent({ type: 'email.opened', data: { email_id: 'msg-mono' } }, 'svix-2');
+    // A late 'delivered' (sent before the open, arrived after) does not move the status back.
+    await handleResendEvent({ type: 'email.delivered', data: { email_id: 'msg-mono' } }, 'svix-1');
+    expect((await row()).status).toBe('opened');
+    // The same delivery processed twice is logged once.
+    await handleResendEvent({ type: 'email.delivered', data: { email_id: 'msg-mono' } }, 'svix-1');
+    expect(((await row()).events as { id?: string }[]).map((e) => e.id)).toEqual(['svix-2', 'svix-1']);
+    await handleResendEvent({ type: 'email.clicked', data: { email_id: 'msg-mono' } }, 'svix-3');
+    expect((await row()).status).toBe('clicked');
+    await handleResendEvent({ type: 'email.complained', data: { email_id: 'msg-mono', to: ['a@example.com'] } }, 'svix-4');
+    await handleResendEvent({ type: 'email.delivered', data: { email_id: 'msg-mono' } }, 'svix-5');
+    await handleResendEvent({ type: 'email.bounced', data: { email_id: 'msg-mono' } }, 'svix-6');
+    expect((await row()).status).toBe('complained');
+    // An event type we don't rank is logged without changing the status.
+    await handleResendEvent({ type: 'email.something_new', data: { email_id: 'msg-mono' } }, 'svix-7');
+    expect((await row()).status).toBe('complained');
+    expect((await row()).events).toHaveLength(7);
+  });
+});
+
 describe('owner bounce banner (plan 05 §18, 02 M13)', () => {
   it('flags the workspaces the address owns on a hard bounce and clears on delivery; soft bounces and non-owners do not', async () => {
     const owner = await makeTenant({ email: 'owner@brand.example' });

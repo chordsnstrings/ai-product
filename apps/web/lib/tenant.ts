@@ -15,7 +15,8 @@ export interface WorkspaceInfo {
   ctx: TenantContext;
   slug: string;
   name: string;
-  user: { id: string; email: string; name: string | null; sessionId: string } | null;
+  /** The signed-in user; `createdAt` is when this session signed in (step-up, plan 02 M14). */
+  user: { id: string; email: string; name: string | null; sessionId: string; createdAt: string } | null;
 }
 
 /** Options for an access check: `probe: false` for lookups that aren't the request's own access (page titles). */
@@ -46,7 +47,7 @@ export async function workspaceBySlug(slug: string, opts: AccessOpts = {}): Prom
     ctx: { workspaceId: m.workspace_id, workspaceState: m.state as WorkspaceState, role: m.role as Role, actor: { kind: 'user', id: user.userId }, requestId: currentRequestId() ?? crypto.randomUUID(), planCode: m.plan_code },
     slug: m.slug,
     name: m.name,
-    user: { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId },
+    user: { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId, createdAt: user.createdAt },
   };
 }
 
@@ -86,7 +87,7 @@ export async function projectAccess(projectId: string, opts: AccessOpts = {}): P
         ctx: { workspaceId: ws, workspaceState: m.state as WorkspaceState, role: m.role as Role, actor: { kind: 'user', id: user.userId }, requestId: currentRequestId() ?? crypto.randomUUID(), planCode: m.plan_code },
         slug: m.slug,
         name: m.name,
-        user: { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId },
+        user: { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId, createdAt: user.createdAt },
         provisional: false,
       };
     }
@@ -98,7 +99,7 @@ export async function projectAccess(projectId: string, opts: AccessOpts = {}): P
       ctx: { workspaceId: ws, workspaceState: 'PROVISIONAL', role: 'OWNER', actor: { kind: 'provisional', id: ws }, requestId: currentRequestId() ?? crypto.randomUUID() },
       slug: '',
       name: 'Your brand',
-      user: user ? { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId } : null,
+      user: user ? { id: user.userId, email: user.email, name: user.name, sessionId: user.sessionId, createdAt: user.createdAt } : null,
       provisional: true,
     };
   }
