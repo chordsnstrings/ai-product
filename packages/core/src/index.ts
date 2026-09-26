@@ -77,6 +77,7 @@ export * from './metrics';
 export * from './reviews';
 export * from './waitlist';
 export * from './webhooks';
+export * from './provider-callbacks';
 export * from './shop-transfer';
 export { parseLocaleNumber } from './csv';
 export * from './render-quotes';

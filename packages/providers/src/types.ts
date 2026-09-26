@@ -78,6 +78,11 @@ export interface VideoRequest {
   ratio: '9:16' | '4:5' | '1:1';
   seed?: number;
   mockLabel?: string;
+  /**
+   * Where the provider should call back when the task finishes (standard §39 "provider callback + polling"). A hint
+   * only: the result is always re-fetched with poll(). Absent when our app URL isn't publicly reachable.
+   */
+  callbackUrl?: string;
 }
 export type VideoStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 export interface VideoPoll {

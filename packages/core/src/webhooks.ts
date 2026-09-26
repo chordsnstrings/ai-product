@@ -3,13 +3,15 @@ import { logger } from '@arkiv/shared/log';
 import { shopifyGid } from '@arkiv/integrations';
 import { systemContext, type TenantContext } from './context';
 import { archiveShopifyProduct } from './performance';
+import { settleProviderCallback } from './model-gateway';
 import { emit } from './events';
 import { enqueue, Queues } from './outbox';
 import { rightsCaseFromEmail, type InboundEmail } from './rights';
 
 const log = logger('webhooks');
 
-export type WebhookProvider = 'shopify' | 'resend' | 'meta' | 'tiktok';
+/** Platforms that post to us; 'byteplus' is a video provider's render callback (provider-callbacks.ts). */
+export type WebhookProvider = 'shopify' | 'resend' | 'meta' | 'tiktok' | 'byteplus';
 
 /** A processing attempt older than this is presumed abandoned (crashed worker) and may be claimed again. */
 export const WEBHOOK_CLAIM_STALE_MINUTES = 5;
@@ -159,6 +161,16 @@ async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ign
       const rows = await integrationsFor('meta', { user: String(body.userId ?? '') });
       await revokeAll(rows, 'meta', r.topic);
       return 'processed';
+    }
+    case 'byteplus': {
+      // A render callback: re-fetch the task and settle it, unless the worker that submitted it is still waiting.
+      const cb = body as { jobId?: string; taskId?: string };
+      if (!cb.jobId || !cb.taskId) return 'ignored';
+      const outcome = await settleProviderCallback(r.provider, cb.jobId, cb.taskId);
+      // The provider said the task ended but it couldn't be settled yet (provider unreachable): retry the receipt
+      // with backoff; the reconciler's sweep is the fallback after that.
+      if (outcome === 'pending' && /^video\.(succeeded|failed|cancelled|expired)$/.test(r.topic)) throw new Error('render not settled yet');
+      return outcome === 'ignored' || outcome === 'left_to_worker' ? 'ignored' : 'processed';
     }
     case 'tiktok': {
       if (!/authoriz|revoke|deauth/i.test(r.topic)) return 'ignored';

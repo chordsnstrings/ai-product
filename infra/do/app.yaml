@@ -46,6 +46,7 @@ envs:
   - { key: EMAIL_FROM, value: "Arkiv <hello@mail.arkiv.app>", scope: RUN_TIME }
   - { key: ANTHROPIC_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: ARK_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
+  - { key: PROVIDER_CALLBACK_SECRET, value: CHANGE_ME_32_random_chars, scope: RUN_TIME, type: SECRET }
   - { key: MINIMAX_API_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: SPACES_KEY, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }
   - { key: SPACES_SECRET, value: CHANGE_ME, scope: RUN_TIME, type: SECRET }

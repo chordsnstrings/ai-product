@@ -169,6 +169,16 @@ export class MockVideo implements VideoProvider {
     const t = this.tasks.get(id);
     if (t && (t.status === 'queued' || t.status === 'running')) t.status = 'cancelled';
   }
+
+  /**
+   * The callback the provider would POST to the task's callback URL, as BytePlus sends it (the task object without
+   * its output). Tests replay it late, twice or out of order; `status` overrides what the task says now.
+   */
+  callbackFor(id: string, status?: MockTask['status']): { url: string | null; body: { id: string; status: string; model: string } } {
+    const t = this.tasks.get(id);
+    if (!t) throw new Error(`unknown mock task ${id}`);
+    return { url: t.req.callbackUrl ?? null, body: { id, status: status ?? t.status, model: `${t.req.model}-mock` } };
+  }
 }
 
 export class MockTts implements TtsProvider {
