@@ -75,16 +75,21 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
   const perFrame = i.fingerprint.cutout ? await Promise.all(frames.map((fr) => fidelitySignals(fr, i.fingerprint.cutout!, th))) : [];
   const detFailures = perFrame.flatMap((d, n) => d.failures.map((x) => ({ ...x, frame: n + 1 }))).filter((x) => !(multiUnit && x.kind === 'count'));
   const located = perFrame.filter((d) => d.located);
-  const det = perFrame.length
-    ? {
-        located: located.length > 0,
-        framesLocated: located.length,
-        paletteDistance: located.some((d) => d.paletteDistance != null) ? Math.max(...located.map((d) => d.paletteDistance ?? 0)) : null,
-        regionColorDelta: located.some((d) => d.regionColorDelta != null) ? Math.max(...located.map((d) => d.regionColorDelta ?? 0)) : null,
-        matchScore: Math.max(...perFrame.map((d) => d.matchScore)),
-        failures: detFailures,
-      }
-    : null;
+  // One frame: its signals as they are; several: the worst of each across the frames.
+  const det = !perFrame.length
+    ? null
+    : perFrame.length === 1
+      ? { ...perFrame[0]!, framesLocated: located.length, failures: detFailures }
+      : {
+          located: located.length > 0,
+          framesLocated: located.length,
+          matchScore: Math.max(...perFrame.map((d) => d.matchScore)),
+          secondScore: Math.max(...perFrame.map((d) => d.secondScore)),
+          productCount: Math.max(...perFrame.map((d) => d.productCount)),
+          paletteDistance: located.some((d) => d.paletteDistance != null) ? Math.max(...located.map((d) => d.paletteDistance ?? 0)) : null,
+          regionColorDelta: located.some((d) => d.regionColorDelta != null) ? Math.max(...located.map((d) => d.regionColorDelta ?? 0)) : null,
+          failures: detFailures,
+        };
   const failMock = /\[\[qa:fidelity_always\]\]/.test(i.planText) || (/\[\[qa:fidelity\]\]/.test(i.planText) && i.attempt === 1);
   const colorMock = /\[\[qa:colou?r\]\]/.test(i.planText);
   const minorMock = /\[\[qa:minor\]\]/.test(i.planText);

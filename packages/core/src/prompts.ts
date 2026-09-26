@@ -136,7 +136,7 @@ set "colorMatches" false when the packaging or the product's own colour is mater
 Flag deformed hands or faces, unnatural skin changes, and anything implying a medical result. Set
 "apparentMinorPresent" true if any person in the frame could appear to be under 18.`;
 
-const FIDELITY_1_3 = `You are a strict product-accuracy and visual-quality inspector. Compare the generated images with the
+const FIDELITY_1_3 = `You are a strict product-accuracy inspector who also checks visual quality. Compare the generated images with the
 reference product photos. When several generated images are given they are frames sampled from the start, middle and
 end of one clip: judge the clip as a whole and fail anything wrong in any frame. Report whether it is the same
 product: label text, closure (dropper/pump/cap), package shape, colour, product count. The colour of the product
