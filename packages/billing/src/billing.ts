@@ -305,7 +305,7 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode, opts:
   const upgrade = PLANS[to].priceMicros > PLANS[from].priceMicros;
   if (upgrade) {
     // A higher recurring charge needs fresh consent to it (plan 04 §3), for this plan at today's price.
-    const consentId = await upgradeConsent(tx, to, opts.consentId);
+    const consentId = await upgradeConsent(tx, ctx.workspaceId, to, opts.consentId);
     // Stripe holds the scheduled lower price: put the current one back first, so the proration charges the
     // difference from what the customer actually pays.
     if (pending) await billingGateway().changeSubscriptionPrice(subId, await ownPrice(), false);
@@ -334,10 +334,11 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode, opts:
 }
 
 /** The consent record an upgrade rests on: recent, for the plan it moves to, at the price that plan sells for now. */
-async function upgradeConsent(tx: Tx, to: PlanCode, consentId: string | null | undefined): Promise<string> {
+async function upgradeConsent(tx: Tx, workspaceId: string, to: PlanCode, consentId: string | null | undefined): Promise<string> {
   const again = () => new DomainError('INVALID', `Please confirm the new monthly charge for ${PLANS[to].name} first.`, { needsConsent: true });
   if (!consentId) throw again();
-  const [c] = await tx`select id, context from consent_records where id = ${consentId} and kind = 'auto_renew' and created_at > now() - interval '30 minutes'`;
+  const [c] = await tx`select id, context from consent_records where id = ${consentId} and workspace_id = ${workspaceId} and kind = 'auto_renew'
+                       and created_at > now() - interval '30 minutes'`;
   const ctxt = (c?.context ?? {}) as { plan?: string; priceMicros?: number };
   if (!c || ctxt.plan !== to) throw again();
   if (Number(ctxt.priceMicros) !== (await currentStripePrice(tx, to)).priceMicros) throw new DomainError('INVALID', 'The plan price has changed. Please confirm the new monthly charge again.', { needsConsent: true });
@@ -1011,13 +1012,8 @@ export async function refundProjectPurchase(ctx: TenantContext, purchaseId: stri
   return done ? 'refunded' : 'skipped';
 }
 
-// ───────────── Purge (plan 02 §7) ─────────────
+// ───────────── Holds (plan 02 §2) ─────────────
 
-/**
- * Before a workspace due for purge is deleted, end its Stripe subscriptions: once the rows are gone nothing could
- * stop Stripe from billing it (x-promises-09). Only for a workspace actually due (a deletion cancelled at the last
- * minute keeps its plan). System job, so the workspace filter is explicit. Returns the subscriptions ended.
- */
 /**
  * Bring Stripe collection in line with the workspace's hold (plan 02 §2: SUSPENDED → billing paused; any other
  * state → billing as normal). Reads the state as committed now, so a late or repeated job converges instead of
@@ -1047,6 +1043,13 @@ export async function syncCollectionHold(workspaceId: string): Promise<{ paused:
   return out;
 }
 
+// ───────────── Purge (plan 02 §7) ─────────────
+
+/**
+ * Before a workspace due for purge is deleted, end its Stripe subscriptions: once the rows are gone nothing could
+ * stop Stripe from billing it (x-promises-09). Only for a workspace actually due (a deletion cancelled at the last
+ * minute keeps its plan). System job, so the workspace filter is explicit. Returns the subscriptions ended.
+ */
 export async function cancelSubscriptionsForPurge(workspaceId: string): Promise<string[]> {
   const subs = await withSystem(async (tx) => {
     const [w] = await tx`select state, purge_at from workspaces where id = ${workspaceId}`;

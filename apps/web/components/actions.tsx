@@ -99,8 +99,8 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
   const [alt, setAlt] = useState<BlockedAlternative | null>(null);
   const [stepUp, setStepUp] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
-  // A compliant alternative replaces the form's first text field (the wording the rules blocked).
-  const wordingField = fields.find((f) => !f.type || f.type === 'text' || f.type === 'textarea')?.name;
+  // A compliant alternative replaces the claim wording the form sends (a form without one only shows the advice).
+  const wordingField = fields.find((f) => f.name === 'wording' && (!f.type || f.type === 'text' || f.type === 'textarea'))?.name;
   const applyWording = (w: string) => {
     const el = wordingField ? formRef.current?.elements.namedItem(wordingField) : null;
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
