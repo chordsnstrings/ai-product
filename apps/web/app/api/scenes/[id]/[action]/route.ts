@@ -8,7 +8,7 @@ import { projectAccess } from '@/lib/tenant';
 /** Scene edits (plan 03 P7/A3): text edits are free and claim-checked; frame changes are limited; locks protect scenes. */
 export const POST = route(async (req, { params }: { params: Promise<{ id: string; action: string }> }) => {
   const { id, action } = await params;
-  const input = await body(req, z.object({ projectId: z.string().uuid(), spokenLine: z.string().max(160).nullish(), overlayText: z.string().max(70).nullish(), locked: z.boolean().optional(), instruction: z.string().max(200).optional() }));
+  const input = await body(req, z.object({ projectId: z.string().uuid(), spokenLine: z.string().max(160).nullish(), overlayText: z.string().max(70).nullish(), locked: z.boolean().optional(), instruction: z.string().max(200).optional(), acceptExploratory: z.boolean().optional() }));
   const a = await projectAccess(input.projectId);
   if (a.provisional) throw new DomainError('FORBIDDEN', 'Save your work to edit the storyboard.', { needsAccount: true });
   // Every scene action edits the storyboard (plan 02 §1.1): refuse a Viewer before revealing whether the scene exists.
@@ -18,7 +18,7 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
   if (!owned) throw new DomainError('NOT_FOUND', 'Scene not found');
   switch (action) {
     case 'edit':
-      return json(await withTenant(a.ctx.workspaceId, (tx) => editScene(tx, a.ctx, id, { spokenLine: input.spokenLine, overlayText: input.overlayText })));
+      return json(await withTenant(a.ctx.workspaceId, (tx) => editScene(tx, a.ctx, id, { spokenLine: input.spokenLine, overlayText: input.overlayText, acceptExploratory: input.acceptExploratory })));
     case 'lock':
       await withTenant(a.ctx.workspaceId, (tx) => setSceneLock(tx, a.ctx, id, !!input.locked));
       return json({ ok: true });

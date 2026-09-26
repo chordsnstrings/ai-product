@@ -59,7 +59,7 @@ export default async function Results({ params }: { params: Promise<{ slug: stri
           {d.exps.map((e) => (
             <Link key={e.id as string} href={`/w/${slug}/results/${e.id}`} className="ak-index-row">
               <span>
-                <span className="ak-index">No. {String(e.catalogue_no).padStart(3, '0')} · {e.name as string}</span>
+                <span className="ak-index">No. {String(e.catalogue_no).padStart(3, '0')} · {e.name as string} · {e.mode === 'EXPLORATORY' ? 'Exploratory' : 'Controlled'}</span>
                 <span style={{ display: 'block' }}>{e.hypothesis as string}</span>
               </span>
               <SignalChip state={String(e.state)} />

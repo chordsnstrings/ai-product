@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { baselineFrom, BASELINE_MIN_TRIALS, compareVariants, DEFAULT_BASELINES, nextLearningState, posterior, probAbove, probBest } from './statistics';
+import { baselineFrom, BASELINE_MIN_TRIALS, commercialVeto, compareCommercial, compareVariants, DEFAULT_BASELINES, MIN_EFFECT, nextLearningState, posterior, probAbove, probBest } from './statistics';
 
 describe('statistics (§21, §45)', () => {
   it('shrinks a tiny sample toward the baseline (no false winner)', () => {
@@ -75,5 +75,90 @@ describe('statistics (§21, §45)', () => {
     expect(probAbove([weak], [strong])).toBeLessThan(0.01);
     expect(probAbove([weak, strong], [weak])).toBeGreaterThan(0.99); // best of the winners
     expect(probAbove([], [weak])).toBe(0.5); // nothing to compare
+  });
+
+  it('without a control, ACTIONABLE needs a material lift over the runner-up (§21 commercial effect)', () => {
+    // Huge volume: a 5% relative difference is statistically separable but too small to act on.
+    const small = compareVariants('ctr', [
+      { variantId: 'a', obs: { successes: 21_000, trials: 1_000_000 }, days: 10 },
+      { variantId: 'b', obs: { successes: 20_000, trials: 1_000_000 }, days: 10 },
+    ], DEFAULT_BASELINES.ctr, 50_000, null);
+    expect(small.variants.find((v) => v.variantId === 'a')!.probBest).toBeGreaterThan(0.95);
+    expect(small.lift!).toBeLessThan(MIN_EFFECT);
+    expect(small.liftVsControl).toBeNull();
+    expect(small.state).toBe('INCONCLUSIVE');
+    expect(small.explanation).toMatch(/small/);
+    // Too few days to call it equivalent: a lean, never actionable.
+    const early = compareVariants('ctr', [
+      { variantId: 'a', obs: { successes: 21_000, trials: 1_000_000 }, days: 4 },
+      { variantId: 'b', obs: { successes: 20_000, trials: 1_000_000 }, days: 4 },
+    ], DEFAULT_BASELINES.ctr, 50_000, null);
+    expect(early.state).toBe('DIRECTIONAL');
+    // A material lift over the runner-up is actionable.
+    const big = compareVariants('ctr', [
+      { variantId: 'a', obs: { successes: 360, trials: 20_000 }, days: 5 },
+      { variantId: 'b', obs: { successes: 240, trials: 20_000 }, days: 5 },
+    ], DEFAULT_BASELINES.ctr, 8_000, null);
+    expect(big.state).toBe('ACTIONABLE');
+    expect(big.lift!).toBeGreaterThan(MIN_EFFECT);
+    expect(big.explanation).toMatch(/next best/);
+  });
+
+  it('compares CPA and ROAS with conversion and order-value uncertainty (§21)', () => {
+    const r = compareCommercial([
+      { variantId: 'cheap', spend: 1_000, purchases: 60, purchaseValue: 3_000, days: 10 },
+      { variantId: 'dear', spend: 1_000, purchases: 30, purchaseValue: 1_500, days: 10 },
+    ], 8_000)!;
+    expect(r.cpa.leader).toBe('cheap');
+    expect(r.cpa.state).toBe('ACTIONABLE');
+    const cheap = r.cpa.variants.find((v) => v.variantId === 'cheap')!;
+    expect(cheap.posterior.raw).toBeCloseTo(1000 / 60);
+    expect(cheap.posterior.ciLow).toBeLessThan(cheap.posterior.mean);
+    expect(cheap.posterior.ciHigh).toBeGreaterThan(cheap.posterior.mean);
+    expect(r.roas.leader).toBe('cheap');
+    // Seeded: reproducible.
+    expect(compareCommercial([
+      { variantId: 'cheap', spend: 1_000, purchases: 60, purchaseValue: 3_000, days: 10 },
+      { variantId: 'dear', spend: 1_000, purchases: 30, purchaseValue: 1_500, days: 10 },
+    ], 8_000)).toEqual(r);
+    // A few purchases: too early, whatever the ratio.
+    const early = compareCommercial([
+      { variantId: 'a', spend: 40, purchases: 3, purchaseValue: 900, days: 2 },
+      { variantId: 'b', spend: 40, purchases: 1, purchaseValue: 30, days: 2 },
+    ], 8_000)!;
+    expect(early.roas.state).toBe('GATHERING_SIGNAL');
+    expect(early.roas.leader).toBeNull();
+    expect(early.roas.explanation).toMatch(/more purchases/);
+    // Fewer than two variants that spent: nothing to compare.
+    expect(compareCommercial([{ variantId: 'a', spend: 10, purchases: 1, purchaseValue: 20, days: 1 }], 8_000)).toBeNull();
+  });
+
+  it('order-value variability widens ROAS more than CPA when purchases are few', () => {
+    const r = compareCommercial([
+      { variantId: 'a', spend: 500, purchases: 25, purchaseValue: 1_250, days: 8 },
+      { variantId: 'b', spend: 500, purchases: 25, purchaseValue: 1_250, days: 8 },
+    ], 8_000)!;
+    const a = r.roas.variants.find((v) => v.variantId === 'a')!;
+    const c = r.cpa.variants.find((v) => v.variantId === 'a')!;
+    const relRoas = (a.posterior.ciHigh - a.posterior.ciLow) / a.posterior.mean;
+    const relCpa = (c.posterior.ciHigh - c.posterior.ciLow) / c.posterior.mean;
+    expect(relRoas).toBeGreaterThan(relCpa);
+    expect(r.roas.state).not.toBe('ACTIONABLE');
+  });
+
+  it('a rate leader that probably costs more per purchase is vetoed', () => {
+    const r = compareCommercial([
+      { variantId: 'clicky', spend: 1_000, purchases: 30, purchaseValue: 1_500, days: 10 },
+      { variantId: 'seller', spend: 1_000, purchases: 60, purchaseValue: 3_000, days: 10 },
+    ], 8_000)!;
+    expect(commercialVeto(r.cpa, 'clicky')).toMatch(/costs more per purchase/);
+    expect(commercialVeto(r.cpa, 'seller')).toBeNull();
+    expect(commercialVeto(null, 'clicky')).toBeNull();
+    // Before the purchase floor the rate result stands.
+    const early = compareCommercial([
+      { variantId: 'clicky', spend: 100, purchases: 2, purchaseValue: 100, days: 3 },
+      { variantId: 'seller', spend: 100, purchases: 9, purchaseValue: 450, days: 3 },
+    ], 8_000)!;
+    expect(commercialVeto(early.cpa, 'clicky')).toBeNull();
   });
 });

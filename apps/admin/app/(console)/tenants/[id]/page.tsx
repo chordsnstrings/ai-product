@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
-import { activeBreakGlass, assertBreakGlass, audit, BREAK_GLASS_REASON_KINDS, BREAK_GLASS_REASON_LABEL, CANCELLABLE_BEFORE_DISPATCH, reconciliationExceptions, RISK_PLAYBOOKS, shouldMaskPii, staffCan, tenantHealth, type BreakGlassReasonKind } from '@arkiv/core';
+import { activeBreakGlass, assertBreakGlass, audit, BREAK_GLASS_REASON_KINDS, BREAK_GLASS_REASON_LABEL, CANCELLABLE_BEFORE_DISPATCH, creativeCoverage, learningVelocity, reconciliationExceptions, RISK_PLAYBOOKS, shouldMaskPii, staffCan, tenantHealth, type BreakGlassReasonKind } from '@arkiv/core';
 import { canResendTemplate } from '@arkiv/email';
 import { newId, PLANS, RefundReason, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { ActButton, ActForm, type F } from '@/components/act';
@@ -85,6 +85,15 @@ async function Overview({ id, w, canFlag }: { id: string; w: Record<string, unkn
                              (select coalesce(sum(bytes), 0) from assets where workspace_id = ${id} and deleted_at is null)::bigint as bytes`)[0]!,
     notes: await tx`select n.body, n.sentiment, n.created_at, s.name from tenant_notes n left join staff_users s on s.id = n.staff_id where n.workspace_id = ${id} order by n.created_at desc`,
     health: await tenantHealth(tx, id),
+    // Appendix C learning metrics for this tenant: velocity over 30 days, and coverage per active SKU.
+    velocity: await learningVelocity(tx, { days: 30, includeTest: true, workspaceId: id }),
+    coverage: await Promise.all(
+      (await tx`select id, name, catalogue_no from skus where workspace_id = ${id} and status = 'active' order by catalogue_no limit 12`).map(async (k) => ({
+        name: k.name as string,
+        no: Number(k.catalogue_no),
+        c: await creativeCoverage(tx, k.id as string),
+      })),
+    ),
   }));
   const { health, quotas, risk } = d0.health;
   const bal = Object.fromEntries(d0.ledger.map((l) => [l.unit as string, Number(l.bal)]));
@@ -97,6 +106,8 @@ async function Overview({ id, w, canFlag }: { id: string; w: Record<string, unkn
           ['Plan', plan ? `${plan.name} · ${money(plan.priceMicros, 0)}/mo · ${plan.creativeTestsPerMonth} tests` : '—'],
           ['Entitlements', `creative tests ${bal.creative_test ?? 0} · taste ${bal.taste ?? 0} · standalone ${bal.standalone ?? 0}`],
           ['Usage', `${d0.counts.skus} SKUs · ${d0.counts.experiments} experiments · ${d0.counts.projects} projects · ${d0.counts.members} members · ${(Number(d0.counts.bytes) / 1e9).toFixed(2)} GB`],
+          ['Learning velocity', d0.velocity.perSkuPerMonth != null ? `${d0.velocity.perSkuPerMonth.toFixed(2)} per SKU per month · ${d0.velocity.experiments} tests reached directional or actionable in 30 days` : '—'],
+          ['Creative coverage', d0.coverage.length ? d0.coverage.map((k) => `No. ${String(k.no).padStart(3, '0')} ${k.c.ratio != null ? `${Math.round(k.c.ratio * 100)}%` : '—'} (${k.c.tested}/${k.c.eligible})`).join(' · ') : '—'],
           ['Timezone', String(w.timezone)],
           ['Tags', ((w.tags as string[]) ?? []).join(', ') || '—'],
         ]} />

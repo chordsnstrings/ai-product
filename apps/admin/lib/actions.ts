@@ -287,7 +287,9 @@ export const ACTIONS = {
         const ctx = await actOnBehalf(tx, s, i.workspaceId, `edit storyboard scene ${i.sceneId}`);
         const [before] = await tx`select spoken_line, overlay_text from scenes where id = ${i.sceneId} and workspace_id = ${i.workspaceId}`;
         if (!before) throw new DomainError('NOT_FOUND', 'Scene not found in this workspace');
-        await editScene(tx, ctx, i.sceneId, { spokenLine: i.spokenLine, overlayText: i.overlayText }); // reads and writes by the verified scene id
+        const edited = await editScene(tx, ctx, i.sceneId, { spokenLine: i.spokenLine, overlayText: i.overlayText }); // reads and writes by the verified scene id
+        // An edit that would make the customer's controlled test exploratory is theirs to confirm, never staff's.
+        if (!edited.applied) throw new DomainError('CONFLICT', `${edited.warning ?? 'Not applied'}: the customer must confirm this edit in Studio.`);
         await audit(tx, s, 'tenant.scene_edit', { type: 'scene', id: i.sceneId }, { workspaceId: i.workspaceId, reason: i.reason, before, after: { spoken_line: i.spokenLine ?? before.spoken_line, overlay_text: i.overlayText ?? before.overlay_text } });
         return { message: 'Scene updated on the customer’s behalf (claims-checked like their own edits).' };
       }),

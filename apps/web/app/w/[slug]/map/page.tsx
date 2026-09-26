@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
-import { creativeMap } from '@arkiv/core';
+import { creativeCoverage, creativeMap } from '@arkiv/core';
 import { Empty, LinkButton } from '@arkiv/ui';
 import { workspacePage } from '@/lib/tenant';
 
@@ -26,7 +26,7 @@ export default async function MapPage({ params, searchParams }: { params: Promis
   const d = await withTenant(w.ctx.workspaceId, async (tx) => {
     const skus = await tx`select id, name, catalogue_no from skus where status = 'active' order by catalogue_no`;
     const sku = skus.find((s) => s.id === sp.sku) ?? skus[0];
-    return { skus, sku, map: sku ? await creativeMap(tx, sku.id as string) : null };
+    return { skus, sku, map: sku ? await creativeMap(tx, sku.id as string) : null, coverage: sku ? await creativeCoverage(tx, sku.id as string) : null };
   });
   if (!d.sku || !d.map) return <Empty title="No products yet" body="Add a product to start building your creative archive." action={<LinkButton href="/start">Add a product</LinkButton>} />;
   const byKey = new Map(d.map.cells.map((c) => [`${c.angle}|${c.treatment}`, c]));
@@ -42,6 +42,12 @@ export default async function MapPage({ params, searchParams }: { params: Promis
           </Link>
         ))}
       </div>
+      {d.coverage?.ratio != null ? (
+        <p className="ak-small">
+          <strong>Creative coverage {Math.round(d.coverage.ratio * 100)}%</strong>
+          <span className="ak-muted"> — {d.coverage.tested} of the {d.coverage.eligible} angle and treatment combinations open to this product have a meaningful test (a read result, or enough delivery). A single under-delivered ad doesn’t count.</span>
+        </p>
+      ) : null}
       <p className="ak-small ak-muted">Rows are angles, columns are production treatments. Numbers count tests and imported ads; the mark shows the strongest signal reached. Empty rows are under-tested territory.</p>
       <ul className="ak-legend" aria-label="Key">
         {Object.entries(STATES).map(([k, s]) => (

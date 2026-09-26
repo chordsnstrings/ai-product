@@ -140,7 +140,7 @@ const GENE_COLUMNS: [string, string][] = [
  * done and the command can be re-run (the update is idempotent). Returns rows changed per table.
  */
 export async function applyTaxonomyRemap(proposalId: string): Promise<Record<string, number>> {
-  const [p] = await withSystem((tx) => tx`select family, op, value, to_value, status from taxonomy_proposals where id = ${proposalId}`);
+  const [p] = await withSystem((tx) => tx`select family, op, value, to_value, status, version from taxonomy_proposals where id = ${proposalId}`);
   if (!p || p.status !== 'approved') throw new Error('proposal is not approved');
   const remap = remapOf({ family: p.family as TaxonomyFamily, op: p.op as TaxonomyChange['op'], value: p.value as string, to: p.to_value as string | null });
   if (!remap) return {};
@@ -150,10 +150,16 @@ export async function applyTaxonomyRemap(proposalId: string): Promise<Record<str
     const workspaces = await withSystem((tx) => tx`select id from workspaces`);
     for (const w of workspaces) {
       await withSystem(async (tx) => {
+        // A remapped genome is a new genome version (creative_genomes keeps the one it replaces, §19).
+        await tx`select set_config('arkiv.genome_source', 'remapped', true)`;
         for (const [table, col] of GENE_COLUMNS) {
           for (const key of keys) {
-            const r = await tx`update ${tx(table)} set ${tx(col)} = jsonb_set(${tx(col)}, ${[key]}::text[], to_jsonb(${remap.to}::text))
-                               where workspace_id = ${w.id as string} and ${tx(col)} ->> ${key} = ${remap.from}`;
+            const r =
+              table === 'creatives' && p.version != null
+                ? await tx`update creatives set genome = jsonb_set(genome, ${[key]}::text[], to_jsonb(${remap.to}::text)), genome_version = greatest(coalesce(genome_version, 0), ${Number(p.version)})
+                           where workspace_id = ${w.id as string} and genome ->> ${key} = ${remap.from}`
+                : await tx`update ${tx(table)} set ${tx(col)} = jsonb_set(${tx(col)}, ${[key]}::text[], to_jsonb(${remap.to}::text))
+                           where workspace_id = ${w.id as string} and ${tx(col)} ->> ${key} = ${remap.from}`;
             counts[`${table}.${col}`] = (counts[`${table}.${col}`] ?? 0) + r.count;
           }
         }

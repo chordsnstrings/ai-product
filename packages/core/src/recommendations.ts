@@ -1,11 +1,16 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { DomainError, type PortfolioSlot, type SkuMaturity } from '@arkiv/shared';
+import { COST_LIMITS, DomainError, type Micros, type Platform, type PortfolioSlot, type SkuMaturity } from '@arkiv/shared';
 import { assertCan } from './authz';
 import { classifyClaim } from './compliance';
 import type { TenantContext } from './context';
+import { AD_PLATFORMS, renderableClaims } from './claims';
 import { authorize, settle } from './cost-governor';
 import { buildContext, contextPacketParts, customerPhrasesPart, gateProposal, isIngredientLed, UNVERIFIED_INGREDIENTS_REASON } from './creative-director';
 import { emit } from './events';
+import { modeFor } from './experiment-design';
+import { fatigueNeedFor, skuFamilyFatigue, type FamilyFatigue } from './fatigue';
+import { estimate as priceEstimate, loadRates, type RateTable } from './rates';
+import { planProduction, productionRoutes, type ProductionRoutes } from './production';
 import { stockState } from './stock';
 import { meaningfulCoverage } from './genome';
 import { ConceptSet, type Proposal } from './intel-schemas';
@@ -34,8 +39,151 @@ export const PORTFOLIO: Record<SkuMaturity, Record<PortfolioSlot, number>> = {
   MATURE: { EXPLOIT: 0.5, EXPAND: 0.3, EXPLORE: 0.2 },
 };
 
-/** TikTok beauty guidance favours reviews, problem/solution, tutorials, routines, comment replies [R7]. */
-const NATIVE_ANGLES = new Set(['TEXTURE_SENSORY', 'ROUTINE', 'APPLICATION_HOWTO', 'PROBLEM_SOLUTION', 'FAQ_RESPONSE', 'OBJECTION_HANDLING', 'SOCIAL_PROOF', 'MYTH_BUSTING']);
+/**
+ * Native fit per distribution environment (§20 "Platform fit: native fit for intended distribution environment"):
+ * how well an angle, a treatment and a hook mechanism sit in each placement. TikTok beauty guidance favours reviews,
+ * problem/solution, tutorials, routines and comment replies with lo-fi creator footage [R7]; Reels tolerates more
+ * polish; the Facebook/Instagram feed favours clear product, proof and value. Values not listed score FIT_DEFAULT.
+ */
+const FIT_DEFAULT = 0.55;
+const TIKTOK_NATIVE = { TEXTURE_SENSORY: 1, ROUTINE: 1, APPLICATION_HOWTO: 1, PROBLEM_SOLUTION: 1, FAQ_RESPONSE: 1, OBJECTION_HANDLING: 1, SOCIAL_PROOF: 1, MYTH_BUSTING: 1 };
+export const PLATFORM_FIT: Record<Platform, { angle: Record<string, number>; treatment: Record<string, number>; hook: Record<string, number> }> = {
+  TIKTOK: {
+    angle: { ...TIKTOK_NATIVE, FOUNDER_STORY: 0.8, INGREDIENT_EDUCATION: 0.75, PRODUCT_COMPARISON: 0.7, EXPERT_AUTHORITY: 0.65, LIFESTYLE_IDENTITY: 0.6 },
+    treatment: { RAW_UGC: 1, CREATOR: 1, FOUNDER: 0.9, POLISHED_UGC: 0.85, HYBRID: 0.75, AI_TALENT: 0.7, PRODUCT_ONLY: 0.55, AI_PRODUCT: 0.55, MOTION_GRAPHICS: 0.5, PREMIUM_STUDIO: 0.35 },
+    hook: { COMMENT_REPLY: 1, QUESTION: 0.9, CONFESSION: 0.9, DEMONSTRATION: 0.9, CONTRARIAN: 0.85, MYTH: 0.85, PROBLEM: 0.85, LIST: 0.8, CURIOSITY: 0.8, TESTIMONIAL: 0.8, WARNING: 0.7, RESULT_FIRST: 0.6, DIRECT_PRODUCT: 0.55 },
+  },
+  INSTAGRAM_REELS: {
+    angle: { ...TIKTOK_NATIVE, LIFESTYLE_IDENTITY: 0.9, FOUNDER_STORY: 0.8, INGREDIENT_EDUCATION: 0.8, PRODUCT_COMPARISON: 0.7, EXPERT_AUTHORITY: 0.7, FAQ_RESPONSE: 0.85 },
+    treatment: { CREATOR: 1, POLISHED_UGC: 1, RAW_UGC: 0.85, FOUNDER: 0.85, HYBRID: 0.8, AI_TALENT: 0.7, PRODUCT_ONLY: 0.7, AI_PRODUCT: 0.65, MOTION_GRAPHICS: 0.65, PREMIUM_STUDIO: 0.7 },
+    hook: { DEMONSTRATION: 1, QUESTION: 0.85, CURIOSITY: 0.85, LIST: 0.85, PROBLEM: 0.85, CONTRARIAN: 0.8, MYTH: 0.8, CONFESSION: 0.8, TESTIMONIAL: 0.8, RESULT_FIRST: 0.7, COMMENT_REPLY: 0.7, DIRECT_PRODUCT: 0.7, WARNING: 0.65 },
+  },
+  FACEBOOK_FEED: {
+    angle: { PROBLEM_SOLUTION: 1, SOCIAL_PROOF: 1, PRICE_VALUE: 0.9, PRODUCT_COMPARISON: 0.85, INGREDIENT_EDUCATION: 0.85, OBJECTION_HANDLING: 0.85, TEXTURE_SENSORY: 0.8, ROUTINE: 0.75, EXPERT_AUTHORITY: 0.75, APPLICATION_HOWTO: 0.75, FOUNDER_STORY: 0.7, LIFESTYLE_IDENTITY: 0.7 },
+    treatment: { PRODUCT_ONLY: 0.9, MOTION_GRAPHICS: 0.9, POLISHED_UGC: 0.9, PREMIUM_STUDIO: 0.85, AI_PRODUCT: 0.8, HYBRID: 0.8, CREATOR: 0.8, FOUNDER: 0.75, RAW_UGC: 0.7, AI_TALENT: 0.65 },
+    hook: { PROBLEM: 0.9, DIRECT_PRODUCT: 0.9, RESULT_FIRST: 0.8, QUESTION: 0.8, TESTIMONIAL: 0.8, LIST: 0.75, DEMONSTRATION: 0.75, CURIOSITY: 0.7, WARNING: 0.65, MYTH: 0.65, CONTRARIAN: 0.6, CONFESSION: 0.6, COMMENT_REPLY: 0.5 },
+  },
+};
+
+/** Where a test runs when nothing says otherwise: the 9:16 master's native placements. */
+export const DEFAULT_TARGET_PLATFORMS: readonly Platform[] = ['TIKTOK', 'INSTAGRAM_REELS'];
+
+/**
+ * The intended distribution environment (§20 platform fit): the placements of the ad accounts the workspace has
+ * connected (Meta → Reels and the feed, TikTok → TikTok), else TikTok + Reels.
+ */
+export function targetPlatforms(connectedProviders: readonly string[]): Platform[] {
+  const out = new Set<Platform>();
+  for (const p of connectedProviders) {
+    if (p === 'meta') {
+      out.add('INSTAGRAM_REELS');
+      out.add('FACEBOOK_FEED');
+    } else if (p === 'tiktok') out.add('TIKTOK');
+  }
+  return out.size ? Platform_ORDER.filter((x) => out.has(x)) : [...DEFAULT_TARGET_PLATFORMS];
+}
+const Platform_ORDER: readonly Platform[] = ['TIKTOK', 'INSTAGRAM_REELS', 'FACEBOOK_FEED'];
+
+/** Native fit of a proposal for its target placements (mean over them): angle 50%, treatment 30%, hook 20%. */
+export function platformFit(p: Pick<Proposal, 'angle' | 'treatment' | 'hookMechanism'>, targets: readonly Platform[] = DEFAULT_TARGET_PLATFORMS): number {
+  const list = targets.length ? targets : DEFAULT_TARGET_PLATFORMS;
+  const one = (t: Platform) => {
+    const f = PLATFORM_FIT[t];
+    return 0.5 * (f.angle[p.angle] ?? FIT_DEFAULT) + 0.3 * (f.treatment[p.treatment] ?? FIT_DEFAULT) + 0.2 * (f.hook[p.hookMechanism] ?? FIT_DEFAULT);
+  };
+  return Math.round((list.reduce((n, t) => n + one(t), 0) / list.length) * 1000) / 1000;
+}
+
+/**
+ * What a placement's ad policy disallows (§20 hard gate "platform disallowance"): a concept that can't run where
+ * this test is meant to run is never produced automatically.
+ */
+export const PLATFORM_DISALLOWED: Record<Platform, { when: (p: Pick<Proposal, 'proofMechanism' | 'treatment' | 'angle'>) => boolean; reason: string }[]> = {
+  TIKTOK: [
+    { when: (p) => p.proofMechanism === 'BEFORE_AFTER_RESTRICTED', reason: 'TikTok’s ad policy restricts before/after skin results' },
+    { when: (p) => p.treatment === 'AI_TALENT' && (p.proofMechanism === 'CUSTOMER_TESTIMONIAL' || p.proofMechanism === 'CREATOR_TESTIMONIAL'), reason: 'TikTok doesn’t allow an AI-generated person to give a testimonial' },
+  ],
+  INSTAGRAM_REELS: [
+    { when: (p) => p.proofMechanism === 'BEFORE_AFTER_RESTRICTED', reason: 'Meta’s ad policy restricts before-and-after images' },
+    { when: (p) => p.treatment === 'AI_TALENT' && (p.proofMechanism === 'CUSTOMER_TESTIMONIAL' || p.proofMechanism === 'CREATOR_TESTIMONIAL'), reason: 'Meta doesn’t allow an AI-generated person to give a testimonial' },
+  ],
+  FACEBOOK_FEED: [
+    { when: (p) => p.proofMechanism === 'BEFORE_AFTER_RESTRICTED', reason: 'Meta’s ad policy restricts before-and-after images' },
+    { when: (p) => p.treatment === 'AI_TALENT' && (p.proofMechanism === 'CUSTOMER_TESTIMONIAL' || p.proofMechanism === 'CREATOR_TESTIMONIAL'), reason: 'Meta doesn’t allow an AI-generated person to give a testimonial' },
+  ],
+};
+
+/** Library assets a proposal needs (§20 "asset availability"): `hard` ones gate it, the others lower feasibility. */
+export interface AssetNeed {
+  kinds: readonly string[];
+  label: string;
+  hard: boolean;
+  /** Only assets whose usage rights were attested count (§20 hard gate "missing rights/assets"). */
+  rights?: boolean;
+}
+const FOOTAGE = ['creator_footage', 'historical_creative'] as const;
+const FOOTAGE_TREATMENTS: ReadonlySet<string> = new Set(['RAW_UGC', 'CREATOR', 'FOUNDER']);
+const FOOTAGE_PROOFS: ReadonlySet<string> = new Set(['CUSTOMER_TESTIMONIAL', 'CREATOR_TESTIMONIAL', 'FOUNDER_EXPLANATION', 'EXPERT_EXPLANATION']);
+
+/**
+ * The assets a proposal needs from the SKU's library: real footage with attested rights for creator, founder or raw
+ * UGC treatments and for testimonial, founder or expert proof (an AI-generated person never stands in for them,
+ * §40); reference views for a texture or application demo; a cut-out for product-only work; product photos always.
+ */
+export function requiredAssets(p: Pick<Proposal, 'treatment' | 'proofMechanism'>): AssetNeed[] {
+  const needs: AssetNeed[] = [{ kinds: ['product_photo', 'reference_view'], label: 'product photos', hard: false }];
+  if (FOOTAGE_TREATMENTS.has(p.treatment) || FOOTAGE_PROOFS.has(p.proofMechanism)) needs.push({ kinds: FOOTAGE, label: 'real footage with confirmed usage rights', hard: true, rights: true });
+  if (p.proofMechanism === 'TEXTURE_DEMO' || p.proofMechanism === 'APPLICATION_DEMO') needs.push({ kinds: ['reference_view'], label: 'a swatch or in-hand photo', hard: false });
+  if (p.treatment === 'PRODUCT_ONLY' || p.treatment === 'AI_PRODUCT' || p.treatment === 'MOTION_GRAPHICS') needs.push({ kinds: ['cutout'], label: 'a product cut-out', hard: false });
+  return needs;
+}
+
+/** Usable library assets of a SKU by kind: `all` rights-valid and approved, `rights` those with attested rights too. */
+export interface AssetInventory {
+  all: Record<string, number>;
+  rights: Record<string, number>;
+}
+
+const have = (inv: AssetInventory, n: AssetNeed) => n.kinds.reduce((c, k) => c + ((n.rights ? inv.rights : inv.all)[k] ?? 0), 0) > 0;
+
+/** Share of a proposal's soft asset needs the library meets (a missing one costs 40% of its share). */
+export function assetAvailability(p: Pick<Proposal, 'treatment' | 'proofMechanism'>, inv: AssetInventory | undefined): number {
+  if (!inv) return 1;
+  const soft = requiredAssets(p).filter((n) => !n.hard);
+  if (!soft.length) return 1;
+  return soft.reduce((a, n) => a + (have(inv, n) ? 1 : 0.6), 0) / soft.length;
+}
+
+/**
+ * Production feasibility (§20 "asset availability and fidelity probability"): how surely the product can be shown
+ * faithfully at this generation class, times how much of what the idea needs is already in the library.
+ */
+export function feasibility(p: Pick<Proposal, 'treatment' | 'proofMechanism' | 'estimatedGenerationClass'>, s: Pick<ScoringContext, 'fidelityConfidence' | 'assets'>): number {
+  const fidelity = Math.min(1, s.fidelityConfidence * (p.estimatedGenerationClass === 'generative_short' ? 0.85 : 1) + 0.1);
+  return Math.round(fidelity * assetAvailability(p, s.assets) * 1000) / 1000;
+}
+
+/**
+ * Customer relevance (§20 "frequency/recency/intensity of the customer tension"): the matched theme's prevalence,
+ * how strongly customers say it, whether it is rising, and how recently they said it. The theme is the one the
+ * proposal cites (customerTensionId), else the best word overlap with its tension and hypothesis.
+ */
+export function themeStrength(t: ScoringTheme): number {
+  const intensity = t.intensity ?? 0.5;
+  const trend = t.trend === 'rising' ? 1 : t.trend === 'falling' ? 0 : 0.5;
+  // Recency decays with a 90-day half-life; unknown recency counts as middling.
+  const recency = t.recencyDays == null ? 0.5 : Math.pow(0.5, Math.max(0, t.recencyDays) / 90);
+  return 0.45 * Math.min(1, t.prevalence) + 0.25 * intensity + 0.15 * recency + 0.15 * trend;
+}
+
+export function customerRelevance(p: Pick<Proposal, 'customerTension' | 'hypothesis' | 'customerTensionSource'> & { customerTensionId?: string | null }, themes: readonly ScoringTheme[]): { score: number; theme: ScoringTheme | null } {
+  const cited = p.customerTensionId ? themes.find((t) => t.id === p.customerTensionId) : undefined;
+  const matched = cited
+    ? { t: cited, o: 1 }
+    : themes.map((t) => ({ t, o: overlap(t.label, `${p.customerTension} ${p.hypothesis}`) })).filter((x) => x.o > 0).sort((a, b) => b.o * themeStrength(b.t) - a.o * themeStrength(a.t))[0];
+  if (!matched) return { score: p.customerTensionSource === 'reviews' ? 0.45 : 0.35, theme: null };
+  return { score: Math.round(Math.min(1, 0.35 + 0.65 * Math.min(1, matched.o) * themeStrength(matched.t)) * 1000) / 1000, theme: matched.t };
+}
 const COGS_SCORE: Record<Proposal['estimatedGenerationClass'], number> = { remix: 1, hybrid_short: 0.75, generative_short: 0.5, premium: 0.15 };
 
 /**
@@ -55,8 +203,19 @@ export interface LearningSignal {
   confidence?: number | null;
 }
 
+export interface ScoringTheme {
+  id?: string;
+  label: string;
+  prevalence: number;
+  /** How strongly customers say it (0–1). */
+  intensity?: number | null;
+  trend?: 'rising' | 'flat' | 'falling' | null;
+  /** Days since a customer last said it (its newest representative snippet). */
+  recencyDays?: number | null;
+}
+
 export interface ScoringContext {
-  themes: { id?: string; label: string; prevalence: number }[];
+  themes: ScoringTheme[];
   /** Meaningful (read, or delivered past the evidence floor) tests per angle — §20 coverage gap. */
   angleTests: Map<string, number>;
   /** Meaningfully tested cells: `angle|hookMechanism` and `angle|t:treatment`. */
@@ -71,6 +230,14 @@ export interface ScoringContext {
   basis?: 'performance' | 'context_limited' | 'cold_start';
   /** False when the SKU has no sourced ingredient list: ingredient-led tests are gated (§42). */
   ingredientsVerified?: boolean;
+  /** Creative families' spend share and deterioration (§20 FatigueNeed). */
+  families?: FamilyFatigue[];
+  /** Usable library assets by kind (§20 feasibility, rights gate); without it only the legacy footage check runs. */
+  assets?: AssetInventory;
+  /** Where the tests are meant to run (§20 platform fit, platform disallowance). */
+  targetPlatforms?: Platform[];
+  /** Estimated provider cost of a nominal test per generation class at today's rates (§20 cost-violation gate). */
+  classCostMicros?: Partial<Record<Proposal['estimatedGenerationClass'], Micros>>;
 }
 
 export interface Scored {
@@ -168,6 +335,40 @@ const overlap = (a: string, b: string) => {
   return wb.filter((w) => wa.has(w)).length / Math.max(1, Math.min(wa.size, wb.length));
 };
 
+/**
+ * The gates a concept the merchant picks from must pass too (§20; plan 06 Phase 2 "hard gates first (claims,
+ * feasibility, duplicates)"): product fidelity good enough for the generation class, not a near-duplicate of a recent
+ * test or an earlier set of ideas, and allowed where it will run. Claims are gated by gateProposal.
+ */
+export function feasibilityGates(p: Proposal, s: Pick<ScoringContext, 'fidelityConfidence' | 'recentKeys' | 'targetPlatforms'>): string[] {
+  const reasons: string[] = [];
+  if (s.fidelityConfidence < 0.3 && p.estimatedGenerationClass !== 'remix') reasons.push(FIDELITY_REASON);
+  if (s.recentKeys.has(`${p.angle}|${p.hookMechanism}`)) reasons.push(`${NEAR_DUPLICATE} of a test run in the last 21 days`);
+  for (const t of s.targetPlatforms ?? DEFAULT_TARGET_PLATFORMS) {
+    for (const rule of PLATFORM_DISALLOWED[t]) if (rule.when(p) && !reasons.includes(rule.reason)) reasons.push(rule.reason);
+  }
+  return reasons;
+}
+
+const FIDELITY_REASON = 'product fidelity too uncertain for generated interaction; add clearer photos';
+
+/**
+ * What the concept gates need (generateConcepts): the SKU's fidelity, the angle × hook keys of its tests of the last
+ * 21 days and of this project's earlier idea sets, and where the ads will run.
+ */
+export async function conceptGateContext(tx: Tx, skuId: string, projectId: string, batch: number): Promise<Pick<ScoringContext, 'fidelityConfidence' | 'recentKeys' | 'targetPlatforms'>> {
+  const [sku] = await tx`select fidelity_confidence from skus where id = ${skuId}`;
+  const recent = await tx`select genes->>'angle' as angle, genes->>'hookMechanism' as hook from experiments where sku_id = ${skuId} and created_at > now() - interval '21 days'
+                          union all
+                          select proposal->>'angle', proposal->>'hookMechanism' from concepts where project_id = ${projectId} and batch < ${batch}`;
+  const integ = await tx`select distinct provider from integrations where provider in ('meta','tiktok') and status <> 'disconnected'`;
+  return {
+    fidelityConfidence: Number(sku?.fidelity_confidence ?? 0.7),
+    recentKeys: new Set(recent.map((r) => `${r.angle}|${r.hook}`)),
+    targetPlatforms: targetPlatforms(integ.map((i) => i.provider as string)),
+  };
+}
+
 export function hardGates(p: Proposal, s: ScoringContext): { passed: boolean; reasons: string[] } {
   const reasons: string[] = [];
   for (const h of p.hookOptions) {
@@ -175,10 +376,16 @@ export function hardGates(p: Proposal, s: ScoringContext): { passed: boolean; re
     if (c.status === 'BLOCKED' || c.status === 'RESTRICTED') reasons.push(`blocked claim in hook “${h}”`);
   }
   for (const w of p.claimWordings) if (!s.approvedClaims.some((a) => a.toLowerCase().includes(w.toLowerCase()))) reasons.push(`claim lacks approval/evidence: “${w}”`);
-  if (s.fidelityConfidence < 0.3 && p.estimatedGenerationClass !== 'remix') reasons.push('product fidelity too uncertain for generated interaction; add clearer photos');
-  if (s.recentKeys.has(`${p.angle}|${p.hookMechanism}`)) reasons.push(`${NEAR_DUPLICATE} of a test run in the last 21 days`);
+  reasons.push(...feasibilityGates(p, s));
+  // Cost violations: premium is outside a standard Creative Test; any class whose nominal plan at today's rates
+  // exceeds the §5 ceiling can't be produced as one either.
+  const cost = s.classCostMicros?.[p.estimatedGenerationClass];
   if (p.estimatedGenerationClass === 'premium') reasons.push('premium production exceeds the standard Creative Test cost ceiling');
-  if (p.treatment === 'RAW_UGC' && !s.hasRealAssets) reasons.push('needs real footage/assets that are not in the library');
+  else if (cost != null && cost > COST_LIMITS.CREATIVE_TEST_CEILING) reasons.push(`${p.estimatedGenerationClass.replace('_', ' ')} production costs more than a Creative Test allows at today’s rates`);
+  // Missing rights/assets: what the idea needs from the library must be there, with usage rights confirmed.
+  if (s.assets) {
+    for (const n of requiredAssets(p).filter((x) => x.hard)) if (!have(s.assets, n)) reasons.push(`needs ${n.label} that isn’t in the library`);
+  } else if (p.treatment === 'RAW_UGC' && !s.hasRealAssets) reasons.push('needs real footage/assets that are not in the library');
   if (p.proofMechanism === 'BEFORE_AFTER_RESTRICTED') reasons.push('before/after requires separate policy review');
   if (s.ingredientsVerified === false && isIngredientLed(p)) reasons.push(UNVERIFIED_INGREDIENTS_REASON);
   return { passed: reasons.length === 0, reasons };
@@ -196,23 +403,23 @@ export function slotFor(p: Proposal, s: ScoringContext): PortfolioSlot {
 
 export function scoreProposal(p: Proposal, s: ScoringContext): Scored {
   const gates = hardGates(p, s);
-  const theme = s.themes.map((t) => ({ t, o: overlap(t.label, `${p.customerTension} ${p.hypothesis}`) })).sort((a, b) => b.o * b.t.prevalence - a.o * a.t.prevalence)[0];
+  const relevance = customerRelevance(p, s.themes);
   const bearing = s.learnings.filter((l) => l.state !== 'INVALIDATED').map((l) => ({ l, m: learningMatch(l, p) })).filter((x) => x.m !== 0);
   const b = {
-    customerRelevance: theme && theme.o > 0 ? Math.min(1, 0.4 + theme.o * 0.3 + theme.t.prevalence * 0.6) : p.customerTensionSource === 'reviews' ? 0.6 : 0.35,
+    customerRelevance: relevance.score,
     adjacentSignal: adjacentSignal(s.learnings, p),
     coverageGap: coverageGap(p, s),
-    fatigueNeed: s.fatiguingAngles.has(p.angle) ? 0.9 : s.fatiguingAngles.size ? 0.5 : 0.2,
+    fatigueNeed: fatigueNeedFor(p.angle, s.families ?? [], s.fatiguingAngles),
     // §21 WEAKENING "schedule validation": a proposal that re-tests a weakening learning's winning value is a
     // revalidation, and as learnable as a hook test.
     learnability: p.primaryVariable === 'hook' || revalidates(p, s) ? 1 : p.riskProfile === 'exploratory' ? 0.45 : 0.75,
-    feasibility: Math.min(1, s.fidelityConfidence * (p.estimatedGenerationClass === 'generative_short' ? 0.85 : 1) + 0.1),
-    platformFit: NATIVE_ANGLES.has(p.angle) ? 1 : 0.55,
+    feasibility: feasibility(p, s),
+    platformFit: platformFit(p, s.targetPlatforms),
     cogsEfficiency: COGS_SCORE[p.estimatedGenerationClass],
   };
   const score = (Object.keys(WEIGHTS) as (keyof typeof WEIGHTS)[]).reduce((acc, k) => acc + WEIGHTS[k] * b[k], 0);
-  const themeMatched = !!theme && theme.o > 0;
-  const used = [...(themeMatched && theme!.t.id ? [theme!.t.id] : []), ...bearing.map((x) => x.l.id).filter((x): x is string => !!x)];
+  const themeMatched = !!relevance.theme;
+  const used = [...(relevance.theme?.id ? [relevance.theme.id] : []), ...bearing.map((x) => x.l.id).filter((x): x is string => !!x)];
   // Only packet item ids (uuids) are stored; anything else was dropped by the gate or never belonged here.
   const rationaleIds = [...new Set([...(p.rationaleIds ?? []), ...used])].filter((id) => UUID.test(id)).slice(0, 12);
   const confidence = recommendationConfidence(s.basis, bearing.map((x) => ({ state: x.l.state, positive: x.m > 0 })), themeMatched);
@@ -251,10 +458,40 @@ export function composePortfolio(scored: Scored[], maturity: SkuMaturity, n = 3,
   return out;
 }
 
+/** A nominal 15-second, five-scene test per generation class: how many scenes are generated interaction. */
+const NOMINAL_GENERATIVE: Record<Proposal['estimatedGenerationClass'], number> = { remix: 0, hybrid_short: 1, generative_short: 3, premium: 5 };
+
+/** Provider cost of a nominal test per generation class at today's rates and routes (Production Planner, §37). */
+export function nominalClassCosts(routes: ProductionRoutes, rates: Map<string, RateTable>): Partial<Record<Proposal['estimatedGenerationClass'], Micros>> {
+  const out: Partial<Record<Proposal['estimatedGenerationClass'], Micros>> = {};
+  for (const [cls, gen] of Object.entries(NOMINAL_GENERATIVE) as [Proposal['estimatedGenerationClass'], number][]) {
+    const scenes = Array.from({ length: 5 }, (_, i) => ({ id: `n${i}`, production_mode: i < gen ? 'GENERATIVE_INTERACTION' : 'STRICT_COMPOSITE', duration_ms: 3000, purpose: 'demonstration', shows_human_skin: i < gen }));
+    try {
+      const plan = planProduction(scenes, 180, routes, rates);
+      out[cls] = priceEstimate(rates, plan.lines).totalMicros;
+    } catch {
+      // A route without a published rate: that class isn't priced (the Cost Governor refuses it at approval anyway).
+    }
+  }
+  return out;
+}
+
+async function classCosts(tx: Tx): Promise<Partial<Record<Proposal['estimatedGenerationClass'], Micros>>> {
+  try {
+    return nominalClassCosts(await productionRoutes(tx, null), await loadRates(tx));
+  } catch {
+    return {};
+  }
+}
+
 /** What scoring needs about a SKU, read through tenant-scoped queries. */
 export async function scoringContext(tx: Tx, skuId: string) {
   const [sku] = await tx`select maturity, fidelity_confidence from skus where id = ${skuId}`;
-  const themes = await tx`select id, label, prevalence from customer_themes where sku_id = ${skuId}`;
+  // Each theme with its intensity, trend and how recently customers said it (§20 customer relevance).
+  const themes = await tx`select t.id, t.label, t.prevalence, t.intensity, t.trend,
+                                 (select extract(epoch from now() - max(coalesce(s.observed_at, s.imported_at))) / 86400 from customer_signals s
+                                  where s.id = any(t.snippet_ids) and s.workspace_id = t.workspace_id)::float8 as recency_days
+                          from customer_themes t where t.sku_id = ${skuId}`;
   const coverage = await meaningfulCoverage(tx, skuId);
   const recent = await tx`select genes->>'angle' as angle, genes->>'hookMechanism' as hook from experiments where sku_id = ${skuId} and created_at > now() - interval '21 days'`;
   // The portfolio mix this SKU's last eight weeks already realized (steers the deficit allocation).
@@ -274,15 +511,30 @@ export async function scoringContext(tx: Tx, skuId: string) {
   const fatigue = await tx`select distinct e.genes->>'angle' as angle from experiments e
                            where e.sku_id = ${skuId} and e.state not in ('INVALIDATED','ARCHIVED') and (e.fatigue->>'fatigued')::boolean is true`;
   // Only footage still usable for new production: rights not expired, not frozen by a takedown case (plan 05 §15).
-  const [assets] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind in ('creator_footage','historical_creative') and deleted_at is null
-                              and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null and coalesce(review_status, 'approved') = 'approved'`;
-  const approved = (await tx`select preferred_wording, mandatory_qualifier from claims where sku_id = ${skuId} and status in ('VERIFIED','VERIFIED_WITH_QUALIFIER')`).map((c) => `${c.preferred_wording}${c.mandatory_qualifier ? ' ' + c.mandatory_qualifier : ''}`);
+  const inventory = await tx`select kind, count(*)::int as n, count(*) filter (where rights_attested_at is not null)::int as attested from assets
+                              where sku_id = ${skuId} and deleted_at is null
+                              and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null and coalesce(review_status, 'approved') = 'approved'
+                              group by kind`;
+  const assets: AssetInventory = {
+    all: Object.fromEntries(inventory.map((a) => [a.kind as string, Number(a.n)])),
+    rights: Object.fromEntries(inventory.map((a) => [a.kind as string, Number(a.attested)])),
+  };
+  // Only claims usable wherever the ad is published (every export platform, the brand's market): a wording narrower
+  // than that passes here and then fails claims QA after render spend (§20 platform disallowance).
+  const approved = (await renderableClaims(tx, skuId, { platforms: AD_PLATFORMS })).map((c) => (c.mandatoryQualifier ? `${c.preferredWording} ${c.mandatoryQualifier}` : c.preferredWording));
   const hasPerf = learnings.length > 0;
   const fresh = integ.filter((i) => i.status === 'active' && i.fresh).length;
   // Stale or missing ad connections downgrade the recommendation basis (§31).
   const basis: NonNullable<ScoringContext['basis']> = !integ.length ? (hasPerf ? 'context_limited' : 'cold_start') : fresh < integ.length ? 'context_limited' : hasPerf ? 'performance' : 'cold_start';
   const out: ScoringContext & { maturity: SkuMaturity; basis: NonNullable<ScoringContext['basis']>; realized: Partial<Record<PortfolioSlot, number>> } = {
-    themes: themes.map((t) => ({ id: t.id as string, label: t.label as string, prevalence: Number(t.prevalence) })),
+    themes: themes.map((t) => ({
+      id: t.id as string,
+      label: t.label as string,
+      prevalence: Number(t.prevalence),
+      intensity: t.intensity == null ? null : Number(t.intensity),
+      trend: (t.trend as ScoringTheme['trend']) ?? null,
+      recencyDays: t.recency_days == null ? null : Number(t.recency_days),
+    })),
     angleTests: coverage.angles,
     testedCells: coverage.cells,
     learnings: learnings.map((l) => {
@@ -303,7 +555,11 @@ export async function scoringContext(tx: Tx, skuId: string) {
     recentKeys: new Set(recent.map((r) => `${r.angle}|${r.hook}`)),
     fidelityConfidence: Number(sku?.fidelity_confidence ?? 0.7),
     approvedClaims: approved,
-    hasRealAssets: (assets?.n ?? 0) > 0,
+    hasRealAssets: FOOTAGE.some((k) => (assets.all[k] ?? 0) > 0),
+    assets,
+    families: await skuFamilyFatigue(tx, skuId),
+    targetPlatforms: targetPlatforms(platforms),
+    classCostMicros: await classCosts(tx),
     maturity: (sku?.maturity as SkuMaturity) ?? 'COLD',
     basis,
     realized: Object.fromEntries(mix.map((m) => [m.slot as PortfolioSlot, m.n as number])),
@@ -336,12 +592,21 @@ export function weekOf(d = new Date()): string {
 export function gateAndScore(
   c: Proposal,
   s: ScoringContext,
-  gate: { approvedClaims: string[]; names?: (string | null | undefined)[]; packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean; prohibited?: readonly string[] },
+  gate: {
+    approvedClaims: string[];
+    names?: (string | null | undefined)[];
+    packetIds?: ReadonlySet<string>;
+    ingredientsVerified?: boolean;
+    prohibited?: readonly string[];
+    themeIds?: ReadonlySet<string>;
+    claimsById?: ReadonlyMap<string, string>;
+    assetIds?: ReadonlySet<string>;
+  },
 ): Scored {
-  const g = gateProposal(c, gate.approvedClaims, gate.names ?? [], { packetIds: gate.packetIds, ingredientsVerified: gate.ingredientsVerified, prohibited: gate.prohibited, pad: false });
+  const g = gateProposal(c, gate.approvedClaims, gate.names ?? [], { packetIds: gate.packetIds, ingredientsVerified: gate.ingredientsVerified, prohibited: gate.prohibited, themeIds: gate.themeIds, claimsById: gate.claimsById, assetIds: gate.assetIds, pad: false });
   if (g.ok && !g.removed.hooks && !g.removed.claims) return scoreProposal(g.cleaned, s);
   const scored = scoreProposal({ ...c, rationaleIds: g.cleaned.rationaleIds }, s);
-  const reasons = [...new Set([...scored.gates.reasons, ...g.reasons.filter((r) => !r.startsWith('unknown rationale id'))])];
+  const reasons = [...new Set([...scored.gates.reasons, ...g.reasons.filter((r) => !r.startsWith('unknown rationale id') && !r.startsWith('unknown asset id') && !r.startsWith('unknown customer tension id'))])];
   return { ...scored, score: 0, gates: { passed: false, reasons } };
 }
 
@@ -355,7 +620,7 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
   const stock = await withTenant(ws, (tx) => stockState(tx, skuId));
   if (stock.needsIntent) return 0;
   const stockPart = stock.inStock === false && stock.intent ? { type: 'text' as const, text: STOCK_INTENT_BRIEF[stock.intent] } : null;
-  const { productContext, packet, packetIds, ingredientsVerified, names, phrases, prohibited } = await withTenant(ws, (tx) => buildContext(tx, skuId));
+  const { productContext, packet, packetIds, assetIds, themeIds, claimsById, ingredientsVerified, names, phrases, prohibited } = await withTenant(ws, (tx) => buildContext(tx, skuId));
   const sc = { ...(await withTenant(ws, (tx) => scoringContext(tx, skuId))), ingredientsVerified };
   const auth = await withTenant(ws, async (tx) =>
     authorize(tx, ctx, { purpose: 'storyboard', projectId: null, lines: await routedLines(tx, ws, [{ task: 'creative_director.recommendations', kind: 'llm', inputTokens: 12_000, outputTokens: 8_000 }]), idempotencyKey: `recs:${skuId}:${week}` }),
@@ -385,33 +650,33 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
       });
       candidates.push(...r.data.concepts);
     }
-    const scored = candidates.map((c) => gateAndScore(c, sc, { approvedClaims: productContext.approvedClaims, names, packetIds, ingredientsVerified, prohibited }));
+    const scored = candidates.map((c) => gateAndScore(c, sc, { approvedClaims: productContext.approvedClaims, names, packetIds, ingredientsVerified, prohibited, themeIds, claimsById, assetIds }));
     const picked = composePortfolio(scored, sc.maturity, 3, sc.realized);
     const refreshes = await withTenant(ws, (tx) => refreshProposals(tx, skuId, scored, picked));
     await withTenant(ws, async (tx) => {
       // A fatigued winner (§45): a controlled refresh — same angle, a new opening, the current winner as control.
       for (const r of refreshes) {
         const [row] = await tx`
-          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, kind, control_creative_id)
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, kind, control_creative_id, mode)
           values (${ws}, ${skuId}, ${week}, 'EXPLOIT', ${tx.json(r.proposal as never)}, ${r.scored.score}, ${tx.json(r.scored.breakdown)}, ${tx.json(r.scored.gates)}, ${sc.basis},
-                  ${r.scored.rationaleIds}::uuid[], ${r.scored.confidence}, 'refresh', ${r.controlCreativeId})
+                  ${r.scored.rationaleIds}::uuid[], ${r.scored.confidence}, 'refresh', ${r.controlCreativeId}, ${modeFor(r.proposal, r.controlCreativeId)})
           returning id`;
         await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: row!.id as string }, { slot: 'EXPLOIT', score: r.scored.score, basis: sc.basis, confidence: r.scored.confidence, rationaleIds: r.scored.rationaleIds, refresh: true }, { skuId });
       }
       for (const p of picked) {
         const [r] = await tx`
-          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence)
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, mode)
           values (${ws}, ${skuId}, ${week}, ${p.slot}, ${tx.json(p.proposal as never)}, ${p.score}, ${tx.json(p.breakdown)}, ${tx.json(p.gates)}, ${sc.basis},
-                  ${p.rationaleIds}::uuid[], ${p.confidence})
+                  ${p.rationaleIds}::uuid[], ${p.confidence}, ${modeFor(p.proposal)})
           returning id`;
         await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: r!.id as string }, { slot: p.slot, score: p.score, basis: sc.basis, confidence: p.confidence, rationaleIds: p.rationaleIds }, { skuId });
       }
       // Refused candidates are kept with their gate reasons for staff review; never shown, never picked.
       for (const g of scored.filter((x) => !x.gates.passed)) {
         await tx`
-          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, status)
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, status, mode)
           values (${ws}, ${skuId}, ${week}, ${g.slot}, ${tx.json(g.proposal as never)}, 0, ${tx.json(g.breakdown)}, ${tx.json(g.gates)}, ${sc.basis},
-                  ${g.rationaleIds}::uuid[], ${g.confidence}, 'gated')`;
+                  ${g.rationaleIds}::uuid[], ${g.confidence}, 'gated', ${modeFor(g.proposal)})`;
       }
       await settle(tx, ctx, auth.authorizationId, 'consumed');
     });
@@ -504,7 +769,7 @@ export async function resolveRationale(tx: Tx, ids: readonly string[]): Promise<
  * and confidence.
  */
 export async function recommendationsForSku(tx: Tx, skuId: string, opts: { sinceWeek?: string } = {}) {
-  const recs = await tx`select id, week_of, slot, proposal, score, basis, gates, rationale_ids, confidence, status from recommendations
+  const recs = await tx`select id, week_of, slot, proposal, score, basis, gates, rationale_ids, confidence, status, mode from recommendations
                         where sku_id = ${skuId} and status = 'open' and week_of >= ${opts.sinceWeek ?? weekOf(new Date(Date.now() - 7 * 86400_000))}
                         order by week_of desc, score desc limit 9`;
   const items = await resolveRationale(tx, recs.flatMap((r) => (r.rationale_ids as string[]) ?? []));
@@ -517,6 +782,7 @@ export async function recommendationsForSku(tx: Tx, skuId: string, opts: { since
       hypothesis: p.hypothesis,
       hookOptions: p.hookOptions,
       primaryVariable: p.primaryVariable,
+      mode: (r.mode as 'CONTROLLED' | 'EXPLORATORY' | null) ?? modeFor(p),
       whyNow: p.whyNow,
       expectedLearning: p.expectedLearning,
       score: Number(r.score),

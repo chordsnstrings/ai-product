@@ -200,12 +200,22 @@ export interface ComparisonResult {
   variants: (VariantEvidence & { posterior: Posterior; probBest: number; meetsFloor: boolean })[];
   leader: string | null;
   liftVsControl: number | null;
+  /**
+   * The leader's relative effect (shrunk posterior means): over the control when one is compared, else over the
+   * best of the other variants. Null with a single variant.
+   */
+  lift: number | null;
   explanation: string;
 }
 
+/** Smallest relative effect worth acting on (§21 ACTIONABLE "sufficient evidence and commercial effect"). */
+export const MIN_EFFECT = 0.1;
+
 /**
  * Compare variants on one metric in ONE measurement context (never mixed, §30/§45).
- * ACTIONABLE requires every variant past its floor, a leader with P(best) ≥ 0.95 and a material lift (≥ 10%).
+ * ACTIONABLE requires every variant past its floor, a leader with P(best) ≥ 0.95 and a material lift (≥ 10%) —
+ * over the control, or over the runner-up when there is no control: a statistically separable but trivially
+ * small difference is never ACTIONABLE (§21). With enough data and no material lift it is INCONCLUSIVE.
  */
 export function compareVariants(
   metric: RateMetric,
@@ -226,7 +236,11 @@ export function compareVariants(
   const leaderIdx = pb.indexOf(Math.max(...pb));
   const leader = rows[leaderIdx]!;
   const control = controlId ? rows.find((r) => r.variantId === controlId) : null;
-  const lift = control && control !== leader ? leader.posterior.mean / control.posterior.mean - 1 : null;
+  const liftVsControl = control && control !== leader ? leader.posterior.mean / control.posterior.mean - 1 : null;
+  const others = rows.filter((r) => r !== leader);
+  const runnerUp = others.length ? Math.max(...others.map((r) => r.posterior.mean)) : null;
+  const lift = liftVsControl ?? (runnerUp && runnerUp > 0 ? leader.posterior.mean / runnerUp - 1 : null);
+  const material = lift === null || Math.abs(lift) >= MIN_EFFECT;
   const allFloors = rows.every((r) => r.meetsFloor);
   const anyFloor = rows.some((r) => r.meetsFloor);
 
@@ -236,22 +250,173 @@ export function compareVariants(
     state = 'GATHERING_SIGNAL';
     const need = Math.max(0, floor.minTrials - Math.min(...rows.map((r) => r.obs.trials)));
     explanation = `Too early to call. About ${need.toLocaleString('en-US')} more ${metric === 'cvr' ? 'clicks' : 'impressions'} needed per variant.`;
-  } else if (allFloors && leader.probBest >= 0.95 && (lift === null || Math.abs(lift) >= 0.1)) {
+  } else if (allFloors && leader.probBest >= 0.95 && material) {
     state = 'ACTIONABLE';
-    explanation = `${pct(leader.probBest)} likely to be the strongest on ${label(metric)}${lift !== null ? `, about ${pct(lift)} above the control` : ''}.`;
-  } else if (allFloors && leader.probBest < 0.7 && days(rows) >= floor.minDays * 2) {
+    explanation = `${pct(leader.probBest)} likely to be the strongest on ${label(metric)}${lift !== null ? `, about ${pct(lift)} above ${liftVsControl !== null ? 'the control' : 'the next best'}` : ''}.`;
+  } else if (allFloors && ((leader.probBest < 0.7 && days(rows) >= floor.minDays * 2) || (!material && days(rows) >= floor.minDays * 2))) {
     state = 'INCONCLUSIVE';
-    explanation = 'Enough data, no meaningful difference. Treat these variants as equivalent on this metric.';
+    explanation = material
+      ? 'Enough data, no meaningful difference. Treat these variants as equivalent on this metric.'
+      : `Enough data: the difference is real but small (about ${pct(Math.abs(lift!))}), too small to change what you run. Treat these variants as equivalent on this metric.`;
+  } else if (allFloors && leader.probBest >= 0.95) {
+    state = 'DIRECTIONAL';
+    explanation = `Leaning toward one variant (${pct(leader.probBest)} chance it’s best), but the difference is small (about ${pct(Math.abs(lift!))}) — not enough to act on yet.`;
   } else {
     state = 'DIRECTIONAL';
     explanation = `Leaning toward one variant (${pct(leader.probBest)} chance it’s best), but not enough to act on yet.`;
   }
-  return { metric, state, variants: rows, leader: state === 'GATHERING_SIGNAL' ? null : leader.variantId, liftVsControl: lift, explanation };
+  return { metric, state, variants: rows, leader: state === 'GATHERING_SIGNAL' ? null : leader.variantId, liftVsControl, lift, explanation };
 }
 
 const pct = (x: number) => `${Math.round(x * 100)}%`;
 const label = (m: RateMetric) => ({ ctr: 'click-through rate', hold_rate: 'hold rate', cvr: 'conversion rate' })[m];
 const days = (rows: { days: number }[]) => Math.min(...rows.map((r) => r.days));
+
+// ───────────── CPA / ROAS (§21 "preserve conversion uncertainty and purchase-value variability") ─────────────
+
+export type MoneyMetric = 'cpa' | 'roas';
+
+export interface CommercialEvidence {
+  variantId: string;
+  /** Spend in the reporting currency (units, not micros). */
+  spend: number;
+  purchases: number;
+  /** Total purchase value in the reporting currency. */
+  purchaseValue: number;
+  days: number;
+}
+
+export interface MoneyPosterior {
+  mean: number;
+  ciLow: number;
+  ciHigh: number;
+  /** Observed ratio (spend ÷ purchases for CPA, value ÷ spend for ROAS); null without the denominator. */
+  raw: number | null;
+}
+
+export interface CommercialComparison {
+  metric: MoneyMetric;
+  state: ComparisonResult['state'];
+  variants: (CommercialEvidence & { posterior: MoneyPosterior; probBest: number; meetsFloor: boolean })[];
+  leader: string | null;
+  /** Leader's relative advantage over the best other variant (lower CPA / higher ROAS), from posterior medians. */
+  lift: number | null;
+  explanation: string;
+}
+
+/** Purchases each variant needs before its CPA / ROAS is read (and days live), by account size. */
+export function commercialFloor(dailyImpressions: number): { minPurchases: number; minDays: number } {
+  return dailyImpressions < 3_000 ? { minPurchases: 15, minDays: 7 } : { minPurchases: 25, minDays: 7 };
+}
+
+/** Shape of individual order values (cv = 1/√k = 0.5): how much one order's value varies around the average. */
+const ORDER_VALUE_SHAPE = 4;
+/** Prior strength of the pooled baselines, in pseudo-purchases. */
+const PRIOR_PURCHASES = 2;
+
+/**
+ * Posterior draws of purchases per unit of spend and of average order value for one variant:
+ *  - purchases ~ Poisson(λ · spend), λ ~ Gamma(prior) → Gamma(a0 + purchases, b0 + spend)  (conversion uncertainty);
+ *  - order values ~ Gamma(k, θ), the pooled average order value as a weak prior → AOV = k·θ with
+ *    θ ~ InvGamma(k·(n + n0), value + n0·AOV0)                                              (purchase-value variability).
+ * CPA = 1/λ; ROAS = λ · AOV.
+ */
+function commercialDraws(v: CommercialEvidence, pooledRate: number, pooledAov: number, draws: number, r: () => number) {
+  const a0 = PRIOR_PURCHASES;
+  const b0 = PRIOR_PURCHASES / Math.max(pooledRate, 1e-9);
+  const cpa: number[] = [];
+  const roas: number[] = [];
+  const shapeN = ORDER_VALUE_SHAPE * (v.purchases + PRIOR_PURCHASES);
+  const valueSum = v.purchaseValue + PRIOR_PURCHASES * pooledAov;
+  for (let i = 0; i < draws; i++) {
+    const lambda = sampleGamma(a0 + v.purchases, r) / (b0 + v.spend);
+    const aov = (ORDER_VALUE_SHAPE * valueSum) / sampleGamma(shapeN, r);
+    cpa.push(1 / lambda);
+    roas.push(lambda * aov);
+  }
+  return { cpa, roas };
+}
+
+const quantile = (xs: number[], q: number) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.max(0, Math.floor(q * (s.length - 1))))]!;
+};
+
+/**
+ * Compare variants on cost per purchase and return on ad spend in ONE measurement context (§21). Deterministic
+ * (seeded Monte Carlo): P(best) is the share of joint draws in which a variant has the lowest CPA / highest ROAS,
+ * intervals are 90%. States follow the rate comparison with a purchase floor: nothing is read before a variant has
+ * enough purchases, and ACTIONABLE needs every variant past the floor, P(best) ≥ 0.95 and a material (≥ 10%)
+ * advantage. Null with fewer than two variants that spent.
+ */
+export function compareCommercial(evidence: CommercialEvidence[], dailyImpressions: number, draws = 4000, seed = 11): { cpa: CommercialComparison; roas: CommercialComparison } | null {
+  const vs = evidence.filter((v) => v.spend > 0);
+  if (vs.length < 2) return null;
+  const totalSpend = vs.reduce((n, v) => n + v.spend, 0);
+  const totalPurchases = vs.reduce((n, v) => n + v.purchases, 0);
+  const totalValue = vs.reduce((n, v) => n + v.purchaseValue, 0);
+  // Pooled across the compared variants: a neutral prior that pulls every variant the same way.
+  const pooledRate = (totalPurchases + 1) / (totalSpend + 50);
+  const pooledAov = totalPurchases > 0 && totalValue > 0 ? totalValue / totalPurchases : 50;
+  const r = rng(seed);
+  const samples = vs.map((v) => commercialDraws(v, pooledRate, pooledAov, draws, r));
+  const floor = commercialFloor(dailyImpressions);
+  const meets = (v: CommercialEvidence) => v.purchases >= floor.minPurchases && v.days >= floor.minDays;
+  const build = (metric: MoneyMetric): CommercialComparison => {
+    const lowerIsBetter = metric === 'cpa';
+    const wins = vs.map(() => 0);
+    for (let i = 0; i < draws; i++) {
+      let best = 0;
+      for (let j = 1; j < vs.length; j++) {
+        const a = samples[j]![metric][i]!;
+        const b = samples[best]![metric][i]!;
+        if (lowerIsBetter ? a < b : a > b) best = j;
+      }
+      wins[best]!++;
+    }
+    const rows = vs.map((v, j) => {
+      const xs = samples[j]![metric];
+      const raw = metric === 'cpa' ? (v.purchases > 0 ? v.spend / v.purchases : null) : v.purchaseValue / v.spend;
+      return { ...v, posterior: { mean: quantile(xs, 0.5), ciLow: quantile(xs, 0.05), ciHigh: quantile(xs, 0.95), raw }, probBest: wins[j]! / draws, meetsFloor: meets(v) };
+    });
+    const leader = rows.reduce((a, b) => (b.probBest > a.probBest ? b : a));
+    const others = rows.filter((x) => x !== leader).map((x) => x.posterior.mean);
+    const ref = lowerIsBetter ? Math.min(...others) : Math.max(...others);
+    const lift = ref > 0 && leader.posterior.mean > 0 ? (lowerIsBetter ? ref / leader.posterior.mean - 1 : leader.posterior.mean / ref - 1) : null;
+    const material = lift === null || Math.abs(lift) >= MIN_EFFECT;
+    const allFloors = rows.every((x) => x.meetsFloor);
+    const name = metric === 'cpa' ? 'cost per purchase' : 'return on ad spend';
+    let state: ComparisonResult['state'];
+    let explanation: string;
+    if (!rows.some((x) => x.meetsFloor)) {
+      state = 'GATHERING_SIGNAL';
+      const need = Math.max(0, floor.minPurchases - Math.min(...rows.map((x) => x.purchases)));
+      explanation = `Too early to compare ${name}. About ${need} more purchases needed per variant.`;
+    } else if (allFloors && leader.probBest >= 0.95 && material) {
+      state = 'ACTIONABLE';
+      explanation = `${pct(leader.probBest)} likely to have the best ${name}${lift !== null ? `, about ${pct(lift)} better than the next best` : ''}.`;
+    } else if (allFloors && (leader.probBest < 0.7 || !material) && days(rows) >= floor.minDays * 2) {
+      state = 'INCONCLUSIVE';
+      explanation = `Enough purchases, no meaningful difference in ${name}.`;
+    } else {
+      state = 'DIRECTIONAL';
+      explanation = `Leaning toward one variant on ${name} (${pct(leader.probBest)} chance it’s best); order values vary, so not enough to act on yet.`;
+    }
+    return { metric, state, variants: rows, leader: state === 'GATHERING_SIGNAL' ? null : leader.variantId, lift, explanation };
+  };
+  return { cpa: build('cpa'), roas: build('roas') };
+}
+
+/**
+ * The commercial check on a rate result (§21 ACTIONABLE needs a commercial effect): once every variant has passed
+ * the purchase floor, a rate leader that is probably worse on cost per purchase (P(its CPA is the lowest) < 0.2) is
+ * not ACTIONABLE. Returns the reason to downgrade, or null.
+ */
+export function commercialVeto(cpa: CommercialComparison | null | undefined, leaderId: string | null): string | null {
+  if (!cpa || !leaderId || !cpa.variants.every((v) => v.meetsFloor)) return null;
+  const row = cpa.variants.find((v) => v.variantId === leaderId);
+  return row && row.probBest < 0.2 ? 'It leads on engagement but probably costs more per purchase, so it isn’t actionable yet.' : null;
+}
 
 /**
  * Learning state update (§21 table): new evidence can strengthen, weaken or invalidate an existing learning.

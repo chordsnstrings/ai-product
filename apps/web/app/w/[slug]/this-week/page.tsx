@@ -27,6 +27,12 @@ const EVENT_TEXT: Record<string, string> = {
   CLAIM_APPROVED: 'A claim was approved',
 };
 
+/** §20 CONTROLLED vs EXPLORATORY, in the merchant's words (plan 03 A1 cards show the mode). */
+const MODE_HINT: Record<string, string> = {
+  CONTROLLED: 'Changes one thing and keeps the rest the same, so the result says what caused it.',
+  EXPLORATORY: 'Changes several things to search new territory: a winner is real, but its cause isn’t isolated.',
+};
+
 const KIND: Record<RationaleItem['kind'], string> = { customer_theme: 'Customers say', learning: 'Learning', claim: 'Approved claim', fact: 'Product fact' };
 
 /** Evidence, in words, for a stored confidence (§38): never a promise that the test will win. */
@@ -125,6 +131,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
                 <dl className="ak-meta ak-small">
                   <dt>Why now</dt><dd>{p.whyNow}</dd>
                   <dt>Tests</dt><dd>{p.primaryVariable}</dd>
+                  {r.mode ? <><dt>Mode</dt><dd title={MODE_HINT[r.mode as string]}>{r.mode === 'CONTROLLED' ? 'Controlled' : 'Exploratory'}</dd></> : null}
                   <dt>Cost</dt><dd>1 Creative Test</dd>
                 </dl>
                 <p className="ak-small ak-muted">

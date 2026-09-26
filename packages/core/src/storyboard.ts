@@ -328,8 +328,8 @@ export async function editScene(
   tx: Tx,
   ctx: TenantContext,
   sceneId: string,
-  patch: { spokenLine?: string | null; overlayText?: string | null; durationMs?: number },
-) {
+  patch: { spokenLine?: string | null; overlayText?: string | null; durationMs?: number; acceptExploratory?: boolean },
+): Promise<{ billable: false; applied: boolean; warning?: string; changes?: string[] }> {
   assertCan(ctx, 'sku.edit');
   const [s] = await tx`select s.*, sb.project_id, sb.status as sb_status, sb.hook_text, p.sku_id from scenes s join storyboards sb on sb.id = s.storyboard_id
                        join projects p on p.id = sb.project_id where s.id = ${sceneId} for update of s`;
@@ -352,6 +352,12 @@ export async function editScene(
       throw new DomainError('GATE_BLOCKED', `“${scan.unmapped[0]}” makes a product claim that isn’t approved yet. Add it to your Claims Vault with evidence, or describe the look or feel instead.`, { unmapped: scan.unmapped });
     }
   }
+  // Plan 03 A3: an edit to a dimension a CONTROLLED test holds constant makes it exploratory — warned first, and only
+  // applied (the test becoming EXPLORATORY) once the merchant confirms.
+  const held = await heldDimensionsTouched(tx, s as never, patch);
+  if (held && !patch.acceptExploratory) {
+    return { billable: false, applied: false, warning: EXPLORATORY_WARNING, changes: held.changed };
+  }
   await tx`update scenes set
              spoken_line = ${patch.spokenLine === undefined ? s.spoken_line : patch.spokenLine},
              overlay_text = ${patch.overlayText === undefined ? s.overlay_text : patch.overlayText},
@@ -365,7 +371,39 @@ export async function editScene(
     const hook = patch.spokenLine !== undefined && s.spoken_line === s.hook_text ? patch.spokenLine : patch.overlayText !== undefined && s.overlay_text === s.hook_text ? patch.overlayText : undefined;
     if (hook && hook.trim()) await tx`update storyboards set hook_text = ${hook.trim().slice(0, 90)} where id = ${s.storyboard_id}`;
   }
-  return { billable: false };
+  if (held) {
+    await tx`update experiments set mode = 'EXPLORATORY', controlled_variables = '{}' where id = ${held.experimentId} and mode = 'CONTROLLED'`;
+    await tx`update variants set held_constant = '{}' where experiment_id = ${held.experimentId}`;
+    await emit(tx, ctx, 'EXPERIMENT_MODE_CHANGED', { type: 'experiment', id: held.experimentId }, { from: 'CONTROLLED', to: 'EXPLORATORY', changed: held.changed, reason: `scene ${Number(s.position) + 1} edited` }, { skuId: s.sku_id as string, sceneId, projectId: s.project_id as string });
+  }
+  return { billable: false, applied: true };
+}
+
+export const EXPLORATORY_WARNING = 'This makes it exploratory';
+
+/**
+ * The held dimensions (§20 controlled_variables) an edit to a master scene changes, when the scene belongs to a
+ * CONTROLLED experiment compared against the merchant's current ad: the words of a later scene are its body (the
+ * CTA scene its call to action) and a new length its duration. A hook test (no control) compares openings made from
+ * one storyboard, so an edit to the shared scenes changes every variant alike and keeps it controlled.
+ */
+async function heldDimensionsTouched(
+  tx: Tx,
+  s: { project_id: string; position: number; purpose: string; spoken_line: string | null; overlay_text: string | null; duration_ms: number },
+  patch: { spokenLine?: string | null; overlayText?: string | null; durationMs?: number },
+): Promise<{ experimentId: string; changed: string[] } | null> {
+  const [e] = await tx`select e.id, e.mode, e.primary_variable, e.controlled_variables from projects p
+                       join experiments e on e.id = p.experiment_id and e.workspace_id = p.workspace_id
+                       join variants v on v.project_id = p.id and v.experiment_id = e.id and v.workspace_id = p.workspace_id
+                       where p.id = ${s.project_id}`;
+  if (!e || e.mode !== 'CONTROLLED' || e.primary_variable === 'hook') return null;
+  const words = (patch.spokenLine !== undefined && (patch.spokenLine ?? null) !== (s.spoken_line ?? null)) || (patch.overlayText !== undefined && (patch.overlayText ?? null) !== (s.overlay_text ?? null));
+  const touched = new Set<string>();
+  if (words) touched.add(Number(s.position) === 0 ? 'hook' : s.purpose === 'cta' ? 'cta' : 'body');
+  if (patch.durationMs !== undefined && patch.durationMs !== Number(s.duration_ms)) touched.add('duration');
+  const held = new Set((e.controlled_variables as string[] | null) ?? []);
+  const changed = [...touched].filter((d) => held.has(d));
+  return changed.length ? { experimentId: e.id as string, changed } : null;
 }
 
 /** The merchant's own images a frame was made from: the cut-out or photo it composites, and the model's references. */

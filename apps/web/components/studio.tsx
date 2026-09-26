@@ -18,6 +18,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
   const { data: v, refresh } = usePoll<ProjectView>(`/api/projects/${masterProjectId ?? '00000000-0000-0000-0000-000000000000'}`, 2000, !!masterProjectId && live && (pre || producing));
   const [edit, setEdit] = useState<{ id: string; spokenLine: string; overlayText: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const done = useCallback(() => { setLive(true); refresh(); }, [refresh]);
   const masterDone = !!v && producing && v.project.state === 'COMPLETE';
   useEffect(() => {
@@ -31,7 +32,12 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
   async function call(url: string, body: unknown) {
     setErr(null);
     try {
-      await api(url, body);
+      const r = (await api(url, body)) as { applied?: boolean; warning?: string } | undefined;
+      // Plan 03 A3: an edit to what a controlled test keeps the same is confirmed first ("This makes it exploratory").
+      if (r && r.applied === false && r.warning) {
+        setWarning(r.warning);
+        return false;
+      }
       done();
       return true;
     } catch (e) {
@@ -39,6 +45,14 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
       return false;
     }
   }
+  const saveEdit = async (acceptExploratory = false) => {
+    if (!edit) return;
+    if (await call(`/api/scenes/${edit.id}/edit`, { projectId: masterProjectId, spokenLine: edit.spokenLine || null, overlayText: edit.overlayText || null, ...(acceptExploratory ? { acceptExploratory: true } : {}) })) {
+      setEdit(null);
+      setWarning(null);
+      if (acceptExploratory) router.refresh();
+    }
+  };
 
   return (
     <div className="ak-stack" style={{ marginTop: 32 }}>
@@ -131,13 +145,25 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
         </section>
       ) : null}
 
-      <Sheet open={!!edit} onOpenChange={(o) => !o && setEdit(null)} title="Edit this scene’s words" description="Free. Every change is checked against cosmetic claim rules.">
+      <Sheet open={!!edit} onOpenChange={(o) => { if (!o) { setEdit(null); setWarning(null); } }} title="Edit this scene’s words" description="Free. Every change is checked against cosmetic claim rules.">
         {edit ? (
-          <form className="ak-stack" onSubmit={async (e) => { e.preventDefault(); if (await call(`/api/scenes/${edit.id}/edit`, { projectId: masterProjectId, spokenLine: edit.spokenLine || null, overlayText: edit.overlayText || null })) setEdit(null); }}>
-            <label className="ak-field"><span className="ak-label">Spoken line</span><textarea className="ak-textarea" maxLength={160} value={edit.spokenLine} onChange={(e) => setEdit({ ...edit, spokenLine: e.target.value })} /></label>
-            <label className="ak-field"><span className="ak-label">On-screen text</span><input className="ak-input" maxLength={70} value={edit.overlayText} onChange={(e) => setEdit({ ...edit, overlayText: e.target.value })} /></label>
+          <form className="ak-stack" onSubmit={async (e) => { e.preventDefault(); await saveEdit(); }}>
+            <label className="ak-field"><span className="ak-label">Spoken line</span><textarea className="ak-textarea" maxLength={160} value={edit.spokenLine} onChange={(e) => { setWarning(null); setEdit({ ...edit, spokenLine: e.target.value }); }} /></label>
+            <label className="ak-field"><span className="ak-label">On-screen text</span><input className="ak-input" maxLength={70} value={edit.overlayText} onChange={(e) => { setWarning(null); setEdit({ ...edit, overlayText: e.target.value }); }} /></label>
             {err ? <p className="ak-error">{err}</p> : null}
-            <Button type="submit">Save</Button>
+            {warning ? (
+              <Banner tone="warn">
+                {warning}: this test keeps that part the same as your current ad so the result can be explained. After this change, a winner is still real but its cause isn’t isolated.
+              </Banner>
+            ) : null}
+            {warning ? (
+              <div className="ak-row">
+                <Button type="button" onClick={() => void saveEdit(true)}>Save and make it exploratory</Button>
+                <Button type="button" variant="secondary" onClick={() => setWarning(null)}>Keep it controlled</Button>
+              </div>
+            ) : (
+              <Button type="submit">Save</Button>
+            )}
           </form>
         ) : null}
       </Sheet>

@@ -127,6 +127,26 @@ export async function probeUntrusted(file: string): Promise<UntrustedProbe> {
   };
 }
 
+/**
+ * Scene cuts of an uploaded (untrusted) video, in seconds: frames whose scene-change score exceeds `threshold`
+ * (ffmpeg select='gt(scene,t)'), read on a downscaled copy under the untrusted resource limits.
+ */
+export async function sceneCutsUntrusted(file: string, threshold = 0.3): Promise<number[]> {
+  const { stderr } = await run(FFMPEG, ['-hide_banner', '-nostats', '-i', file, '-an', '-vf', `scale=160:-2,select='gt(scene,${threshold})',showinfo`, '-f', 'null', '-'], 60_000, { untrusted: true });
+  return [...stderr.matchAll(/pts_time:\s*([0-9.]+)/g)].map((m) => Math.round(Number(m[1]) * 100) / 100).filter((t) => Number.isFinite(t));
+}
+
+/** Stills of an uploaded (untrusted) video at the given seconds, as PNGs no wider than 512px, under the untrusted limits. */
+export async function framesAtUntrusted(file: string, seconds: readonly number[], dir: string): Promise<string[]> {
+  const outs: string[] = [];
+  for (const [i, t] of seconds.entries()) {
+    const out = path.join(dir, `still-${i}.png`);
+    await run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-ss', Math.max(0, t).toFixed(3), '-i', file, '-frames:v', '1', '-vf', 'scale=512:-2', out], 30_000, { untrusted: true });
+    if (existsSync(out)) outs.push(out);
+  }
+  return outs;
+}
+
 /** Scratch directory that is always cleaned up. */
 export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), 'arkiv-media-'));
