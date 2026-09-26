@@ -79,6 +79,7 @@ const WORKSPACE_ACTIONS: Row[] = [
   ['stock-intent', 'MEMBER', () => ({ skuId, intent: null })],
   ['fact-confirm', 'MEMBER', () => ({ skuId, factIds: [u()] })],
   ['asset-delete', 'MEMBER', () => ({ assetId: u() })],
+  ['asset-attest', 'MEMBER', () => ({ assetId: u() })],
   ['fact-accept-source', 'MEMBER', () => ({ skuId, factId: u() })],
   ['claim-propose', 'MEMBER', () => ({ skuId, wording: 'Hydrates for 24 hours' })],
   ['claim-approve', 'ADMIN', () => ({ claimId: u(), markets: ['US'], platforms: ['META'] })],
@@ -163,12 +164,46 @@ describe('forms with a resumably uploaded file (plan 06 Phase 1 D3)', () => {
 describe('importing a past ad (standard §19)', () => {
   it('stores its media as a historical creative, not as creator footage for new productions', async () => {
     const { productPhoto } = await import('@arkiv/core/testing');
-    const f = form({ skuId, copy: 'The serum that sold out twice' })();
+    const f = form({ skuId, copy: 'The serum that sold out twice', rights: 'attested', creatorHandle: '@glowwithsam', sourceUrl: 'https://www.tiktok.com/@glowwithsam/video/1' })();
     f.set('file', new File([new Uint8Array(await productPhoto())], 'old-ad.jpg', { type: 'image/jpeg' }));
     expect(await call('MEMBER', `/api/w/${t.slug}/import-creative`, workspacePost, { slug: t.slug, action: 'import-creative' }, f)).toBe(200);
     const [cr] = await ownerPool()`select final_asset_ids from creatives where workspace_id = ${t.workspaceId} and platform_refs->>'copy' = 'The serum that sold out twice'`;
-    const [a] = await ownerPool()`select kind from assets where id = ${(cr!.final_asset_ids as string[])[0]!}`;
+    const [a] = await ownerPool()`select kind, origin, rights_attested_by, rights_attested_at from assets where id = ${(cr!.final_asset_ids as string[])[0]!}`;
     expect(a!.kind).toBe('historical_creative');
+    // §40: the merchant's rights attestation, and the footage's origin, are kept.
+    expect(a).toMatchObject({ rights_attested_by: users.MEMBER, origin: { filename: 'old-ad.jpg', creatorHandle: '@glowwithsam', sourceUrl: 'https://www.tiktok.com/@glowwithsam/video/1' } });
+    expect(a!.rights_attested_at).not.toBeNull();
+    const [c] = await ownerPool()`select user_id, text_snapshot, context from consent_records where workspace_id = ${t.workspaceId} and kind = 'rights_attestation'`;
+    expect(c).toMatchObject({ user_id: users.MEMBER, context: { assetId: (cr!.final_asset_ids as string[])[0]! } });
+    expect(c!.text_snapshot).toMatch(/permission/);
+  });
+
+  it('refuses footage without a rights attestation (§40); copy alone needs none', async () => {
+    const { productPhoto } = await import('@arkiv/core/testing');
+    const f = form({ skuId, copy: 'An ad with borrowed footage' })();
+    f.set('file', new File([new Uint8Array(await productPhoto())], 'ugc.jpg', { type: 'image/jpeg' }));
+    expect(await call('MEMBER', `/api/w/${t.slug}/import-creative`, workspacePost, { slug: t.slug, action: 'import-creative' }, f)).toBe(422);
+    expect(await ownerPool()`select 1 from creatives where workspace_id = ${t.workspaceId} and platform_refs->>'copy' = 'An ad with borrowed footage'`).toHaveLength(0);
+    expect(await call('MEMBER', `/api/w/${t.slug}/import-creative`, workspacePost, { slug: t.slug, action: 'import-creative' }, form({ skuId, copy: 'Copy only, no video' })())).toBe(200);
+  });
+
+  it('an older import can be attested afterwards', async () => {
+    const { productPhoto, ctxFor } = await import('@arkiv/core/testing');
+    const { ingestBytes } = await import('@arkiv/core');
+    const asset = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctxFor(t.workspaceId, users.OWNER), await productPhoto(), 'historical_creative', skuId));
+    expect(await call('MEMBER', `/api/w/${t.slug}/asset-attest`, workspacePost, { slug: t.slug, action: 'asset-attest' }, { assetId: asset.id })).toBe(200);
+    const [a] = await ownerPool()`select rights_attested_by from assets where id = ${asset.id}`;
+    expect(a!.rights_attested_by).toBe(users.MEMBER);
+  });
+});
+
+describe('offer context facts (plan 03 A4)', () => {
+  it('stores subscription and bundle availability as yes/no, and refuses anything else', async () => {
+    const post = (value: string) => call('MEMBER', `/api/w/${t.slug}/fact`, workspacePost, { slug: t.slug, action: 'fact' }, { skuId, key: 'subscription_available', value });
+    expect(await post('Yes')).toBe(200);
+    const [f] = await ownerPool()`select value_json, state from product_facts where sku_id = ${skuId} and normalized_key = 'subscription_available' and status <> 'SUPERSEDED' order by observed_at desc limit 1`;
+    expect(f).toMatchObject({ value_json: true, state: 'DECIDED' });
+    expect(await post('sometimes')).toBe(422);
   });
 });
 
