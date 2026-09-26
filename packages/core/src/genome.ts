@@ -1,4 +1,10 @@
+import { readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
+import { framesAtUntrusted, probeUntrusted, sceneCutsUntrusted, withTempDir } from '@arkiv/media';
+import type { ContentPart } from '@arkiv/providers';
+import { logger } from '@arkiv/shared/log';
+import { assetBytes } from './assets';
 import { DomainError, Taxonomy } from '@arkiv/shared';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
@@ -9,7 +15,7 @@ import { brandBrainFor } from './brand';
 import { currentClaimVersions } from './claims';
 import { RULES_VERSION } from './compliance';
 import { mockGenome } from './mock-intel';
-import { holdForReview } from './vision';
+import { holdForReview, toJpegBase64 } from './vision';
 import { canonicalTaxonomy, taxonomyRemaps, type TaxonomyFamily } from './taxonomy';
 import { llmJson, routedLines } from './model-gateway';
 import { enqueue, Queues } from './outbox';
@@ -60,25 +66,90 @@ export async function importHistoricalCreative(
   return c!.id as string;
 }
 
+/** What an imported ad's video shows, read deterministically: its length, cuts and a few stills (§19 hook/production genes). */
+export interface VideoReading {
+  durationSec: number;
+  cuts: number[];
+  sceneCount: number;
+  cutsPerMinute: number;
+  /** Stills (JPEG base64) at 0s, 1s, 3s and the middle, for the analyst. */
+  stills: string[];
+  stillAt: number[];
+}
+
+/** The seconds an imported ad's stills are taken at: the first frame, 1s, 3s and the middle (within its length). */
+export const stillTimes = (durationSec: number) => [...new Set([0, 1, 3, durationSec / 2].map((t) => Math.round(Math.min(t, Math.max(0, durationSec - 0.1)) * 10) / 10))];
+
+/** Frames per still in the Cost Governor's authorization for a genome read. */
+const TOKENS_PER_STILL = 1_600;
+
+/**
+ * Read the ad's uploaded video (§19 "every … ad must receive a structured genome"): probe its length, detect scene
+ * cuts and take stills, all under the untrusted-media limits. Null when there is no usable video or it can't be read —
+ * the genome is then read from the copy alone.
+ */
+async function readAdVideo(ws: string, assetIds: readonly string[]): Promise<VideoReading | null> {
+  const id = assetIds[0];
+  if (!id) return null;
+  try {
+    const bytes = await withTenant(ws, async (tx) => {
+      const [a] = await tx`select mime from assets where id = ${id} and deleted_at is null and coalesce(review_status, 'approved') <> 'rejected'`;
+      return a && String(a.mime).startsWith('video/') ? assetBytes(tx, id) : null;
+    });
+    if (!bytes) return null;
+    return await withTempDir(async (dir) => {
+      const file = path.join(dir, 'ad.mp4');
+      await writeFile(file, bytes);
+      const p = await probeUntrusted(file);
+      const durationSec = Math.round((p.durationMs / 1000) * 10) / 10;
+      if (!p.width || durationSec <= 0) return null;
+      const cuts = (await sceneCutsUntrusted(file)).filter((t) => t > 0.2 && t < durationSec - 0.2);
+      const at = stillTimes(durationSec);
+      const files = await framesAtUntrusted(file, at, dir);
+      const stills = await Promise.all(files.map(async (f) => toJpegBase64(await readFile(f), 768)));
+      return { durationSec, cuts, sceneCount: cuts.length + 1, cutsPerMinute: Math.round((cuts.length / (durationSec / 60)) * 10) / 10, stills, stillAt: at.slice(0, stills.length) };
+    });
+  } catch (e) {
+    logger('genome').warn('ad video could not be read; using the copy', { assetId: id, err: e });
+    return null;
+  }
+}
+
+/**
+ * Extract (or re-extract) an imported ad's genome (§19). A genome already read against the current taxonomy is kept;
+ * one read against an older taxonomy version is read again, the earlier one staying in creative_genomes.
+ */
 export async function extractGenome(ctx: TenantContext, creativeId: string) {
   const ws = ctx.workspaceId;
-  const cr = await withTenant(ws, async (tx) => (await tx`select * from creatives where id = ${creativeId}`)[0]);
-  if (!cr || cr.genome) return false;
+  const { cr, taxonomyVersion } = await withTenant(ws, async (tx) => ({ cr: (await tx`select * from creatives where id = ${creativeId}`)[0], taxonomyVersion: (await canonicalTaxonomy(tx)).version }));
+  if (!cr) return false;
+  if (cr.genome && Number(cr.genome_version ?? 0) >= taxonomyVersion) return false;
   const copy = String((cr.platform_refs as Record<string, unknown>)?.copy ?? '');
+  const video = await readAdVideo(ws, (cr.final_asset_ids as string[] | null) ?? []);
   const auth = await withTenant(ws, async (tx) =>
-    authorize(tx, ctx, { purpose: 'storyboard', lines: await routedLines(tx, ws, [{ task: 'genome.extract', kind: 'llm', inputTokens: 3_000, outputTokens: 600 }]), idempotencyKey: `genome:${creativeId}` }),
+    authorize(tx, ctx, {
+      purpose: 'storyboard',
+      lines: await routedLines(tx, ws, [{ task: 'genome.extract', kind: 'llm', inputTokens: 3_000 + TOKENS_PER_STILL * (video?.stills.length ?? 0), outputTokens: 600 }]),
+      idempotencyKey: `genome:${creativeId}:v${taxonomyVersion}`,
+    }),
   );
+  const videoParts: ContentPart[] = video
+    ? [
+        { type: 'text', text: `The ad's video, measured: ${video.durationSec}s long, ${video.sceneCount} scene${video.sceneCount === 1 ? '' : 's'}, cuts at ${video.cuts.length ? video.cuts.map((c) => `${c}s`).join(', ') : 'none'}. Stills follow, taken at ${video.stillAt.map((t) => `${t}s`).join(', ')}.` },
+        ...video.stills.map((b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: b })),
+      ]
+    : [];
   try {
     const r = await llmJson({
       ctx,
       token: auth.token,
       task: 'genome.extract',
       subject: { type: 'creative', id: creativeId },
-      inputRefs: { creativeId, taxonomyVersion: Taxonomy.version },
+      inputRefs: { creativeId, taxonomyVersion, video: video ? { durationSec: video.durationSec, cuts: video.cuts.length, stills: video.stills.length } : null },
       template: 'genome',
-      content: [{ type: 'untrusted', sourceId: 'ad_copy', text: copy.slice(0, 8000) }, { type: 'text', text: `Taxonomy v${Taxonomy.version}.` }],
+      content: [{ type: 'untrusted', sourceId: 'ad_copy', text: copy.slice(0, 8000) }, ...videoParts, { type: 'text', text: `Taxonomy v${taxonomyVersion}.` }],
       schema: Genome,
-      mock: () => mockGenome(copy),
+      mock: () => mockGenome(copy, video),
       effort: 'low',
       maxTokens: 800,
     });
@@ -86,7 +157,9 @@ export async function extractGenome(ctx: TenantContext, creativeId: string) {
       // Stored against the current canonical taxonomy: values renamed or deprecated (with a replacement) since
       // Appendix A follow the approved remaps (plan 05 §19).
       const tax = await canonicalTaxonomy(tx);
-      const genome = canonicalGenome(r.data, await taxonomyRemaps(tx));
+      // What the video itself measures (length, scene count, cut rate) is set from the probe, never the model's guess.
+      const read = video ? { ...r.data, durationSec: video.durationSec, sceneCount: video.sceneCount, cutsPerMinute: video.cutsPerMinute } : r.data;
+      const genome = canonicalGenome(read, await taxonomyRemaps(tx));
       const [lin] = await tx`select parent_creative_id, final_asset_ids, secondary_sku_ids from creatives where id = ${creativeId}`;
       await tx`update creatives set genome = ${tx.json(importedGenome(genome, { sourceAssetIds: (lin?.final_asset_ids as string[] | undefined) ?? [], parentCreativeId: (lin?.parent_creative_id as string | null | undefined) ?? null, promptVersion: r.promptVersion, model: r.model }) as never)}, genome_version = ${tax.version} where id = ${creativeId}`;
       await emit(tx, ctx, 'GENOME_EXTRACTED', { type: 'creative', id: creativeId }, { angle: genome.angle, version: tax.version });
