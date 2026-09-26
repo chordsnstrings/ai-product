@@ -9,10 +9,10 @@ import { newId, type Role } from '@arkiv/shared';
  * Owner as the control, through the real route handler, session → membership resolution and tenant transaction.
  * Only the cookie read is replaced: `currentUser()` returns the user under test.
  */
-let who: { userId: string; workspaceId: string } | null = null;
+let who: { userId: string; workspaceId: string; signedInAt?: Date } | null = null;
 vi.mock('@/lib/session', () => ({
   currentUser: async () =>
-    who && { userId: who.userId, email: `${who.userId.slice(-6)}@example.com`, name: null, sessionId: 'test-session', lastWorkspaceId: who.workspaceId },
+    who && { userId: who.userId, email: `${who.userId.slice(-6)}@example.com`, name: null, sessionId: 'test-session', lastWorkspaceId: who.workspaceId, createdAt: (who.signedInAt ?? new Date()).toISOString() },
   provisionalToken: async () => null,
 }));
 
@@ -133,6 +133,31 @@ describe('workspace API actions enforce the role matrix (plan 02 §1.1)', () => 
     expect(await call('MEMBER', `/api/w/${t.slug}/fact`, workspacePost, { slug: t.slug, action: 'fact' }, { skuId, key: 'size', value: '50 ml' })).toBe(200);
     expect(await call('ADMIN', `/api/w/${t.slug}/invite-revoke`, workspacePost, { slug: t.slug, action: 'invite-revoke' }, { id: u() })).toBe(200);
     expect(await call('OWNER', `/api/w/${t.slug}/rename`, workspacePost, { slug: t.slug, action: 'rename' }, { name: 'Renamed' })).toBe(200);
+  });
+});
+
+describe('step-up confirmation (plan 02 M14)', () => {
+  it('disconnecting an integration, exporting and changing the Owner need a sign-in from the last 10 minutes', async () => {
+    const post = async (action: string, payload: unknown, signedInAt: Date) => {
+      who = { userId: users.OWNER, workspaceId: t.workspaceId, signedInAt };
+      const res = await workspacePost(
+        new Request(`http://localhost/api/w/${t.slug}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': `k-${u()}` }, body: JSON.stringify(payload) }),
+        { params: Promise.resolve({ slug: t.slug, action }) } as never,
+      );
+      return { status: res.status, body: (await res.json()) as { details?: { stepUp?: boolean } } };
+    };
+    const old = new Date(Date.now() - 30 * 60_000);
+    for (const [action, payload] of [['integration-disconnect', { id: u() }], ['export', {}], ['transfer', { userId: users.ADMIN }]] as const) {
+      const r = await post(action, payload, old);
+      expect(r.status, action).toBe(403);
+      expect(r.body.details?.stepUp, action).toBe(true);
+    }
+    // Nothing happened while the confirmation was missing.
+    expect(await ownerPool()`select 1 from outbox where workspace_id = ${t.workspaceId} and queue = 'export-workspace'`).toHaveLength(0);
+    expect((await ownerPool()`select role from memberships where user_id = ${users.OWNER} and workspace_id = ${t.workspaceId}`)[0]!.role).toBe('OWNER');
+    // Freshly signed in: the export goes through; an unknown integration is a plain 404, not a step-up.
+    expect((await post('export', {}, new Date())).status).toBe(200);
+    expect((await post('integration-disconnect', { id: u() }, new Date())).status).toBe(404);
   });
 });
 

@@ -56,6 +56,7 @@ import {
   approveFingerprintViews,
   weekOf,
 } from '@arkiv/core';
+import { assertRecentLogin } from '@arkiv/auth';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
 import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
@@ -87,6 +88,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
   // §39: creates carry the client's Idempotency-Key (one per submission); a replay returns the first answer.
   const idemKey = idempotencyKeyOf(req);
   const once = <T>(tx: Parameters<Parameters<typeof withTenant<T>>[1]>[0], request: unknown, fn: () => Promise<T>) => withIdempotency(tx, ctx.workspaceId, action, idemKey, request, fn);
+  // Plan 02 M14 step-up: disconnecting an integration, exporting all data and changing the Owner need a sign-in from
+  // the last 10 minutes. Checked after the role, so a Viewer is told they can't, not asked to confirm it's them.
+  const stepUp = () => assertRecentLogin({ createdAt: w.user?.createdAt ?? '' });
 
   // Multipart actions first (files). Each one is authorised by role, here or inside the core function.
   if (MULTIPART.has(action)) {
@@ -365,6 +369,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     case 'transfer': {
       const { userId } = await body(req, z.object({ userId: uuid }));
+      assertCan(ctx, 'workspace.transfer');
+      stepUp();
       await t((tx) => transferOwnership(tx, ctx, userId));
       return json({ ok: true });
     }
@@ -412,6 +418,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     /* ── Integrations ── */
     case 'integration-disconnect': {
       const { id } = await body(req, z.object({ id: uuid }));
+      assertCan(ctx, 'integration.manage');
+      stepUp();
       await t((tx) => disconnectIntegration(tx, ctx, id));
       return json({ ok: true });
     }
@@ -524,6 +532,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     /* ── Data ── */
     case 'export':
+      assertCan(ctx, 'workspace.export');
+      stepUp();
       await t((tx) => requestExport(tx, ctx));
       return json({ ok: true });
     case 'delete': {

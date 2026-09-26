@@ -107,9 +107,13 @@ export async function rememberWorkspace(sessionId: string, workspaceId: string) 
   await globalTx((tx) => tx`update sessions set last_workspace_id = ${workspaceId} where id = ${sessionId}`);
 }
 
-/** Step-up (plan 02 M14): sensitive actions need a login within the last 10 minutes. */
-export function assertRecentLogin(s: SessionUser, minutes = 10) {
-  if (Date.now() - new Date(s.createdAt).getTime() > minutes * 60_000) {
+/**
+ * Step-up (plan 02 M14): sensitive actions need a login within the last 10 minutes. A session whose sign-in time is
+ * unknown counts as old (fail closed).
+ */
+export function assertRecentLogin(s: Pick<SessionUser, 'createdAt'>, minutes = 10) {
+  const at = new Date(s.createdAt).getTime();
+  if (!Number.isFinite(at) || Date.now() - at > minutes * 60_000) {
     throw new DomainError('FORBIDDEN', 'Please confirm it’s you to continue.', { stepUp: true });
   }
 }
