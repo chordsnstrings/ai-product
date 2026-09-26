@@ -125,17 +125,43 @@ export async function revokeAtPlatform(provider: string, tokenEnc: string | null
 }
 
 /**
+ * Is this token also what other live connections use? One Meta or TikTok login authorises several ad accounts (and an
+ * agency may connect the same login to several workspaces): revoking it at the platform for one would cut them all
+ * off. Shared means the same Meta user, or the same token.
+ */
+export function tokenShared(mine: { token_enc: string | null; platform_user_id?: string | null }, others: readonly { token_enc: string | null; platform_user_id?: string | null }[]): boolean {
+  if (!mine.token_enc) return false;
+  let plain: string | null = null;
+  try {
+    plain = decryptToken(mine.token_enc);
+  } catch {
+    return false;
+  }
+  return others.some((o) => {
+    if (mine.platform_user_id && o.platform_user_id === mine.platform_user_id) return true;
+    try {
+      return !!o.token_enc && decryptToken(o.token_enc) === plain;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
  * The merchant disconnects a connection: the token is revoked at the platform (best effort) and dropped here, the
  * shop's routing is released, INTEGRATION_DISCONNECTED is recorded and the owners get the "integration disconnected"
  * email (plan 03 A10). The revoke call runs inside this transaction, bounded by the connector's timeout.
  */
 export async function disconnectIntegration(tx: Tx, ctx: TenantContext, integrationId: string) {
   assertCan(ctx, 'integration.manage');
-  const [cur] = await tx`select provider, external_account_id, status, token_enc from integrations where id = ${integrationId} for update`;
+  const [cur] = await tx`select provider, external_account_id, status, token_enc, platform_user_id from integrations where id = ${integrationId} for update`;
   if (!cur) throw new DomainError('NOT_FOUND', 'Integration not found');
   await tx`update integrations set status = 'disconnected', token_enc = null, refresh_token_enc = null where id = ${integrationId}`;
   if (cur.provider === 'shopify') await tx`delete from shopify_shops where shop_domain = ${cur.external_account_id} and workspace_id = ${ctx.workspaceId}`;
-  const revoked = await revokeAtPlatform(cur.provider as string, (cur.token_enc as string | null) ?? null, cur.external_account_id as string);
+  // The same login may still serve this workspace's other ad accounts: then only our copy of the token goes.
+  const others = await tx`select token_enc, platform_user_id from integrations where provider = ${cur.provider} and id <> ${integrationId} and token_enc is not null and status in ('active', 'degraded')`;
+  const shared = tokenShared(cur as { token_enc: string | null; platform_user_id: string | null }, others as unknown as { token_enc: string | null; platform_user_id: string | null }[]);
+  const revoked = shared ? { ok: false as const, error: 'still used by another connection' } : await revokeAtPlatform(cur.provider as string, (cur.token_enc as string | null) ?? null, cur.external_account_id as string);
   await emit(tx, ctx, 'INTEGRATION_DISCONNECTED', { type: 'integration', id: integrationId }, { provider: cur.provider, revokedAtPlatform: revoked.ok, ...(revoked.ok ? {} : { revokeError: revoked.error }) });
   if (cur.status !== 'disconnected') {
     await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'integration_disconnected', provider: PROVIDER_LABEL[cur.provider as Provider] ?? cur.provider }, { singletonKey: `integration-disconnected:${integrationId}` });

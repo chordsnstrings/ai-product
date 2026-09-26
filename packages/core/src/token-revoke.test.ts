@@ -19,9 +19,9 @@ beforeEach(async () => {
 afterEach(() => setTokenRevoker(null));
 afterAll(closeAll);
 
-async function connect(t: Awaited<ReturnType<typeof makeTenant>>, provider: 'shopify' | 'meta' | 'tiktok', account: string, token: string) {
+async function connect(t: Awaited<ReturnType<typeof makeTenant>>, provider: 'shopify' | 'meta' | 'tiktok', account: string, token: string, platformUserId?: string) {
   const ctx = ctxFor(t.workspaceId, t.userId);
-  return withTenant(t.workspaceId, (tx) => saveIntegration(tx, ctx, { provider, externalAccountId: account, token, scopes: ['read'] }));
+  return withTenant(t.workspaceId, (tx) => saveIntegration(tx, ctx, { provider, externalAccountId: account, token, scopes: ['read'], platformUserId }));
 }
 
 describe('disconnecting an integration', () => {
@@ -50,6 +50,36 @@ describe('disconnecting an integration', () => {
     expect((await ownerPool()`select status, token_enc from integrations where id = ${meta}`)[0]).toEqual({ status: 'disconnected', token_enc: null });
     const [ev] = await ownerPool()`select payload from events where type = 'INTEGRATION_DISCONNECTED' and subject_id = ${meta}`;
     expect(ev!.payload).toMatchObject({ provider: 'meta', revokedAtPlatform: false, revokeError: '[meta] mock revoke failure' });
+  });
+});
+
+describe('a login shared by several connections', () => {
+  it('is not revoked while another ad account still uses it; the last one out revokes it', async () => {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const a = await connect(t, 'meta', 'act_1', 'shared-token', 'fb-user-1');
+    const b = await connect(t, 'meta', 'act_2', 'shared-token', 'fb-user-1');
+    const tt1 = await connect(t, 'tiktok', '7001', 'tt-shared');
+    await connect(t, 'tiktok', '7002', 'tt-shared');
+    await withTenant(t.workspaceId, (tx) => disconnectIntegration(tx, ctx, a));
+    await withTenant(t.workspaceId, (tx) => disconnectIntegration(tx, ctx, tt1));
+    expect(revoker.calls).toEqual([]);
+    const [ev] = await ownerPool()`select payload from events where type = 'INTEGRATION_DISCONNECTED' and subject_id = ${a}`;
+    expect(ev!.payload).toMatchObject({ revokedAtPlatform: false, revokeError: 'still used by another connection' });
+    await withTenant(t.workspaceId, (tx) => disconnectIntegration(tx, ctx, b));
+    expect(revoker.calls.map((c) => c.token)).toEqual(['shared-token']);
+  });
+
+  it('a purge leaves a login another workspace still uses', async () => {
+    const t = await makeTenant({ state: 'PURGE_SCHEDULED' });
+    const agency = await makeTenant();
+    await connect(t, 'meta', 'act_1', 'agency-token', 'fb-agency');
+    await connect(agency, 'meta', 'act_9', 'agency-token', 'fb-agency');
+    revoker.calls.length = 0;
+    await ownerPool()`update workspaces set purge_at = now() - interval '1 minute' where id = ${t.workspaceId}`;
+    const counts = await purgeWorkspace(t.workspaceId);
+    expect(revoker.calls).toEqual([]);
+    expect(counts.integration_tokens_revoked).toBe(0);
   });
 });
 
