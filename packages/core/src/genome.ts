@@ -234,6 +234,40 @@ export async function meaningfulCoverage(tx: Tx, skuId: string): Promise<Coverag
   return { angles, cells };
 }
 
+/** Treatments that need the merchant's own footage with confirmed rights (never generated people, §40). */
+const FOOTAGE_TREATMENTS = ['RAW_UGC', 'CREATOR', 'FOUNDER'];
+
+export interface CreativeCoverage {
+  /** Eligible angle × treatment cells meaningfully tested. */
+  tested: number;
+  /** Angle × treatment cells this SKU could test. */
+  eligible: number;
+  ratio: number | null;
+}
+
+/**
+ * Creative coverage (Appendix C: "meaningfully tested hypotheses / eligible hypothesis universe; one trivial or
+ * under-delivered ad should not mark territory complete"): angle × treatment cells with a meaningful test
+ * (meaningfulCoverage) over the cells open to this SKU — the canonical taxonomy minus what its gates rule out:
+ * ingredient education without a sourced ingredient list, footage treatments without rights-confirmed footage.
+ */
+export async function creativeCoverage(tx: Tx, skuId: string): Promise<CreativeCoverage> {
+  const tax = await canonicalTaxonomy(tx);
+  const { currentFacts } = await import('./product-truth');
+  const { verifiedIngredients } = await import('./creative-director');
+  const ingredients = verifiedIngredients(await currentFacts(tx, skuId)).verified;
+  const [f] = await tx`select count(*)::int as n from assets where sku_id = ${skuId} and kind in ('creator_footage','historical_creative') and deleted_at is null
+                         and rights_attested_at is not null and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null
+                         and coalesce(review_status, 'approved') = 'approved'`;
+  const footage = Number(f?.n ?? 0) > 0;
+  const angles = tax.families.angle.filter((a) => ingredients || a !== 'INGREDIENT_EDUCATION');
+  const treatments = tax.families.treatment.filter((t) => footage || !FOOTAGE_TREATMENTS.includes(t));
+  const eligible = new Set(angles.flatMap((a) => treatments.map((t) => `${a}|t:${t}`)));
+  const { cells } = await meaningfulCoverage(tx, skuId);
+  const tested = [...cells].filter((c) => eligible.has(c)).length;
+  return { tested, eligible: eligible.size, ratio: eligible.size ? Math.round((tested / eligible.size) * 1000) / 1000 : null };
+}
+
 const GENOME_KEYS: [string, TaxonomyFamily][] = [['angle', 'angle'], ['secondaryAngle', 'angle'], ['hookMechanism', 'hook'], ['proofMechanism', 'proof'], ['treatment', 'treatment']];
 
 /** A genome with renamed/deprecated taxonomy values replaced by their canonical successors. */

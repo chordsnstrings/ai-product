@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { withAdmin } from '@arkiv/db';
-import { auditView, currentPlanPrices, PRICE_NOTICE_DAYS, classifySubscriptionEvents, mrrReport, mrrTotals, reconciliationExceptions, subscriptionEvents } from '@arkiv/core';
+import { auditView, currentPlanPrices, PRICE_NOTICE_DAYS, classifySubscriptionEvents, mrrReport, mrrTotals, reconciliationExceptions, subscriptionEvents, tasteContribution } from '@arkiv/core';
 import { assembleDisputeEvidence, DISPUTE_OPEN } from '@arkiv/billing';
 import { PLANS, type PlanCode } from '@arkiv/shared';
 import { ActButton, ActForm } from '@/components/act';
@@ -30,6 +30,8 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
     return {
       subs: await tx`select plan_code, status, count(*)::int as n from subscriptions where true ${t()} group by 1, 2`,
       mrrMove: mrrTotals(moves, new Date(Date.now() - days * 86400_000)),
+      // Appendix C: Taste contribution over the same window.
+      taste: await tasteContribution(tx, { days, includeTest: prefs.includeTest }),
       report: tab === 'revenue' ? mrrReport(moves, { months: 12, tz }) : null,
       oneTime: tab === 'revenue' ? await tx`select to_char(date_trunc('month', paid_at, ${tz}) at time zone ${tz}, 'YYYY-MM') as month, kind, count(*)::int as n, sum(amount_micros)::bigint as amt from purchases where status in ('paid','refunded') ${t()} group by 1, 2 order by 1 desc` : [],
       unmatched: await tx`select id, type, received_at, attempts, payload->'data'->'object'->>'customer' as customer, payload->'data'->'object'->'metadata'->>'workspace_id' as meta_ws from stripe_events where status = 'unmatched' order by received_at`,
@@ -61,6 +63,7 @@ export default async function Billing({ searchParams }: { searchParams: Promise<
       <Grid>
         <Kpi label="MRR" value={money(mrr, 0)} sub={`ARR ${money(mrr * 12, 0)}`} />
         <Kpi label={`Net new MRR (${days}d)`} value={money(d0.mrrMove.net, 0)} sub={`new ${money(d0.mrrMove.new, 0)} · expansion ${money(d0.mrrMove.expansion, 0)} · contraction ${money(d0.mrrMove.contraction, 0)} · churned ${money(d0.mrrMove.churned, 0)}`} alert={d0.mrrMove.net < 0} alertText="Shrinking" />
+        <Kpi label={`Taste contribution (${days}d)`} value={money(d0.taste.contributionMicros, 0)} alert={d0.taste.purchases > 0 && d0.taste.contributionMicros < 0} alertText="Negative" sub={`${d0.taste.purchases} Tastes ${money(d0.taste.grossMicros, 0)} − refunds ${money(d0.taste.refundedMicros, 0)} − expected refunds ${money(d0.taste.expectedRefundsMicros, 0)} (${pct(d0.taste.expectedRefundRate)}) − COGS ${money(d0.taste.cogsMicros, 0)} − fees ${money(d0.taste.paymentFeeMicros, 0)}`} />
         <Kpi label="Active subscriptions" value={active.reduce((a, x) => a + Number(x.n), 0)} sub={active.map((x) => `${x.plan_code} ${x.n}`).join(' · ')} />
         <Kpi label="Unmatched Stripe events" value={d0.unmatched.length} alert={d0.unmatched.length > 0} />
         <Kpi label="Reconciliation exceptions" value={openRecon} alert={openRecon > 0} sub={d0.lastRun ? `Stripe check ${d0.lastRun.status} ${dt(d0.lastRun.finished_at ?? d0.lastRun.started_at)}` : 'Stripe check not run yet'} />

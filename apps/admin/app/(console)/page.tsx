@@ -1,5 +1,5 @@
 import { withAdmin } from '@arkiv/db';
-import { ACTIVE_PRODUCTION_STATES, HEARTBEAT_STALE_SECONDS, costPerUsableExport, firstRenderAcceptance, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
+import { ACTIVE_PRODUCTION_STATES, HEARTBEAT_STALE_SECONDS, costPerUsableExport, learningVelocity, tasteContribution, firstRenderAcceptance, mrrMovement, qaQueueSql, REPEATED_FIDELITY_TARGET, repeatedFidelityFailures, staffCan } from '@arkiv/core';
 import { ActButton } from '@/components/act';
 import { PLANS, type PlanCode, type ProjectState } from '@arkiv/shared';
 import { ago, FilterChip, Grid, Kpi, money, Page, pct, Section, Table } from '@/components/ui';
@@ -77,6 +77,9 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
                              and created_at >= date_trunc('day', now(), ${tz}) - interval '7 days' and created_at < date_trunc('day', now(), ${tz}) ${t()}`;
     // Appendix C: all variable cost over the distinct paid ads customers actually exported.
     const usable = await costPerUsableExport(tx, { days, includeTest: prefs.includeTest });
+    // Appendix C: Taste contribution (after expected refunds, output COGS and payment fees) and learning velocity.
+    const taste = await tasteContribution(tx, { days, includeTest: prefs.includeTest });
+    const velocity = await learningVelocity(tx, { days, includeTest: prefs.includeTest });
     const [conn] = await tx`select count(*)::int as n, count(*) filter (where ${integrationFresh(tx)})::int as fresh from integrations where status <> 'disconnected' ${t()}`;
     const [risk] = await tx`select count(*)::int as n from risk_flags where raised_at >= date_trunc('day', now(), ${tz}) and resolved_at is null ${t()}`;
     const queues = await tx`
@@ -92,7 +95,7 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
     const [workers] = await tx`select count(*) filter (where last_seen_at > now() - make_interval(secs => ${HEARTBEAT_STALE_SECONDS}))::int as up, max(last_seen_at) as last
                                from service_heartbeats where service = 'worker'`;
     const alerts = await tx`select id, kind, severity, subject_type, subject_id, message, created_at from platform_alerts where resolved_at is null order by created_at desc limit 50`;
-    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, firstRender, cogs, today, prior, usable, conn, risk, queues, alerts, workers };
+    return { funnel, rev, subs, mrrMove, jobs, outbox, queued, prov, qa, fidelity, firstRender, cogs, today, prior, usable, taste, velocity, conn, risk, queues, alerts, workers };
   });
   const count = (t: string) => Number(m.funnel.find((r) => r.type === t)?.n ?? 0);
   const base = (t: string) => Number(m.funnel.find((r) => r.type === t)?.base ?? 0);
@@ -139,6 +142,8 @@ export default async function Pulse({ searchParams }: { searchParams: Promise<{ 
       <Section title="Business">
         <Grid>
           <Kpi label="Taste revenue" value={money(m.rev!.taste, 0)} sub={`all one-time ${money(m.rev!.total, 0)}`} href={`/billing?tab=revenue`} />
+          <Kpi label="Taste contribution" value={money(m.taste.contributionMicros, 0)} alert={m.taste.purchases > 0 && m.taste.contributionMicros < 0} alertText="Negative" sub={`${m.taste.purchases} Tastes · ${m.taste.perTasteMicros != null ? `${money(m.taste.perTasteMicros)} each · ` : ''}refunds ${money(m.taste.refundedMicros, 0)} + expected ${money(m.taste.expectedRefundsMicros, 0)} · COGS ${money(m.taste.cogsMicros, 0)} · fees ${money(m.taste.paymentFeeMicros, 0)}`} href={`/billing?tab=revenue`} />
+          <Kpi label="Learning velocity" value={m.velocity.perSkuPerMonth != null ? m.velocity.perSkuPerMonth.toFixed(2) : '—'} sub={`${m.velocity.experiments} tests reached directional or actionable · ${m.velocity.activeSkus} active SKUs · per SKU per month`} />
           <Kpi label="Subscription MRR" value={money(mrr, 0)} sub={`${m.subs.reduce((a, s) => a + Number(s.n), 0)} subscriptions`} href="/billing?tab=revenue" />
           <Kpi label="Net new MRR" value={signed(m.mrrMove.net)} sub={`new ${money(m.mrrMove.new, 0)} · expansion ${money(m.mrrMove.expansion, 0)} · contraction ${money(m.mrrMove.contraction, 0)} · churned ${money(m.mrrMove.churned, 0)}`} alert={m.mrrMove.net < 0} alertText="Shrinking" href="/billing?tab=revenue" />
           <Kpi label="Cost per usable export" value={Number.isFinite(costPerExport) ? money(costPerExport) : '—'} alert={costPerExport > 8_500_000} alertText="Above $8.50" sub={`${m.usable.outputs} exported paid ads · COGS ${money(m.usable.costMicros, 0)}`} href={`/ledger?tab=cogs&days=${days}`} />
