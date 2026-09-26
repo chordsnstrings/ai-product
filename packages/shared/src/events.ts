@@ -22,6 +22,8 @@ export const EventType = [
   'CLAIM_UNBLOCKED',
   // Platform event: our compliance team asked the brand for more evidence on a RESTRICTED claim (plan 05 §14).
   'CLAIM_EVIDENCE_REQUESTED',
+  // Platform event: an approved claim went back to review (its evidence is expiring, plan 03 A5).
+  'CLAIM_REVIEW_REQUIRED',
   // Creative
   'CREATIVE_IMPORTED',
   'GENOME_EXTRACTED',
@@ -96,6 +98,8 @@ export const EventType = [
   'INTEGRATION_DISCONNECTED',
   // Platform event: staff moved a SKU between workspaces with the owner's consent (plan 05 §2.3); one per side.
   'SKU_TRANSFERRED',
+  // Standard §42 'Duplicate import': an import that was a product already catalogued was merged into it.
+  'SKU_MERGED',
   // Standard §9/§11: the Day-30 / month-end SKU Creative Review was written.
   'SKU_REVIEW_CREATED',
   // Funnel (plan 04 §1) — server-side source of truth
@@ -163,6 +167,7 @@ export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
   // COMPLIANCE lifted a block (four-eyes): the claim goes back to review, never straight to approved.
   CLAIM_UNBLOCKED: z.object({ from: z.literal('BLOCKED'), to: z.enum(ClaimStatus), reason: z.string() }).strict(),
   CLAIM_EVIDENCE_REQUESTED: z.object({ note: z.string() }).strict(),
+  CLAIM_REVIEW_REQUIRED: z.object({ reason: z.enum(['evidence_expiring']), expiresOn: z.string().nullable() }).strict(),
   // Usage-ledger events of the Model Gateway (§37): one per provider call opened and closed. They carry no money
   // amount of their own (the ledger's PROVIDER_COST_RECORDED does); estimate/actual are for reconstruction.
   PROVIDER_JOB_CREATED: z
@@ -276,6 +281,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   CLAIM_BLOCKED: 'claim',
   CLAIM_UNBLOCKED: 'claim',
   CLAIM_EVIDENCE_REQUESTED: 'claim',
+  CLAIM_REVIEW_REQUIRED: 'claim',
   CREATIVE_IMPORTED: 'creative',
   GENOME_EXTRACTED: 'creative',
   CREATIVE_VERSIONED: 'creative',
@@ -332,6 +338,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   INTEGRATION_DEGRADED: 'integration',
   INTEGRATION_DISCONNECTED: 'integration',
   SKU_TRANSFERRED: 'sku',
+  SKU_MERGED: 'sku',
   SKU_REVIEW_CREATED: 'sku',
   LP_VIEWED: null,
   UPLOAD_STARTED: null,

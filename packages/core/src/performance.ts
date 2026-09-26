@@ -31,7 +31,8 @@ import { emit } from './events';
 import { autoLinkByCode } from './experiments';
 import { recordFunnel, workspaceVisitor } from './funnel';
 import { enqueue, isFreeTier, priorityFor, queueFor, Queues } from './outbox';
-import { recordFacts, type FactInput } from './product-truth';
+import { inciFacts, recordFacts, type FactInput } from './product-truth';
+import { storeCategory } from './compliance';
 import { planSteps } from './progress';
 import { nextCatalogueNo } from './workspaces';
 import { recordVariants } from './sku-variants';
@@ -660,10 +661,10 @@ export async function recordAdCreativeRefs(tx: Tx, ctx: Pick<TenantContext, 'wor
     if (cur.known === ref) continue;
     // Edited on the platform: a new creative, child of the one the test made, with the new platform reference.
     const [child] = await tx`
-      insert into creatives (workspace_id, sku_id, origin, parent_creative_id, genome, genome_version, final_asset_ids, platform_refs, content_hash, ai_generated, synthetic_people)
+      insert into creatives (workspace_id, sku_id, origin, parent_creative_id, genome, genome_version, final_asset_ids, platform_refs, content_hash, ai_generated, synthetic_people, visual_fingerprint_id)
       values (${ctx.workspaceId}, ${cur.sku_id}, ${cur.origin}, ${cur.creative_id}, ${tx.json((cur.genome ?? null) as never)}, ${cur.genome_version}, '{}',
               ${tx.json({ [`${provider}_ad_ids`]: [adId], creative_refs: { [key]: ref }, editedOnPlatform: { from: cur.known, at: new Date().toISOString() } } as never)}, ${refHash(ref)},
-              ${!!cur.ai_generated}, ${!!cur.synthetic_people})
+              ${!!cur.ai_generated}, ${!!cur.synthetic_people}, (select visual_fingerprint_id from creatives where id = ${cur.creative_id} and workspace_id = ${ctx.workspaceId}))
       returning id`;
     // Its own variant in the same experiment (never a retroactive change to the original's results).
     const [n] = await tx`select count(*)::int as n from variants where experiment_id = ${cur.experiment_id}`;
@@ -786,6 +787,8 @@ export async function applyShopifyProduct(tx: Tx, ctx: TenantContext, shop: stri
     src('description', { valueText: p.descriptionText.slice(0, 4000) || null }),
     src('brand', { valueText: p.vendor ?? null }),
     src('product_type', { valueText: p.productType ?? null }),
+    // The skincare category the store's own product type names (structured data before the model's reading, §16).
+    ...(p.productType && storeCategory(p.productType) ? [src('category', { valueText: storeCategory(p.productType), valueJson: { storeCategory: p.productType }, confidence: 0.9 })] : []),
     src('price', { valueNumber: v0?.price ?? null, valueJson: money }, v0?.id),
     src('compare_at_price', { valueNumber: v0?.compareAtPrice ?? null, valueJson: v0?.compareAtPrice ? money : undefined }, v0?.id),
     src('variants', { valueJson: p.variants }),
@@ -795,6 +798,13 @@ export async function applyShopifyProduct(tx: Tx, ctx: TenantContext, shop: stri
     src('images', { valueJson: p.images.length ? p.images.slice(0, 6) : null }),
     // Metafields that state product truth (ingredients, size, shade), with the metafield named as the source record.
     ...shopifyMetafieldFacts(p.metafields ?? []).map((m) => src(m.key, { valueText: m.value, sourceUrl: `shopify-metafield:${m.source}` })),
+    // §16 "INCI ingredient": the metafield's ingredient list, one fact per ingredient in label order.
+    ...shopifyMetafieldFacts(p.metafields ?? []).filter((m) => m.key === 'ingredients').flatMap((m) => inciFacts(m.value, { sourceType: 'shopify', sourceId: productId, sourceUrl: `shopify-metafield:${m.source}` })),
+    // The store's tags (bundle / subscription markers among them), as the store states them.
+    src('tags', { valueJson: p.tags?.length ? p.tags : null }),
+    // §16 "subscription availability", as the store's selling plans state it (unknown stays unrecorded).
+    src('subscription_available', { valueJson: typeof p.subscriptionAvailable === 'boolean' ? p.subscriptionAvailable : null }),
+    ...(p.tags?.some((t) => /\b(bundle|set|kit)\b/i.test(t)) || /\b(bundle|gift set|kit)\b/i.test(p.productType ?? '') ? [src('bundle_eligible', { valueJson: true })] : []),
     src('source_snapshot', { valueJson: { sha256: shopifySnapshotHash(p), updatedAt: p.updatedAt || null } }),
   ]);
   // §42: variant-specific price, availability and image.

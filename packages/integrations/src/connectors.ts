@@ -346,6 +346,10 @@ export interface ShopifyProduct {
   options?: { name: string; values: string[] }[];
   /** Product metafields as the store defines them. */
   metafields?: { namespace: string; key: string; type: string | null; value: string }[];
+  /** The store's own tags. */
+  tags?: string[];
+  /** A selling plan (subscription) is offered or required for the product; null when the store didn't say. */
+  subscriptionAvailable?: boolean | null;
   variants: {
     id: string;
     title: string;
@@ -361,7 +365,8 @@ export interface ShopifyProduct {
   updatedAt: string;
 }
 
-const PRODUCT_FIELDS = `id title handle productType onlineStoreUrl description status vendor updatedAt
+const PRODUCT_FIELDS = `id title handle productType onlineStoreUrl description status vendor updatedAt tags
+      requiresSellingPlan sellingPlanGroupsCount { count }
       options { name values }
       metafields(first: 20) { nodes { namespace key type value } }
       media(first: 6) { nodes { ... on MediaImage { image { url } } } }
@@ -450,6 +455,13 @@ export function normalizeShopifyProduct(n: Record<string, unknown>): ShopifyProd
     images: media,
     options,
     metafields,
+    tags: Array.isArray(n.tags) ? (n.tags as unknown[]).map(String).filter(Boolean).slice(0, 40) : [],
+    subscriptionAvailable:
+      n.requiresSellingPlan === true || Number((n.sellingPlanGroupsCount as { count?: unknown } | null)?.count ?? 0) > 0
+        ? true
+        : typeof n.requiresSellingPlan === 'boolean' || n.sellingPlanGroupsCount != null
+          ? false
+          : null,
     variants,
     updatedAt: String(n.updatedAt ?? ''),
   };

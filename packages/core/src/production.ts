@@ -28,6 +28,8 @@ import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, 
 import { GENOME_VERSION_SQL } from './creatives';
 import { setExperimentState } from './experiment-state';
 import { assertLineageComplete, qaClaims, qaClipContract, type ExportProvenance, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, qaVoiceTrack, summarize, type CheckResult } from './qa';
+import { fingerprintFor, pinnedFingerprintId, sceneFingerprintSql } from './fingerprint';
+import { genomeForGenerated } from './genome';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -381,7 +383,7 @@ export async function planProjectRun(tx: Tx, ws: string, projectId: string, purp
   const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} and workspace_id = ${ws} order by position`) as unknown as SceneRow[];
   const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                              where workspace_id = ${ws} and scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
-  const run = await planRun(tx, ws, projectId, purpose, scenes, versions, await productImagery(tx, p.sku_id as string));
+  const run = await planRun(tx, ws, projectId, purpose, scenes, versions, await productImagery(tx, p.sku_id as string, await pinnedFingerprintId(tx, projectId)));
   return { ...run, storyboardId: p.storyboard_id as string, scenes };
 }
 
@@ -617,12 +619,13 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     const scenes = (await tx`select * from scenes where storyboard_id = ${p.storyboard_id} order by position`) as unknown as SceneRow[];
     const [sb] = await tx`select * from storyboards where id = ${p.storyboard_id}`;
     const [sku] = await tx`select * from skus where id = ${p.sku_id}`;
-    const [fp] = await tx`select * from visual_fingerprints where sku_id = ${p.sku_id} and active`;
+    // The packaging the approved storyboard was drawn for (§42): a packaging refresh since doesn't change this ad.
+    const fp = await fingerprintFor(tx, p.sku_id as string, (sb?.visual_fingerprint_id as string | null | undefined) ?? null);
     const [variant] = p.variant_id ? await tx`select * from variants where id = ${p.variant_id}` : [null];
     const versions = (await tx`select id, scene_id, version, kind, asset_id, status, technique, input_hash, lineage, qa from scene_versions
                                where scene_id = any(${scenes.map((s) => s.id)}::uuid[]) order by version`) as unknown as VersionRow[];
     const brand = await brandBrainFor(tx, p.sku_id as string);
-    return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string) };
+    return { p, scenes, sb, sku: sku!, fp, variant, versions, brand, imagery: await productImagery(tx, p.sku_id as string, (sb?.visual_fingerprint_id as string | null | undefined) ?? null) };
   });
   const { p, scenes, sb, sku, fp, variant, versions, brand, imagery } = load;
   // {price} / {size} in on-screen text and the CTA show the product's current facts (§42): resolved now, and kept
@@ -807,10 +810,10 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
           const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'frame'`;
           // A generated plate's provider job (§41), with its cost, on the version it produced.
           const jobId = (lineage.plateJobId as string | undefined) ?? null;
-          const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, qa, status, lineage, provider_job_id, cost_micros)
+          const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, qa, status, lineage, provider_job_id, cost_micros, visual_fingerprint_id)
                                  values (${ws}, ${s.id}, ${v!.v}, 'frame', ${a.id}, ${technique}, ${tx.json(qa as never)}, 'accepted',
                                          ${tx.json({ projectId, ...lineage } as never)}, ${jobId},
-                                         coalesce((select actual_micros from provider_jobs where id = ${jobId} and workspace_id = ${ws}), 0))
+                                         coalesce((select actual_micros from provider_jobs where id = ${jobId} and workspace_id = ${ws}), 0), ${sceneFingerprintSql(tx, s.id)})
                                  returning id`;
           return { assetId: a.id, versionId: row!.id as string };
         });
@@ -861,9 +864,9 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
                                  order by created_at desc limit 1`;
           const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
           const qa = [{ check: 'visual', pass: false, hard: false, detail: `provider moderation: ${e.message.slice(0, 200)}`, data: { moderation: true } }];
-          await tx`insert into scene_versions (workspace_id, scene_id, version, kind, technique, qa, status, input_hash, lineage, provider_job_id)
+          await tx`insert into scene_versions (workspace_id, scene_id, version, kind, technique, qa, status, input_hash, lineage, provider_job_id, visual_fingerprint_id)
                    values (${ws}, ${s.id}, ${v!.v}, 'render', 'generative', ${tx.json(qa as never)}, 'failed', ${hashes.get(s.id)!},
-                           ${tx.json({ attempt, moderation: true, provider: e.provider, providerJobId: (job?.id as string) ?? null } as never)}, ${(job?.id as string) ?? null})`;
+                           ${tx.json({ attempt, moderation: true, provider: e.provider, providerJobId: (job?.id as string) ?? null } as never)}, ${(job?.id as string) ?? null}, ${sceneFingerprintSql(tx, s.id)})`;
           if (job) {
             await emit(tx, ctx, 'PROVIDER_MODERATION_REJECTED', { type: 'scene', id: s.id }, { projectId, provider: e.provider, attempt, error: e.message.slice(0, 200) }, {
               projectId, skuId: sku.id as string, storyboardId: sb!.id as string, providerJobId: job.id as string, authorizationId: auth.authorizationId,
@@ -971,11 +974,11 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
               const [v] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where scene_id = ${s.id} and kind = 'render'`;
               // §41: the render's job and cost on its version; a failed QA's first failing check is the repair reason.
               const repairReason = ok ? null : (res.find((c) => !c.pass)?.detail ?? 'QA').slice(0, 200);
-              const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage, provider_job_id, cost_micros)
+              const [row] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, prompt_version, qa, status, input_hash, lineage, provider_job_id, cost_micros, visual_fingerprint_id)
                                      values (${ws}, ${s.id}, ${v!.v}, 'render', ${a.id}, 'generative', ${vid.modelVersion ?? null}, ${vid.promptVersion},
                                              ${tx.json(res as never)}, ${ok ? 'accepted' : 'qa_failed'}, ${hashes.get(s.id)!},
                                              ${tx.json({ attempt, providerJobId: vid.jobId, frameVersionId: s.current_version_id ?? null, ...(repairReason ? { repairReason } : {}) } as never)},
-                                             ${vid.jobId}, coalesce((select actual_micros from provider_jobs where id = ${vid.jobId} and workspace_id = ${ws}), 0))
+                                             ${vid.jobId}, coalesce((select actual_micros from provider_jobs where id = ${vid.jobId} and workspace_id = ${ws}), 0), ${sceneFingerprintSql(tx, s.id)})
                                      returning id`;
               await emit(tx, ctx, ok ? 'QA_PASSED' : 'QA_FAILED', { type: 'scene', id: s.id }, { attempt, projectId, hardFail: hardFidelityFail(res), checks: res.map((c) => ({ check: c.check, pass: c.pass, hard: c.hard })) }, {
                 projectId, skuId: sku.id as string, storyboardId: sb!.id as string, experimentId: p.experiment_id as string | null, variantId: p.variant_id as string | null,
@@ -1318,11 +1321,21 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       // holder may deliver.
       await heartbeat();
       await withTenant(ws, async (tx) => {
+        // §19 genome of the ad as made: strategy, hook, body, production, compliance (claim versions) and lineage
+        // (prompt/model versions, experiment, the fingerprint and Brand Brain versions it was made with).
+        const genome = await genomeForGenerated(tx, projectId, {
+          durationMs: totalMs,
+          hasVoiceover: segments.length > 0,
+          hasCaptions: true,
+          syntheticVoice: !!(disclosure as { syntheticVoice?: boolean }).syntheticVoice,
+          hookText: (sb.hook_text as string | null) ?? null,
+          extraLineage: { statementMap },
+        });
         const [cr] = await tx`
-          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, captions_asset_id)
-          values (${ws}, ${sku.id}, 'generated', ${projectId},
-            ${tx.json({ angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment, hookText: sb.hook_text, durationSec: Math.round(totalMs / 1000), hasCaptions: true, hasVoiceover: segments.length > 0, lineage: { statementMap } } as never)},
-            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople}, ${captionsAsset.id})
+          insert into creatives (workspace_id, sku_id, origin, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, visual_fingerprint_id, captions_asset_id)
+          values (${ws}, ${sku.id}, 'generated', ${projectId}, ${tx.json(genome as never)},
+            (${GENOME_VERSION_SQL(tx)}), ${exportAssets.map((e) => e.assetId)}, ${tx.json(manifest as never)}, ${disclosure.aiGenerated}, ${disclosure.syntheticPeople},
+            ${(sb.visual_fingerprint_id as string | null | undefined) ?? (fp?.id as string | null | undefined) ?? null}, ${captionsAsset.id})
           returning id`;
         if (p.variant_id) await tx`update variants set creative_id = ${cr!.id}, platform_assets = ${tx.json(platformAssets(exportAssets) as never)} where id = ${p.variant_id}`;
         await tx`update projects set qa_report = ${tx.json({ ...report, pass: true, statementMap, ...(impliedReview.length ? { impliedClaims: impliedReview } : {}) } as never)}, final_creative_id = ${cr!.id}, outage = null where id = ${projectId}`;

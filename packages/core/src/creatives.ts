@@ -34,10 +34,11 @@ export interface CreativeVersion {
  */
 export async function versionCreative(tx: Tx, ctx: Pick<TenantContext, 'workspaceId' | 'actor'>, v: CreativeVersion): Promise<string> {
   // A version keeps its parent's AI-content flags (standard §40): it reuses the parent's media.
-  const [parent] = await tx`select ai_generated, synthetic_people from creatives where id = ${v.parentCreativeId} and workspace_id = ${ctx.workspaceId}`;
-  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, captions_asset_id)
+  const [parent] = await tx`select ai_generated, synthetic_people, visual_fingerprint_id from creatives where id = ${v.parentCreativeId} and workspace_id = ${ctx.workspaceId}`;
+  // …and its packaging (the parent's Visual Fingerprint version, §42): a new hook on an old ad keeps the old pack.
+  const [cr] = await tx`insert into creatives (workspace_id, sku_id, origin, parent_creative_id, project_id, genome, genome_version, final_asset_ids, composition, ai_generated, synthetic_people, visual_fingerprint_id, captions_asset_id)
                         values (${ctx.workspaceId}, ${v.skuId}, 'generated', ${v.parentCreativeId}, ${v.projectId}, ${tx.json(v.genome as never)}, (${GENOME_VERSION_SQL(tx)}),
-                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)}, ${!!parent?.ai_generated}, ${!!parent?.synthetic_people}, ${v.captionsAssetId ?? null})
+                                ${v.finalAssetIds}, ${tx.json((v.composition ?? null) as never)}, ${!!parent?.ai_generated}, ${!!parent?.synthetic_people}, ${(parent?.visual_fingerprint_id as string | null | undefined) ?? null}, ${v.captionsAssetId ?? null})
                         returning id`;
   const id = cr!.id as string;
   await emit(

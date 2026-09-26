@@ -159,9 +159,9 @@ export async function recordFacts(tx: Tx, ctx: TenantContext, skuId: string, fac
     // The same source's earlier reading is replaced, not disputed (§16 valid_from/valid_to, supersedes_fact_id).
     const replaced = f.state === 'DECIDED' ? [] : existing.filter((e) => e.state !== 'DECIDED' && sameSource(e, f));
     const [row] = await tx`
-      insert into product_facts (workspace_id, sku_id, fact_type, normalized_key, value_text, value_number, value_json,
+      insert into product_facts (workspace_id, brand_id, sku_id, fact_type, normalized_key, value_text, value_number, value_json,
         source_type, source_id, source_url, confidence, state, created_by, supersedes_fact_id)
-      values (${ctx.workspaceId}, ${skuId}, ${f.factType ?? f.key}, ${f.key}, ${f.valueText ?? null}, ${f.valueNumber ?? null},
+      values (${ctx.workspaceId}, (select brand_id from skus where id = ${skuId} and workspace_id = ${ctx.workspaceId}), ${skuId}, ${f.factType ?? f.key}, ${f.key}, ${f.valueText ?? null}, ${f.valueNumber ?? null},
         ${f.valueJson === undefined ? null : tx.json(f.valueJson as never)}, ${f.sourceType}, ${f.sourceId ?? null},
         ${f.sourceUrl ?? null}, ${f.confidence ?? 1}, ${f.state}, ${actorString(ctx)}, ${(replaced.at(-1)?.id as string) ?? null})
       returning id`;
@@ -202,10 +202,10 @@ export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key:
   await lockKey(tx, skuId, key);
   const prior = await tx`select id, source_type, state, value_text, value_number from product_facts where sku_id = ${skuId} and normalized_key = ${key} and status <> 'SUPERSEDED' order by observed_at desc`;
   const [row] = await tx`
-    insert into product_facts (workspace_id, sku_id, fact_type, normalized_key, value_text, value_number, value_json,
-      source_type, state, merchant_confirmed, created_by, supersedes_fact_id)
-    values (${ctx.workspaceId}, ${skuId}, ${key}, ${key}, ${value.text ?? null}, ${value.number ?? null},
-      ${value.json === undefined ? null : tx.json(value.json as never)}, 'merchant', 'DECIDED', true, ${actorString(ctx)},
+    insert into product_facts (workspace_id, brand_id, sku_id, fact_type, normalized_key, value_text, value_number, value_json,
+      source_type, source_id, state, merchant_confirmed, created_by, supersedes_fact_id)
+    values (${ctx.workspaceId}, (select brand_id from skus where id = ${skuId} and workspace_id = ${ctx.workspaceId}), ${skuId}, ${key.startsWith('inci:') ? 'inci_ingredient' : key}, ${key}, ${value.text ?? null}, ${value.number ?? null},
+      ${value.json === undefined ? null : tx.json(value.json as never)}, 'merchant', ${actorString(ctx)}, 'DECIDED', true, ${actorString(ctx)},
       ${((prior.find((p) => p.state === 'DECIDED') ?? prior[0])?.id as string) ?? null})
     returning id`;
   const nonShopify = prior.filter((p) => p.source_type !== 'shopify').map((p) => p.id as string);
@@ -223,8 +223,52 @@ export async function decideFact(tx: Tx, ctx: TenantContext, skuId: string, key:
   }, { factId: row!.id as string });
   const current = prior.find((p) => p.state === 'DECIDED') ?? prior[0];
   if (current && String(current.value_number != null ? Number(current.value_number) : (current.value_text ?? '')) !== String(value.number ?? value.text ?? '')) await onMaterialProductChange(tx, ctx, skuId, key);
+  // The merchant's ingredient list is the decided INCI too, one ingredient per fact; positions it no longer has end.
+  if (key === 'ingredients' && value.text) {
+    const list = splitInci(value.text);
+    for (const [i, name] of list.entries()) {
+      const k = inciKey(i);
+      const [cur] = await tx`select value_text from product_facts where sku_id = ${skuId} and normalized_key = ${k} and state = 'DECIDED' and status <> 'SUPERSEDED'`;
+      if (cur?.value_text !== name) await decideFact(tx, ctx, skuId, k, { text: name });
+    }
+    const beyond = await tx`select id from product_facts where sku_id = ${skuId} and fact_type = 'inci_ingredient' and status <> 'SUPERSEDED'
+                            and (substring(normalized_key from 6))::int > ${list.length}`;
+    if (beyond.length) await tx`update product_facts set status = 'SUPERSEDED', valid_to = now() where id in ${tx(beyond.map((b) => b.id as string))}`;
+  }
   return row!.id as string;
 }
+
+/** Fact key of the n-th (0-based) INCI ingredient: `inci:1`, `inci:2`, … in label order. */
+export const inciKey = (i: number) => `inci:${i + 1}`;
+
+/**
+ * An INCI list split into its ingredients, in order (standard §16 "INCI ingredient" facts): commas and semicolons
+ * separate, parenthesised synonyms stay with their ingredient ("Aqua (Water)"), and "may contain" tails are kept as
+ * one entry. At most 80 entries.
+ */
+export function splitInci(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of text.replace(/^\s*ingredients?\s*[:\-]\s*/i, '')) {
+    if (ch === '(' || ch === '[') depth++;
+    if (ch === ')' || ch === ']') depth = Math.max(0, depth - 1);
+    if ((ch === ',' || ch === ';' || ch === '\n') && depth === 0) {
+      out.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out.map((x) => x.replace(/\s+/g, ' ').replace(/^[\s.•·*-]+|[\s.]+$/g, '').trim()).filter((x) => x.length >= 2 && x.length <= 120).slice(0, 80);
+}
+
+/** One OBSERVED fact per INCI ingredient, in order, from a source's ingredient list. */
+export function inciFacts(text: string, source: Pick<FactInput, 'sourceType' | 'sourceId' | 'sourceUrl'>, confidence = 0.9): FactInput[] {
+  return splitInci(text).map((name, i) => ({ key: inciKey(i), factType: 'inci_ingredient', valueText: name, valueJson: { position: i + 1 }, state: 'OBSERVED' as const, confidence, ...source }));
+}
+
+/** Keys that are parts of a larger fact (one INCI ingredient each): shown with the ingredient list, not as rows. */
+export const isPartFactKey = (key: string) => key.startsWith('inci:');
 
 /**
  * "Use the store's value": the merchant accepts a source observation that disagrees with their earlier decision.

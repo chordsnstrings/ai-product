@@ -1,8 +1,11 @@
+import { readFileSync } from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { AddressInfo } from 'node:net';
 import zlib from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { assertPublicUrl, fetchImage, importProductUrl, parseProductHtml, parseShopifyProduct, safeFetch, shopifyJsonUrl } from './ingest';
+import { assertPublicUrl, fetchImage, findUsageDirections, importProductUrl, parseProductHtml, parseShopifyProduct, safeFetch, shopifyJsonUrl } from './ingest';
 import { isPublicAddress, type NetGuard } from './net-guard';
 
 describe('SSRF guard', () => {
@@ -233,5 +236,53 @@ describe('product page parsing (fixtures)', () => {
     expect(p?.compareAtMicros).toBe(48_000_000);
     expect(p?.shopifyProductId).toBe('gid://shopify/Product/99'); // the Admin API's id form, so a later store sync matches (§42)
     expect(shopifyJsonUrl(new URL('https://nimbus.shop/products/cloud-cream?variant=1'))).toBe('https://nimbus.shop/products/cloud-cream.json');
+  });
+});
+
+const fixture = (name: string) => readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '__fixtures__/pages', name), 'utf8');
+
+describe('page fixtures: custom sites, product groups, listings and JS shells (plan 06 Phase 1)', () => {
+  it('reads a custom site with no structured data: title, price, size, INCI, usage directions and subscription', () => {
+    const p = parseProductHtml(fixture('custom-site.html'), 'https://maisondew.example/shop/dew-drops');
+    // No product markup: 'unknown', which the analysis reads as this product (never as a listing).
+    expect(p).toMatchObject({ source: 'html', pageKind: 'unknown', sizeText: '30 ml', subscriptionAvailable: true });
+    expect(p.name).toMatch(/^Dew Drops/);
+    expect(p.ingredients).toMatch(/^Aqua \(Water\), Glycerin/);
+    expect(p.usageDirections).toBe('Apply two drops to clean skin morning and night.');
+  });
+
+  it('reads a JSON-LD ProductGroup: its variants with options, price, availability and image, category and properties', () => {
+    const p = parseProductHtml(fixture('productgroup-jsonld.html'), 'https://lumen.example/products/barrier-cream');
+    expect(p).toMatchObject({ source: 'json_ld', pageKind: 'product', name: 'Barrier Cream', brand: 'Lumen', productType: 'Skin Care > Moisturizers', priceMicros: 34_000_000, inStock: true, properties: { 'Skin type': 'Dry' } });
+    expect(p.variants?.map((v) => [v.externalId, v.options, v.priceMicros, v.available, v.imageUrl])).toEqual([
+      ['BC-50', { Size: '50 ml' }, 34_000_000, true, 'https://lumen.example/bc50.jpg'],
+      ['BC-100', { Size: '100 ml' }, 58_000_000, false, 'https://lumen.example/bc100.jpg'],
+    ]);
+  });
+
+  it('a collection page is a listing whose choices are this site’s own products (never another site’s)', () => {
+    const p = parseProductHtml(fixture('collection.html'), 'https://lumen.example/collections/serums');
+    expect(p.pageKind).toBe('listing');
+    expect(p.productChoices).toEqual([
+      { name: 'Glow Serum No. 3', url: 'https://lumen.example/collections/serums/products/glow-serum' },
+      { name: 'Calm Drops', url: 'https://lumen.example/collections/serums/products/calm-drops' },
+      { name: 'Night Oil', url: 'https://lumen.example/products/night-oil' },
+    ]);
+    // A home page listing products is a listing too; one product's page is not.
+    expect(parseProductHtml(fixture('collection.html'), 'https://lumen.example/').pageKind).toBe('listing');
+    expect(parseProductHtml(fixture('productgroup-jsonld.html'), 'https://lumen.example/').pageKind).toBe('product');
+  });
+
+  it('a JavaScript shell yields no product (the analysis falls back to photos)', () => {
+    const p = parseProductHtml(fixture('js-shell.html'), 'https://spa.example/p/1');
+    expect(p).toMatchObject({ source: 'html', pageKind: 'unknown', images: [] });
+    expect(p.ingredients).toBeUndefined();
+    expect(p.priceMicros).toBeUndefined();
+  });
+
+  it('reads Shopify tags, selling plans and bundle markers, and stated usage directions', () => {
+    const p = parseShopifyProduct(JSON.stringify({ product: { id: 5, title: 'Duo Set', product_type: 'Serum', tags: 'bundle, vegan', selling_plan_groups: [{ name: 'Subscribe' }], variants: [{ id: 1, title: 'Default', price: '60.00' }] } }));
+    expect(p).toMatchObject({ tags: ['bundle', 'vegan'], subscriptionAvailable: true, bundleEligible: true });
+    expect(findUsageDirections('Directions: Massage into damp skin, then rinse. Ingredients: Aqua')).toBe('Massage into damp skin, then rinse.');
   });
 });

@@ -123,7 +123,20 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
     learnings: learnings.map((l) => ({ id: l.id, statement: l.statement, state: l.state, platform: l.scope_platform })),
     // The merchant's own Brand Brain (versioned): shapes voice and visuals, never overrides claim rules.
     brand: brand
-      ? { name: brand.name, tone: brand.brain.tone, neverShowOrSay: brand.brain.prohibited, requiredDisclosures: brand.brain.disclosures, preferredCta: brand.brain.cta, colors: brand.brain.colors, market: brand.brain.market }
+      ? {
+          name: brand.name,
+          tone: brand.brain.tone,
+          neverShowOrSay: brand.brain.prohibited,
+          requiredDisclosures: brand.brain.disclosures,
+          preferredCta: brand.brain.cta,
+          colors: brand.brain.colors,
+          market: brand.brain.market,
+          // §16: font rules, approved talent types, CTA vocabulary and brand-wide restrictions (claims go through the vault).
+          ...(brand.brain.fonts.heading || brand.brain.fonts.body ? { fonts: brand.brain.fonts } : {}),
+          ...(brand.brain.talentTypes.length ? { approvedTalentTypes: brand.brain.talentTypes } : {}),
+          ...(brand.brain.ctaVocabulary.length ? { ctaVocabulary: brand.brain.ctaVocabulary } : {}),
+          ...(brand.brain.restrictions.length ? { brandRestrictions: brand.brain.restrictions } : {}),
+        }
       : null,
     platform: 'TikTok + Instagram Reels (9:16)',
     objective: goal === 'performance' ? 'Find the next creative test worth running for this SKU' : `${CREATIVE_GOAL_BRIEF[goal]}. Each concept is still a test with one primary variable.`,
@@ -134,7 +147,7 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   const r = productContext.rationaleIds!;
   const packetIds = new Set([...r.themes, ...r.claims, ...r.facts, ...r.learnings]);
   // Terms the brand never shows or says: an extra blocking list for concepts, hooks and storyboard lines (§16).
-  const prohibited = prohibitedTerms(brand?.brain.prohibited);
+  const prohibited = prohibitedTerms([brand?.brain.prohibited ?? '', ...(brand?.brain.restrictions ?? [])].join('\n'));
   return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, phrases, prohibited, brandBrainVersionId: brand?.versionId ?? null };
 }
 

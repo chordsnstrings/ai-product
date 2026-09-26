@@ -67,8 +67,10 @@ async function startUpload(req: Request, form: FormData, input: { url: string | 
   // §39/§35: one preview per submission. The key is scoped to this (provisional or signed-in) workspace; a double
   // submit or a retried request returns the first product instead of creating a second SKU and project.
   const key = idempotencyKeyOf(req);
-  const request = { url, uploaded, photos: photos.map(fileIdentity) };
-  const r = await withTenant(ctx.workspaceId, (tx) => withIdempotency(tx, ctx.workspaceId, 'preview', key, request, () => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip }))).catch(async (e) => {
+  // Multi-brand workspaces can say which brand the product is (§16); the workspace's first brand otherwise.
+  const brandId = /^[0-9a-f-]{36}$/i.test(String(form.get('brandId') ?? '')) ? String(form.get('brandId')) : null;
+  const request = { url, uploaded, photos: photos.map(fileIdentity), brandId };
+  const r = await withTenant(ctx.workspaceId, (tx) => withIdempotency(tx, ctx.workspaceId, 'preview', key, request, () => startPreview(tx, ctx, { url, photoAssetIds: assetIds, visitorId: vid, ip, brandId }))).catch(async (e) => {
     // The free-preview multi-SKU heuristic (plan 05 §15): recorded for trust & safety (the refusal itself rolled back).
     if (e instanceof DomainError && e.code === 'PAYMENT_REQUIRED' && (e.details as { needsAccount?: boolean } | undefined)?.needsAccount) {
       await recordAbuseSignalSafe({ kind: 'multi_sku_limit', key: allowKey.ip(ip) ?? allowKey.ws(ctx.workspaceId)!, workspaceId: ctx.workspaceId, detail: { workspace: ctx.workspaceId } });

@@ -2,6 +2,7 @@ import { withAdmin, withSystem, type Tx } from '@arkiv/db';
 import { DomainError, newId, type WorkspaceState } from '@arkiv/shared';
 import { assertBreakGlass, assertStaff, audit, type Staff } from './admin';
 import { emit } from './events';
+import { withClaimChange } from './claims';
 import { enqueue, Queues } from './outbox';
 import { storage } from './storage';
 
@@ -146,6 +147,7 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
       }, v);
       counts.product_facts = await copyRows(tx, 'product_facts', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, {
         id: remap('facts', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid', supersedes_fact_id: remap('facts', 'supersedes_fact_id'),
+        brand_id: '{{brand}}::uuid',
       }, v);
       // Sizes/shades with their price, availability and images (standard §42), so creative in the target
       // workspace can still name the right variant.
@@ -156,8 +158,16 @@ export async function transferSku(transferId: string): Promise<SkuTransferResult
       counts.visual_fingerprints = await copyRows(tx, 'visual_fingerprints', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, {
         id: remap('fps', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid', cutout_asset_id: remap('assets', 'cutout_asset_id'),
         reference_asset_ids: `array(select ({{assets}}::text::jsonb ->> r::text)::uuid from unnest(reference_asset_ids) r where {{assets}}::text::jsonb ? r::text)`,
+        approved_view_ids: `array(select ({{assets}}::text::jsonb ->> r::text)::uuid from unnest(approved_view_ids) r where {{assets}}::text::jsonb ? r::text)`,
+        label_crop_asset_id: remap('assets', 'label_crop_asset_id'),
+        views: `(select coalesce(jsonb_object_agg({{assets}}::text::jsonb ->> e.key, e.value), '{}'::jsonb) from jsonb_each(views) e where {{assets}}::text::jsonb ? e.key)`,
+        critical_regions: `(select coalesce(jsonb_agg(r.value || jsonb_build_object('assetId', {{assets}}::text::jsonb ->> (r.value->>'assetId'), 'cropAssetId', {{assets}}::text::jsonb ->> (r.value->>'cropAssetId'))), '[]'::jsonb)
+                            from jsonb_array_elements(critical_regions) r where {{assets}}::text::jsonb ? (r.value->>'assetId'))`,
       }, v);
-      counts.claims = await copyRows(tx, 'claims', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, { id: remap('claims', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid' }, v);
+      // Each copied claim starts its history in the target workspace as a 'transferred' version (claims trigger).
+      counts.claims = await withClaimChange(tx, { kind: 'transferred', actor: `staff:${t.requested_by as string}`, reason: t.reason as string }, () =>
+        copyRows(tx, 'claims', `workspace_id = {{from}}::uuid and sku_id = {{oldSku}}::uuid`, { id: remap('claims', 'id'), workspace_id: '{{to}}::uuid', sku_id: '{{newSku}}::uuid' }, v),
+      );
       counts.claim_evidence = await copyRows(tx, 'claim_evidence', `workspace_id = {{from}}::uuid and {{evidence}}::text::jsonb ? id::text`, {
         id: remap('evidence', 'id'), workspace_id: '{{to}}::uuid', claim_id: remap('claims', 'claim_id'), source_asset_id: remap('assets', 'source_asset_id'),
       }, v);

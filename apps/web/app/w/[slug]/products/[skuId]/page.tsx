@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
-import { assetUrl, currentFacts, verifiedIngredients } from '@arkiv/core';
+import { assetUrl, currentFacts, isPartFactKey, verifiedIngredients } from '@arkiv/core';
 import { MetadataTable, SpecimenCard } from '@arkiv/ui';
 import { ProvenanceChip } from '@arkiv/ui/client';
 import { formatDate } from '@arkiv/shared/format';
@@ -16,7 +16,11 @@ export async function generateMetadata({ params }: { params: Promise<{ slug: str
   return skuTitle(slug, skuId, 'Product');
 }
 
-const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', key_ingredients: 'Key ingredients', ingredients: 'Ingredients (INCI)', texture: 'Texture', format: 'Format', sku_code: 'SKU', gtin: 'GTIN', description: 'Description' };
+const LABEL: Record<string, string> = { name: 'Name', brand: 'Brand', size: 'Size', price: 'Price', compare_at_price: 'Compare-at price', category: 'Category', key_ingredients: 'Key ingredients', ingredients: 'Ingredients (INCI)', texture: 'Texture', format: 'Format', sku_code: 'SKU', gtin: 'GTIN', description: 'Description', usage_directions: 'How to use' };
+/** Read-only facts that are shown but never corrected from the fact form (store/structured signals). */
+const INFO_LABEL: Record<string, string> = { product_type: 'Store category', subscription_available: 'Subscription', bundle_eligible: 'Bundles', tags: 'Store tags' };
+const VIEW_WORDS: Record<string, string> = { front: 'Front', side: 'Side', back: 'Back', closure: 'Closure', swatch: 'Swatch', in_hand: 'In hand', other: 'Other' };
+const REASON_WORDS: Record<string, string> = { analysis: 'analysed', added_views: 'views added', segmented_cutout: 'cleaner cut-out', packaging_refresh: 'packaging refresh', views_approved: 'views approved', merged: 'merged import' };
 /** Where a value that disagrees with the merchant's correction came from. */
 const SOURCE_WORDS: Record<string, string> = { shopify: 'Shopify', product_page: 'Your product page', json_ld: 'Your product page', photo_ocr: 'The label', import: 'Your import' };
 /** Files the customer uploaded (deleteAsset refuses generated work). */
@@ -34,7 +38,21 @@ export default async function Product({ params, searchParams }: { params: Promis
     if (!sku) return null;
     const facts = await currentFacts(tx, skuId);
     const [fp] = await tx`select * from visual_fingerprints where sku_id = ${skuId} and active`;
-    const fps = await tx`select version, created_at from visual_fingerprints where sku_id = ${skuId} order by version desc`;
+    const fps = await tx`select version, created_at, reason from visual_fingerprints where sku_id = ${skuId} order by version desc`;
+    const brands = await tx`select id, name from brands order by created_at`;
+    // §16 reference views with the view each shows and whether the merchant approved it; the label crop.
+    const refIds = ((fp?.reference_asset_ids as string[] | undefined) ?? []);
+    const refs = refIds.length ? await tx`select id, review_status from assets where id = any(${refIds}::uuid[]) and deleted_at is null` : [];
+    const views = await Promise.all(
+      refIds.filter((id) => refs.some((r) => r.id === id)).map(async (id) => ({
+        id,
+        view: ((fp?.views as Record<string, string> | undefined) ?? {})[id] ?? null,
+        approved: ((fp?.approved_view_ids as string[] | undefined) ?? []).includes(id),
+        pending: refs.find((r) => r.id === id)?.review_status === 'pending',
+        url: await assetUrl(tx, id),
+      })),
+    );
+    const labelCrop = fp?.label_crop_asset_id ? await assetUrl(tx, fp.label_crop_asset_id as string) : null;
     const themes = await tx`select * from customer_themes where sku_id = ${skuId} order by prevalence * relevance desc limit 20`;
     const signals = await tx`select count(*)::int as n from customer_signals where sku_id = ${skuId}`;
     const assets = await tx`select id, kind, mime, created_at, source, rights_expires_at <= now() as rights_expired, review_status from assets where sku_id = ${skuId} and deleted_at is null and kind in ('product_photo','cutout','reference_view','final_export','creator_footage') order by created_at desc limit 48`;
@@ -47,6 +65,9 @@ export default async function Product({ params, searchParams }: { params: Promis
       facts,
       fp,
       fps,
+      brands: brands.map((b) => ({ value: b.id as string, label: b.name as string })),
+      views,
+      labelCrop,
       themes,
       signalCount: signals[0]!.n as number,
       cutout: fp?.cutout_asset_id ? await assetUrl(tx, fp.cutout_asset_id as string) : null,
@@ -96,9 +117,9 @@ export default async function Product({ params, searchParams }: { params: Promis
       {tab === 'facts' ? (
         <div className="ak-grid-2" style={{ alignItems: 'start' }}>
           <MetadataTable
-            rows={Object.entries(d.facts).map(([k, f]) => ({
+            rows={Object.entries(d.facts).filter(([k]) => !isPartFactKey(k) && !['tags', 'properties', 'source_snapshot', 'images', 'options', 'variants'].includes(k)).map(([k, f]) => ({
               key: k,
-              label: LABEL[k] ?? k.replace(/_/g, ' '),
+              label: LABEL[k] ?? INFO_LABEL[k] ?? k.replace(/_/g, ' '),
               value: (
                 <span>
                   {f.value.valueText ? (f.value.valueText.length > 240 ? `${f.value.valueText.slice(0, 240)}…` : f.value.valueText) : f.value.valueNumber != null ? String(f.value.valueNumber) : JSON.stringify(f.value.valueJson)}
@@ -150,6 +171,13 @@ export default async function Product({ params, searchParams }: { params: Promis
                 <ul className="ak-small" style={{ margin: 0 }}>{((d.sku.analysis as { missingEvidence: string[] }).missingEvidence).slice(0, 6).map((m) => <li key={m}>{m}</li>)}</ul>
               </div>
             ) : null}
+            {d.brands.length > 1 ? (
+              <div className="ak-panel">
+                <h2 className="ak-label">Brand</h2>
+                <p className="ak-small ak-muted">The Brand Brain this product’s ads follow. Its brand-wide claims are added to this product for your approval.</p>
+                <ActionForm slug={slug} action="sku-brand" extra={{ skuId }} submit="Save brand" fields={[{ name: 'brandId', label: 'Brand', type: 'select', defaultValue: (d.sku.brand_id as string | null) ?? d.brands[0]!.value, options: d.brands }]} />
+              </div>
+            ) : null}
             <div className="ak-panel">
               <h2 className="ak-label">Correct a fact</h2>
               <p className="ak-small ak-muted">Your value becomes the decided truth and wins over page and photo readings. If your store says something different, we keep showing it next to your value so you can switch back.</p>
@@ -169,13 +197,56 @@ export default async function Product({ params, searchParams }: { params: Promis
               meta={[['Fingerprint', `v${d.fp.version as number}`], ['Package', String(d.fp.package_type ?? '—')]]}
               image={d.cutout ? { src: d.cutout, alt: `${d.sku.name as string} product cutout` } : null}
             />
-            <MetadataTable rows={[
-              { label: 'Package', value: String(d.fp.package_type ?? '—') },
-              { label: 'Closure', value: String(d.fp.closure ?? '—') },
-              { label: 'Label text', value: String(d.fp.label_text ?? '—') },
-              { label: 'Colours', value: <span className="ak-row">{(d.fp.dominant_colors as string[]).map((c) => <span key={c} title={c} style={{ width: 18, height: 18, background: c, border: '1px solid var(--rule)', display: 'inline-block' }} />)}</span> },
-              { label: 'Versions', value: d.fps.map((f) => `v${f.version} · ${formatDate(f.created_at as string)}`).join(', ') },
-            ]} />
+            <div className="ak-stack">
+              <MetadataTable rows={[
+                { label: 'Package', value: String(d.fp.package_type ?? '—') },
+                { label: 'Closure', value: String(d.fp.closure ?? '—') },
+                { label: 'Shape', value: (() => {
+                  const g = (d.fp.geometry ?? {}) as { silhouette?: string; aspectRatio?: number | null; measuredAspectRatio?: number };
+                  const ratio = g.measuredAspectRatio ?? g.aspectRatio;
+                  return g.silhouette || ratio ? `${g.silhouette ?? ''}${ratio ? ` · ${ratio}× taller than wide` : ''}`.replace(/^ · /, '') : '—';
+                })() },
+                { label: 'Label text', value: String(d.fp.label_text ?? '—') },
+                { label: 'Label crop', value: d.labelCrop ? <img src={d.labelCrop} alt="The label, cropped from your photo" style={{ maxWidth: 220, maxHeight: 120, objectFit: 'contain' }} /> : '—' },
+                { label: 'Product colour', value: String(d.fp.liquid_color ?? '—') },
+                { label: 'Colours', value: <span className="ak-row">{(d.fp.dominant_colors as string[]).map((c) => <span key={c} title={c} style={{ width: 18, height: 18, background: c, border: '1px solid var(--rule)', display: 'inline-block' }} />)}</span> },
+                { label: 'Versions', value: d.fps.map((f) => `v${f.version} · ${formatDate(f.created_at as string)}${f.reason ? ` (${REASON_WORDS[f.reason as string] ?? String(f.reason)})` : ''}`).join(', ') },
+              ]} />
+              {d.views.length ? (
+                <div className="ak-panel">
+                  <h2 className="ak-label">Reference views</h2>
+                  <div className="ak-grid-3">
+                    {d.views.map((v) => (
+                      <figure key={v.id} className="ak-frame" style={{ margin: 0 }}>
+                        <div className="ak-well" style={{ aspectRatio: '1' }}><img src={v.url} alt={`${VIEW_WORDS[v.view ?? 'other'] ?? 'Reference'} view`} style={{ objectFit: 'contain', width: '100%', height: '100%' }} /></div>
+                        <figcaption className="ak-index">{VIEW_WORDS[v.view ?? ''] ?? 'View'}{v.approved ? ' · approved' : ''}{v.pending ? ' · waiting for review' : ''}</figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                  {canEdit ? (
+                    <ActionForm slug={slug} action="approve-views" extra={{ skuId }} submit="Save approved views" fields={[{
+                      name: 'assetIds',
+                      label: 'These photos show the product as it is sold today',
+                      type: 'checkboxes',
+                      options: d.views.filter((v) => !v.pending).map((v, i) => ({ value: v.id, label: `${VIEW_WORDS[v.view ?? ''] ?? 'View'} ${i + 1}` })),
+                      checked: d.views.filter((v) => v.approved).map((v) => v.id),
+                      hint: 'Approved views are what every ad is checked against.',
+                    }]} />
+                  ) : null}
+                </div>
+              ) : null}
+              {canEdit ? (
+                <div className="ak-panel">
+                  <h2 className="ak-label">New packaging?</h2>
+                  <p className="ak-small ak-muted">Add a photo of the new pack. Ads you’ve already made keep the packaging they were made with; new ones use this.</p>
+                  <ActionForm slug={slug} action="packaging-refresh" multipart extra={{ skuId }} submit="Update packaging" fields={[
+                    { name: 'file', label: 'Photo of the new packaging (front)', type: 'file', accept: 'image/*', required: true },
+                    { name: 'labelText', label: 'What the new label says (if it changed)', type: 'textarea', max: 400 },
+                    { name: 'note', label: 'What changed (optional)', max: 200 },
+                  ]} />
+                </div>
+              ) : null}
+            </div>
           </div>
         ) : <p className="ak-muted">No packaging fingerprint yet — add a clear product photo.</p>
       ) : null}

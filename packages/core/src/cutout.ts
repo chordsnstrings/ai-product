@@ -2,7 +2,7 @@ import { withTenant, type Tx } from '@arkiv/db';
 import { logger } from '@arkiv/shared/log';
 import { assetBytes, saveAsset } from './assets';
 import type { TenantContext } from './context';
-import { emit } from './events';
+import { versionFingerprint } from './fingerprint';
 import { CUTOUT_TASK, removeBackground } from './model-gateway';
 import { dominantColors } from './vision';
 
@@ -112,13 +112,8 @@ async function segment(ctx: TenantContext, token: string, skuId: string): Promis
       source: 'generated',
       lineage: { from: photoAssetId, keyed: true, technique: 'segmentation', segmentation: r.technique, model: r.modelVersion, providerJobId: r.jobId, promptVersion: r.promptVersion, coverage: Math.round(r.coverage * 1000) / 1000, replaces: s!.cutoutAssetId },
     });
-    const [v] = await tx`select coalesce(max(version), 0) + 1 as v from visual_fingerprints where sku_id = ${skuId}`;
-    await tx`update visual_fingerprints set active = false where sku_id = ${skuId}`;
-    await tx`insert into visual_fingerprints (workspace_id, sku_id, version, reference_asset_ids, cutout_asset_id, label_text, brand_text, package_type, closure,
-               dominant_colors, liquid_color, transparency, critical_regions, thresholds)
-             values (${ws}, ${skuId}, ${v!.v}, ${fp.reference_asset_ids}, ${c.id}, ${fp.label_text}, ${fp.brand_text}, ${fp.package_type}, ${fp.closure},
-               ${tx.json(colors)}, ${fp.liquid_color}, ${fp.transparency}, ${tx.json(fp.critical_regions as never)}, ${tx.json(fp.thresholds as never)})`;
-    await emit(tx, ctx, 'VISUAL_FINGERPRINT_VERSIONED', { type: 'sku', id: skuId }, { version: v!.v, keyed: true, technique: 'segmentation' }, { providerJobId: r.jobId });
-    return { status: 'segmented', jobId: r.jobId, cutoutAssetId: c.id, version: Number(v!.v) };
+    // Same packaging, a cleaner cut-out: everything else carries over from the version it follows.
+    const v = await versionFingerprint(tx, ctx, skuId, { cutout_asset_id: c.id, dominant_colors: colors }, { reason: 'segmented_cutout', payload: { keyed: true, technique: 'segmentation' }, refs: { providerJobId: r.jobId } });
+    return { status: 'segmented', jobId: r.jobId, cutoutAssetId: c.id, version: v.version };
   });
 }

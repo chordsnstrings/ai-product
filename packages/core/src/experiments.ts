@@ -11,6 +11,7 @@ import { available, lockEntitlement } from './ledger';
 import type { Proposal } from './intel-schemas';
 import { enqueue, priorityFor, queueFor, Queues } from './outbox';
 import { recordFatigue } from './fatigue';
+import { projectFingerprintSql } from './fingerprint';
 import { FRESHNESS_DAYS } from './performance';
 import { approveForProduction } from './production';
 import { planSteps } from './progress';
@@ -79,7 +80,7 @@ export async function createExperiment(
   const [concept] = await tx`insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, prompt_version, model)
                              values (${ctx.workspaceId}, ${input.skuId}, ${projectId}, 1, 'A', ${tx.json(p as never)}, true, 'recommendation', 'n/a') returning id`;
   // Storyboard straight away (the approval boundary before expensive production, §13).
-  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${concept!.id}, 'generating') returning id`;
+  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status, visual_fingerprint_id) values (${ctx.workspaceId}, ${projectId}, ${concept!.id}, 'generating', ${projectFingerprintSql(tx, projectId)}) returning id`;
   await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: concept!.id, storyboard_id: sb!.id } });
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
   await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: concept!.id, actor: ctx.actor, experiment: true }, { priority: priorityFor(ctx) });

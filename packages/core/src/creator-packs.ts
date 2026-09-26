@@ -100,7 +100,7 @@ export async function creatorPackContent(tx: Tx, experimentId: string): Promise<
     productVisibleBySec: Math.min(3, reveal?.sec ?? 3),
     requiredShots: shots.filter((s) => s.purpose !== 'cta').map(({ purpose: _p, ...s }) => s),
     approvedClaims: allowed.map((c) => ({ wording: c.wording, qualifier: c.qualifier ?? null })),
-    forbiddenClaims: [...forbidden.map((f) => f.preferred_wording as string), ...(brand?.brain.prohibited ?? '').split(/[\n,;]+/).map((x) => x.trim())].filter(Boolean),
+    forbiddenClaims: [...forbidden.map((f) => f.preferred_wording as string), ...(brand?.brain.prohibited ?? '').split(/[\n,;]+/).map((x) => x.trim()), ...(brand?.brain.restrictions ?? [])].filter(Boolean),
     cta: safe((sb?.cta_text as string | null) ?? null) ?? brand?.brain.cta ?? 'Shop now',
     framing: FRAMING,
     voiceover: voiceover ? safe(voiceover) : null,
