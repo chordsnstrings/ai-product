@@ -22,6 +22,7 @@ export type AssetKind =
   | 'creator_footage'
   | 'evidence_doc'
   | 'brand_logo'
+  | 'brand_reference'
   | 'historical_creative'
   | 'thumbnail';
 
@@ -114,7 +115,7 @@ export async function storageUsedBytes(tx: Tx): Promise<number> {
 }
 
 /** Asset kinds a customer supplied and may delete themselves (standard §40). Generated work is not deleted here. */
-const CUSTOMER_DELETABLE = new Set<AssetKind>(['product_photo', 'reference_view', 'creator_footage', 'evidence_doc', 'brand_logo', 'historical_creative']);
+const CUSTOMER_DELETABLE = new Set<AssetKind>(['product_photo', 'reference_view', 'creator_footage', 'evidence_doc', 'brand_logo', 'brand_reference', 'historical_creative']);
 
 /**
  * Delete an uploaded asset (standard §40 "delete uploaded assets … subject to legitimate retention obligations").
@@ -127,7 +128,12 @@ export async function deleteAsset(tx: Tx, ctx: TenantContext, assetId: string): 
   const [a] = await tx`select id, kind, sku_id, storage_key from assets where id = ${assetId} and deleted_at is null for update`;
   if (!a) throw notFound('File not found');
   if (!CUSTOMER_DELETABLE.has(a.kind as AssetKind)) throw new DomainError('FORBIDDEN', 'Only files you uploaded can be deleted here.');
-  const [fp] = await tx`select 1 from visual_fingerprints where active and (${assetId} = any(reference_asset_ids) or cutout_asset_id = ${assetId}) limit 1`;
+  // The current fingerprint, and any older version an ad still in the works is pinned to (§42 packaging refresh).
+  const [fp] = await tx`select 1 from visual_fingerprints f
+                        where (f.active or exists (select 1 from storyboards sb join projects p on p.id = sb.project_id and p.workspace_id = sb.workspace_id
+                                                   where sb.visual_fingerprint_id = f.id and sb.status in ('generating', 'ready', 'approved')
+                                                     and p.state not in ('COMPLETE', 'REFUNDED', 'CANCELLED')))
+                          and (${assetId} = any(f.reference_asset_ids) or f.cutout_asset_id = ${assetId}) limit 1`;
   if (fp) throw new DomainError('CONFLICT', 'This photo is the one we catalogued your product from. Add another photo and re-analyse before deleting it.');
   const [kept] = await tx`
     select exists (select 1 from claim_evidence where source_asset_id = ${assetId}) as evidence,

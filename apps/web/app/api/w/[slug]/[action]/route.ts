@@ -48,6 +48,11 @@ import {
   STOCK_INTENTS,
   transferOwnership,
   updateBrandBrain,
+  createBrand,
+  assignSkuBrand,
+  toBrain,
+  refreshPackaging,
+  approveFingerprintViews,
   weekOf,
 } from '@arkiv/core';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
@@ -58,7 +63,16 @@ import { workspaceBySlug } from '@/lib/tenant';
 
 const uuid = z.string().uuid();
 const PLAN = z.enum(['LAUNCH', 'GROWTH', 'SCALE']);
-const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative', 'asset-replace']);
+const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative', 'asset-replace', 'brand-logo', 'brand-reference', 'packaging-refresh']);
+/** A textarea of one item per line (or comma-separated) → a clean list. */
+const lines = (v: string | undefined, max: number, len: number) => [...new Set((v ?? '').split(/\n|,(?![^(]*\))/).map((x) => x.trim()).filter(Boolean).map((x) => x.slice(0, len)))].slice(0, max);
+/** Brand colours as the form writes them (#hex, comma or space separated). */
+const hexes = (v: string | string[] | undefined) => {
+  const all = (Array.isArray(v) ? v : (v ?? '').split(/[\s,]+/)).map((x) => x.trim()).filter(Boolean);
+  const bad = all.find((x) => !/^#[0-9a-f]{6}$/i.test(x));
+  if (bad) throw new DomainError('INVALID', `“${bad}” isn’t a colour. Use hex codes like #1F2A44.`);
+  return [...new Set(all.map((x) => x.toUpperCase()))].slice(0, 6);
+};
 
 /**
  * Workspace-scoped mutations (plan 03 Part B). Every action resolves membership from the session (layer 1),
@@ -119,6 +133,46 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const assetId = uuid.parse(form.get('assetId'));
         if (!(file instanceof File) || !file.size) throw new DomainError('INVALID', 'Choose the replacement file.');
         const r = await t((tx) => once(tx, { assetId, file: fileIdentity(file) }, async () => replaceAsset(tx, ctx, assetId, Buffer.from(await file.arrayBuffer()), file.name)));
+        return json({ ok: true, ...r });
+      }
+      case 'brand-logo':
+        assertCan(ctx, 'sku.edit');
+      // falls through: the logo and the visual references are stored the same way
+      case 'brand-reference': {
+        // Brand Brain (§16) logo and visual references: stored as brand files, referenced by a new Brand Brain version.
+        assertCan(ctx, 'sku.edit');
+        const brandId = uuid.parse(form.get('brandId'));
+        if (!(file instanceof File) || !file.size) throw new DomainError('INVALID', 'Choose an image.');
+        const kind = action === 'brand-logo' ? 'brand_logo' : 'brand_reference';
+        const r = await t((tx) =>
+          once(tx, { brandId, kind, file: fileIdentity(file) }, async () => {
+            const [b] = await tx`select name, brain from brands where id = ${brandId} and workspace_id = ${ctx.workspaceId}`;
+            if (!b) throw new DomainError('NOT_FOUND', 'Brand not found');
+            const brain = toBrain(b.brain);
+            if (kind === 'brand_reference' && brain.visualReferenceAssetIds.length >= 12) throw new DomainError('INVALID', 'A brand keeps up to 12 visual references. Remove one first.');
+            const a = await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), kind, null, { filename: file.name, brandId });
+            return updateBrandBrain(tx, ctx, {
+              ...brain,
+              brandId,
+              name: b.name as string,
+              ...(kind === 'brand_logo' ? { logoAssetId: a.id } : { visualReferenceAssetIds: [...brain.visualReferenceAssetIds, a.id] }),
+            }, kind === 'brand_logo' ? 'logo updated' : 'visual reference added');
+          }),
+        );
+        return json({ ok: true, version: r.version });
+      }
+      case 'packaging-refresh': {
+        // §42 packaging refresh: new photos → a new Visual Fingerprint version; ads already made keep the old one.
+        const skuId = uuid.parse(form.get('skuId'));
+        const labelText = z.string().trim().max(400).optional().parse((form.get('labelText') as string | null) || undefined) ?? null;
+        const note = z.string().trim().max(200).optional().parse((form.get('note') as string | null) || undefined) ?? null;
+        const photos = form.getAll('photos').concat(file ? [file] : []).filter((f): f is File => f instanceof File && f.size > 0);
+        if (photos.length > 6) throw new DomainError('INVALID', 'Add up to 6 photos at a time.');
+        const r = await t((tx) =>
+          once(tx, { skuId, labelText, files: photos.map(fileIdentity) }, async () =>
+            refreshPackaging(tx, ctx, skuId, await Promise.all(photos.map(async (f) => ({ bytes: Buffer.from(await f.arrayBuffer()), filename: f.name }))), { labelText, note }),
+          ),
+        );
         return json({ ok: true, ...r });
       }
       case 'import-creative': {
@@ -392,10 +446,73 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     }
     /* ── Brand, workspace ── */
     case 'brand': {
-      const i = await body(req, z.object({ name: z.string().trim().min(1).max(80), tone: z.string().max(300).optional(), colors: z.array(z.string().regex(/^#[0-9a-f]{6}$/i)).max(6).optional(), prohibited: z.string().max(500).optional(), disclosures: z.string().max(500).optional(), cta: z.string().max(40).optional(), market: z.string().trim().min(2).max(3).optional(), reason: z.string().max(200).optional() }));
-      // A new immutable Brand Brain version (with diff + BRAND_BRAIN_VERSIONED), never an in-place overwrite.
-      const r = await t((tx) => updateBrandBrain(tx, ctx, i, i.reason?.trim() || null));
-      return json({ ok: true, version: r.version, changed: r.changed });
+      const i = await body(
+        req,
+        z.object({
+          brandId: uuid.optional(),
+          name: z.string().trim().min(1).max(80),
+          tone: z.string().max(300).optional(),
+          colors: z.union([z.array(z.string()).max(6), z.string().max(200)]).optional(),
+          headingFont: z.string().trim().max(60).optional(),
+          bodyFont: z.string().trim().max(60).optional(),
+          prohibited: z.string().max(500).optional(),
+          talentTypes: z.string().max(800).optional(),
+          disclosures: z.string().max(500).optional(),
+          cta: z.string().max(40).optional(),
+          ctaVocabulary: z.string().max(600).optional(),
+          claims: z.string().max(2000).optional(),
+          restrictions: z.string().max(1500).optional(),
+          market: z.string().trim().min(2).max(3).optional(),
+          reason: z.string().max(200).optional(),
+        }),
+      );
+      // The form carries the whole Brand Brain: a field left empty clears it. A new immutable version (with diff +
+      // BRAND_BRAIN_VERSIONED), never an in-place overwrite; new brand-wide claims go to each product's vault.
+      const r = await t((tx) =>
+        updateBrandBrain(tx, ctx, {
+          brandId: i.brandId ?? null,
+          name: i.name,
+          tone: i.tone,
+          colors: hexes(i.colors),
+          fonts: { heading: i.headingFont || null, body: i.bodyFont || null },
+          prohibited: i.prohibited,
+          talentTypes: lines(i.talentTypes, 10, 120),
+          disclosures: i.disclosures,
+          cta: i.cta,
+          ctaVocabulary: lines(i.ctaVocabulary, 12, 40),
+          claims: lines(i.claims, 20, 200),
+          restrictions: lines(i.restrictions, 20, 120),
+          market: i.market,
+          // The logo and visual references are managed by their own actions: left out, they keep their value.
+        }, i.reason?.trim() || null),
+      );
+      return json({ ok: true, version: r.version, changed: r.changed, claimsProposed: r.claimsProposed });
+    }
+    case 'brand-create': {
+      // Multi-brand plans (PLANS.brands): a new brand with its own Brand Brain.
+      const { name } = await body(req, z.object({ name: z.string().trim().min(1).max(80) }));
+      const r = await t((tx) => once(tx, { name }, () => createBrand(tx, ctx, name)));
+      return json({ ok: true, ...r, next: `/w/${slug}/settings/brand?brand=${r.brandId}` });
+    }
+    case 'brand-reference-remove': {
+      const i = await body(req, z.object({ brandId: uuid, assetId: uuid }));
+      const r = await t(async (tx) => {
+        const [b] = await tx`select name, brain from brands where id = ${i.brandId} and workspace_id = ${ctx.workspaceId}`;
+        if (!b) throw new DomainError('NOT_FOUND', 'Brand not found');
+        const brain = toBrain(b.brain);
+        return updateBrandBrain(tx, ctx, { ...brain, brandId: i.brandId, name: b.name as string, visualReferenceAssetIds: brain.visualReferenceAssetIds.filter((x) => x !== i.assetId), logoAssetId: brain.logoAssetId === i.assetId ? null : brain.logoAssetId }, 'visual reference removed');
+      });
+      return json({ ok: true, version: r.version });
+    }
+    case 'sku-brand': {
+      // Which of the workspace's brands a product belongs to (§16 Brand Brain sits above the SKU).
+      const i = await body(req, z.object({ skuId: uuid, brandId: uuid }));
+      return json({ ok: true, ...(await t((tx) => assignSkuBrand(tx, ctx, i.skuId, i.brandId))) });
+    }
+    case 'approve-views': {
+      // §16 "approved front/side/back views": the reference photos the merchant confirms show today's packaging.
+      const i = await body(req, z.object({ skuId: uuid, assetIds: z.array(uuid).max(12) }));
+      return json({ ok: true, ...(await t((tx) => approveFingerprintViews(tx, ctx, i.skuId, i.assetIds))) });
     }
     case 'rename': {
       const { name } = await body(req, z.object({ name: z.string().trim().min(1).max(80) }));

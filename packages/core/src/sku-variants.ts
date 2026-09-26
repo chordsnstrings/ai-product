@@ -3,6 +3,7 @@ import { DomainError } from '@arkiv/shared';
 import { saveAsset } from './assets';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
+import { pinnedFingerprintId } from './fingerprint';
 import { fetchImage, findSize, type ExtractedVariant } from './ingest';
 import { refreshStock } from './stock';
 import { usableAssetIds } from './vision';
@@ -147,7 +148,10 @@ export function variantTruth(variants: readonly SkuVariant[], chosen: SkuVariant
  * show the wrong size/shade"), then the fingerprint's reference photos.
  */
 export async function referenceAssetIds(tx: Tx, skuId: string, projectId: string | null): Promise<string[]> {
-  const [fp] = await tx`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and active`;
+  // The packaging the project's storyboard was drawn for (§42), else the SKU's current fingerprint.
+  const pinned = projectId ? await pinnedFingerprintId(tx, projectId) : null;
+  const [fp] = await tx`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and (id = ${pinned}::uuid or active)
+                        order by (id = ${pinned}::uuid) desc nulls last, version desc limit 1`;
   const variant = projectId ? await projectVariant(tx, projectId) : null;
   // Media held for compliance review (before/after, possible minors) or rejected is never a production input (plan 05 §14).
   return (await usableAssetIds(tx, [...new Set([...(variant?.imageAssetIds ?? []), ...((fp?.reference_asset_ids as string[]) ?? [])])])).slice(0, 2);

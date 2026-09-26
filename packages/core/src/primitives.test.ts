@@ -288,7 +288,7 @@ describe('model gateway', () => {
     await withTenant(t.workspaceId, async (tx) => {
       const [job] = await tx`select * from provider_jobs where id = ${r.jobId}`;
       expect(job!.status).toBe('succeeded');
-      expect(job!.prompt_version).toBe('extract-product@1.2.0');
+      expect(job!.prompt_version).toBe('extract-product@1.3.0');
       const [a] = await tx`select spent_micros from cost_authorizations where id = ${auth.authorizationId}`;
       expect(Number(a!.spent_micros)).toBe(Number(job!.actual_micros));
       const [c] = await tx`select sum(amount)::bigint as n from ledger_entries where type = 'PROVIDER_COST_RECORDED'`;

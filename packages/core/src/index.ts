@@ -70,6 +70,8 @@ export * from './landing';
 export * from './offer-experiments';
 export * from './finance';
 export * from './sku-transfer';
+export * from './sku-merge';
+export * from './fingerprint';
 export * from './evals';
 export * from './metrics';
 export * from './reviews';

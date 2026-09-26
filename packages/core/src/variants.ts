@@ -12,6 +12,7 @@ import { diffCompositions, disclosureMetadata, type CompositionManifest, type Vo
 import type { TenantContext } from './context';
 import { authorizeOrTakeOver, settle } from './cost-governor';
 import { versionCreative } from './creatives';
+import { genomeForGenerated } from './genome';
 import { allowedClaimTexts } from './creative-director';
 import { emit } from './events';
 import { setExperimentState } from './experiments';
@@ -215,7 +216,21 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
           skuId: p.sku_id as string,
           parentCreativeId: p.final_creative_id as string,
           projectId,
-          genome: { ...(v.genes as object), hookText: hook },
+          // The master's genome with this variant's genes and lineage (§19): what changed, its role, its parent.
+          genome: {
+            ...(await genomeForGenerated(tx, projectId, {
+              durationMs: built.manifest.durationMs,
+              hasVoiceover: !!built.manifest.voiceover,
+              hasCaptions: true,
+              syntheticVoice: !!built.manifest.disclosure?.syntheticVoice,
+              hookText: hook,
+              parentCreativeId: p.final_creative_id as string,
+              changedVariables: built.changed.length ? built.changed : ['hook'],
+              variantId: v.id as string,
+            })),
+            ...(v.genes as object),
+            hookText: hook,
+          },
           finalAssetIds: ids,
           composition: built.manifest,
           changedVariables: built.changed.length ? built.changed : ['hook'],
@@ -295,7 +310,18 @@ async function runBonusHook(ctx: TenantContext, projectId: string, holder: strin
         skuId: p.sku_id as string,
         parentCreativeId: p.final_creative_id as string,
         projectId,
-        genome: { hookText: hook, bonus: 'alternate_hook' },
+        genome: {
+          ...(await genomeForGenerated(tx, projectId, {
+            durationMs: built.manifest.durationMs,
+            hasVoiceover: !!built.manifest.voiceover,
+            hasCaptions: true,
+            syntheticVoice: !!built.manifest.disclosure?.syntheticVoice,
+            hookText: hook,
+            parentCreativeId: p.final_creative_id as string,
+            changedVariables: built.changed.length ? built.changed : ['hook'],
+          })),
+          bonus: 'alternate_hook',
+        },
         finalAssetIds: ids,
         composition: built.manifest,
         changedVariables: built.changed.length ? built.changed : ['hook'],

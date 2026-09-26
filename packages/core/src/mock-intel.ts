@@ -25,7 +25,7 @@ const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >
 
 const INGREDIENTS = ['niacinamide', 'hyaluronic acid', 'ceramides', 'squalane', 'peptides', 'vitamin c', 'retinol', 'glycerin', 'panthenol', 'centella', 'bakuchiol', 'azelaic acid'];
 
-export function mockExtraction(input: { name?: string; description?: string; text: string; ingredients?: string; sizeText?: string; labelText?: string | null }): ProductExtraction {
+export function mockExtraction(input: { name?: string; description?: string; text: string; ingredients?: string; sizeText?: string; labelText?: string | null; photoCount?: number }): ProductExtraction {
   const all = `${input.name ?? ''} ${input.description ?? ''} ${input.text}`;
   const notSkin = nonSkincareCategory(all);
   // Drug/SPF detection reads the product itself (name, description, INCI, label) — never the page's menus.
@@ -37,7 +37,9 @@ export function mockExtraction(input: { name?: string; description?: string; tex
     .split(/(?<=[.!])\s+/)
     .filter((s) => /\b(hydrat|smooth|bright|firm|plump|calm|sooth|absorb|glow|reduce|visibly|clinically|dermatologist|non-comedogenic|fragrance[- ]free|lightweight|acne|wrinkle)/i.test(s))
     .slice(0, 6)
-    .map((s) => ({ wording: s.trim().replace(/\s+/g, ' ').slice(0, 200), sourceQuote: s.trim().slice(0, 300) }));
+    .map((s) => ({ wording: s.trim().replace(/\s+/g, ' ').slice(0, 200), sourceQuote: s.trim().slice(0, 300), canonicalMeaning: s.trim().replace(/\s+/g, ' ').replace(/[.!]+$/, '').toLowerCase().slice(0, 160) }));
+  // Directions only as the page states them ("How to use: …", "Directions: …") — never written by the analyst.
+  const usageDirections = /\b(?:how to use|directions(?: for use)?)\s*[:\-]\s*([^.]{5,380}\.?)/i.exec(all)?.[1]?.trim() ?? null;
   const format = /\bgel\b/i.test(all) ? 'gel' : /\boil\b/i.test(all) ? 'oil' : /\bcream\b/i.test(all) ? 'cream' : category === 'serum' ? 'serum' : null;
   const packaging = category === 'serum' || category === 'facial_oil' ? 'dropper_bottle' : category === 'moisturizer' || category === 'mask' ? 'jar' : category === 'cleanser' ? 'pump_bottle' : 'bottle';
   return {
@@ -57,6 +59,11 @@ export function mockExtraction(input: { name?: string; description?: string; tex
     suggestedViews: ['side', 'swatch'],
     assetQualityConfidence: 0.8,
     multipleProductsVisible: false,
+    usageDirections,
+    photoViews: Array.from({ length: Math.max(1, Math.min(3, input.photoCount ?? 1)) }, (_, index) => ({ index, view: (['front', 'side', 'back'] as const)[index]! })),
+    labelBox: (input.labelText !== undefined ? input.labelText : (input.name ?? null)) ? { x: 0.3, y: 0.35, w: 0.4, h: 0.3 } : null,
+    closureBox: { x: 0.4, y: 0.04, w: 0.2, h: 0.16 },
+    geometry: packaging === 'jar' ? { silhouette: 'jar', aspectRatio: 0.7 } : packaging === 'pump_bottle' ? { silhouette: 'cylinder', aspectRatio: 3 } : { silhouette: 'cylinder', aspectRatio: 2.5 },
     // Test hooks: page text markers make the mock analyst flag the first photo for compliance review.
     imageReview: /\[\[review:before_after\]\]/.test(all) ? [{ index: 0, beforeAfter: true, possibleMinor: false }] : /\[\[review:minor\]\]/.test(all) ? [{ index: 0, beforeAfter: false, possibleMinor: true }] : [],
   };
@@ -197,6 +204,25 @@ export function mockGenome(text: string): Genome {
     hasCaptions: true,
     hasVoiceover: true,
     offer: /\d+% off|bundle|free shipping/.test(t) ? (t.match(/\d+% off|bundle|free shipping/)?.[0] ?? null) : null,
+    desiredOutcome: /hydrat|plump|dewy/.test(t) ? 'skin that feels hydrated' : /glow|bright/.test(t) ? 'a healthy-looking glow' : null,
+    objection: /sticky|greasy|heavy/.test(t) ? 'feels sticky or heavy' : /price|expensive/.test(t) ? 'price' : null,
+    benefit: /absorb|lightweight/.test(t) ? 'absorbs quickly' : null,
+    ingredientProposition: INGREDIENTS.find((i) => t.includes(i)) ?? null,
+    funnelIntent: /shop|buy|off|link/.test(t) ? 'conversion' : 'consideration',
+    emotionalFrame: /finally|love|obsessed/.test(t) ? 'relief' : null,
+    firstFrameSubject: angle === 'TEXTURE_SENSORY' ? 'texture' : /i |my /.test(t) ? 'face' : 'product',
+    firstMotion: angle === 'TEXTURE_SENSORY' ? 'drop falls onto skin' : null,
+    bodySequence: angle === 'TEXTURE_SENSORY' ? ['texture_demo', 'application', 'cta'] : angle === 'ROUTINE' ? ['routine', 'application', 'cta'] : ['problem', 'product_reveal', 'cta'],
+    sceneCount: null,
+    cutsPerMinute: null,
+    humanScreenRatio: null,
+    productScreenRatio: null,
+    voice: /\bi\b|\bmy\b/.test(t) ? 'creator' : 'voiceover_human',
+    music: 'unknown',
+    polish: null,
+    impliedClaimFlags: [],
+    beforeAfter: /before\s*(and|&|\/)\s*after/.test(t),
+    creatorConnection: /#ad\b|#sponsored|paid partnership/.test(t) ? 'paid' : /gifted/.test(t) ? 'gifted' : null,
   };
 }
 

@@ -49,6 +49,19 @@ const EXTRACT_PRODUCT_1_2 = EXTRACT_PRODUCT_1_1.replace(
 - If the product is not cosmetic skincare`,
 );
 
+// 1.3.0 adds the Visual Fingerprint and Product Brain fields: each claim's canonical meaning, usage directions,
+// each photo's view, the label/closure regions and the package geometry.
+const EXTRACT_PRODUCT_1_3 = `${EXTRACT_PRODUCT_1_2}
+- For each claim give "canonicalMeaning": what it means in plain words, the same for every phrasing of the same
+  claim ("24h hydration" and "hydrates for 24 hours" both mean "hydrates for 24 hours").
+- "usageDirections" copies how to use the product as the page or label states it; null if it is not stated.
+  Never write directions yourself.
+- "photoViews" gives each photo's view of the product by 0-based position: front, side, back, closure (a close-up
+  of the cap/dropper/pump), swatch (the product itself on skin or a surface), in_hand, or other.
+- "labelBox" and "closureBox" mark the main label and the closure in the first photo as fractions of the photo
+  (x, y from the top-left, w, h); null when not visible.
+- "geometry" describes the package as it stands: its silhouette and its height divided by its width.`;
+
 const CONCEPTS_1_0 = `You are the senior Creative Director for performance ads of one US skincare product (Meta and TikTok).
 Propose exactly three genuinely different creative TESTS — different hypotheses, not copy variations.
 Rules:
@@ -117,6 +130,18 @@ const THEMES_1_1 = `${THEMES_1_0}
 
 const GENOME_1_0 = `You annotate a short-form skincare ad with a fixed creative taxonomy. Choose the closest controlled values;
 do not invent new ones. Record the exact hook text if present.`;
+
+// 1.1.0: the full §19 genome families — strategy, hook, body/proof, production and compliance genes.
+const GENOME_1_1 = `${GENOME_1_0}
+Also record, only from what the ad itself shows or says (null or empty when it doesn't):
+- Strategy: the desired outcome it promises, the objection it answers, the benefit it leads with, any ingredient
+  proposition, its funnel intent (awareness, consideration, conversion, retention) and its emotional frame.
+- Hook: what the first frame shows and the first motion.
+- Body: the beats after the hook, in order, from the controlled list.
+- Production: scene count, cuts per minute, the share of screen time showing a person and showing the product, the
+  voice (none, creator, human or synthetic voice-over), music and polish style.
+- Compliance: any implied claim in plain words, whether it shows a before/after, and the creator's connection to the
+  brand if the ad discloses one. These flags are data for our compliance team, never a verdict.`;
 
 const FIDELITY_1_0 = `You are a strict product-accuracy inspector. Compare the generated frame with the reference product photos.
 Report whether it is the same product: label text, closure (dropper/pump/cap), package shape, colour, product
@@ -188,6 +213,16 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     changelog: 'Reads the net size printed on the packaging (sizeText) and flags sunscreen/OTC drugs as drug_or_sunscreen for the scope check.',
     author: AUTHOR,
     date: '2026-09-24',
+  },
+  {
+    name: 'extract-product',
+    version: '1.3.0',
+    text: EXTRACT_PRODUCT_1_3,
+    variables: { photos: 'up to 3 product photos (JPEG)', product_page: 'untrusted product page JSON: name, description, ingredients, size, price' },
+    outputSchema: 'ProductExtraction',
+    changelog: 'Adds each claim’s canonical meaning, verbatim usage directions, per-photo views, label/closure boxes and package geometry (standard §16, §17).',
+    author: AUTHOR,
+    date: '2026-09-25',
   },
   {
     name: 'concepts',
@@ -309,6 +344,16 @@ export const PROMPT_TEMPLATES: readonly PromptTemplate[] = [
     changelog: 'Initial Creative Genome annotation template.',
     author: AUTHOR,
     date: '2026-09-23',
+  },
+  {
+    name: 'genome',
+    version: '1.1.0',
+    text: GENOME_1_1,
+    variables: { creative: 'script, overlays and scene descriptions of one ad', taxonomy: 'controlled vocabulary (Appendix A)' },
+    outputSchema: 'Genome',
+    changelog: 'Adds the standard §19 strategy, hook, body/proof, production and compliance genes.',
+    author: AUTHOR,
+    date: '2026-09-25',
   },
   {
     name: 'fidelity',

@@ -300,6 +300,76 @@ function HeroPicker({ projectId, photoUrl, onPicked }: { projectId: string; phot
   );
 }
 
+/** Plan 03 P2 "URL is a collection page or home page → 'Which product?' picker from parsed products." */
+function ProductChooser({ projectId, choices, onChosen }: { projectId: string; choices: { name: string; url: string }[]; onChosen: () => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  async function choose(url: string) {
+    setBusy(url);
+    setErr(null);
+    try {
+      await api(`/api/projects/${projectId}/choose-product`, { url });
+      onChosen();
+    } catch (e) {
+      setErr((e as Error).message);
+      setBusy(null);
+    }
+  }
+  return (
+    <div className="ak-panel ak-stack">
+      <h2 className="ak-label">Which product?</h2>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>That page lists several products. Choose the one this ad is for — nothing has been charged.</p>
+      <ul className="ak-stack" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+        {choices.map((c) => (
+          <li key={c.url} className="ak-between" style={{ gap: 12 }}>
+            <span style={{ overflowWrap: 'anywhere' }}>{c.name}</span>
+            <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => void choose(c.url)}>{busy === c.url ? 'Reading…' : 'This one'}</Button>
+          </li>
+        ))}
+      </ul>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
+/** §42 Duplicate import: "This looks like No. 003 — update it or add as new?" */
+function DuplicateChoice({ projectId, dup, onKept }: { projectId: string; dup: { catalogueNo: number; name: string; blocking: boolean }; onKept: () => void }) {
+  const [busy, setBusy] = useState<'merge' | 'keep' | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [merged, setMerged] = useState(false);
+  async function decide(choice: 'merge' | 'keep') {
+    setBusy(choice);
+    setErr(null);
+    try {
+      const r = await api<{ next?: string | null }>(`/api/projects/${projectId}/duplicate`, { choice });
+      if (choice === 'merge') {
+        if (r.next) window.location.assign(r.next);
+        else setMerged(true);
+        return;
+      }
+      onKept();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(null);
+  }
+  const no = `No. ${String(dup.catalogueNo).padStart(3, '0')}`;
+  if (merged) return <p role="status" className="ak-body">Added to {no} ({dup.name}). Its facts, photos and claims now include what we found here.</p>;
+  return (
+    <div className="ak-panel ak-stack">
+      <h2 className="ak-label">Is this {no}?</h2>
+      <p className="ak-small ak-muted" style={{ margin: 0 }}>
+        This looks like {no} ({dup.name}), already in your catalogue. Update that product with what we found here, or keep this as a separate product.
+      </p>
+      <div className="ak-row">
+        <Button size="sm" disabled={!!busy} onClick={() => void decide('merge')}>{busy === 'merge' ? 'Updating…' : `Update ${no}`}</Button>
+        <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => void decide('keep')}>{busy === 'keep' ? 'Saving…' : dup.blocking ? 'Add as new and carry on' : 'Keep as new'}</Button>
+      </div>
+      {err ? <p className="ak-error" role="alert">{err}</p> : null}
+    </div>
+  );
+}
+
 /** Plan 03 P2: an out-of-scope product gets a waitlist email instead (no generation spend). */
 function WaitlistForm({ projectId }: { projectId: string }) {
   const [email, setEmail] = useState('');
@@ -528,6 +598,8 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                 <div className="ak-stack">
                   <Banner tone="warn">{v.project.failureReason ?? 'We couldn’t finish reading this product.'}</Banner>
                   {v.sku.selectProduct ? <HeroPicker projectId={projectId} photoUrl={v.sku.selectProduct.photoUrl} onPicked={() => { resume(); refresh(); }} /> : null}
+                  {v.sku.productChoices ? <ProductChooser projectId={projectId} choices={v.sku.productChoices} onChosen={() => { resume(); refresh(); }} /> : null}
+                  {v.sku.duplicate?.blocking ? <DuplicateChoice projectId={projectId} dup={v.sku.duplicate} onKept={() => { resume(); refresh(); }} /> : null}
                   {v.sku.sourceUrl ? <p className="ak-small ak-muted" style={{ margin: 0, overflowWrap: 'anywhere' }}>Your link is saved: {v.sku.sourceUrl}</p> : null}
                   <PhotoAdder
                     projectId={projectId}
@@ -536,7 +608,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                     cta="Add photos and continue"
                     onAdded={() => { resume(); refresh(); }}
                   />
-                  {v.sku.usablePhotos && !v.sku.selectProduct ? (
+                  {v.sku.usablePhotos && !v.sku.selectProduct && !v.sku.productChoices && !v.sku.duplicate?.blocking ? (
                     <>
                       <MissingFacts projectId={projectId} fields={v.sku.missingFacts} onSaved={refresh} />
                       <div><Button variant="secondary" onClick={() => void retryAnalysis()}>Try again</Button></div>
@@ -569,6 +641,7 @@ export function AnalysisFlow({ projectId }: { projectId: string }) {
                   onAdded={refresh}
                 />
               ) : null}
+              {!failed && v.sku.duplicate && !v.sku.duplicate.blocking && v.access.signedIn ? <DuplicateChoice projectId={projectId} dup={v.sku.duplicate} onKept={refresh} /> : null}
               {!failed && v.sku.variants.length > 1 ? <VariantPicker projectId={projectId} v={v} onSaved={refresh} /> : null}
               {!failed && v.sku.missingEvidence.length ? (
                 <div>

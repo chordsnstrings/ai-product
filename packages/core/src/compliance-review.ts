@@ -2,6 +2,7 @@ import type { Tx } from '@arkiv/db';
 import { DomainError, newId } from '@arkiv/shared';
 import { assertStaff, audit, type Staff } from './admin';
 import type { TenantContext } from './context';
+import { withClaimChange } from './claims';
 import { emit } from './events';
 import { attestationOf } from './vision';
 
@@ -34,7 +35,9 @@ async function restrictedClaim(tx: Tx, workspaceId: string, claimId: string) {
 export async function keepClaimRestricted(tx: Tx, s: Staff, workspaceId: string, claimId: string, note: string) {
   assertStaff(s, 'claims.review');
   const c = await restrictedClaim(tx, workspaceId, claimId);
-  await tx`update claims set compliance_note = ${note}, reviewed_at = now(), approved_by = ${`staff:${s.staffId}`} where id = ${claimId} and workspace_id = ${workspaceId}`;
+  await withClaimChange(tx, { kind: 'kept_restricted', actor: `staff:${s.staffId}`, reason: note }, () =>
+    tx`update claims set compliance_note = ${note}, reviewed_at = now(), approved_by = ${`staff:${s.staffId}`} where id = ${claimId} and workspace_id = ${workspaceId}`,
+  );
   await emit(tx, staffCtx(s, workspaceId), 'CLAIM_RESTRICTED', { type: 'claim', id: claimId }, { reason: note }, { skuId: c.sku_id as string });
   await record(tx, s, workspaceId, 'claim_review', { type: 'claim', id: claimId }, 'keep_restricted', note);
   await audit(tx, s, 'claim.keep_restricted', { type: 'claim', id: claimId }, { workspaceId, reason: note, before: { compliance_note: c.compliance_note }, after: { status: 'RESTRICTED', compliance_note: note } });
@@ -45,7 +48,9 @@ export async function keepClaimRestricted(tx: Tx, s: Staff, workspaceId: string,
 export async function requestClaimEvidence(tx: Tx, s: Staff, workspaceId: string, claimId: string, note: string) {
   assertStaff(s, 'claims.review');
   const c = await restrictedClaim(tx, workspaceId, claimId);
-  await tx`update claims set compliance_note = ${note}, evidence_requested_at = now() where id = ${claimId} and workspace_id = ${workspaceId}`;
+  await withClaimChange(tx, { kind: 'evidence_requested', actor: `staff:${s.staffId}`, reason: note }, () =>
+    tx`update claims set compliance_note = ${note}, evidence_requested_at = now() where id = ${claimId} and workspace_id = ${workspaceId}`,
+  );
   await emit(tx, staffCtx(s, workspaceId), 'CLAIM_EVIDENCE_REQUESTED', { type: 'claim', id: claimId }, { note }, { skuId: c.sku_id as string });
   await record(tx, s, workspaceId, 'claim_review', { type: 'claim', id: claimId }, 'request_evidence', note);
   await audit(tx, s, 'claim.request_evidence', { type: 'claim', id: claimId }, { workspaceId, reason: note, after: { evidence_requested: true } });

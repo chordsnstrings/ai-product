@@ -182,6 +182,23 @@ export function nonSkincareCategory(text: string): string | null {
   return null;
 }
 
+/** The skincare category a store's own category names ("Skin Care > Serums" → serum); null when it names none. */
+export function storeCategory(text: string): string | null {
+  const t = text.toLowerCase();
+  const rules: [RegExp, string][] = [
+    [/\bserums?\b|\bessence\b|\bampoule/, 'serum'],
+    [/\bcleans(?:er|ing)|face ?wash/, 'cleanser'],
+    [/\beye\b/, 'eye'],
+    [/\bmasks?\b/, 'mask'],
+    [/facial oil|face oil|\boils?\b/, 'facial_oil'],
+    [/\btoners?\b|\bmists?\b/, 'toner'],
+    [/exfoliat|\bpeel|\bscrub/, 'exfoliant'],
+    [/\bbalms?\b/, 'balm'],
+    [/moisturi[sz]er|\bcreams?\b|\blotion/, 'moisturizer'],
+  ];
+  return rules.find(([re]) => re.test(t))?.[1] ?? null;
+}
+
 export function detectSkincareCategory(text: string): string {
   const t = text.toLowerCase();
   const table: [RegExp, string][] = [
@@ -258,3 +275,51 @@ export function fleschKincaidGrade(copy: string | readonly string[]): number {
 
 /** Plan 04 L14: the highest reading grade landing copy may have. */
 export const MAX_LANDING_GRADE = 7;
+
+// ───────────── Claim meaning (standard §17 canonical_meaning) ─────────────
+
+/** Words that carry no claim meaning ("for", "the", "your skin"): dropped from the meaning key. */
+const MEANING_STOPWORDS = new Set(['a', 'an', 'the', 'for', 'of', 'to', 'up', 'your', 'you', 'our', 'with', 'and', 'in', 'on', 'it', 'its', 'is', 'are', 'that', 'this', 'by', 'skin', 'product', 'formula', 'helps', 'help']);
+/** Same meaning, different word: folded onto one form (before and after stemming). */
+const MEANING_SYNONYMS: Record<string, string> = {
+  moisturize: 'hydrate', moisturise: 'hydrate', moisturizes: 'hydrate', moisturises: 'hydrate', moisturizing: 'hydrate', moisturising: 'hydrate', moisturiz: 'hydrate', moisturis: 'hydrate',
+  moisture: 'hydrate', hydration: 'hydrate', hydrating: 'hydrate', hydrates: 'hydrate', hydrated: 'hydrate', hydrat: 'hydrate',
+  hrs: 'hour', hr: 'hour', h: 'hour', hours: 'hour', percent: '%', pct: '%', days: 'day', weeks: 'week', wks: 'week', wk: 'week',
+};
+const NUMBER_WORDS: Record<string, string> = { one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9', ten: '10', twelve: '12', twenty: '20', thirty: '30' };
+
+function stem(w: string): string {
+  if (w.length <= 4 || /\d/.test(w)) return w;
+  for (const suffix of ['ations', 'ation', 'ings', 'ing', 'ness', 'ies', 'ied', 'es', 'ed', 'ly', 'er', 's']) {
+    if (w.endsWith(suffix) && w.length - suffix.length >= 4) return suffix === 'ies' || suffix === 'ied' ? `${w.slice(0, -3)}y` : w.slice(0, -suffix.length);
+  }
+  // "reduce" / "reduces" / "reduced" share one stem.
+  return w.endsWith('e') ? w.slice(0, -1) : w;
+}
+
+/**
+ * Deterministic meaning key of a claim wording: lower-cased, numbers and units normalised ("24h", "24-hour",
+ * "twenty-four hours" → "24 hour"), synonyms folded, key verbs stemmed, filler dropped and the words sorted — so the
+ * same claim found on the page and on the label ("24h hydration" / "hydrates for 24 hours") is one claim. Negations
+ * ("not", "no", "free") are kept: they change the meaning. The fallback when no model meaning is given, and how
+ * two meanings are compared.
+ */
+export function claimMeaningKey(text: string): string {
+  const s = text
+    .toLowerCase()
+    .replace(/twenty[\s-]four/g, '24')
+    .replace(/[“”"'’`]/g, '')
+    .replace(/(\d+(?:\.\d+)?)\s*%/g, '$1 %')
+    .replace(/(\d+(?:\.\d+)?)\s*-?\s*(h|hr|hrs|hours?|days?|weeks?|wks?|ml|g|oz)\b/g, '$1 $2')
+    .replace(/[^a-z0-9%.\s]+/g, ' ')
+    .replace(/\.(?!\d)/g, ' ');
+  const words = s
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => NUMBER_WORDS[w] ?? w)
+    .map((w) => MEANING_SYNONYMS[w] ?? w)
+    .filter((w) => !MEANING_STOPWORDS.has(w))
+    .map(stem)
+    .map((w) => MEANING_SYNONYMS[w] ?? w);
+  return [...new Set(words)].sort().join(' ');
+}

@@ -17,10 +17,12 @@ export interface ProductImagery {
 }
 
 /** The active Visual Fingerprint's cut-out (with whether keying succeeded), first reference photo and palette. */
-export async function productImagery(tx: Tx, skuId: string): Promise<ProductImagery> {
+export async function productImagery(tx: Tx, skuId: string, fingerprintId: string | null = null): Promise<ProductImagery> {
+  // The fingerprint version the work is pinned to (a storyboard's packaging, §42), else the active one.
   const [fp] = await tx`select f.cutout_asset_id, f.reference_asset_ids, f.dominant_colors, a.lineage->>'keyed' as keyed, a.lineage->>'from' as cut_from
                         from visual_fingerprints f left join assets a on a.id = f.cutout_asset_id and a.workspace_id = f.workspace_id
-                        where f.sku_id = ${skuId} and f.active`;
+                        where f.sku_id = ${skuId} and (f.id = ${fingerprintId}::uuid or f.active)
+                        order by (f.id = ${fingerprintId}::uuid) desc nulls last, f.version desc limit 1`;
   if (!fp) return { cutout: null, reference: null, palette: [] };
   // Media held for compliance review or rejected, or whose rights expired or are frozen by a takedown case, is never
   // drawn into a frame (plan 05 §14–§15) — nor is a cut-out made from such a photo.

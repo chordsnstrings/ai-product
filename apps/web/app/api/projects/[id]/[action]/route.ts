@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { withTenant } from '@arkiv/db';
-import { acceptSourceFact, addProductPhotos, produceFreeRevision, reportNotRight, selectHeroProduct, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, produceWithCreativeTest, retryAnalysis, retryProduction, retryStoryboard, selectConcept, selectVariant } from '@arkiv/core';
+import { acceptSourceFact, addProductPhotos, chooseProduct, resolveDuplicate, produceFreeRevision, reportNotRight, selectHeroProduct, cancelProduction, confirmFacts, MAX_ADDED_PHOTOS, decideFact, finishAfterEdit, recordAssetWatched, reopenForEdit, requestConcepts, requestRecompose, produceWithCreativeTest, retryAnalysis, retryProduction, retryStoryboard, selectConcept, selectVariant } from '@arkiv/core';
 import { closeOpenCheckouts, startProductionCheckout } from '@arkiv/billing';
 import { CreativeGoal, DomainError } from '@arkiv/shared';
 import { body, json, route } from '@/lib/http';
@@ -18,6 +18,8 @@ import { projectAccess } from '@/lib/tenant';
  *   cancel    – cancel the production; what happens to the credit or payment follows the dispatch/spend state
  *   recompose – "Update my ad" after the product's price or size changed: new on-screen text, same footage (§42)
  *   select-product – mark the hero product in a photo that shows several (plan 03 P2); the analysis resumes
+ *   choose-product – "Which product?" on a collection/home page link (plan 03 P2): one of the listed products
+ *   duplicate – "This looks like No. 003": merge into that product, or keep this as a new one (§42)
  *   storyboard-retry – draw the chosen idea's storyboard again after we failed to (P7 edge, §14)
  *   retry-analysis – read the product again after a failed analysis (plan 03 P3)
  *   photos    – add photos to this product (multipart `photos`): resumes an analysis waiting for them (the URL
@@ -154,6 +156,19 @@ export const POST = route(async (req, { params }: { params: Promise<{ id: string
       const box = await body(req, z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1), w: z.number().gt(0).max(1), h: z.number().gt(0).max(1) }));
       const r = await withTenant(a.ctx.workspaceId, (tx) => selectHeroProduct(tx, a.ctx, id, box));
       return json({ ok: true, queued: true, ...r }, 202);
+    }
+    case 'choose-product': {
+      // Plan 03 P2: the link listed several products — the analysis reads the one chosen (from that list, same site).
+      const { url } = await body(req, z.object({ url: z.string().url().max(2000) }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => chooseProduct(tx, a.ctx, id, url));
+      return json({ ok: true, queued: true, ...r }, 202);
+    }
+    case 'duplicate': {
+      // §42 Duplicate import: fold this import into the product already catalogued, or keep it as a new product.
+      const { choice } = await body(req, z.object({ choice: z.enum(['merge', 'keep']) }));
+      const r = await withTenant(a.ctx.workspaceId, (tx) => resolveDuplicate(tx, a.ctx, id, choice));
+      const slug = r.mergedInto && !a.provisional ? (await withTenant(a.ctx.workspaceId, (tx) => tx`select slug from workspaces where id = ${a.ctx.workspaceId}`))[0]?.slug : null;
+      return json({ ok: true, ...r, next: r.mergedInto ? (slug ? `/w/${slug as string}/products/${r.mergedInto}` : null) : null }, r.mergedInto ? 200 : 202);
     }
     case 'storyboard-retry': {
       const r = await withTenant(a.ctx.workspaceId, (tx) => retryStoryboard(tx, a.ctx, id));

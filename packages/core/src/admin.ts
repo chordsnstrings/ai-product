@@ -1,6 +1,6 @@
 import { withAdmin, type Tx } from '@arkiv/db';
 import { DomainError, newId, type Actor, type PlanCode, type ProjectState, type RiskIndicator, type StaffRole, type WorkspaceState } from '@arkiv/shared';
-import { approveClaim, claimMarket } from './claims';
+import { approveClaim, claimMarket, withClaimChange } from './claims';
 import type { TenantContext } from './context';
 import { settle } from './cost-governor';
 import { emit } from './events';
@@ -372,8 +372,10 @@ registerExecutor('staff.roles', async (p, { approver }) =>
 registerExecutor('claim.unblock', async (p, { approver }) =>
   withAdmin(async (tx) => {
     const ws = p.workspaceId as string;
-    const [c] = await tx`update claims set status = 'MERCHANT_REVIEW_REQUIRED', block_reason = null, reviewed_at = now()
-                         where id = ${p.claimId as string} and workspace_id = ${ws} and status = 'BLOCKED' returning id`;
+    const [c] = await withClaimChange(tx, { kind: 'unblocked', actor: `staff:${approver.staffId}`, reason: String(p.reason ?? '') || null }, () =>
+      tx`update claims set status = 'MERCHANT_REVIEW_REQUIRED', block_reason = null, reviewed_at = now()
+         where id = ${p.claimId as string} and workspace_id = ${ws} and status = 'BLOCKED' returning id`,
+    );
     if (!c) throw new DomainError('CONFLICT', 'Claim is not blocked');
     await emit(tx, staffCtx(approver, ws), 'CLAIM_UNBLOCKED', { type: 'claim', id: p.claimId as string }, { from: 'BLOCKED', to: 'MERCHANT_REVIEW_REQUIRED', reason: String(p.reason ?? '') });
     await audit(tx, approver, 'claim.unblocked', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string, before: { status: 'BLOCKED' }, after: { status: 'MERCHANT_REVIEW_REQUIRED' } });

@@ -10,6 +10,7 @@ import { classifyClaim, isFirstPersonTestimonial, scanCreativeText, showsSynthet
 import { CLEAN_PHOTO_TIP, exactProductFrame, productImagery } from './composite';
 import type { TenantContext } from './context';
 import { cutoutState, segmentCutout, wantsSegmentation } from './cutout';
+import { fingerprintFor, pinnedFingerprintId, projectFingerprintSql, sceneFingerprintSql } from './fingerprint';
 import { authorize, authorizeOrTakeOver, estimateCost, settle } from './cost-governor';
 import { allowedClaimTexts, planStoryboard } from './creative-director';
 import { emit } from './events';
@@ -82,7 +83,7 @@ export async function selectConcept(tx: Tx, ctx: TenantContext, projectId: strin
     }
   }
   await transition(tx, ctx, projectId, 'CONCEPT_SELECTED', { patch: { selected_concept_id: conceptId } });
-  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${conceptId}, 'generating') returning id`;
+  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status, visual_fingerprint_id) values (${ctx.workspaceId}, ${projectId}, ${conceptId}, 'generating', ${projectFingerprintSql(tx, projectId)}) returning id`;
   await tx`update storyboards set status = 'superseded' where project_id = ${projectId} and id <> ${sb!.id} and status in ('ready','generating')`;
   await tx`update projects set storyboard_id = ${sb!.id} where id = ${projectId}`;
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
@@ -168,11 +169,11 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
     const [pv] = await withTenant(ws, (tx) => tx`select sku_variant_id from projects where id = ${projectId}`);
     if (pv?.sku_variant_id) await ensureVariantImage(ctx, pv.sku_variant_id as string);
     if (segment) await segmentCutout({ ctx, token: auth.token, skuId });
-    const { imagery, refs, refAssetIds } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId), refs: await referenceDataUrls(tx, skuId, projectId), refAssetIds: await referenceAssetIds(tx, skuId, projectId) }));
+    const { imagery, refs, refAssetIds } = await withTenant(ws, async (tx) => ({ imagery: await productImagery(tx, skuId, await pinnedFingerprintId(tx, projectId)), refs: await referenceDataUrls(tx, skuId, projectId), refAssetIds: await referenceAssetIds(tx, skuId, projectId) }));
     const cut = imagery.cutout?.keyed ? imagery.cutout : null;
     // What a generated frame is checked against (§16): the active fingerprint, its reference photos and the cut-out.
     const fidelity = await withTenant(ws, async (tx) => {
-      const [fp] = await tx`select label_text, closure, dominant_colors, liquid_color, thresholds from visual_fingerprints where sku_id = ${skuId} and active order by version desc limit 1`;
+      const fp = await fingerprintFor(tx, skuId, await pinnedFingerprintId(tx, projectId));
       const refBytes = await Promise.all(refAssetIds.slice(0, 2).map((id) => assetBytes(tx, id)));
       return {
         referenceBytes: refBytes,
@@ -241,10 +242,10 @@ export async function generateStoryboard(ctx: TenantContext, projectId: string, 
         // §41: the job's output id, and the job (with its cost) on the version it produced.
         const jobId = (lineage.providerJobId as string | undefined) ?? null;
         const { costMicros } = jobId ? await linkJobOutput(tx, ws, jobId, a.id) : { costMicros: 0 };
-        const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage, qa, provider_job_id, cost_micros)
-                             values (${ws}, ${s.id}, 1, 'frame', ${a.id}, ${technique}, ${jobModel}, 'succeeded', ${tx.json(lineage as never)}, ${tx.json((qa ?? {}) as never)}, ${jobId}, ${costMicros})
+        const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage, qa, provider_job_id, cost_micros, visual_fingerprint_id)
+                             values (${ws}, ${s.id}, 1, 'frame', ${a.id}, ${technique}, ${jobModel}, 'succeeded', ${tx.json(lineage as never)}, ${tx.json((qa ?? {}) as never)}, ${jobId}, ${costMicros}, ${sceneFingerprintSql(tx, s.id as string)})
                              on conflict (workspace_id, scene_id, kind, version) do update set asset_id = excluded.asset_id, technique = excluded.technique, lineage = excluded.lineage, qa = excluded.qa,
-                               provider_job_id = excluded.provider_job_id, cost_micros = excluded.cost_micros
+                               provider_job_id = excluded.provider_job_id, cost_micros = excluded.cost_micros, visual_fingerprint_id = excluded.visual_fingerprint_id
                              returning id`;
         await tx`update scenes set current_version_id = ${v!.id} where id = ${s.id}`;
       });
@@ -298,7 +299,7 @@ export async function retryStoryboard(tx: Tx, ctx: TenantContext, projectId: str
   if (p.state !== 'CONCEPT_SELECTED' || p.sb_status !== 'failed' || !p.selected_concept_id) throw new DomainError('CONFLICT', 'This storyboard doesn’t need another try.');
   const [f] = await tx`select count(*)::int as n from storyboards where project_id = ${projectId} and concept_id = ${p.selected_concept_id} and status = 'failed'`;
   if (Number(f!.n) >= STORYBOARD_RETRY_LIMIT) throw new DomainError('CONFLICT', 'We couldn’t draw this idea. Pick another idea — nothing was charged.', { pickAnother: true });
-  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status) values (${ctx.workspaceId}, ${projectId}, ${p.selected_concept_id}, 'generating') returning id`;
+  const [sb] = await tx`insert into storyboards (workspace_id, project_id, concept_id, status, visual_fingerprint_id) values (${ctx.workspaceId}, ${projectId}, ${p.selected_concept_id}, 'generating', ${projectFingerprintSql(tx, projectId)}) returning id`;
   await tx`update projects set storyboard_id = ${sb!.id} where id = ${projectId}`;
   await planSteps(tx, ctx.workspaceId, sb!.id as string, STORYBOARD_STEPS);
   await enqueue(tx, ctx.workspaceId, queueFor(Queues.generateStoryboard, ctx), { projectId, storyboardId: sb!.id, conceptId: p.selected_concept_id, actor: ctx.actor }, { singletonKey: `sb:${sb!.id}`, priority: priorityFor(ctx) });
@@ -418,7 +419,7 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
                          join projects p on p.id = sb.project_id join skus sk on sk.id = p.sku_id where s.id = ${sceneId}`;
     if (!s) throw new DomainError('NOT_FOUND', 'Scene not found');
     const [done] = await tx`select 1 from scene_versions where scene_id = ${sceneId} and kind = 'frame' and version = ${version}`;
-    const imagery = done ? null : await productImagery(tx, s.sku_id as string);
+    const imagery = done ? null : await productImagery(tx, s.sku_id as string, await pinnedFingerprintId(tx, s.project_id as string));
     return { s, done: !!done, cut: imagery?.cutout?.keyed ? imagery.cutout : null, refs: done ? [] : await referenceDataUrls(tx, s.sku_id as string, s.project_id as string), refAssetIds: done ? [] : await referenceAssetIds(tx, s.sku_id as string, s.project_id as string) };
   });
   if (info.done) {
@@ -475,8 +476,8 @@ export async function regenerateFrame(ctx: TenantContext, sceneId: string, instr
     await withTenant(ws, async (tx) => {
       const a = await saveAsset(tx, ws, { bytes, mime: 'image/png', kind: 'storyboard_frame', skuId: info.s.sku_id as string, source: 'generated', lineage: { sceneId, ...lineage } });
       const { costMicros } = await linkJobOutput(tx, ws, img.jobId, a.id);
-      const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage, provider_job_id, cost_micros)
-                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, ${composite ? 'generated_bg+exact_product' : 'generated'}, ${img.modelVersion}, 'succeeded', ${tx.json(lineage as never)}, ${img.jobId}, ${costMicros}) returning id`;
+      const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, asset_id, technique, model, status, lineage, provider_job_id, cost_micros, visual_fingerprint_id)
+                           values (${ws}, ${sceneId}, ${version}, 'frame', ${a.id}, ${composite ? 'generated_bg+exact_product' : 'generated'}, ${img.modelVersion}, 'succeeded', ${tx.json(lineage as never)}, ${img.jobId}, ${costMicros}, ${sceneFingerprintSql(tx, sceneId)}) returning id`;
       await tx`update scenes set current_version_id = ${v!.id}, free_regenerations_used = free_regenerations_used + 1,
                  visual_plan = ${`${info.s.visual_plan}. ${instruction}`.slice(0, 300)} where id = ${sceneId}`;
       await settle(tx, ctx, auth.authorizationId, 'consumed');

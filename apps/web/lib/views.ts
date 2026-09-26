@@ -25,6 +25,7 @@ import {
   stepEta,
   storyboardView,
   verifiedIngredients,
+  isPartFactKey,
   type Proposal,
   type QaReport,
 } from '@arkiv/core';
@@ -112,7 +113,7 @@ export async function projectView(workspaceId: string, projectId: string) {
           })
         : [];
     const factRows = Object.entries(facts)
-      .filter(([k]) => !['description', 'variants', 'packaging', 'label_text'].includes(k))
+      .filter(([k]) => !['description', 'variants', 'packaging', 'label_text', 'tags', 'properties', 'source_snapshot', 'images', 'options'].includes(k) && !isPartFactKey(k))
       .map(([key, f]) => ({
         key,
         id: f.value.id,
@@ -180,7 +181,14 @@ export async function projectView(workspaceId: string, projectId: string) {
         status: p.sku_status as string,
         rejectReason: (p.reject_reason as string) ?? null,
         analysis: p.analysis ?? {},
-        cutoutUrl: fp?.cutout_asset_id ? await assetUrl(tx, fp.cutout_asset_id as string) : null,
+        // The fingerprint's cut-out once there is one; before that, the cut-out keyed within seconds of upload.
+        cutoutUrl: await (async () => {
+          if (fp?.cutout_asset_id) return assetUrl(tx, fp.cutout_asset_id as string);
+          const early = (p.analysis as { earlyCutout?: { assetId?: string } } | null)?.earlyCutout?.assetId;
+          if (!early) return null;
+          const [a] = await tx`select 1 from assets where id = ${early} and sku_id = ${p.sku_id} and deleted_at is null`;
+          return a ? assetUrl(tx, early) : null;
+        })(),
         packaging: fp ? { type: fp.package_type, closure: fp.closure, label: fp.label_text } : null,
         /** What a good ad would still need (§42), from the analysis. */
         missingEvidence: ((p.analysis as { missingEvidence?: string[] } | null)?.missingEvidence ?? []).slice(0, 6),
@@ -202,6 +210,16 @@ export async function projectView(workspaceId: string, projectId: string) {
           const a = (p.analysis ?? {}) as { selectPhotoId?: string; heroSelected?: boolean };
           if (p.sku_status !== 'needs_input' || p.state !== 'NEEDS_USER_ACTION' || !a.selectPhotoId || a.heroSelected) return null;
           return { photoUrl: await assetUrl(tx, a.selectPhotoId, 3600) };
+        })(),
+        /** The link was a collection or home page: "Which product?" (plan 03 P2), from the products it listed. */
+        productChoices: (() => {
+          const a = (p.analysis ?? {}) as { productChoices?: { name: string; url: string }[] };
+          return p.sku_status === 'needs_input' && p.state === 'NEEDS_USER_ACTION' && a.productChoices?.length ? a.productChoices.slice(0, 12) : null;
+        })(),
+        /** §42 Duplicate import: the product already in the catalogue this one looks like, until the merchant decides. */
+        duplicate: (() => {
+          const d = (p.analysis as { duplicate?: { skuId: string; catalogueNo: number; name: string; reason: string; resolved?: string } } | null)?.duplicate;
+          return d && !d.resolved ? { skuId: d.skuId, catalogueNo: Number(d.catalogueNo), name: d.name, reason: d.reason, blocking: p.state === 'NEEDS_USER_ACTION' } : null;
         })(),
         /** Key facts we could not find, asked for inline (plan 03 P3 "ask for the missing field"). */
         missingFacts: ANALYSIS_KEY_FACTS.filter((k) => !facts[k.key] && !(k.key === 'ingredients' && facts.key_ingredients)).map((k) => ({ key: k.key, label: k.label })),
