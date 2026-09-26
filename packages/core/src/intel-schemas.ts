@@ -91,6 +91,14 @@ export const Proposal = z.object({
    * product facts) — the rationale we show instead of chain-of-thought (§38). Unknown ids are dropped by the gate.
    */
   rationaleIds: z.array(z.string().max(64)).max(8).optional().describe('ids of context-packet items (themes, learnings, claims, facts) this idea is grounded in'),
+  /**
+   * Standard §22 CreativeDirectorProposal ids (concepts/recommendations ≥ 1.3.0): the customer theme the tension comes
+   * from, the APPROVED claims the idea uses and the library assets it needs — each an id from the context packet,
+   * checked deterministically by the gate. Optional: proposals made before them carry text only.
+   */
+  customerTensionId: z.string().max(64).nullable().optional().describe('id of the customerThemes item the tension comes from, or null'),
+  claimIds: z.array(z.string().max(64)).max(4).optional().describe('ids of APPROVED claims the idea uses (claims.APPROVED_IDS)'),
+  assetIds: z.array(z.string().max(64)).max(6).optional().describe('ids of library assets the idea needs (assets[].items)'),
 });
 export type Proposal = z.infer<typeof Proposal>;
 

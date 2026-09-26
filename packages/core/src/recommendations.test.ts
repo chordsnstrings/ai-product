@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { mockConcepts } from './mock-intel';
 import { gateProposal, normalizePlan, prohibitedIn, prohibitedTerms } from './creative-director';
 import { mockStoryboard } from './mock-intel';
-import { adjacentSignal, composePortfolio, coverageGap, gateAndScore, hardGates, learningMatch, recommendationConfidence, scoreProposal, slotFor, WEIGHTS, type LearningSignal, type Scored, type ScoringContext } from './recommendations';
+import { adjacentSignal, assetAvailability, composePortfolio, coverageGap, customerRelevance, feasibility, feasibilityGates, gateAndScore, hardGates, learningMatch, platformFit, recommendationConfidence, requiredAssets, scoreProposal, slotFor, targetPlatforms, WEIGHTS, type LearningSignal, type Scored, type ScoringContext } from './recommendations';
+import { familyFatigue, fatigueNeedFor } from './fatigue';
 
 const ctx = (over: Partial<ScoringContext> = {}): ScoringContext => ({
   themes: [{ label: 'sticky or greasy feel', prevalence: 0.4 }],
@@ -218,5 +219,89 @@ describe('Brand Brain never-show-or-say (§16)', () => {
     expect(() => normalizePlan(plan, [], ['Glow Serum'])).not.toThrow();
     const word = plan.scenes[0]!.visualPlan.split(/\s+/).find((w) => /^[a-z]{4,}$/i.test(w))!.toLowerCase();
     expect(() => normalizePlan(plan, [], ['Glow Serum'], [word])).toThrow(/brand check/);
+  });
+});
+
+describe('Opportunity Score drivers (§20)', () => {
+  const [p] = mockConcepts(pc).concepts; // texture-first: hybrid, texture demo, “sticky” tension
+
+  it('customer relevance weighs prevalence, intensity, trend and recency of the matched tension', () => {
+    const base = { label: 'sticky feel', prevalence: 0.4 };
+    const hot = customerRelevance({ ...p!, customerTension: 'Shoppers worry it feels sticky' }, [{ ...base, intensity: 0.9, trend: 'rising', recencyDays: 3 }]);
+    const cold = customerRelevance({ ...p!, customerTension: 'Shoppers worry it feels sticky' }, [{ ...base, intensity: 0.2, trend: 'falling', recencyDays: 400 }]);
+    expect(hot.score).toBeGreaterThan(cold.score + 0.1);
+    expect(hot.theme?.label).toBe('sticky feel');
+    // A cited theme id wins over word overlap.
+    const T = '00000000-0000-4000-8000-00000000000d';
+    const cited = customerRelevance({ ...p!, customerTension: 'nothing in common', customerTensionId: T } as never, [{ id: T, label: 'pills under makeup', prevalence: 0.5, intensity: 0.8, trend: 'flat', recencyDays: 10 }, { ...base }]);
+    expect(cited.theme?.id).toBe(T);
+    // Nothing matches: a lower, source-based prior.
+    expect(customerRelevance({ ...p!, customerTension: 'zzz', hypothesis: 'qqq' }, [base]).theme).toBeNull();
+  });
+
+  it('fatigue need follows spend share and measured deterioration of the family', () => {
+    const w = (imp: number, clk: number) => ({ impressions: imp, clicks: clk, videoStarts: 0, video75: 0 });
+    const fams = familyFatigue([
+      { family: 'TEXTURE_SENSORY', spend14: 800, recent: w(20_000, 100), prior: w(40_000, 400) }, // CTR halves, most of the spend
+      { family: 'ROUTINE', spend14: 200, recent: w(10_000, 100), prior: w(20_000, 200) }, // steady
+    ]);
+    const tex = fams.find((f) => f.family === 'TEXTURE_SENSORY')!;
+    expect(tex.spendShare).toBeCloseTo(0.8);
+    expect(tex.deterioration).toBe(1);
+    expect(fams.find((f) => f.family === 'ROUTINE')!.deterioration).toBeLessThan(0.1);
+    const replacement = fatigueNeedFor('TEXTURE_SENSORY', fams);
+    const other = fatigueNeedFor('OBJECTION_HANDLING', fams);
+    const calm = fatigueNeedFor('OBJECTION_HANDLING', []);
+    expect(replacement).toBeGreaterThan(other);
+    expect(other).toBeGreaterThan(calm);
+    // The same decay on a family that carries little spend asks for less.
+    const small = familyFatigue([
+      { family: 'TEXTURE_SENSORY', spend14: 50, recent: w(20_000, 100), prior: w(40_000, 400) },
+      { family: 'ROUTINE', spend14: 950, recent: w(10_000, 100), prior: w(20_000, 200) },
+    ]);
+    expect(fatigueNeedFor('OBJECTION_HANDLING', small)).toBeLessThan(other);
+    // Too little delivery: no trend is read.
+    expect(familyFatigue([{ family: 'X', spend14: 10, recent: w(300, 1), prior: w(300, 9) }])[0]!.deterioration).toBe(0);
+    expect(scoreProposal(p!, ctx({ families: fams })).breakdown.fatigueNeed).toBe(fatigueNeedFor(p!.angle, fams));
+  });
+
+  it('feasibility weighs asset availability; missing footage or unconfirmed rights gate the idea', () => {
+    const none = { all: {}, rights: {} };
+    const photos = { all: { product_photo: 3, reference_view: 1 }, rights: {} };
+    expect(assetAvailability(p!, photos)).toBe(1);
+    expect(assetAvailability(p!, none)).toBeLessThan(1);
+    expect(feasibility(p!, { fidelityConfidence: 0.8, assets: none })).toBeLessThan(feasibility(p!, { fidelityConfidence: 0.8, assets: photos }));
+    const ugc = { ...p!, treatment: 'RAW_UGC' as const };
+    expect(requiredAssets(ugc).some((n) => n.hard)).toBe(true);
+    expect(hardGates(ugc, ctx({ assets: photos })).reasons.join()).toMatch(/real footage with confirmed usage rights/);
+    // Footage whose rights nobody attested is not enough.
+    expect(hardGates(ugc, ctx({ assets: { all: { ...photos.all, creator_footage: 2 }, rights: {} } })).passed).toBe(false);
+    expect(hardGates(ugc, ctx({ assets: { all: { ...photos.all, creator_footage: 2 }, rights: { creator_footage: 1 } } })).passed).toBe(true);
+    // A testimonial needs a real person whatever the treatment.
+    expect(hardGates({ ...p!, proofMechanism: 'CUSTOMER_TESTIMONIAL' }, ctx({ assets: photos })).passed).toBe(false);
+  });
+
+  it('platform fit and disallowance follow where the test will run', () => {
+    expect(targetPlatforms([])).toEqual(['TIKTOK', 'INSTAGRAM_REELS']);
+    expect(targetPlatforms(['meta'])).toEqual(['INSTAGRAM_REELS', 'FACEBOOK_FEED']);
+    expect(targetPlatforms(['tiktok', 'meta'])).toEqual(['TIKTOK', 'INSTAGRAM_REELS', 'FACEBOOK_FEED']);
+    const studio = { ...p!, angle: 'PRICE_VALUE' as const, treatment: 'PRODUCT_ONLY' as const, hookMechanism: 'DIRECT_PRODUCT' as const };
+    expect(platformFit(studio, ['FACEBOOK_FEED'])).toBeGreaterThan(platformFit(studio, ['TIKTOK']) + 0.2);
+    expect(platformFit(p!, ['TIKTOK'])).toBeGreaterThan(platformFit(studio, ['TIKTOK']));
+    expect(scoreProposal(studio, ctx({ targetPlatforms: ['FACEBOOK_FEED'] })).breakdown.platformFit).toBe(platformFit(studio, ['FACEBOOK_FEED']));
+    const fakeTestimonial = { ...p!, treatment: 'AI_TALENT' as const, proofMechanism: 'CUSTOMER_TESTIMONIAL' as const };
+    expect(feasibilityGates(fakeTestimonial, { fidelityConfidence: 0.9, recentKeys: new Set(), targetPlatforms: ['TIKTOK'] }).join()).toMatch(/AI-generated person/);
+  });
+
+  it('a generation class that costs more than a Creative Test at today’s rates is gated', () => {
+    expect(hardGates(p!, ctx({ classCostMicros: { hybrid_short: 9_000_000 } })).reasons.join()).toMatch(/costs more than a Creative Test/);
+    expect(hardGates(p!, ctx({ classCostMicros: { hybrid_short: 3_000_000 } })).passed).toBe(true);
+  });
+
+  it('concept gates: low fidelity refuses generated work, a repeat of a recent test is a near-duplicate', () => {
+    const low = feasibilityGates(p!, { fidelityConfidence: 0.2, recentKeys: new Set() });
+    expect(low.join()).toMatch(/fidelity too uncertain/);
+    expect(feasibilityGates({ ...p!, estimatedGenerationClass: 'remix' }, { fidelityConfidence: 0.2, recentKeys: new Set() })).toEqual([]);
+    expect(feasibilityGates(p!, { fidelityConfidence: 0.9, recentKeys: new Set([`${p!.angle}|${p!.hookMechanism}`]) }).join()).toMatch(/near-duplicate/);
   });
 });

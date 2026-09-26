@@ -135,3 +135,104 @@ export async function recordFatigue(tx: Tx, experimentId: string, variantIds: st
   await tx`update experiments set fatigue = ${tx.json(f as never)}, fatigue_at = now() where id = ${experimentId}`;
   return f;
 }
+
+// ───────────── Creative families: spend-weighted deterioration (§20 FatigueNeed, §45) ─────────────
+
+/** One creative family's (an angle's) delivery in the recent and the prior window. */
+export interface FamilyDelivery {
+  family: string;
+  /** Spend over the last 14 days, in the reporting currency's micros. */
+  spend14: number;
+  recent: { impressions: number; clicks: number; videoStarts: number; video75: number };
+  prior: { impressions: number; clicks: number; videoStarts: number; video75: number };
+}
+
+export interface FamilyFatigue {
+  family: string;
+  /** Share of the SKU's last-14-day spend this family carries (0–1). */
+  spendShare: number;
+  /** Relative drop of the shrunk CTR / hold rate, last 7 days vs the 14 before (null without enough delivery). */
+  ctrDrop: number | null;
+  holdDrop: number | null;
+  /** 0 (steady) … 1 (a 30%+ drop). */
+  deterioration: number;
+  /** spendShare × deterioration: how much the SKU needs a replacement for this family. */
+  need: number;
+}
+
+/** Relative drop that counts as full deterioration. */
+export const FAMILY_FULL_DROP = 0.3;
+/** Impressions each window needs before a family's trend is read. */
+export const FAMILY_MIN_IMPRESSIONS = 1000;
+
+/**
+ * Each family's fatigue (§20 "Fatigue / replacement need — increase priority when current family carries spend and
+ * deteriorates"): its share of the SKU's recent spend times the decay of its click-through and hold rates, last 7
+ * days against the 14 before. Rates are shrunk toward the SKU's pooled rate (a Beta prior worth 2,000 impressions /
+ * 500 video starts), so a small family's noisy week does not read as decay.
+ */
+export function familyFatigue(rows: readonly FamilyDelivery[]): FamilyFatigue[] {
+  const total = rows.reduce((n, r) => n + Math.max(0, r.spend14), 0);
+  const sum = (k: 'impressions' | 'clicks' | 'videoStarts' | 'video75') => rows.reduce((n, r) => n + r.recent[k] + r.prior[k], 0);
+  const pooledCtr = sum('impressions') > 0 ? sum('clicks') / sum('impressions') : 0.01;
+  const pooledHold = sum('videoStarts') > 0 ? sum('video75') / sum('videoStarts') : 0.2;
+  const shrunk = (s: number, t: number, rate: number, strength: number) => (s + rate * strength) / (t + strength);
+  return rows.map((r) => {
+    const enough = r.recent.impressions >= FAMILY_MIN_IMPRESSIONS && r.prior.impressions >= FAMILY_MIN_IMPRESSIONS;
+    const ctrDrop = enough ? 1 - shrunk(r.recent.clicks, r.recent.impressions, pooledCtr, 2000) / shrunk(r.prior.clicks, r.prior.impressions, pooledCtr, 2000) : null;
+    const holdEnough = r.recent.videoStarts >= FAMILY_MIN_IMPRESSIONS / 2 && r.prior.videoStarts >= FAMILY_MIN_IMPRESSIONS / 2;
+    const holdDrop = holdEnough ? 1 - shrunk(r.recent.video75, r.recent.videoStarts, pooledHold, 500) / shrunk(r.prior.video75, r.prior.videoStarts, pooledHold, 500) : null;
+    const drop = Math.max(ctrDrop ?? 0, holdDrop ?? 0);
+    const deterioration = Math.max(0, Math.min(1, drop / FAMILY_FULL_DROP));
+    const spendShare = total > 0 ? Math.max(0, r.spend14) / total : 0;
+    return { family: r.family, spendShare, ctrDrop, holdDrop, deterioration, need: spendShare * deterioration };
+  });
+}
+
+/**
+ * A SKU's families from its delivery of the last 21 days: an observation belongs to the angle of the experiment
+ * variant or the imported creative it is linked to. Tenant-scoped read (RLS), current revisions only.
+ */
+export async function skuFamilyFatigue(tx: Tx, skuId: string): Promise<FamilyFatigue[]> {
+  const rows = await tx`
+    select coalesce(v.genes->>'angle', e.genes->>'angle', c.genome->>'angle') as family,
+      coalesce(sum(o.spend_reporting_micros) filter (where o.date > current_date - 14), 0)::float8 as spend14,
+      coalesce(sum(o.impressions) filter (where o.date > current_date - 7), 0)::float8 as r_imp,
+      coalesce(sum(o.clicks) filter (where o.date > current_date - 7), 0)::float8 as r_clk,
+      coalesce(sum(o.video_starts) filter (where o.date > current_date - 7), 0)::float8 as r_vs,
+      coalesce(sum(o.video_75) filter (where o.date > current_date - 7), 0)::float8 as r_v75,
+      coalesce(sum(o.impressions) filter (where o.date <= current_date - 7), 0)::float8 as p_imp,
+      coalesce(sum(o.clicks) filter (where o.date <= current_date - 7), 0)::float8 as p_clk,
+      coalesce(sum(o.video_starts) filter (where o.date <= current_date - 7), 0)::float8 as p_vs,
+      coalesce(sum(o.video_75) filter (where o.date <= current_date - 7), 0)::float8 as p_v75
+    from performance_observations o
+    left join variants v on v.id = o.variant_id and v.workspace_id = o.workspace_id
+    left join experiments e on e.id = v.experiment_id and e.workspace_id = v.workspace_id
+    left join creatives c on c.id = o.creative_id and c.workspace_id = o.workspace_id
+    where o.superseded_at is null and o.date > current_date - 21
+      and (e.sku_id = ${skuId} or c.sku_id = ${skuId})
+    group by 1`;
+  return familyFatigue(
+    rows
+      .filter((r) => r.family)
+      .map((r) => ({
+        family: r.family as string,
+        spend14: Number(r.spend14),
+        recent: { impressions: Number(r.r_imp), clicks: Number(r.r_clk), videoStarts: Number(r.r_vs), video75: Number(r.r_v75) },
+        prior: { impressions: Number(r.p_imp), clicks: Number(r.p_clk), videoStarts: Number(r.p_vs), video75: Number(r.p_v75) },
+      })),
+  );
+}
+
+/**
+ * FatigueNeed for a proposal (§20): the SKU's overall need for new creative (Σ spend share × deterioration over its
+ * families) raises every candidate, and a candidate on a deteriorating family — a replacement for it — more. A winner
+ * whose own decay was measured (experiments.fatigue) counts as a deteriorating family even without spend data.
+ */
+export function fatigueNeedFor(angle: string, families: readonly FamilyFatigue[], fatiguingAngles: ReadonlySet<string> = new Set()): number {
+  const overall = Math.min(1, families.reduce((n, f) => n + f.need, 0));
+  const own = families.find((f) => f.family === angle);
+  const ownNeed = Math.max(own ? own.deterioration * Math.max(own.spendShare, 0.25) : 0, fatiguingAngles.has(angle) ? 0.6 : 0);
+  const anyMeasured = fatiguingAngles.size > 0 ? 0.15 : 0;
+  return Math.round(Math.max(0, Math.min(1, 0.2 + 0.4 * Math.max(overall, anyMeasured) + 0.4 * ownNeed)) * 1000) / 1000;
+}

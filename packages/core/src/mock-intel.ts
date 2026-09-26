@@ -75,6 +75,14 @@ function pickThemes(ctx: ProductContext) {
   return { objection: objection ?? (ctx.category === 'serum' ? 'feels sticky under makeup' : 'heavy, greasy feel'), benefit: benefit ?? 'skin feels soft and comfortable' };
 }
 
+/** Hook mechanisms a mock idea set cycles through per angle, one per set (batch 1 keeps the base mechanism). */
+const MOCK_ALT_HOOKS: Partial<Record<Proposal['angle'], Proposal['hookMechanism'][]>> = {
+  TEXTURE_SENSORY: ['DEMONSTRATION', 'CURIOSITY', 'CONFESSION', 'RESULT_FIRST'],
+  OBJECTION_HANDLING: ['QUESTION', 'CONTRARIAN', 'COMMENT_REPLY', 'WARNING'],
+  INGREDIENT_EDUCATION: ['MYTH', 'CURIOSITY', 'QUESTION', 'LIST'],
+  ROUTINE: ['LIST', 'CURIOSITY', 'QUESTION', 'CONFESSION'],
+};
+
 export function mockConcepts(ctx: ProductContext, batch = 1): ConceptSet {
   const n = ctx.name;
   const { objection, benefit } = pickThemes(ctx);
@@ -145,10 +153,21 @@ export function mockConcepts(ctx: ProductContext, batch = 1): ConceptSet {
     base[0]!.rationaleIds = [...r.themes.slice(0, 1), ...r.claims.slice(0, 1), ...r.facts.slice(0, 1), ...r.learnings.slice(0, 1)];
     base[1]!.rationaleIds = [...r.themes.slice(0, 2), ...r.claims.slice(0, 1)];
     base[2]!.rationaleIds = r.facts.slice(0, 2);
+    // §22 ids: the review theme each tension comes from and the APPROVED claim it uses.
+    base[0]!.customerTensionId = ctx.themes.length ? (r.themes[0] ?? null) : null;
+    base[1]!.customerTensionId = ctx.themes.length ? (r.themes[0] ?? null) : null;
+    base[2]!.customerTensionId = null;
+    if (approved.length && r.claims[0]) base[0]!.claimIds = base[1]!.claimIds = [r.claims[0]];
   }
   const offset = (batch - 1) % 3;
   const concepts = [...base.slice(offset), ...base.slice(0, offset)] as [Proposal, Proposal, Proposal];
   if (batch > 1) concepts.forEach((c, i) => (c.hookOptions = [c.hookOptions[(i + batch) % 3]!, ...c.hookOptions.filter((_, j) => j !== (i + batch) % 3)]));
+  // A later set opens differently (a new hook mechanism per angle), as a real Creative Director asked for "different
+  // directions" does — so it is never a near-duplicate of the earlier set.
+  if (batch > 1) {
+    const alt = (c: Proposal) => MOCK_ALT_HOOKS[c.angle] ?? MOCK_ALT_HOOKS.ROUTINE!;
+    concepts.forEach((c) => (c.hookMechanism = alt(c)[(batch - 1) % 4]!));
+  }
   // §8 goal: the idea that fits the goal leads (and is our pick), shaped to it; performance keeps the default.
   const goal = ctx.goal ?? 'performance';
   if (goal !== 'performance') {
@@ -186,7 +205,7 @@ export function mockStoryboard(ctx: ProductContext, concept: Proposal): Storyboa
   };
 }
 
-export function mockGenome(text: string): Genome {
+export function mockGenome(text: string, video?: { durationSec: number; sceneCount: number; cutsPerMinute: number } | null): Genome {
   const h = hash(text);
   const t = text.toLowerCase();
   const angle = /texture|absorb|feel/.test(t) ? 'TEXTURE_SENSORY' : /routine|step/.test(t) ? 'ROUTINE' : /ingredient|niacinamide|hyaluronic/.test(t) ? 'INGREDIENT_EDUCATION' : /\?/.test(t) ? 'OBJECTION_HANDLING' : /founder|i made/.test(t) ? 'FOUNDER_STORY' : /off|sale|bundle/.test(t) ? 'OFFER' : 'PROBLEM_SOLUTION';
@@ -200,7 +219,7 @@ export function mockGenome(text: string): Genome {
     customerProblem: null,
     productRevealSec: 2,
     faceRevealSec: null,
-    durationSec: 15,
+    durationSec: video?.durationSec ?? 15,
     hasCaptions: true,
     hasVoiceover: true,
     offer: /\d+% off|bundle|free shipping/.test(t) ? (t.match(/\d+% off|bundle|free shipping/)?.[0] ?? null) : null,
@@ -213,8 +232,8 @@ export function mockGenome(text: string): Genome {
     firstFrameSubject: angle === 'TEXTURE_SENSORY' ? 'texture' : /i |my /.test(t) ? 'face' : 'product',
     firstMotion: angle === 'TEXTURE_SENSORY' ? 'drop falls onto skin' : null,
     bodySequence: angle === 'TEXTURE_SENSORY' ? ['texture_demo', 'application', 'cta'] : angle === 'ROUTINE' ? ['routine', 'application', 'cta'] : ['problem', 'product_reveal', 'cta'],
-    sceneCount: null,
-    cutsPerMinute: null,
+    sceneCount: video?.sceneCount ?? null,
+    cutsPerMinute: video?.cutsPerMinute ?? null,
     humanScreenRatio: null,
     productScreenRatio: null,
     voice: /\bi\b|\bmy\b/.test(t) ? 'creator' : 'voiceover_human',

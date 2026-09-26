@@ -62,9 +62,41 @@ begin
 end $$;
 create trigger creative_genomes_guard before update on creative_genomes for each row execute function arkiv_creative_genome_guard();
 
+-- Every new or changed genome is recorded, whichever path wrote it (extraction, an ad we made, a derived version, a
+-- taxonomy remap). The writer may name the source in the transaction-local setting arkiv.genome_source.
+create or replace function arkiv_creative_genome_history() returns trigger language plpgsql as $$
+declare src text := nullif(current_setting('arkiv.genome_source', true), '');
+begin
+  if new.genome is null or (tg_op = 'UPDATE' and new.genome is not distinct from old.genome and new.genome_version is not distinct from old.genome_version) then
+    return new;
+  end if;
+  if src is null then
+    src := case
+      when tg_op = 'UPDATE' and old.genome is not null then 'reextracted'
+      when new.parent_creative_id is not null then 'derived'
+      when new.origin = 'generated' then 'generated'
+      else 'extracted' end;
+  end if;
+  insert into creative_genomes (workspace_id, creative_id, taxonomy_version, schema_version, genome, source, model, prompt_version)
+  values (new.workspace_id, new.id, coalesce(new.genome_version, 1),
+          case when jsonb_typeof(new.genome->'schemaVersion') = 'number' then (new.genome->>'schemaVersion')::int end,
+          new.genome, src, new.genome #>> '{lineage,models,0}', new.genome #>> '{lineage,promptVersions,genome}');
+  return new;
+end $$;
+create trigger creatives_genome_history after insert or update of genome, genome_version on creatives
+  for each row execute function arkiv_creative_genome_history();
+
 -- The genomes that exist today are each creative's first history row.
 insert into creative_genomes (workspace_id, creative_id, taxonomy_version, schema_version, genome, source, model, prompt_version, created_at)
-select c.workspace_id, c.id, coalesce(c.genome_version, 1), nullif(c.genome->>'schemaVersion', '')::int, c.genome,
+select c.workspace_id, c.id, coalesce(c.genome_version, 1),
+       case when jsonb_typeof(c.genome->'schemaVersion') = 'number' then (c.genome->>'schemaVersion')::int end, c.genome,
        case c.origin when 'imported' then 'extracted' else 'generated' end,
        null, c.genome #>> '{lineage,promptVersions,genome}', c.created_at
 from creatives c where c.genome is not null;
+
+-- ───────────── Prompt versions (§41 "prompt changes are software changes") ─────────────
+-- concepts / recommendations / storyboard 1.3.0: fact states (an INFERRED fact is never product truth), the full
+-- Context Packet (§22) and, for concepts and recommendations, ids for the customer tension, claims and assets.
+update model_routes set prompt_version = 'concepts@1.3.0' where task = 'creative_director.concepts' and prompt_version in ('concepts@1.0.0', 'concepts@1.1.0', 'concepts@1.2.0');
+update model_routes set prompt_version = 'recommendations@1.3.0' where task = 'creative_director.recommendations' and prompt_version in ('recommendations@1.0.0', 'recommendations@1.1.0', 'recommendations@1.2.0');
+update model_routes set prompt_version = 'storyboard@1.3.0' where task = 'creative_director.storyboard' and prompt_version in ('storyboard@1.0.0', 'storyboard@1.1.0', 'storyboard@1.2.0');

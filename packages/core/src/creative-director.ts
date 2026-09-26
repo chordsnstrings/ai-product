@@ -1,5 +1,5 @@
 import { withTenant, type Tx } from '@arkiv/db';
-import { CREATIVE_GOAL_BRIEF, CreativeGoal, DomainError, type Angle } from '@arkiv/shared';
+import { COST_LIMITS, CREATIVE_GOAL_BRIEF, CreativeGoal, DomainError, type Angle, type Platform } from '@arkiv/shared';
 import type { ContentPart } from '@arkiv/providers';
 import { brandBrainFor } from './brand';
 import { AD_PLATFORMS, listClaims, renderableClaims, type ClaimScope } from './claims';
@@ -7,6 +7,8 @@ import { classifyClaim, scanCreativeText, scanPasses, syntheticTestimonials } fr
 import type { TenantContext } from './context';
 import { redactPii } from './customer-language';
 import { emit } from './events';
+import { skuFamilyFatigue } from './fatigue';
+import { available } from './ledger';
 import { ConceptSet, StoryboardPlan, type Proposal } from './intel-schemas';
 import { mockConcepts, mockStoryboard, type ProductContext } from './mock-intel';
 import { llmJson } from './model-gateway';
@@ -66,10 +68,38 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   const themes = await tx`select id, label, signal_type, prevalence, sample_size, snippet_ids from customer_themes where sku_id = ${skuId}
                           order by prevalence * relevance desc limit 6`;
   const phrases = await customerPhrases(tx, themes.map((t) => ({ label: t.label as string, snippetIds: (t.snippet_ids as string[] | null) ?? [] })));
-  const coverage = await tx`select genes->>'angle' as angle, state, count(*)::int as n from experiments where sku_id = ${skuId}
-                            group by 1, 2`;
+  // Coverage: this SKU's experiments and its imported ads' genomes, by angle (§19, §22 "creative coverage").
+  const coverage = await tx`select angle, state, count(*)::int as n from (
+                              select genes->>'angle' as angle, state from experiments where sku_id = ${skuId}
+                              union all
+                              select genome->>'angle', 'IMPORTED' from creatives where sku_id = ${skuId} and origin = 'imported' and genome is not null) x
+                            where angle is not null group by 1, 2`;
   const learnings = await tx`select id, statement, state, scope_platform, confidence from learnings where sku_id = ${skuId}
                              and state in ('DIRECTIONAL','ACTIONABLE','WEAKENING') and not confounded order by confidence desc limit 6`;
+  // §22 recent experiments with their outcome, and the current winners per measurement context.
+  const recent = await tx`select e.id, e.hypothesis, e.primary_variable, e.mode, e.state, e.genes->>'angle' as angle, e.genes->>'hookMechanism' as hook_mechanism,
+                                 (select v.label from experiment_comparisons c join variants v on v.id = c.leader_variant_id and v.workspace_id = c.workspace_id
+                                  where c.experiment_id = e.id and c.metric = e.primary_metric and c.state in ('DIRECTIONAL','ACTIONABLE')
+                                  order by (c.state = 'ACTIONABLE') desc, c.computed_at desc limit 1) as leader
+                          from experiments e where e.sku_id = ${skuId} order by e.created_at desc limit 8`;
+  const winners = await tx`select distinct on (c.measurement_context) c.measurement_context, c.state, c.experiment_id, v.id as variant_id, v.creative_id, v.label
+                           from experiment_comparisons c join experiments e on e.id = c.experiment_id and e.workspace_id = c.workspace_id
+                           join variants v on v.id = c.leader_variant_id and v.workspace_id = c.workspace_id
+                           where e.sku_id = ${skuId} and c.metric = e.primary_metric and c.state in ('ACTIONABLE','DIRECTIONAL')
+                           order by c.measurement_context, (c.state = 'ACTIONABLE') desc, c.computed_at desc`;
+  const fatigue = await skuFamilyFatigue(tx, skuId);
+  // §22 available assets: usable library items by kind (ids to cite), capped, with whether usage rights were confirmed.
+  const assetRows = await tx`select id, kind, rights_attested_at is not null as rights from assets where sku_id = ${skuId} and deleted_at is null
+                               and kind in ('product_photo','reference_view','cutout','label_crop','creator_footage','historical_creative')
+                               and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null and coalesce(review_status, 'approved') = 'approved'
+                             order by created_at desc limit 40`;
+  // §22 production budget class: the plan, the Creative Tests left this period and the classes a standard test allows.
+  const [ws] = await tx`select plan_code from workspaces where id = ${sku.workspace_id as string}`;
+  const testsLeft = await available(tx, 'creative_test', sku.workspace_id as string);
+  // §22 platform: where the tests run (the connected ad accounts' placements, else TikTok + Reels).
+  const integ = await tx`select distinct provider from integrations where provider in ('meta','tiktok') and status <> 'disconnected'`;
+  const { targetPlatforms } = await import('./recommendations');
+  const platforms: Platform[] = targetPlatforms(integ.map((i) => i.provider as string));
   const { list: ingredients, verified: ingredientsVerified } = verifiedIngredients(facts);
   const brand = await brandBrainFor(tx, skuId);
   const approvedRows = claims.filter((c) => usable.has(c.id));
@@ -120,7 +150,7 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
     },
     customerThemes: themes.map((t) => ({ id: t.id, label: t.label, type: t.signal_type, prevalence: Number(t.prevalence), n: t.sample_size })),
     coverage: coverage.map((c) => ({ angle: c.angle, state: c.state, count: c.n })),
-    learnings: learnings.map((l) => ({ id: l.id, statement: l.statement, state: l.state, platform: l.scope_platform })),
+    learnings: learnings.map((l) => ({ id: l.id, statement: l.statement, state: l.state, platform: l.scope_platform, confidence: l.confidence == null ? null : Math.round(Number(l.confidence) * 100) / 100 })),
     // The merchant's own Brand Brain (versioned): shapes voice and visuals, never overrides claim rules.
     brand: brand
       ? {
@@ -138,7 +168,28 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
           ...(brand.brain.restrictions.length ? { brandRestrictions: brand.brain.restrictions } : {}),
         }
       : null,
-    platform: 'TikTok + Instagram Reels (9:16)',
+    platform: { targets: platforms, master: '9:16, also exported 4:5 and 1:1' },
+    // §14 product truth vs system interpretation: where each fact came from and whether it is confirmed. INFERRED
+    // values are the system's reading, never stated as facts.
+    factStates: Object.fromEntries(FACT_KEYS.filter((k) => facts[k]).map((k) => [k, { state: facts[k]!.value.state, source: facts[k]!.value.sourceType, confirmed: facts[k]!.value.state === 'DECIDED', disputed: facts[k]!.disputed }])),
+    // Hypotheses and winning hooks are text the model wrote from imported data: they travel as untrusted data.
+    recentHypotheses: recent.map((e) => ({ id: e.id as string, hypothesis: e.hypothesis as string, leadingHook: (e.leader as string | null) ?? null })),
+    recentExperiments: recent.map((e) => ({ id: e.id as string, primaryVariable: e.primary_variable as string, mode: e.mode as string, state: e.state as string, angle: e.angle as string | null, hookMechanism: e.hook_mechanism as string | null })),
+    currentWinners: winners.map((w) => ({ context: w.measurement_context as string, state: w.state as string, experimentId: w.experiment_id as string, variantId: w.variant_id as string, creativeId: (w.creative_id as string | null) ?? null })),
+    fatigue: fatigue.filter((f) => f.spendShare > 0 || f.deterioration > 0).map((f) => ({ family: f.family, spendShare: Math.round(f.spendShare * 100) / 100, deterioration: Math.round(f.deterioration * 100) / 100 })),
+    assets: Object.entries(
+      assetRows.reduce<Record<string, { id: string; rightsConfirmed: boolean }[]>>((acc, a) => {
+        const list = (acc[a.kind as string] ??= []);
+        if (list.length < 6) list.push({ id: a.id as string, rightsConfirmed: !!a.rights });
+        return acc;
+      }, {}),
+    ).map(([kind, items]) => ({ kind, count: assetRows.filter((a) => a.kind === kind).length, items })),
+    budget: {
+      plan: (ws?.plan_code as string | null) ?? null,
+      creativeTestsLeft: Math.max(0, testsLeft),
+      perTestCeilingUsd: COST_LIMITS.CREATIVE_TEST_CEILING / 1_000_000,
+      allowedGenerationClasses: ['remix', 'hybrid_short', 'generative_short'],
+    },
     objective: goal === 'performance' ? 'Find the next creative test worth running for this SKU' : `${CREATIVE_GOAL_BRIEF[goal]}. Each concept is still a test with one primary variable.`,
     goal,
   };
@@ -146,9 +197,12 @@ export async function buildContext(tx: Tx, skuId: string, opts: { projectId?: st
   const names = [sku.name as string, brand?.name ?? null];
   const r = productContext.rationaleIds!;
   const packetIds = new Set([...r.themes, ...r.claims, ...r.facts, ...r.learnings]);
+  const assetIds = new Set(assetRows.map((a) => a.id as string));
+  const themeIds = new Set(themes.map((t) => t.id as string));
+  const claimsById = new Map(approvedRows.map((c, i) => [c.id, productContext.approvedClaims[i]!] as const));
   // Terms the brand never shows or says: an extra blocking list for concepts, hooks and storyboard lines (§16).
   const prohibited = prohibitedTerms([brand?.brain.prohibited ?? '', ...(brand?.brain.restrictions ?? [])].join('\n'));
-  return { sku, facts, productContext, packet, packetIds, ingredientsVerified, names, phrases, prohibited, brandBrainVersionId: brand?.versionId ?? null };
+  return { sku, facts, productContext, packet, packetIds, assetIds, themeIds, claimsById, ingredientsVerified, names, phrases, prohibited, brandBrainVersionId: brand?.versionId ?? null };
 }
 
 type ContextPacket = Awaited<ReturnType<typeof buildContext>>['packet'];
@@ -162,7 +216,7 @@ type ContextPacket = Awaited<ReturnType<typeof buildContext>>['packet'];
  * gated by gateProposal / normalizePlan whatever the model answers.
  */
 export function contextPacketParts(packet: ContextPacket): ContentPart[] {
-  const { product, claims, customerThemes, ...rest } = packet;
+  const { product, claims, customerThemes, recentHypotheses, ...rest } = packet;
   const { factIds, ingredientsUnverified, price, ...imported } = product;
   const trusted = {
     ...rest,
@@ -175,6 +229,7 @@ export function contextPacketParts(packet: ContextPacket): ContentPart[] {
     { type: 'untrusted', sourceId: 'product_facts', text: JSON.stringify(imported) },
     { type: 'untrusted', sourceId: 'claims_vault', text: JSON.stringify(claims) },
     { type: 'untrusted', sourceId: 'customer_themes', text: JSON.stringify(customerThemes.map((t) => ({ id: t.id, label: t.label }))) },
+    ...(recentHypotheses.length ? [{ type: 'untrusted' as const, sourceId: 'recent_experiments', text: JSON.stringify(recentHypotheses) }] : []),
   ];
 }
 
@@ -248,7 +303,16 @@ export function gateProposal(
   p: Proposal,
   approved: string[],
   names: (string | null | undefined)[] = [],
-  opts: { packetIds?: ReadonlySet<string>; ingredientsVerified?: boolean; pad?: boolean; prohibited?: readonly string[] } = {},
+  opts: {
+    packetIds?: ReadonlySet<string>;
+    ingredientsVerified?: boolean;
+    pad?: boolean;
+    prohibited?: readonly string[];
+    /** §22 ids: the packet's customer themes, APPROVED claims (id → wording) and library assets. */
+    themeIds?: ReadonlySet<string>;
+    claimsById?: ReadonlyMap<string, string>;
+    assetIds?: ReadonlySet<string>;
+  } = {},
 ): { ok: boolean; reasons: string[]; cleaned: Proposal; removed: { hooks: number; claims: number }; droppedClaims: string[]; paddedHooks: number } {
   const reasons: string[] = [];
   const { packetIds } = opts;
@@ -259,6 +323,25 @@ export function gateProposal(
     if (!known) reasons.push(`unknown rationale id dropped: ${id.slice(0, 40)}`);
     return known;
   });
+  // §22 ids are validated deterministically: a theme of this SKU, APPROVED claims usable where the ad runs, assets
+  // that exist in the library with usable rights. Anything else is dropped and said so.
+  let customerTensionId = p.customerTensionId ?? null;
+  if (customerTensionId && opts.themeIds && !opts.themeIds.has(customerTensionId)) {
+    reasons.push(`unknown customer tension id dropped: ${customerTensionId.slice(0, 40)}`);
+    customerTensionId = null;
+  }
+  const claimIds = [...new Set(p.claimIds ?? [])].filter((id) => {
+    if (!opts.claimsById || opts.claimsById.has(id)) return true;
+    reasons.push(`claim id not approved: ${id.slice(0, 40)}`);
+    return false;
+  });
+  const assetIds = [...new Set(p.assetIds ?? [])].filter((id) => {
+    if (!opts.assetIds || opts.assetIds.has(id)) return true;
+    reasons.push(`unknown asset id dropped: ${id.slice(0, 40)}`);
+    return false;
+  });
+  // Wording comes from the vault for cited claims: an id is the claim, its text is never the model's paraphrase.
+  const citedWordings = opts.claimsById ? claimIds.map((id) => opts.claimsById!.get(id)!).filter(Boolean) : [];
   const vault = approved.map((w, i) => ({ id: String(i), wording: w }));
   // Only customer-facing copy is claims-scanned; hypothesis/body are internal strategy notes. A hook that makes a
   // product claim no approved claim covers would be refused by claims QA after render spend, so it goes now.
@@ -283,7 +366,7 @@ export function gateProposal(
   if (beforeAfter) reasons.push(BEFORE_AFTER_REASON);
   const blockedStrategy = claimBlocked || !!brandBanned || beforeAfter;
   const droppedClaims: string[] = [];
-  const cleanClaims = p.claimWordings.filter((w) => {
+  const cleanClaims = [...new Set([...citedWordings, ...p.claimWordings])].slice(0, 4).filter((w) => {
     const ok = approved.some((a) => a.toLowerCase().includes(w.toLowerCase()) || w.toLowerCase().includes(a.toLowerCase()));
     if (!ok) {
       reasons.push(`claim not approved: "${w}"`);
@@ -291,7 +374,7 @@ export function gateProposal(
     }
     return ok;
   });
-  const removed = { hooks: p.hookOptions.length - cleanHooks.length, claims: p.claimWordings.length - cleanClaims.length };
+  const removed = { hooks: p.hookOptions.length - cleanHooks.length, claims: droppedClaims.length + ((p.claimIds?.length ?? 0) - claimIds.length) };
   // An idea whose every opening line failed the gates is refused, never shown behind a filler headline (plan 03 P5
   // "never pad with junk"): the merchant would be choosing an idea we can't say.
   const noHook = cleanHooks.length === 0;
@@ -309,7 +392,15 @@ export function gateProposal(
   return {
     ok: !blockedStrategy && !ingredientBlocked && !noHook,
     reasons,
-    cleaned: { ...p, hookOptions: cleanHooks.slice(0, 3), claimWordings: cleanClaims, rationaleIds },
+    cleaned: {
+      ...p,
+      hookOptions: cleanHooks.slice(0, 3),
+      claimWordings: cleanClaims,
+      rationaleIds,
+      ...(p.customerTensionId !== undefined ? { customerTensionId } : {}),
+      ...(p.claimIds !== undefined ? { claimIds } : {}),
+      ...(p.assetIds !== undefined ? { assetIds } : {}),
+    },
     removed,
     droppedClaims,
     paddedHooks,
@@ -335,19 +426,24 @@ export interface ConceptRun {
 export const CONCEPTS_MAX_TOKENS = 6000;
 
 export async function generateConcepts(run: ConceptRun) {
-  const { productContext, packet, packetIds, ingredientsVerified, brandBrainVersionId, names, phrases, prohibited } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
+  const { productContext, packet, packetIds, assetIds, themeIds, claimsById, ingredientsVerified, brandBrainVersionId, names, phrases, prohibited } = await withTenant(run.ctx.workspaceId, (tx) => buildContext(tx, run.skuId, { projectId: run.projectId }));
   const phrasePart = customerPhrasesPart(phrases);
   const content: ContentPart[] = [
     ...contextPacketParts(packet),
     ...(phrasePart ? [phrasePart] : []),
     { type: 'text', text: run.batch > 1 ? `This is request #${run.batch}: the merchant wants different directions from the earlier set.` : 'Propose the first three tests.' },
   ];
+  // Feasibility, near-duplicate and platform gates (§20; plan 06 Phase 2), loaded lazily: recommendations builds on
+  // this module.
+  const { conceptGateContext, feasibilityGates } = await import('./recommendations');
+  const gateCtx = await withTenant(run.ctx.workspaceId, (tx) => conceptGateContext(tx, run.skuId, run.projectId, run.batch));
+  const refused: { angle: string; hookMechanism: string; reasons: string[] }[] = [];
   let attempt = 0;
   let res: Awaited<ReturnType<typeof llmJson<ConceptSet>>> | null = null;
   let gated: ReturnType<typeof gateProposal>[] = [];
   while (attempt < 2) {
     attempt++;
-    res = await llmJson({
+    const call = llmJson({
       ctx: run.ctx,
       token: run.token,
       task: 'creative_director.concepts',
@@ -360,7 +456,20 @@ export async function generateConcepts(run: ConceptRun) {
       effort: 'high',
       maxTokens: CONCEPTS_MAX_TOKENS,
     });
-    gated = res.data.concepts.map((c) => gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified, prohibited }));
+    try {
+      res = await call;
+    } catch (e) {
+      // A second attempt the batch's authorization can't cover: keep what the first attempt gave (an honest
+      // shortfall), never fail the whole set.
+      if (attempt > 1 && e instanceof DomainError && e.code === 'FORBIDDEN' && (e.details as { reason?: string } | undefined)?.reason === 'ceiling_or_expired') break;
+      throw e;
+    }
+    gated = res.data.concepts.map((c) => {
+      const g = gateProposal(c, productContext.approvedClaims, names, { packetIds, ingredientsVerified, prohibited, themeIds, claimsById, assetIds });
+      const hard = feasibilityGates(g.cleaned, gateCtx);
+      return hard.length ? { ...g, ok: false, reasons: [...g.reasons, ...hard] } : g;
+    });
+    for (const g of gated.filter((x) => !x.ok)) refused.push({ angle: g.cleaned.angle, hookMechanism: g.cleaned.hookMechanism, reasons: g.reasons.slice(0, 6) });
     const valid = gated.filter((g) => g.ok);
     if (valid.length === 3 && conceptsAreDistinct(valid.map((v) => v.cleaned))) break;
     content.push({ type: 'text', text: `Previous attempt was rejected by compliance/diversity gates: ${gated.flatMap((g) => g.reasons).join('; ') || 'concepts too similar'}. Fix and return three distinct compliant concepts.` });
@@ -375,7 +484,7 @@ export async function generateConcepts(run: ConceptRun) {
       const [c] = await tx`
         insert into concepts (workspace_id, sku_id, project_id, batch, idx, proposal, is_pick, pick_reason, gate_results, prompt_version, model, brand_brain_version_id)
         values (${run.ctx.workspaceId}, ${run.skuId}, ${run.projectId}, ${run.batch}, ${letters[i]!}, ${tx.json(g.cleaned as never)},
-          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons, droppedClaims: g.droppedClaims, paddedHooks: g.paddedHooks } as never)}, ${res!.promptVersion}, ${res!.model}, ${brandBrainVersionId})
+          ${i === pick}, ${i === pick ? res!.data.pickReason : null}, ${tx.json({ reasons: g.reasons, droppedClaims: g.droppedClaims, paddedHooks: g.paddedHooks, refused } as never)}, ${res!.promptVersion}, ${res!.model}, ${brandBrainVersionId})
         on conflict (workspace_id, project_id, batch, idx) do update set proposal = excluded.proposal
         returning id`;
       ids.push(c!.id as string);
