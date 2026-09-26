@@ -386,8 +386,10 @@ export async function recordScriptVersion(tx: Tx, workspaceId: string, sceneId: 
   if (!s) return null;
   const [n] = await tx`select coalesce(max(version), 0) + 1 as v from scene_versions where workspace_id = ${workspaceId} and scene_id = ${sceneId} and kind = 'script'`;
   const script = { spoken: s.spoken_line ?? null, overlay: s.overlay_text ?? null, durationMs: s.duration_ms, visualPlan: s.visual_plan, productBehavior: s.product_behavior ?? null, productionMode: s.production_mode };
-  const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, status, script, lineage)
-                       values (${workspaceId}, ${sceneId}, ${n!.v}, 'script', 'accepted', ${tx.json(script as never)}, ${tx.json({ source, ...extra } as never)})
+  // Like every scene version, it records the packaging version its storyboard is pinned to (§42).
+  const [v] = await tx`insert into scene_versions (workspace_id, scene_id, version, kind, status, script, lineage, visual_fingerprint_id)
+                       values (${workspaceId}, ${sceneId}, ${n!.v}, 'script', 'accepted', ${tx.json(script as never)}, ${tx.json({ source, ...extra } as never)},
+                               ${sceneFingerprintSql(tx, sceneId)})
                        returning id`;
   return v!.id as string;
 }
