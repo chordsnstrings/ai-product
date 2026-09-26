@@ -32,6 +32,8 @@ export const EventType = [
   'EXPERIMENT_CREATED',
   'EXPERIMENT_APPROVED',
   'EXPERIMENT_STATE_CHANGED',
+  // Platform event: a CONTROLLED experiment became EXPLORATORY (plan 03 A3: an edit changed a held variable).
+  'EXPERIMENT_MODE_CHANGED',
   'VARIANT_GENERATED',
   // Platform event: a hook variant was not shipped (claims, integrity or fit) — never shipped confounded.
   'VARIANT_SKIPPED',
@@ -179,6 +181,7 @@ export const EVENT_PAYLOADS: Partial<Record<EventType, z.ZodType>> = {
   PROVIDER_JOB_FAILED: z
     .object({ task: z.string(), latencyMs: z.number().int().nullable(), actualMicros: z.number().int(), providerRequestId: z.string().nullable(), errorKind: z.string() })
     .strict(),
+  EXPERIMENT_MODE_CHANGED: z.object({ from: z.literal('CONTROLLED'), to: z.literal('EXPLORATORY'), changed: z.array(z.string()).min(1), reason: z.string() }).strict(),
   CREATIVE_REGENERATION_REQUESTED: z.object({ by: z.enum(['user', 'staff', 'system']), from: z.string(), reason: z.string().nullable() }).strict(),
   // A creative derived from a delivered one (a hook variant, a recomposition): its parent and what changed.
   CREATIVE_VERSIONED: z
@@ -288,6 +291,7 @@ export const EVENT_SUBJECT: Record<EventType, EventSubjectType | null> = {
   EXPERIMENT_CREATED: 'experiment',
   EXPERIMENT_APPROVED: 'experiment',
   EXPERIMENT_STATE_CHANGED: 'experiment',
+  EXPERIMENT_MODE_CHANGED: 'experiment',
   VARIANT_GENERATED: 'variant',
   VARIANT_SKIPPED: 'variant',
   VARIANT_EXPORTED: 'variant',
@@ -393,6 +397,7 @@ export const EVENT_REQUIRED_REFS: Partial<Record<EventType, readonly EventRefKey
   CONFIDENCE_CHANGED: ['experimentId', 'skuId'],
   EXPERIMENT_CREATED: ['experimentId', 'skuId'],
   EXPERIMENT_APPROVED: ['experimentId', 'skuId', 'projectId'],
+  EXPERIMENT_MODE_CHANGED: ['experimentId', 'skuId'],
   RECOMMENDATION_CREATED: ['recommendationId', 'skuId'],
   RECOMMENDATION_ACCEPTED: ['recommendationId', 'experimentId', 'skuId'],
   GENOME_EXTRACTED: ['creativeId'],

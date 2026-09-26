@@ -6,6 +6,7 @@ import type { TenantContext } from './context';
 import { authorize, settle } from './cost-governor';
 import { buildContext, contextPacketParts, customerPhrasesPart, gateProposal, isIngredientLed, UNVERIFIED_INGREDIENTS_REASON } from './creative-director';
 import { emit } from './events';
+import { modeFor } from './experiment-design';
 import { stockState } from './stock';
 import { meaningfulCoverage } from './genome';
 import { ConceptSet, type Proposal } from './intel-schemas';
@@ -392,26 +393,26 @@ export async function generateRecommendations(ctx: TenantContext, skuId: string,
       // A fatigued winner (§45): a controlled refresh — same angle, a new opening, the current winner as control.
       for (const r of refreshes) {
         const [row] = await tx`
-          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, kind, control_creative_id)
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, kind, control_creative_id, mode)
           values (${ws}, ${skuId}, ${week}, 'EXPLOIT', ${tx.json(r.proposal as never)}, ${r.scored.score}, ${tx.json(r.scored.breakdown)}, ${tx.json(r.scored.gates)}, ${sc.basis},
-                  ${r.scored.rationaleIds}::uuid[], ${r.scored.confidence}, 'refresh', ${r.controlCreativeId})
+                  ${r.scored.rationaleIds}::uuid[], ${r.scored.confidence}, 'refresh', ${r.controlCreativeId}, ${modeFor(r.proposal, r.controlCreativeId)})
           returning id`;
         await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: row!.id as string }, { slot: 'EXPLOIT', score: r.scored.score, basis: sc.basis, confidence: r.scored.confidence, rationaleIds: r.scored.rationaleIds, refresh: true }, { skuId });
       }
       for (const p of picked) {
         const [r] = await tx`
-          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence)
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, mode)
           values (${ws}, ${skuId}, ${week}, ${p.slot}, ${tx.json(p.proposal as never)}, ${p.score}, ${tx.json(p.breakdown)}, ${tx.json(p.gates)}, ${sc.basis},
-                  ${p.rationaleIds}::uuid[], ${p.confidence})
+                  ${p.rationaleIds}::uuid[], ${p.confidence}, ${modeFor(p.proposal)})
           returning id`;
         await emit(tx, ctx, 'RECOMMENDATION_CREATED', { type: 'recommendation', id: r!.id as string }, { slot: p.slot, score: p.score, basis: sc.basis, confidence: p.confidence, rationaleIds: p.rationaleIds }, { skuId });
       }
       // Refused candidates are kept with their gate reasons for staff review; never shown, never picked.
       for (const g of scored.filter((x) => !x.gates.passed)) {
         await tx`
-          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, status)
+          insert into recommendations (workspace_id, sku_id, week_of, slot, proposal, score, score_breakdown, gates, basis, rationale_ids, confidence, status, mode)
           values (${ws}, ${skuId}, ${week}, ${g.slot}, ${tx.json(g.proposal as never)}, 0, ${tx.json(g.breakdown)}, ${tx.json(g.gates)}, ${sc.basis},
-                  ${g.rationaleIds}::uuid[], ${g.confidence}, 'gated')`;
+                  ${g.rationaleIds}::uuid[], ${g.confidence}, 'gated', ${modeFor(g.proposal)})`;
       }
       await settle(tx, ctx, auth.authorizationId, 'consumed');
     });
@@ -504,7 +505,7 @@ export async function resolveRationale(tx: Tx, ids: readonly string[]): Promise<
  * and confidence.
  */
 export async function recommendationsForSku(tx: Tx, skuId: string, opts: { sinceWeek?: string } = {}) {
-  const recs = await tx`select id, week_of, slot, proposal, score, basis, gates, rationale_ids, confidence, status from recommendations
+  const recs = await tx`select id, week_of, slot, proposal, score, basis, gates, rationale_ids, confidence, status, mode from recommendations
                         where sku_id = ${skuId} and status = 'open' and week_of >= ${opts.sinceWeek ?? weekOf(new Date(Date.now() - 7 * 86400_000))}
                         order by week_of desc, score desc limit 9`;
   const items = await resolveRationale(tx, recs.flatMap((r) => (r.rationale_ids as string[]) ?? []));
@@ -517,6 +518,7 @@ export async function recommendationsForSku(tx: Tx, skuId: string, opts: { since
       hypothesis: p.hypothesis,
       hookOptions: p.hookOptions,
       primaryVariable: p.primaryVariable,
+      mode: (r.mode as 'CONTROLLED' | 'EXPLORATORY' | null) ?? modeFor(p),
       whyNow: p.whyNow,
       expectedLearning: p.expectedLearning,
       score: Number(r.score),

@@ -5,6 +5,7 @@ import { assertCan } from './authz';
 import type { TenantContext } from './context';
 import { actorString } from './context';
 import { emit } from './events';
+import { assertExperimentDesign, experimentMetrics, experimentPrimaryVariable, heldConstant, HELD_DEFAULT, metricsFor, modeFor } from './experiment-design';
 import { confoundRunning, CONTEXT_CHANGE_KINDS, LIVE_STATES, recordExperimentApproval, setExperimentState, weakenLearnings } from './experiment-state';
 import { authorizeFromQuote, renderQuote } from './render-quotes';
 import { available, lockEntitlement } from './ledger';
@@ -20,6 +21,8 @@ import { STORYBOARD_STEPS } from './storyboard';
 import { assertStockCleared } from './stock';
 import {
   baselineFrom,
+  commercialVeto,
+  compareCommercial,
   compareVariants,
   DEFAULT_BASELINES,
   nextLearningState,
@@ -28,10 +31,12 @@ import {
   toRate,
   type BaselinePool,
   type ComparisonResult,
+  type MoneyMetric,
   type RateMetric,
   type VariantEvidence,
 } from './statistics';
 
+export { HELD_DEFAULT, heldConstant, experimentPrimaryVariable, modeFor, metricsFor, experimentMetrics, validateExperimentDesign, assertExperimentDesign, type DesignVariant } from './experiment-design';
 export { setExperimentState, EXPERIMENT_NEXT, canExperimentTransition, onMaterialProductChange, weakenLearnings, sweepStaleLearnings, CONTEXT_CHANGE_KINDS, LEARNING_REVALIDATION_DAYS } from './experiment-state';
 
 /**
@@ -40,8 +45,6 @@ export { setExperimentState, EXPERIMENT_NEXT, canExperimentTransition, onMateria
  * the result. Results are computed per measurement context and attribution window — never averaged across
  * platforms or measurement bases (§30, §48).
  */
-
-const HELD_DEFAULT = ['body', 'offer', 'cta', 'product', 'duration'];
 
 /**
  * Variant code for ad names (auto-linking, §30): AK-<catalogue no>-<letter> for a SKU's first experiment and
@@ -108,9 +111,10 @@ async function insertExperiment(
   // told why and offered replacement footage; its past results are untouched.
   if (input.controlCreativeId) await assertAssetUsable(tx, await creativeSourceAssets(tx, input.controlCreativeId), 'Your current ad');
   const declared = p.primaryVariable;
-  const primaryVariable = input.controlCreativeId ? declared : 'hook';
-  const controlled = declared === 'hook' || !!input.controlCreativeId;
-  const mode = controlled && p.riskProfile !== 'exploratory' ? 'CONTROLLED' : 'EXPLORATORY';
+  const primaryVariable = experimentPrimaryVariable(p, input.controlCreativeId);
+  const mode = modeFor(p, input.controlCreativeId);
+  const held = heldConstant(mode, primaryVariable);
+  const metrics = metricsFor(primaryVariable);
   // Locked: the SKU's experiment sequence (and so its variant codes) can't be taken twice by concurrent creates.
   const [sku] = await tx`select catalogue_no from skus where id = ${input.skuId} for update`;
   if (!sku) throw new DomainError('NOT_FOUND', 'Product not found');
@@ -120,10 +124,10 @@ async function insertExperiment(
   const expId = newId();
   const genes = { angle: p.angle, hookMechanism: p.hookMechanism, proofMechanism: p.proofMechanism, treatment: p.treatment, declaredVariable: declared };
   await tx`
-    insert into experiments (id, workspace_id, sku_id, hypothesis, rationale, primary_variable, controlled_variables, primary_metric,
+    insert into experiments (id, workspace_id, sku_id, hypothesis, rationale, primary_variable, controlled_variables, primary_metric, leading_metrics,
       expected_learning, if_test_fails, mode, state, portfolio_slot, recommendation_id, genes, created_by)
     values (${expId}, ${ctx.workspaceId}, ${input.skuId}, ${p.hypothesis}, ${p.whyNow}, ${primaryVariable},
-      ${mode === 'CONTROLLED' ? HELD_DEFAULT : []}, ${primaryVariable === 'hook' ? 'hold_rate' : 'ctr'}, ${p.expectedLearning},
+      ${held}, ${metrics.primary}, ${metrics.leading}, ${p.expectedLearning},
       ${p.ifTestFails}, ${mode}, ${input.recommendationId ? 'RECOMMENDED' : 'DRAFT'}, ${input.slot ?? null}, ${input.recommendationId ?? null},
       ${tx.json(genes as never)}, ${actorString(ctx)})`;
   // Variants: optional control (existing creative) + master + up to two economical hook variants (§5).
@@ -131,19 +135,21 @@ async function insertExperiment(
   if (input.controlCreativeId) {
     const [cid] = await tx`insert into variants (workspace_id, experiment_id, label, code, role, creative_id, changed_variables, held_constant)
                            values (${ctx.workspaceId}, ${expId}, 'Current control', ${code(i++)}, 'control',
-                                   ${input.controlCreativeId}, '{}', ${HELD_DEFAULT}) returning id`;
+                                   ${input.controlCreativeId}, '{}', ${held}) returning id`;
     await tx`update experiments set control_variant_id = ${cid!.id} where id = ${expId}`;
   }
   const [master] = await tx`
     insert into variants (workspace_id, experiment_id, label, code, role, project_id, changed_variables, held_constant, genes)
     values (${ctx.workspaceId}, ${expId}, ${p.hookOptions[0]!}, ${code(i++)}, 'variant', ${input.projectId},
-            ${input.controlCreativeId ? [declared] : []}, ${mode === 'CONTROLLED' ? HELD_DEFAULT : []}, ${tx.json({ ...genes, hook: p.hookOptions[0] } as never)})
+            ${input.controlCreativeId ? [declared] : []}, ${held}, ${tx.json({ ...genes, hook: p.hookOptions[0] } as never)})
     returning id`;
   for (const hook of p.hookOptions.slice(1, 3)) {
     await tx`insert into variants (workspace_id, experiment_id, label, code, role, changed_variables, held_constant, genes)
              values (${ctx.workspaceId}, ${expId}, ${hook}, ${code(i++)}, 'variant', ${['hook']},
                      ${[...HELD_DEFAULT, 'scenes_2_plus', 'voiceover']}, ${tx.json({ ...genes, hook } as never)})`;
   }
+  // §38: the server validates the controlled-variable schema before the experiment exists.
+  await assertExperimentDesign(tx, expId);
   return { experimentId: expId, masterVariantId: master!.id as string, mode, primaryVariable };
 }
 
@@ -215,6 +221,8 @@ export async function approveExperiment(tx: Tx, ctx: TenantContext, experimentId
   const projectId = v.project_id as string;
   if (e.approved_at) return { changed: false, projectId };
   if (!['DRAFT', 'RECOMMENDED', 'APPROVED'].includes(e.state as string)) throw new DomainError('CONFLICT', 'This test has already moved past approval.');
+  // §38 POST /experiments/:id/approve: the controlled-variable schema is checked again before any spend.
+  await assertExperimentDesign(tx, experimentId);
   // §42: an out-of-stock product is flagged before production; it goes ahead once the merchant says what for.
   await assertStockCleared(tx, e.sku_id as string);
   // With a render quote (the customer app always sends one, §38): the Cost Governor authorization is made now, in
@@ -526,29 +534,43 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
   // One comparison per measurement context × attribution window: a 7-day-click and a 1-day-view reading are
   // different measurements and are never summed together (§30).
   const groups = [...new Map(agg.map((a) => [`${a.measurement_context}|${a.attribution_window}`, { context: a.measurement_context, window: a.attribution_window }])).values()];
-  const metrics: RateMetric[] = e.primary_metric === 'hold_rate' ? ['hold_rate', 'ctr', 'cvr'] : ['ctr', 'hold_rate', 'cvr'];
+  // The experiment's own primary metric and leading metrics (§20), never a fixed list.
+  const metrics = experimentMetrics(e);
   interface Summary {
     context: MeasurementContext;
     window: string;
     metric: RateMetric;
     state: ComparisonResult['state'];
     leader: string | null;
+    lift: number | null;
     explanation: string;
     cmp: ComparisonResult;
   }
   const summary: Summary[] = [];
+  const commercial: { context: MeasurementContext; window: string; metric: MoneyMetric; state: ComparisonResult['state']; leader: string | null; lift: number | null; explanation: string }[] = [];
 
   for (const g of groups) {
     const pools = await baselinePools(tx, e.sku_id as string, variantIds, g.context, g.window, accounts);
     const sc = scopes.get(`${g.context}|${g.window}`);
     const scope = { ...(sc?.scope ?? {}), excludedImpressions: sc?.excluded ?? 0 };
     const rows = agg.filter((a) => a.measurement_context === g.context && a.attribution_window === g.window);
+    // CPA / ROAS (§21): conversion uncertainty and order-value variability, in the reporting currency — not read
+    // when some delivery in this context has no conversion rate (its spend would be missing from the sums).
+    const money = rows.some((r) => Number(r.unconverted) > 0)
+      ? null
+      : compareCommercial(
+          rows.map((r) => ({ variantId: r.variant_id, spend: Number(r.spend_micros) / 1_000_000, purchases: Number(r.purchases), purchaseValue: Number(r.purchase_value_micros) / 1_000_000, days: Number(r.days) })),
+          daily,
+        );
     for (const metric of metrics) {
       const ev: VariantEvidence[] = rows.map((r) => ({ variantId: r.variant_id, obs: toRate(metric, r), days: Number(r.days) })).filter((x) => x.obs.trials > 0);
       if (!ev.length) continue;
       // Shrink toward this SKU's (else the account's) recent baseline in the same context and window (§21).
       const base = baselineFrom(metric, pools[metric], DEFAULT_BASELINES[metric]);
-      const cmp = ev.length > 1 ? compareVariants(metric, ev, base, daily, (e.control_variant_id as string) ?? null) : null;
+      let cmp = ev.length > 1 ? compareVariants(metric, ev, base, daily, (e.control_variant_id as string) ?? null) : null;
+      // §21 ACTIONABLE needs a commercial effect: a leader that probably costs more per purchase stays DIRECTIONAL.
+      const veto = cmp?.state === 'ACTIONABLE' ? commercialVeto(money?.cpa, cmp.leader) : null;
+      if (cmp && veto) cmp = { ...cmp, state: 'DIRECTIONAL', explanation: `${cmp.explanation} ${veto}` };
       for (const r of ev) {
         const post = posterior(r.obs, base);
         const row = cmp?.variants.find((x) => x.variantId === r.variantId);
@@ -563,9 +585,34 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
             ci_low = excluded.ci_low, ci_high = excluded.ci_high, prob_best = excluded.prob_best, state = excluded.state,
             confounder_windows = excluded.confounder_windows, scope = excluded.scope, computed_at = now()`;
       }
-      if (cmp) summary.push({ context: g.context, window: g.window, metric, state: cmp.state, leader: cmp.leader, explanation: cmp.explanation, cmp });
+      if (cmp) summary.push({ context: g.context, window: g.window, metric, state: cmp.state, leader: cmp.leader, lift: cmp.lift, explanation: cmp.explanation, cmp });
+    }
+    for (const m of money ? [money.cpa, money.roas] : []) {
+      for (const r of m.variants) {
+        await tx`
+          insert into experiment_results (workspace_id, experiment_id, variant_id, measurement_context, attribution_window, metric, successes, trials, raw_rate,
+            posterior_mean, ci_low, ci_high, prob_best, state, confounder_windows, scope)
+          values (${ctx.workspaceId}, ${experimentId}, ${r.variantId}, ${g.context}, ${g.window}, ${m.metric}, ${m.metric === 'cpa' ? r.purchases : r.purchaseValue}, ${r.spend},
+            ${r.posterior.raw}, ${r.posterior.mean}, ${r.posterior.ciLow}, ${r.posterior.ciHigh}, ${r.probBest}, ${m.state},
+            ${tx.json(confounderWindows as never)}, ${tx.json(scope as never)})
+          on conflict (workspace_id, experiment_id, variant_id, measurement_context, attribution_window, metric) do update set
+            successes = excluded.successes, trials = excluded.trials, raw_rate = excluded.raw_rate, posterior_mean = excluded.posterior_mean,
+            ci_low = excluded.ci_low, ci_high = excluded.ci_high, prob_best = excluded.prob_best, state = excluded.state,
+            confounder_windows = excluded.confounder_windows, scope = excluded.scope, computed_at = now()`;
+      }
+      commercial.push({ context: g.context, window: g.window, metric: m.metric, state: m.state, leader: m.leader, lift: m.lift, explanation: m.explanation });
     }
   }
+  // Each comparison's reading and explanation (§21 "explain that more data is needed", "avoid definitive language"),
+  // kept per context, window and metric; a comparison that no longer exists (its data corrected away) is removed.
+  for (const c of [...summary, ...commercial]) {
+    await tx`
+      insert into experiment_comparisons (workspace_id, experiment_id, measurement_context, attribution_window, metric, state, leader_variant_id, lift, explanation)
+      values (${ctx.workspaceId}, ${experimentId}, ${c.context}, ${c.window}, ${c.metric}, ${c.state}, ${c.leader}, ${c.lift}, ${c.explanation})
+      on conflict (workspace_id, experiment_id, measurement_context, attribution_window, metric) do update set
+        state = excluded.state, leader_variant_id = excluded.leader_variant_id, lift = excluded.lift, explanation = excluded.explanation, computed_at = now()`;
+  }
+  await tx`delete from experiment_comparisons where workspace_id = ${ctx.workspaceId} and experiment_id = ${experimentId} and computed_at < now()`;
 
   // The test's state and its learnings come from paid delivery only: organic and affiliate results are stored and
   // shown as their own panels, never read as a paid comparison (§48).
@@ -585,7 +632,7 @@ export async function computeResults(tx: Tx, ctx: TenantContext, experimentId: s
       await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'signal_update', window: w.key }, { singletonKey: `signal:${w.key}`, runAfter: w.runAt });
     }
   }
-  const out = { state: (moved ? resultState : prev) as ExperimentState, summary: summary.map(({ cmp: _c, ...s }) => s), confounderWindows };
+  const out = { state: (moved ? resultState : prev) as ExperimentState, summary: summary.map(({ cmp: _c, ...s }) => s), commercial, confounderWindows };
   // Measured decay of the leading variant (§45): a fatigued winner asks for a controlled refresh, the learning stays.
   await recordFatigue(tx, experimentId, variantIds, best && (best.state === 'ACTIONABLE' || best.state === 'DIRECTIONAL') ? best.leader : null);
   // Learnings come from tests that ran (an archived test's late conversions still revise them), never from a

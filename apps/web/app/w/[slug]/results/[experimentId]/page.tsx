@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
-import { experimentView } from '@arkiv/core';
+import { evidenceFloor, experimentView } from '@arkiv/core';
 import { MeasurementContextCaveat, measurementContextLabel, type MeasurementContext } from '@arkiv/shared';
 import { Banner, SignalChip, VideoThumb } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
@@ -17,6 +17,12 @@ export async function generateMetadata({ params }: { params: Promise<{ slug: str
 }
 
 const pct = (n: number | null) => (n == null ? '—' : `${(Number(n) * 100).toFixed(2)}%`);
+const money = (n: number | null) => (n == null ? '—' : `$${Number(n).toFixed(2)}`);
+const ratio = (n: number | null) => (n == null ? '—' : `${Number(n).toFixed(2)}×`);
+/** How a metric's values read: rates as percentages, cost per purchase in money, ROAS as a multiple. */
+const fmt = (metric: string) => (metric === 'cpa' ? money : metric === 'roas' ? ratio : pct);
+const METRIC_LABEL: Record<string, string> = { ctr: 'click-through', hold_rate: 'hold rate', cvr: 'conversion', cpa: 'cost per purchase', roas: 'return on ad spend' };
+const METRIC_ORDER = ['hold_rate', 'ctr', 'cvr', 'cpa', 'roas'];
 
 /** Metrics shown only inside their measurement context — Meta paid and TikTok GMV Max are never merged (§30). */
 export default async function ResultDetail({ params }: { params: Promise<{ slug: string; experimentId: string }> }) {
@@ -37,7 +43,11 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     // Ads deleted on the platform (§48): their history stays; the variant is labelled, never back-filled.
     const deleted = await tx`select v.id from variants v join creatives c on c.id = v.creative_id and c.workspace_id = v.workspace_id
                              where v.experiment_id = ${experimentId} and c.source_deleted_at is not null`;
-    return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs, deletedVariants: new Set(deleted.map((x) => x.id as string)) };
+    // Each comparison's reading in words (§21), and the account's recent volume for the evidence floors.
+    const comparisons = await tx`select measurement_context, attribution_window, metric, state, explanation from experiment_comparisons where experiment_id = ${experimentId}`;
+    const [vol] = await tx`select coalesce(sum(impressions) / nullif(count(distinct date), 0), 0)::bigint as daily from performance_observations
+                           where date > now() - interval '30 days' and superseded_at is null`;
+    return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs, deletedVariants: new Set(deleted.map((x) => x.id as string)), comparisons, daily: Number(vol?.daily ?? 0) };
   });
   if (!d) return denyPage('experiment', experimentId, w);
   // One table per measurement context and attribution window: different windows are different measurements (§30).
@@ -47,6 +57,15 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
   // Confounder windows that overlapped this test's observed dates (§45), as of the last computation.
   const overlapping = new Set(d.results.flatMap((r) => ((r.confounder_windows as { id: string }[] | null) ?? []).map((c) => c.id)));
   const canEdit = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
+  const exploratory = d.experiment.mode === 'EXPLORATORY';
+  const primaryMetric = String(d.experiment.primary_metric ?? 'ctr');
+  // The empty state from the real evidence floor for this test's metric and this account's volume (§21).
+  const floor = evidenceFloor((['ctr', 'hold_rate', 'cvr'].includes(primaryMetric) ? primaryMetric : 'ctr') as 'ctr' | 'hold_rate' | 'cvr', d.daily);
+  const floorUnit = primaryMetric === 'cvr' ? 'clicks' : primaryMetric === 'hold_rate' ? 'video views' : 'impressions';
+  const explanationsFor = (ctx: string, window: string) =>
+    d.comparisons
+      .filter((c) => c.measurement_context === ctx && String(c.attribution_window ?? 'default') === window)
+      .sort((a, b) => METRIC_ORDER.indexOf(a.metric as string) - METRIC_ORDER.indexOf(b.metric as string));
   const day = (x: unknown) => formatDate(x as string);
   const scopeOf = (ctx: string, window: string) => {
     const r = d.results.find((x) => x.measurement_context === ctx && String(x.attribution_window ?? 'default') === window);
@@ -59,6 +78,11 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
         <h1 className="ak-h1" style={{ margin: 0 }}>{d.experiment.hypothesis as string}</h1>
         <SignalChip state={String(d.experiment.state)} />
       </div>
+      <p className="ak-small ak-muted">
+        {exploratory ? 'Exploratory test' : 'Controlled test'} · judged on {METRIC_LABEL[primaryMetric] ?? primaryMetric}
+        {Array.isArray(d.experiment.leading_metrics) && (d.experiment.leading_metrics as string[]).length ? `, with ${(d.experiment.leading_metrics as string[]).map((m) => METRIC_LABEL[m] ?? m).join(' and ')} alongside` : ''}
+      </p>
+      {exploratory ? <Banner>Exploratory: the winner is real, but the cause isn’t isolated — more than one thing changed between these ads.</Banner> : null}
       {d.thumbs.length ? (
         <div className="ak-scroll-row" role="list" aria-label="Variants" style={{ marginTop: 24 }}>
           {d.thumbs.map((t) => (
@@ -71,7 +95,7 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
       {d.revisedAt ? <Banner>Updated: numbers were revised on {formatDate(d.revisedAt)} as late conversions arrived.</Banner> : null}
       {d.freshness?.stale ? <Banner tone="warn">{d.freshness.degraded ? 'A connected ad account needs attention' : 'Your ad data hasn’t synced for over a week'} — these numbers may be incomplete.</Banner> : null}
       {groups.length === 0 ? (
-        <p className="ak-muted" style={{ marginTop: 24 }}>No performance data yet. Launch the ads with the variant codes in their names, or upload a CSV from Results. Signals appear after roughly 1,000 impressions per variant.</p>
+        <p className="ak-muted" style={{ marginTop: 24 }}>No performance data yet. Launch the ads with the variant codes in their names, or upload a CSV from Results. A first read needs about {floor.minTrials.toLocaleString('en-US')} {floorUnit} per variant over at least {floor.minDays} days.</p>
       ) : (
         groups.map(({ ctx, window }) => (
           <section key={`${ctx}|${window}`} className="ak-section">
@@ -88,6 +112,13 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
                 </p>
               ) : null;
             })()}
+            {explanationsFor(ctx, window).length ? (
+              <ul className="ak-small" style={{ paddingLeft: 18, maxWidth: 720 }}>
+                {explanationsFor(ctx, window).map((c) => (
+                  <li key={c.metric as string}><span className="ak-muted">{METRIC_LABEL[c.metric as string] ?? String(c.metric)}:</span> {c.explanation as string}</li>
+                ))}
+              </ul>
+            ) : null}
             <div className="ak-scroll-x">
               <table className="ak-table">
                 <thead><tr><th>Variant</th><th>Metric</th><th>Observed</th><th>Estimated</th><th>Range (90%)</th><th>Chance best</th><th>Signal</th></tr></thead>
@@ -95,10 +126,15 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
                   {d.results.filter((r) => r.measurement_context === ctx && String(r.attribution_window ?? 'default') === window).map((r) => (
                     <tr key={r.id as string}>
                       <td className="ak-mono">{label.get(r.variant_id as string)}</td>
-                      <td>{String(r.metric).replace('_', ' ')}</td>
-                      <td className="ak-mono">{pct(r.raw_rate as number)} <span className="ak-muted">({Number(r.successes).toLocaleString()}/{Number(r.trials).toLocaleString()})</span></td>
-                      <td className="ak-mono">{pct(r.posterior_mean as number)}</td>
-                      <td className="ak-mono">{pct(r.ci_low as number)} – {pct(r.ci_high as number)}</td>
+                      <td>{METRIC_LABEL[r.metric as string] ?? String(r.metric).replace('_', ' ')}</td>
+                      <td className="ak-mono">
+                        {fmt(r.metric as string)(r.raw_rate as number)}{' '}
+                        <span className="ak-muted">
+                          {r.metric === 'cpa' ? `(${Number(r.successes).toLocaleString()} purchases, ${money(r.trials as number)} spend)` : r.metric === 'roas' ? `(${money(r.successes as number)} sales, ${money(r.trials as number)} spend)` : `(${Number(r.successes).toLocaleString()}/${Number(r.trials).toLocaleString()})`}
+                        </span>
+                      </td>
+                      <td className="ak-mono">{fmt(r.metric as string)(r.posterior_mean as number)}</td>
+                      <td className="ak-mono">{fmt(r.metric as string)(r.ci_low as number)} – {fmt(r.metric as string)(r.ci_high as number)}</td>
                       <td className="ak-mono">{r.prob_best == null ? '—' : `${Math.round(Number(r.prob_best) * 100)}%`}</td>
                       <td><SignalChip state={String(r.state)} /></td>
                     </tr>
