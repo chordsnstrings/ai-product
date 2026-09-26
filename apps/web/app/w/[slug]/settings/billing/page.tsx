@@ -1,11 +1,14 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { withTenant } from '@arkiv/db';
-import { currentPlanPrices, pendingPriceChange, periodUsage, quoteAfterOffer, setting, subscriptionPrice } from '@arkiv/core';
+import { can, currentPlanPrices, currentQuote, pendingPriceChange, periodUsage, quoteAfterOffer, setting, subscriptionPrice } from '@arkiv/core';
+import { upgradeRenewText } from '@arkiv/billing';
 import { formatUsd, PLANS, type PlanCode } from '@arkiv/shared';
 import { Banner, LinkButton } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
 import { CancelFlow } from '@/components/cancel-flow';
+import { PlanUpgrade } from '@/components/plan-upgrade';
+import { noPlanPanel } from '@/lib/billing-view';
 import { workspacePage } from '@/lib/tenant';
 import { formatDate } from '@arkiv/shared/format';
 
@@ -21,23 +24,33 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
     const usage = sub ? await periodUsage(tx, new Date(sub.current_period_start as string).toISOString().slice(0, 10)) : null;
     const purchases = await tx`select p.kind, p.amount_micros, p.status, p.paid_at, p.created_at, s.name from purchases p left join projects pr on pr.id = p.project_id left join skus s on s.id = pr.sku_id where p.status in ('paid','refunded') order by p.created_at desc limit 20`;
     const [cust] = await tx`select customer_id from stripe_customers where workspace_id = ${w.ctx.workspaceId}`;
-    // The per-ad price this workspace would pay today (its live standalone version), not a constant.
-    const perAd = sub ? null : (await quoteAfterOffer(tx)).priceMicros;
+    // What this workspace would pay per ad today (a live intro offer, else its standalone version), not a constant.
+    const quote = sub ? null : await currentQuote(tx);
+    const after = sub ? null : (await quoteAfterOffer(tx)).priceMicros;
+    const [ws] = await tx`select state, cancelled_at from workspaces where id = ${w.ctx.workspaceId}`;
     // Plan 04 §3: what this subscription pays, a notified price change, and today's prices for plan changes.
     const own = sub ? await subscriptionPrice(tx, { id: sub.id as string, workspaceId: w.ctx.workspaceId, planCode: sub.plan_code as PlanCode, createdAt: sub.created_at as string }) : null;
     const change = sub ? await pendingPriceChange(tx, w.ctx.workspaceId, sub.id as string) : null;
     const prices = await currentPlanPrices(tx);
-    return { sub, usage, purchases, perAd, own, change, prices, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
+    return { sub, usage, purchases, quote, after, ws, own, change, prices, hasCustomer: !!cust, archiveDays: await setting(tx, 'retention.cancelled_archive_days'), support: await setting(tx, 'support.email') };
   });
-  const canManage = ['OWNER', 'ADMIN'].includes(w.ctx.role);
+  // Billing is Owner-only (plan 02 §1.1): an Admin sees the plan but is not offered actions the server refuses.
+  const canManage = can(w.ctx, 'billing.manage');
   const plan = d.sub ? PLANS[d.sub.plan_code as PlanCode] : null;
+  const noPlan = d.sub ? null : noPlanPanel({
+    state: w.ctx.workspaceState,
+    cancelledAt: (d.ws?.cancelled_at as string | null) ?? null,
+    archiveDays: d.archiveDays,
+    quote: { kind: d.quote!.kind, priceMicros: d.quote!.priceMicros, status: d.quote!.status, expiresAt: d.quote!.expiresAt },
+    afterMicros: d.after!,
+  });
   return (
     <div className="ak-stack" style={{ ['--stack' as string]: '32px' }}>
       {!d.sub ? (
         <div className="ak-panel">
-          <h2 className="ak-label">No plan</h2>
-          <p>You’re paying per ad ({formatUsd(d.perAd ?? 0, 0)} each). Choose a plan to test continuously.</p>
-          {canManage ? <LinkButton href="/app/plan">See plans</LinkButton> : null}
+          <h2 className="ak-label">{noPlan!.title}</h2>
+          <p>{noPlan!.body}</p>
+          {noPlan!.cta && canManage ? <LinkButton href={noPlan!.cta.href}>{noPlan!.cta.label}</LinkButton> : noPlan!.cta ? <p className="ak-small ak-muted">Only the workspace owner can choose a plan.</p> : null}
         </div>
       ) : (
         <div className="ak-panel">
@@ -54,6 +67,7 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
             {canManage && d.hasCustomer ? <ActionButton slug={slug} action="portal">Payment method & invoices</ActionButton> : null}
           </div>
           {d.sub.status === 'past_due' ? <Banner tone="risk">Your last payment failed. Update your card to keep producing tests.</Banner> : null}
+          {d.sub.collection_paused_at ? <Banner>Billing is paused while this workspace is on hold. You won’t be charged until the hold is lifted.</Banner> : null}
           {d.sub.pending_plan_code ? (
             <Banner>
               Switching to {PLANS[d.sub.pending_plan_code as PlanCode].name} on {fmt(d.sub.current_period_end as string)}.{' '}
@@ -77,15 +91,19 @@ export default async function Billing({ params }: { params: Promise<{ slug: stri
             {(['LAUNCH', 'GROWTH', 'SCALE'] as const).map((c) => {
               const p = PLANS[c];
               const current = c === d.sub!.plan_code;
-              const up = d.prices[c] > d.own!.priceMicros;
+              // Upgrade vs downgrade by plan tier, as the server decides it (an upgrade applies now, a downgrade at renewal).
+              const up = PLANS[c].priceMicros > PLANS[d.sub!.plan_code as PlanCode].priceMicros;
               const scheduled = c === d.sub!.pending_plan_code;
               return (
                 <div key={c} className={`ak-card${current ? ' ak-card--pick' : ''}`}>
                   <h3 className="ak-label">{p.name}</h3>
                   <p style={{ margin: 0 }}>{formatUsd(d.prices[c], 0)}/mo · {p.creativeTestsPerMonth} tests</p>
-                  {current ? <span className="ak-small ak-muted">Current plan</span> : scheduled ? <span className="ak-small ak-muted">Starts at renewal</span> : (
-                    <ActionButton slug={slug} action="change-plan" body={{ plan: c }} confirm={up ? `Upgrade to ${p.name} now? You'll be charged the prorated difference today and get extra tests for this period.` : `Downgrade to ${p.name} at the end of this period? Nothing changes until then.`}>
-                      {up ? 'Upgrade now' : 'Downgrade at renewal'}
+                  {current ? <span className="ak-small ak-muted">Current plan</span> : scheduled ? <span className="ak-small ak-muted">Starts at renewal</span> : up ? (
+                    // A higher recurring charge: express consent to the new monthly terms (plan 04 §3).
+                    <PlanUpgrade slug={slug} plan={c} planName={p.name} terms={upgradeRenewText(c, new Date(d.sub!.current_period_end as string), d.prices[c])} />
+                  ) : (
+                    <ActionButton slug={slug} action="change-plan" body={{ plan: c }} confirm={`Downgrade to ${p.name} at the end of this period? Nothing changes until then.`}>
+                      Downgrade at renewal
                     </ActionButton>
                   )}
                 </div>

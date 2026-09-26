@@ -11,6 +11,7 @@ import {
   processStripeEvent,
   receiveStripeWebhook,
   recordAutoRenewConsent,
+  recordUpgradeConsent,
   setCancellation,
   startProductionCheckout,
   startSubscriptionCheckout,
@@ -157,9 +158,11 @@ describe('plan changes (plan 02 B6/B7)', () => {
 
   it('two concurrent upgrades apply one after the other: the extra tests match the final plan, never double', async () => {
     const { t, ctx } = await subscribed('LAUNCH');
+    const consent = (plan: 'GROWTH' | 'SCALE') => withTenant(t.workspaceId, (tx) => recordUpgradeConsent(tx, ctx(), { userId: t.userId, plan, agreed: true }));
+    const [toGrowth, toScale] = [await consent('GROWTH'), await consent('SCALE')];
     const results = await Promise.allSettled([
-      withTenant(t.workspaceId, (tx) => changePlan(tx, ctx(), 'GROWTH')),
-      withTenant(t.workspaceId, (tx) => changePlan(tx, ctx(), 'SCALE')),
+      withTenant(t.workspaceId, (tx) => changePlan(tx, ctx(), 'GROWTH', { consentId: toGrowth })),
+      withTenant(t.workspaceId, (tx) => changePlan(tx, ctx(), 'SCALE', { consentId: toScale })),
     ]);
     expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
     const [extra] = await ownerPool()`select coalesce(sum(amount), 0)::int as n from ledger_entries where workspace_id = ${t.workspaceId} and type = 'CREDIT_GRANTED' and idempotency_key like 'upgrade:%'`;

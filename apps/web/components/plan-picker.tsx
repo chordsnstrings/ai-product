@@ -33,7 +33,7 @@ export function PlanPicker({ slug, plans, initial, canBuy }: { slug: string; pla
     }
   }
   if (embedded) return <embedded.C clientSecret={embedded.clientSecret} pk={embedded.pk} />;
-  if (!canBuy) return <Banner tone="warn">Only the workspace owner or an admin can choose a plan.</Banner>;
+  if (!canBuy) return <Banner tone="warn">Only the workspace owner can choose a plan.</Banner>;
   return (
     <div className="ak-stack" style={{ marginTop: 24 }}>
       <div role="radiogroup" aria-label="Plan" className="ak-stack">

@@ -54,6 +54,17 @@ export function autoRenewText(plan: PlanCode, now = new Date(), priceMicros: num
   return `${formatUsd(priceMicros, 0)}/month plus applicable sales tax, charged today and ${when} until you cancel. Cancel online anytime in Settings → Billing.`;
 }
 
+/**
+ * The recurring terms of an upgrade (plan 04 §3): the new monthly price, that the prorated difference is charged
+ * today, and the day the subscription keeps renewing on (its current billing day, not today).
+ */
+export function upgradeRenewText(plan: PlanCode, renewsOn: Date, priceMicros: number = PLANS[plan].priceMicros) {
+  const day = renewsOn.getUTCDate();
+  const suffix = day % 10 === 1 && day !== 11 ? 'st' : day % 10 === 2 && day !== 12 ? 'nd' : day % 10 === 3 && day !== 13 ? 'rd' : 'th';
+  const when = day > 28 ? `on the ${day}${suffix} of each month (the last day of shorter months)` : `on the ${day}${suffix} of each month`;
+  return `${PLANS[plan].name}: ${formatUsd(priceMicros, 0)}/month plus applicable sales tax. The prorated difference for the rest of this period is charged today, then ${formatUsd(priceMicros, 0)} ${when} until you cancel. Cancel online anytime in Settings → Billing.`;
+}
+
 async function ensureCustomer(tx: Tx, ctx: TenantContext, email: string): Promise<string> {
   const [w] = await tx`select stripe_customer_id, name from workspaces where id = ${ctx.workspaceId} for update`;
   if (w?.stripe_customer_id) return w.stripe_customer_id as string;
@@ -170,6 +181,32 @@ export async function recordAutoRenewConsent(
   return c!.id as string;
 }
 
+/**
+ * Consent to an upgrade's new recurring charge (plan 04 §3: express consent to the auto-renew terms, kept ≥ 3 years):
+ * an unchecked box next to the new monthly price, recorded with the exact text shown. An upgrade can't happen
+ * without one (changePlan checks it).
+ */
+export async function recordUpgradeConsent(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { userId: string | null; plan: PlanCode; agreed: boolean; ip?: string | null; userAgent?: string | null },
+) {
+  assertCan(ctx, 'billing.manage');
+  if (!input.agreed) throw new DomainError('INVALID', 'Please tick the box to agree to the new monthly charge.', { needsConsent: true });
+  const [s] = await tx`select plan_code, current_period_end from subscriptions where workspace_id = ${ctx.workspaceId} and status in ('active','trialing')
+                       order by created_at desc limit 1`;
+  if (!s) throw new DomainError('NOT_FOUND', 'No active plan.');
+  // The text describes an upgrade (a prorated charge today); a downgrade waits for renewal and needs no new consent.
+  if (!(PLANS[input.plan].priceMicros > PLANS[s.plan_code as PlanCode].priceMicros)) throw new DomainError('INVALID', `${PLANS[input.plan].name} isn’t an upgrade from your plan.`);
+  const { priceMicros } = await currentStripePrice(tx, input.plan);
+  const text = upgradeRenewText(input.plan, new Date(s.current_period_end as string), priceMicros);
+  const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)
+                       values (${ctx.workspaceId}, ${input.userId}, 'auto_renew', ${AUTO_RENEW_TEXT_VERSION}, ${text},
+                               ${tx.json({ plan: input.plan, priceMicros, from: s.plan_code as string, via: 'upgrade' })}, ${input.ip ?? null}, ${input.userAgent ?? null})
+                       returning id`;
+  return c!.id as string;
+}
+
 /** P11: subscription checkout; requires a consent record created in the same flow (plan 04 §3). */
 export async function startSubscriptionCheckout(tx: Tx, ctx: TenantContext, plan: PlanCode, consentId: string, user: { id: string; email: string }) {
   assertCan(ctx, 'billing.manage');
@@ -245,7 +282,7 @@ export async function setCancellation(tx: Tx, ctx: TenantContext, cancel: boolea
  *    price; the plan, its tests and the meter change only when that period starts.
  *  - Choosing the current plan while a downgrade is scheduled withdraws it ("Keep my plan").
  */
-export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
+export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode, opts: { consentId?: string | null } = {}) {
   assertCan(ctx, 'billing.manage');
   const [s] = await tx`select * from subscriptions where workspace_id = ${ctx.workspaceId} and status in ('active','trialing','past_due')
                        order by created_at desc limit 1 for update`;
@@ -267,11 +304,14 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   }
   const upgrade = PLANS[to].priceMicros > PLANS[from].priceMicros;
   if (upgrade) {
+    // A higher recurring charge needs fresh consent to it (plan 04 §3), for this plan at today's price.
+    const consentId = await upgradeConsent(tx, to, opts.consentId);
     // Stripe holds the scheduled lower price: put the current one back first, so the proration charges the
     // difference from what the customer actually pays.
     if (pending) await billingGateway().changeSubscriptionPrice(subId, await ownPrice(), false);
     await billingGateway().changeSubscriptionPrice(subId, await toPrice(), true);
-    await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
+    await tx`update subscriptions set plan_code = ${to}, pending_plan_code = null, consent_record_id = ${consentId}, stripe_event_at = greatest(stripe_event_at, now())
+             where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
     await tx`update workspaces set plan_code = ${to} where id = ${ctx.workspaceId}`;
     // Pro-rata extra Creative Tests for the rest of this period (rounded up).
     const start = new Date(s.current_period_start as string).getTime();
@@ -293,6 +333,17 @@ export async function changePlan(tx: Tx, ctx: TenantContext, to: PlanCode) {
   return { effective: 'period_end' as const, on: s.current_period_end as string };
 }
 
+/** The consent record an upgrade rests on: recent, for the plan it moves to, at the price that plan sells for now. */
+async function upgradeConsent(tx: Tx, to: PlanCode, consentId: string | null | undefined): Promise<string> {
+  const again = () => new DomainError('INVALID', `Please confirm the new monthly charge for ${PLANS[to].name} first.`, { needsConsent: true });
+  if (!consentId) throw again();
+  const [c] = await tx`select id, context from consent_records where id = ${consentId} and kind = 'auto_renew' and created_at > now() - interval '30 minutes'`;
+  const ctxt = (c?.context ?? {}) as { plan?: string; priceMicros?: number };
+  if (!c || ctxt.plan !== to) throw again();
+  if (Number(ctxt.priceMicros) !== (await currentStripePrice(tx, to)).priceMicros) throw new DomainError('INVALID', 'The plan price has changed. Please confirm the new monthly charge again.', { needsConsent: true });
+  return c.id as string;
+}
+
 // ───────────── Staff billing actions (plan 05 §2.2 Billing) ─────────────
 
 /**
@@ -311,7 +362,7 @@ export async function staffChangePlan(tx: Tx, ctx: TenantContext, to: PlanCode, 
                        values (${ctx.workspaceId}, null, 'auto_renew', ${AUTO_RENEW_TEXT_VERSION}, ${autoRenewText(to, new Date(), priceMicros)},
                                ${tx.json({ plan: to, priceMicros, from: s.plan_code as string, via: 'staff', staffId: consent.staffId, reference: consent.reference.trim() })})
                        returning id`;
-  const r = await changePlan(tx, ctx, to);
+  const r = await changePlan(tx, ctx, to, { consentId: c!.id as string });
   return { ...r, consentRecordId: c!.id as string };
 }
 
