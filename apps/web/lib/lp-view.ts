@@ -1,5 +1,6 @@
 import { deviceClass, recordFunnel } from '@arkiv/core';
 import { geoFromHeaders } from '@arkiv/shared';
+import { IN_APP_UA } from './in-app';
 
 /**
  * One landing view (standard §7 "Click / landing view"; plan 05 §4 slices): the page and copy variant, the
@@ -17,6 +18,6 @@ export async function recordLandingView(input: { visitorId: string; page: string
     page: input.page,
     variant: input.variant,
     utm,
-    props: { inApp: /Instagram|FBAN|FBAV|TikTok|musical_ly|BytedanceWebview/i.test(ua), device: deviceClass(ua), country: geo?.country ?? null, region: geo?.region ?? null, returning: input.returning, adId },
+    props: { inApp: IN_APP_UA.test(ua), device: deviceClass(ua), country: geo?.country ?? null, region: geo?.region ?? null, returning: input.returning, adId },
   });
 }

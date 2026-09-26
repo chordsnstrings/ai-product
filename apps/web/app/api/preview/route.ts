@@ -3,6 +3,7 @@ import { abuseGate, allowKey, ingestBytes, isMarketplaceUrl, MARKETPLACE_MESSAGE
 import { DomainError, env } from '@arkiv/shared';
 import { clientFingerprint, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
 import { previewContext } from '@/lib/preview-context';
+import { noJsAnswer } from '@/lib/preview-nojs';
 import { visitorId } from '@/lib/session';
 import { verifyTurnstile } from '@arkiv/auth';
 
@@ -15,6 +16,18 @@ const uploadedIds = (form: FormData) => [...new Set(form.getAll('assetIds').map(
  */
 export const POST = route(async (req) => {
   const form = await req.formData();
+  // The plain form (no JavaScript): redirects instead of JSON (plan 03 P1 progressive enhancement).
+  if (form.get('nojs') === '1') {
+    try {
+      return noJsAnswer((await (await preview(req, form)).json()) as { projectId: string });
+    } catch (e) {
+      return noJsAnswer({ error: e, url: (form.get('url') as string | null)?.trim() || null });
+    }
+  }
+  return preview(req, form);
+});
+
+async function preview(req: Request, form: FormData): Promise<Response> {
   const url = (form.get('url') as string | null)?.trim() || null;
   const photos = form.getAll('photos').filter((f): f is File => f instanceof File && f.size > 0).slice(0, 6);
   if (!url && !photos.length && !uploadedIds(form).length) throw new DomainError('INVALID', 'Paste your product link or add a photo.');
@@ -31,7 +44,7 @@ export const POST = route(async (req) => {
     await recordFunnel('UPLOAD_FAILED', { visitorId: vid, page, variant, props: { method, category: uploadFailureCategory(e), reason: e instanceof DomainError ? e.message.slice(0, 120) : 'error' } }).catch(() => {});
     throw e;
   }
-});
+}
 
 async function startUpload(req: Request, form: FormData, input: { url: string | null; photos: File[]; vid: string }) {
   const { url, photos, vid } = input;

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, useSubmissionKey } from '@arkiv/ui/client';
+import { inAppBrowser, OPEN_IN_BROWSER, type InApp } from '@/lib/in-app';
 import { loadTurnstile } from './turnstile';
 import { usePhotoUploads } from './photo-uploads';
 
@@ -76,13 +77,20 @@ const hostOf = (u: string) => {
 /**
  * P2 upload (plan 04 L2/L5/L6/L19): photo or link, no account, starts immediately. Mobile camera + library are
  * first-class; the URL field uses the url keyboard; errors keep what the user entered.
+ *
+ * Plan 03 P1 edge cases: without JavaScript the same form posts itself (link and photos) to /api/preview, which
+ * answers with redirects; `initialError`/`initialUrl` carry a refused post's reason and link back. Inside an in-app
+ * browser that may block the file picker, the link comes first with how to open the page in the real browser.
  */
-export function UploadModule({ page, variant, compact, turnstileSiteKey, assurance }: { page: string; variant?: string | null; compact?: boolean; turnstileSiteKey?: string | null; assurance?: string }) {
+export function UploadModule({ page, variant, compact, turnstileSiteKey, assurance, initialError, initialUrl }: { page: string; variant?: string | null; compact?: boolean; turnstileSiteKey?: string | null; assurance?: string; initialError?: string | null; initialUrl?: string }) {
   const turnstile = useTurnstile(turnstileSiteKey);
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState(initialUrl ?? '');
   const uploads = usePhotoUploads(downscale);
   const [state, setState] = useState<'idle' | 'drag' | 'busy'>('idle');
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialError ?? null);
+  // Read after load: landing pages are static, so the user agent is only known in the browser.
+  const [inApp, setInApp] = useState<InApp | null>(null);
+  useEffect(() => setInApp(inAppBrowser(navigator.userAgent)), []);
   const fileRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
   // Standard §13: Shopify connection is first-class on the upload step (plan 03 P2).
@@ -165,6 +173,9 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
   return (
     <form
       id="upload"
+      action="/api/preview"
+      method="post"
+      encType="multipart/form-data"
       onSubmit={submit}
       className="ak-upload"
       data-state={state}
@@ -181,11 +192,16 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
       aria-busy={state === 'busy'}
     >
       {!compact && <p className="ak-upload-title">Your product, catalogued.</p>}
+      {/* Posted only by the plain form (no JavaScript); the scripted submit builds its own request. */}
+      <input type="hidden" name="nojs" value="1" />
+      <input type="hidden" name="page" value={page} />
+      {variant ? <input type="hidden" name="variant" value={variant} /> : null}
       <div className="ak-field">
         <label className="ak-label" htmlFor="product-url">Product link</label>
         <div className="ak-row">
           <input
             id="product-url"
+            name="url"
             className="ak-input"
             type="url"
             inputMode="url"
@@ -201,6 +217,17 @@ export function UploadModule({ page, variant, compact, turnstileSiteKey, assuran
           <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={pasteFromClipboard} aria-label="Paste link from clipboard">Paste</button>
         </div>
       </div>
+      {inApp ? (
+        <p className="ak-small ak-panel" role="note" style={{ margin: 0 }}>
+          Adding photos can fail inside {inApp}. Paste your product link above, or to add photos {OPEN_IN_BROWSER[inApp]}.
+        </p>
+      ) : null}
+      <noscript>
+        <div className="ak-field">
+          <label className="ak-label" htmlFor="product-photos-plain">Or add photos</label>
+          <input id="product-photos-plain" name="photos" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" multiple />
+        </div>
+      </noscript>
       <div className="ak-row" style={{ flexWrap: 'wrap' }}>
         <span className="ak-label">or</span>
         <button type="button" className="ak-btn ak-btn--secondary ak-btn--sm" onClick={() => cameraRef.current?.click()}>Take a photo</button>
