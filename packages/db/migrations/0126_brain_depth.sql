@@ -136,7 +136,7 @@ alter table creatives add column visual_fingerprint_id uuid;
 -- Brand Brain visual references (standard §16 "visual references") are brand assets, not a SKU's.
 alter table assets drop constraint assets_kind_check;
 alter table assets add constraint assets_kind_check check (kind in ('product_photo','cutout','reference_view','label_crop','storyboard_frame',
-  'scene_render','voiceover','final_export','creator_footage','evidence_doc','brand_logo','brand_reference','historical_creative','thumbnail'));
+  'scene_render','voiceover','final_export','creator_footage','evidence_doc','brand_logo','brand_reference','historical_creative','thumbnail','captions'));
 
 -- ───────────── Prompt versions (§41 "prompt changes are software changes") ─────────────
 -- extract-product@1.3.0: each photo's view, label/closure boxes, package geometry, usage directions and each claim's
