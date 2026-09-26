@@ -95,13 +95,19 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
         <p className="ak-index">{weekLine()}</p>
         <h1 className="ak-h1">Welcome to your archive</h1>
         <Empty title="Add your first product" body="Paste a product link or add a photo. We’ll catalogue it and draft three test ideas in about a minute." action={<LinkButton href="/start">Add a product</LinkButton>} />
+        <p className="ak-small ak-muted">Selling on Shopify or running Meta or TikTok ads? <Link href={`/w/${slug}/connect`}>Connect your accounts</Link> — products, prices and results come in by themselves.</p>
       </>
     );
   }
   const outOfTests = data.sub && data.bal.creativeTests <= 0;
   return (
     <>
-      {sp.subscribed ? <Banner>Your plan is active. Creative Tests are ready to use.</Banner> : null}
+      {sp.subscribed ? (
+        <Banner>
+          Your plan is active. Creative Tests are ready to use.
+          {data.adAccounts === 0 ? <> <Link href={`/w/${slug}/connect?step=meta`}>Connect your ad accounts</Link> so results flow into your tests.</> : null}
+        </Banner>
+      ) : null}
       <p className="ak-index">{weekLine()}</p>
       <div className="ak-between" style={{ flexWrap: 'wrap', gap: 12 }}>
         <h1 className="ak-h1" style={{ margin: 0 }}>What to test this week</h1>

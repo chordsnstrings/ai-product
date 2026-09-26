@@ -949,6 +949,9 @@ export interface ExchangeResult {
   expiresAt: Date | null;
 }
 
+/** At most this many pages (100 accounts each) of ad accounts are listed for the picker. */
+export const META_AD_ACCOUNT_PAGES = 10;
+
 /** Meta: code → short-lived → long-lived (~60 day) user token, plus the ad accounts it can read. */
 export async function metaExchangeCode(code: string, now = Date.now()): Promise<ExchangeResult> {
   const e = env();
@@ -960,9 +963,17 @@ export async function metaExchangeCode(code: string, now = Date.now()): Promise<
   const j2 = (await (await platformFetch('meta', `${META_API}/oauth/access_token?${q2}`)).json().catch(() => ({}))) as { access_token?: string; expires_in?: number };
   const token = j2.access_token ?? j1.access_token;
   const expiresIn = j2.access_token ? j2.expires_in : j1.expires_in;
-  const acc = (await (await platformFetch('meta', `${META_API}/me/adaccounts?${new URLSearchParams({ fields: 'account_id,name,currency,timezone_name', limit: '50', access_token: token })}`)).json()) as {
-    data?: { account_id: string; name: string; currency?: string; timezone_name?: string }[];
-  };
+  // Every readable ad account, page by page (an agency login can read hundreds); the merchant picks from them.
+  type AdAccountPage = { data?: { account_id: string; name: string; currency?: string; timezone_name?: string }[]; paging?: { next?: string } };
+  const accounts: NonNullable<AdAccountPage['data']> = [];
+  let next: string | null = `${META_API}/me/adaccounts?${new URLSearchParams({ fields: 'account_id,name,currency,timezone_name', limit: '100', access_token: token })}`;
+  for (let page = 0; next && page < META_AD_ACCOUNT_PAGES; page++) {
+    const j: AdAccountPage = (await (await platformFetch('meta', next)).json()) as AdAccountPage;
+    accounts.push(...(j.data ?? []));
+    // Only follow Graph's own next link (it carries the token); anything else ends the listing.
+    next = j.paging?.next && j.paging.next.startsWith(META_API) ? j.paging.next : null;
+  }
+  const acc = { data: accounts };
   // The app-scoped user id: Meta's deauthorize and data-deletion callbacks name the user, not the ad account.
   const me = (await (await platformFetch('meta', `${META_API}/me?${new URLSearchParams({ fields: 'id', access_token: token })}`)).json().catch(() => ({}))) as { id?: string };
   const scopes = await metaGrantedPermissions(token).catch(() => null);

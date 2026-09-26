@@ -9,6 +9,7 @@ const log = logger('oauth-callback');
 import { currentUser } from '@/lib/session';
 import { clientFingerprint } from '@/lib/http';
 import { previewContext } from '@/lib/preview-context';
+import { wizardStepAfter } from '@/lib/connect-wizard';
 
 /**
  * OAuth callback for Shopify / Meta / TikTok. The state must verify AND the signed-in user must still be an
@@ -19,7 +20,11 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
   const url = new URL(req.url);
   const q = Object.fromEntries(url.searchParams);
   const st = verifyState(q.state ?? '');
-  const back = (slug: string, msg: string) => NextResponse.redirect(`${env().APP_URL}/w/${slug}/settings/integrations?${new URLSearchParams({ result: msg })}`, 303);
+  // Started from the connection wizard (plan 03 A8): back to it — on the next step once this one connected.
+  const back = (slug: string, msg: string, connected = false) =>
+    st?.wizard === '1'
+      ? NextResponse.redirect(`${env().APP_URL}/w/${slug}/connect?${new URLSearchParams({ step: connected ? wizardStepAfter(provider) : provider, result: msg })}`, 303)
+      : NextResponse.redirect(`${env().APP_URL}/w/${slug}/settings/integrations?${new URLSearchParams({ result: msg })}`, 303);
   if (!st || st.provider !== provider) return NextResponse.redirect(`${env().APP_URL}/app?error=connection_expired`, 303);
   // "Connect Shopify" from the upload step (plan 03 P2): the store joins the preview it was started from.
   if (st.preview === '1' && provider === 'shopify') return previewShopifyCallback(req, q, st);
@@ -46,7 +51,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
       }
       // Product webhooks now (§28 "re-sync on webhook"); the nightly check repairs a registration that fails here.
       await registerShopifyWebhooks(shop, tok.accessToken).catch((err: unknown) => log.warn('webhook registration failed', { shop, err }));
-      return back(st.slug!, 'Shopify connected. Importing products…');
+      return back(st.slug!, 'Shopify connected. Importing products…', true);
     }
     if (!q.code && !q.auth_code) return back(st.slug!, q.error_description ?? 'Connection cancelled.');
     const r = provider === 'meta' ? await metaExchangeCode(q.code!) : await tiktokExchangeCode(q.auth_code ?? q.code!);
@@ -68,7 +73,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ provider
           tokenExpiresAt: r.expiresAt,
         }),
       );
-      return back(st.slug!, `${label} connected (${a.name}). First sync running.`);
+      return back(st.slug!, `${label} connected (${a.name}). First sync running.`, true);
     }
     // Several readable accounts (an agency login can read other brands'): nothing is connected until the merchant
     // picks which belong to this workspace (§47 "Wrong ad account selected").

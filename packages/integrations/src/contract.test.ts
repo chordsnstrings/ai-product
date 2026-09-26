@@ -184,6 +184,20 @@ describe('Meta Marketing API insights contract', () => {
     expect(unavailableFeatures('meta', ['ads_read'])).toEqual([]);
   });
 
+  it('lists every readable ad account across pages for the picker, following only Graph’s own next links', async () => {
+    const calls = stub((url) => {
+      if (url.includes('grant_type=fb_exchange_token')) return json({ access_token: 'long', expires_in: 5_184_000 });
+      if (url.includes('/oauth/access_token')) return json({ access_token: 'short', expires_in: 3600 });
+      if (url.includes('/me/adaccounts') && url.includes('after=p2')) return json({ data: [{ account_id: '2', name: 'Client B' }], paging: { next: 'https://evil.example/steal' } });
+      if (url.includes('/me/adaccounts')) return json({ data: [{ account_id: '1', name: 'Client A' }], paging: { next: `${META_API}/me/adaccounts?after=p2&access_token=long` } });
+      if (url.includes('/me/permissions')) return json({ data: [{ permission: 'ads_read', status: 'granted' }] });
+      return json({ id: 'fb-user-1' });
+    });
+    const r = await metaExchangeCode('code');
+    expect(r.accounts.map((a) => a.id)).toEqual(['act_1', 'act_2']);
+    expect(calls.some((c) => c.url.includes('evil.example'))).toBe(false);
+  });
+
   it('reads ad statuses; an id Meta says does not exist is deleted, one it did not answer for stays unknown', async () => {
     stub((url) => {
       const ids = new URL(url).searchParams.get('ids')!.split(',');

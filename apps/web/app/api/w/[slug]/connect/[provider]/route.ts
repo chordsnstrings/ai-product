@@ -10,7 +10,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ slug: st
     const { slug, provider } = await params;
     const w = await workspaceBySlug(slug);
     assertCan(w.ctx, 'integration.manage');
-    const state = signState({ ws: w.ctx.workspaceId, uid: w.user!.id, slug, provider });
+    // From the connection wizard, the callback returns to the wizard (plan 03 A8).
+    const wizard = new URL(req.url).searchParams.get('wizard') === '1';
+    const state = signState({ ws: w.ctx.workspaceId, uid: w.user!.id, slug, provider, ...(wizard ? { wizard: '1' } : {}) });
     if (provider === 'shopify') {
       const shop = (new URL(req.url).searchParams.get('shop') ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
       return NextResponse.redirect(shopifyInstallUrl(shop.includes('.') ? shop : `${shop}.myshopify.com`, state));
