@@ -62,7 +62,8 @@ describe('callback URL', () => {
     expect(url.searchParams.get('job')).toBe(jobId);
     expect(verifyProviderCallback('byteplus', jobId, url.searchParams.get('sig'))).toBe(true);
     expect(verifyProviderCallback('byteplus', newId(), url.searchParams.get('sig'))).toBe(false); // another job
-    expect(verifyProviderCallback('byteplus', jobId, `${url.searchParams.get('sig')!.slice(0, -1)}A`)).toBe(false);
+    const sig = url.searchParams.get('sig')!;
+    expect(verifyProviderCallback('byteplus', jobId, `${sig.slice(0, -1)}${sig.endsWith('A') ? 'B' : 'A'}`)).toBe(false); // tampered
     expect(verifyProviderCallback('byteplus', jobId, null)).toBe(false);
     expect(providerCallbackUrl('minimax', jobId)).toBeNull(); // not a video provider that calls back
     for (const local of ['http://localhost:3000', 'https://localhost', 'https://192.168.1.4', 'http://app.arkiv.test']) expect(publicAppUrl(local), local).toBe(false);
