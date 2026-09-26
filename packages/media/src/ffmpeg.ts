@@ -20,6 +20,14 @@ export class MediaError extends Error {
 /** Resource limits for parsing untrusted media: address space, CPU seconds, no core dumps, few open files. */
 export const UNTRUSTED_LIMITS = { memoryBytes: 1024 * 1024 * 1024, cpuSeconds: 20, openFiles: 64 };
 
+/**
+ * Untrusted parsing runs single-threaded: each codec/filter thread reserves its stack inside the address-space limit,
+ * so a host with a large default thread stack (or many cores) cannot start ffmpeg's worker threads under the limit
+ * (EAGAIN: "pthread_create() failed"). One thread also keeps a hostile file's CPU and memory use predictable.
+ */
+const ONE_THREAD_IN = ['-threads', '1'];
+const ONE_THREAD_OUT = ['-threads', '1', '-filter_threads', '1'];
+
 let prlimitPath: string | null | undefined;
 function prlimit(): string | null {
   if (prlimitPath !== undefined) return prlimitPath;
@@ -132,7 +140,7 @@ export async function probeUntrusted(file: string): Promise<UntrustedProbe> {
  * (ffmpeg select='gt(scene,t)'), read on a downscaled copy under the untrusted resource limits.
  */
 export async function sceneCutsUntrusted(file: string, threshold = 0.3): Promise<number[]> {
-  const { stderr } = await run(FFMPEG, ['-hide_banner', '-nostats', '-i', file, '-an', '-vf', `scale=160:-2,select='gt(scene,${threshold})',showinfo`, '-f', 'null', '-'], 60_000, { untrusted: true });
+  const { stderr } = await run(FFMPEG, ['-hide_banner', '-nostats', ...ONE_THREAD_IN, '-i', file, '-an', ...ONE_THREAD_OUT, '-vf', `scale=160:-2,select='gt(scene,${threshold})',showinfo`, '-f', 'null', '-'], 60_000, { untrusted: true });
   return [...stderr.matchAll(/pts_time:\s*([0-9.]+)/g)].map((m) => Math.round(Number(m[1]) * 100) / 100).filter((t) => Number.isFinite(t));
 }
 
@@ -141,7 +149,7 @@ export async function framesAtUntrusted(file: string, seconds: readonly number[]
   const outs: string[] = [];
   for (const [i, t] of seconds.entries()) {
     const out = path.join(dir, `still-${i}.png`);
-    await run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-ss', Math.max(0, t).toFixed(3), '-i', file, '-frames:v', '1', '-vf', 'scale=512:-2', out], 30_000, { untrusted: true });
+    await run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', ...ONE_THREAD_IN, '-ss', Math.max(0, t).toFixed(3), '-i', file, '-frames:v', '1', ...ONE_THREAD_OUT, '-vf', 'scale=512:-2', out], 30_000, { untrusted: true });
     if (existsSync(out)) outs.push(out);
   }
   return outs;
