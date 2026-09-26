@@ -342,7 +342,7 @@ export async function editScene(
     const scan = scanCreativeText(lines, await allowedClaimTexts(tx, s.sku_id as string), { names: [sku?.name as string | undefined, (await brandBrainFor(tx, s.sku_id as string))?.name] });
     if (!scan.ok) {
       const v = scan.violations[0]!;
-      throw new DomainError('GATE_BLOCKED', `“${v.text}” can’t be used: ${v.reason}`, { alternative: v.alternative ?? classifyClaim(v.text).matched[0]?.alternative });
+      throw new DomainError('GATE_BLOCKED', `“${v.text}” can’t be used: ${v.reason}`, { alternative: v.alternative ?? classifyClaim(v.text).matched[0]?.alternative, text: v.text });
     }
     // §40: a scene with an AI-generated person never speaks as a customer.
     const testimonial = lines.find((l) => isFirstPersonTestimonial(l));

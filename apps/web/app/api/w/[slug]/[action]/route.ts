@@ -59,7 +59,7 @@ import {
   weekOf,
 } from '@arkiv/core';
 import { assertRecentLogin } from '@arkiv/auth';
-import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
+import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, recordUpgradeConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { sendEmail } from '@arkiv/email';
 import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
 import { body, clientIp, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
@@ -124,6 +124,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const type = z.enum(['clinical_study', 'consumer_perception', 'lab_test', 'certificate', 'ingredient_spec', 'other']).parse(form.get('type'));
         // §43: evidence is a document (or a link to one) and says whether it is about this product.
         const applicability = z.enum(EVIDENCE_APPLICABILITY).parse(form.get('applicability'));
+        // §17 evidence_strength, as the supplier rates it (weak evidence never verifies a high-risk claim).
+        const strength = z.enum(['weak', 'moderate', 'strong']).default('moderate').parse((form.get('strength') as string | null) || undefined);
         const location = z.string().trim().max(500).optional().parse((form.get('location') as string | null) || undefined) || null;
         const wording = z.string().trim().max(200).optional().parse((form.get('wording') as string | null) || undefined) || null;
         const expiry = z.string().date().optional().parse((form.get('expiry') as string | null) || undefined) ?? null;
@@ -131,9 +133,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         if (!hasFile && !/^https?:\/\/\S+$/i.test(location ?? '')) throw new DomainError('INVALID', 'Attach the document, or paste a link to it. A description alone isn’t evidence.');
         assertCan(ctx, 'sku.edit');
         await t((tx) =>
-          once(tx, { claimId, type, applicability, location, wording, expiry, file: fileIdentity(file) }, async () => {
+          once(tx, { claimId, type, applicability, strength, location, wording, expiry, file: fileIdentity(file) }, async () => {
             const assetId = hasFile ? (await ingestBytes(tx, ctx, Buffer.from(await (file as File).arrayBuffer()), 'evidence_doc', null, { filename: (file as File).name })).id : null;
-            await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, expiry, wording });
+            await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, strength, expiry, wording });
             return { ok: true };
           }),
         );
@@ -417,8 +419,16 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'uncancel':
       return json(await t((tx) => setCancellation(tx, ctx, false)));
     case 'change-plan': {
-      const { plan } = await body(req, z.object({ plan: PLAN }));
-      return json(await t((tx) => changePlan(tx, ctx, plan)));
+      // An upgrade raises the recurring charge: the customer ticks consent to the new monthly price first (plan 04 §3).
+      const { plan, agreed } = await body(req, z.object({ plan: PLAN, agreed: z.boolean().optional() }));
+      return json(
+        await t(async (tx) => {
+          const consentId = agreed
+            ? await recordUpgradeConsent(tx, ctx, { userId: w.user?.id ?? null, plan, agreed, ip: clientIp(req), userAgent: req.headers.get('user-agent') })
+            : null;
+          return changePlan(tx, ctx, plan, { consentId });
+        }),
+      );
     }
     case 'portal': {
       assertCan(ctx, 'billing.manage');

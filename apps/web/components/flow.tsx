@@ -5,7 +5,9 @@ import { Banner, Button, ClaimChip, Field, Input, LinkButton, LockButton, Metada
 import { api, LiveLedger, OfferExpiry, ProvenanceChip, Sheet, StickyCta, usePoll } from '@arkiv/ui/client';
 import { formatDate, formatTime } from '@arkiv/shared/format';
 import { MAGIC_LINK_TTL_MIN } from '@arkiv/shared/auth';
+import { AlternativeHint } from './actions';
 import { EmailLinkForm } from './email-link';
+import { blockedAlternative, fieldForAlternative, type BlockedAlternative } from '@/lib/claim-alternative';
 import { registerPasskey } from './profile';
 import { projectRoute } from '@/lib/project-route';
 import type { ProjectView } from '@/lib/views';
@@ -887,6 +889,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
   const [edit, setEdit] = useState<{ id: string; spokenLine: string; overlayText: string } | null>(null);
   const [regen, setRegen] = useState<{ id: string; text: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [alt, setAlt] = useState<BlockedAlternative | null>(null);
   const [busy, setBusy] = useState(false);
   const [expired, setExpired] = useState(false);
   if (!v) return error ? <div className="ak-wrap ak-section"><Banner tone="risk">{error}</Banner></div> : <Loading />;
@@ -912,6 +915,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
 
   async function call(url: string, body: unknown) {
     setErr(null);
+    setAlt(null);
     setBusy(true);
     try {
       await api(url, body);
@@ -919,6 +923,7 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
       return true;
     } catch (e) {
       setErr((e as Error).message);
+      setAlt(blockedAlternative(e));
       return false;
     } finally {
       setBusy(false);
@@ -1051,6 +1056,8 @@ export function StoryboardFlow({ projectId }: { projectId: string }) {
             <label className="ak-field"><span className="ak-label">Spoken line</span><textarea className="ak-textarea" maxLength={160} value={edit.spokenLine} onChange={(e) => setEdit({ ...edit, spokenLine: e.target.value })} /></label>
             <label className="ak-field"><span className="ak-label">On-screen text</span><input className="ak-input" maxLength={70} value={edit.overlayText} onChange={(e) => setEdit({ ...edit, overlayText: e.target.value })} /></label>
             {err ? <p className="ak-error" role="alert">{err}</p> : null}
+            {/* Plan 03 A3 edge: a blocked edit comes with a compliant alternative, one tap to use. */}
+            {err && alt ? <AlternativeHint alt={alt} onUse={(w) => { setEdit({ ...edit, [fieldForAlternative(edit, alt)]: w }); setErr(null); setAlt(null); }} /> : null}
             <Button type="submit" disabled={busy}>Save</Button>
           </form>
         ) : null}

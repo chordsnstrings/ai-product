@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeAll, ownerPool, withTenant } from '@arkiv/db';
 import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
 import { newId } from '@arkiv/shared';
-import { approveClaim, attachEvidence, proposeClaim } from './claims';
+import { approveClaim, attachEvidence, INGREDIENT_EVIDENCE_REASON, proposeClaim } from './claims';
 import type { TenantContext } from './context';
 import { ctxFor } from './testing';
 
@@ -42,18 +42,35 @@ describe('claim approval needs qualifying evidence (§43)', () => {
     expect((ev!.payload as { evidenceIds: string[] }).evidenceIds).toHaveLength(1);
   });
 
-  it('ingredient-level, other-formula, ingredient-spec and expired evidence do not verify a clinical or quantified claim', async () => {
+  it('other-formula, ingredient-spec, weak and expired evidence do not verify a clinical or quantified claim', async () => {
     const { t, ctx, claimId } = await setup('92% of users saw smoother skin');
     const link = 'https://lab.example/study.pdf';
     await withTenant(t.workspaceId, async (tx) => {
-      await attachEvidence(tx, ctx, claimId, { type: 'clinical_study', location: link, applicability: 'ingredient_level' });
       await attachEvidence(tx, ctx, claimId, { type: 'clinical_study', location: link, applicability: 'other_formulation' });
+      await attachEvidence(tx, ctx, claimId, { type: 'consumer_perception', location: link, applicability: 'product_specific', strength: 'weak' });
       await attachEvidence(tx, ctx, claimId, { type: 'ingredient_spec', location: link, applicability: 'product_specific' });
       await attachEvidence(tx, ctx, claimId, { type: 'clinical_study', location: link, applicability: 'product_specific', expiry: '2020-01-01' });
     });
     await expect(withTenant(t.workspaceId, (tx) => approveClaim(tx, ctx, claimId, scope))).rejects.toThrow(/expired|about this product/);
+    await expect(withTenant(t.workspaceId, (tx) => approveClaim(tx, ctx, claimId, scope))).rejects.toThrow(/weak evidence/);
     await withTenant(t.workspaceId, (tx) => attachEvidence(tx, ctx, claimId, { type: 'consumer_perception', location: link, applicability: 'product_specific' }));
     expect((await withTenant(t.workspaceId, (tx) => approveClaim(tx, ctx, claimId, { ...scope, qualifier: 'in a 4-week consumer study of 32 women' }))).status).toBe('VERIFIED_WITH_QUALIFIER');
+  });
+
+  it('ingredient-level evidence for a high-risk claim goes to our compliance team, never transferred automatically', async () => {
+    const { t, ctx, claimId } = await setup('92% of users saw smoother skin');
+    await withTenant(t.workspaceId, (tx) => attachEvidence(tx, ctx, claimId, { type: 'clinical_study', location: 'https://lab.example/niacinamide.pdf', applicability: 'ingredient_level', strength: 'strong' }));
+    const [c] = await ownerPool()`select status, block_reason from claims where id = ${claimId}`;
+    expect(c).toMatchObject({ status: 'RESTRICTED', block_reason: INGREDIENT_EVIDENCE_REASON });
+    await expect(withTenant(t.workspaceId, (tx) => approveClaim(tx, ctx, claimId, scope))).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { restricted: true } });
+    expect(await ownerPool()`select 1 from events where subject_id = ${claimId} and type = 'CLAIM_RESTRICTED'`).toHaveLength(1);
+  });
+
+  it('ingredient-level evidence on a low-risk claim leaves it with the merchant', async () => {
+    const { t, ctx, claimId } = await setup('Skin feels soft');
+    await withTenant(t.workspaceId, (tx) => attachEvidence(tx, ctx, claimId, { type: 'lab_test', location: 'https://lab.example/a.pdf', applicability: 'ingredient_level' }));
+    const [c] = await ownerPool()`select status from claims where id = ${claimId}`;
+    expect(c!.status).toBe('MERCHANT_REVIEW_REQUIRED');
   });
 
   it('refuses an unknown applicability', async () => {
@@ -88,5 +105,23 @@ describe('staff approvals of RESTRICTED claims (§43 "Clinically tested ingredie
     await withTenant(t.workspaceId, (tx) => approveClaim(tx, staff, claimId, { ...scope, overrideReason: 'Study reviewed offline by counsel' }));
     const [ev] = await ownerPool()`select payload from events where subject_id = ${claimId} and type = 'CLAIM_APPROVED'`;
     expect(ev!.payload).toMatchObject({ evidenceIds: [], evidenceOverride: 'Study reviewed offline by counsel' });
+  });
+});
+
+describe('compliant alternatives (§43 "Merchant insists on blocked claim")', () => {
+  it('a blocked or restricted claim keeps the alternative the rules propose; a reviewable one has none', async () => {
+    const { t, ctx, claimId } = await setup('Cures acne overnight');
+    const [c] = await ownerPool()`select status, sku_id, suggested_alternative from claims where id = ${claimId}`;
+    expect(c!.status).toBe('BLOCKED');
+    expect(c!.suggested_alternative).toMatch(/looks clearer/);
+    const restricted = await withTenant(t.workspaceId, (tx) => proposeClaim(tx, ctx, c!.sku_id as string, { wording: 'Great for rosacea', origin: 'merchant' }));
+    expect(restricted).toMatchObject({ status: 'RESTRICTED', suggestedAlternative: expect.stringMatching(/appearance/) });
+    const fine = await withTenant(t.workspaceId, (tx) => proposeClaim(tx, ctx, c!.sku_id as string, { wording: 'Skin feels soft', origin: 'merchant' }));
+    expect(fine.suggestedAlternative).toBeNull();
+  });
+
+  it('approving a blocked wording is refused with the alternative in the error details', async () => {
+    const { t, ctx, claimId } = await setup('Removes wrinkles');
+    await expect(withTenant(t.workspaceId, (tx) => approveClaim(tx, ctx, claimId, scope))).rejects.toMatchObject({ code: 'GATE_BLOCKED', details: { alternative: expect.stringMatching(/reduces the look of fine lines/) } });
   });
 });
