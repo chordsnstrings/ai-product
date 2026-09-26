@@ -4,7 +4,7 @@ import { makeTenant, truncateAll } from '@arkiv/db/testing';
 import { MockImage, MockLlm, MockTts, MockVideo, setProviders } from '@arkiv/providers';
 import { newId, resetEnvCache } from '@arkiv/shared';
 import { authorize } from './cost-governor';
-import { generateVideo, reconcileProviderJobs, routedLines } from './model-gateway';
+import { collectOpenRender, generateVideo, reconcileProviderJobs, routedLines } from './model-gateway';
 import { providerCallbackUrl, publicAppUrl, receiveProviderCallback, verifyProviderCallback } from './provider-callbacks';
 import { ctxFor } from './testing';
 import { processPendingWebhooks } from './webhooks';
@@ -41,7 +41,7 @@ async function videoToken(workspaceId: string, userId: string) {
 }
 
 /** A render submitted by a worker that then died: dispatched, with a provider task, last polled `polledAgo` ago. */
-async function orphanedRender(t: Awaited<ReturnType<typeof makeTenant>>, polledAgo = '10 minutes') {
+async function orphanedRender(t: Awaited<ReturnType<typeof makeTenant>>, polledAgo = '10 minutes', sceneId = newId()) {
   const { authorizationId } = await videoToken(t.workspaceId, t.userId);
   const jobId = newId();
   const { providerRequestId } = await video.submit({ model: 'm', prompt: 'hands', references: [], seconds: 5, resolution: '720p', ratio: '9:16', callbackUrl: providerCallbackUrl('byteplus', jobId)! });
@@ -49,7 +49,7 @@ async function orphanedRender(t: Awaited<ReturnType<typeof makeTenant>>, polledA
   await ownerPool()`insert into provider_jobs (id, workspace_id, provider, task, model, request_hash, status, authorization_id, estimate_micros, provider_request_id,
                       subject_type, subject_id, input_refs, raw_meta, last_polled_at)
                     values (${jobId}, ${t.workspaceId}, 'byteplus', 'video.scene', 'm', 'h', 'dispatched', ${authorizationId}, 900000, ${providerRequestId},
-                      'scene', ${newId()}, ${ownerPool().json({ inputHash: 'abc' })}, ${ownerPool().json({ planned })}, now() - ${polledAgo}::interval)`;
+                      'scene', ${sceneId}, ${ownerPool().json({ sceneId, inputHash: 'abc' })}, ${ownerPool().json({ planned })}, now() - ${polledAgo}::interval)`;
   await new Promise((r) => setTimeout(r, 60)); // the mock finishes after its latency
   return { jobId, providerRequestId };
 }
@@ -139,6 +139,23 @@ describe('settling from a callback', () => {
     await ownerPool()`update webhook_receipts set claimed_at = now() - interval '1 hour'`;
     await processPendingWebhooks(deps);
     expect((await ownerPool()`select status from provider_jobs where id = ${jobId}`)[0]!.status).toBe('succeeded');
+  });
+
+  it('a resumed production collects the render its crashed run submitted instead of paying for another', async () => {
+    const t = await makeTenant();
+    const sceneId = newId();
+    const { jobId } = await orphanedRender(t, '10 minutes', sceneId);
+    expect(await collectOpenRender(t.workspaceId, sceneId, 'other-inputs')).toBe(false); // different inputs: not this render
+    expect(await collectOpenRender(t.workspaceId, sceneId, 'abc')).toBe(true);
+    const [asset] = await ownerPool()`select lineage from assets where workspace_id = ${t.workspaceId} and kind = 'scene_render'`;
+    expect(asset!.lineage).toMatchObject({ sceneId, inputHash: 'abc', providerJobId: jobId });
+    expect((await ownerPool()`select status from provider_jobs where id = ${jobId}`)[0]!.status).toBe('succeeded');
+    expect(await collectOpenRender(t.workspaceId, sceneId, 'abc')).toBe(false); // nothing left open
+    // A render another worker is still polling is not taken from it.
+    const live = newId();
+    await orphanedRender(t, '5 seconds', live);
+    expect(await collectOpenRender(t.workspaceId, live, 'abc')).toBe(false);
+    expect(await ownerPool()`select 1 from assets where workspace_id = ${t.workspaceId} and kind = 'scene_render'`).toHaveLength(1);
   });
 
   it('refuses bodies that are not task callbacks', async () => {

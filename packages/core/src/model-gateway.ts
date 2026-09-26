@@ -1017,6 +1017,43 @@ async function settleOpenRender(j: OpenRender, p: ProviderSet): Promise<'succeed
   return 'pending';
 }
 
+/**
+ * A resumed production is about to render a scene: a render with exactly these inputs that the interrupted run
+ * submitted and never collected (still dispatched, nobody polling it) is waited on and collected instead of being
+ * paid for again (standard §35, §39; plan 06 Phase 3 D3 "resume from provider_jobs"). Returns true when an output
+ * was collected: it is then an unjudged scene_render asset of that scene and input hash, which the caller picks up.
+ * Gives up (false) when the provider failed it or it is still unfinished at the deadline (the reconciler owns it).
+ */
+export async function collectOpenRender(
+  workspaceId: string,
+  sceneId: string,
+  inputHash: string,
+  opts: { heartbeat?: () => Promise<void>; timeoutMs?: number; pollMs?: number } = {},
+): Promise<boolean> {
+  const [j] = await withTenant(workspaceId, (tx) => tx`
+    select id, workspace_id, task, provider, subject_type, subject_id, project_id, authorization_id, estimate_micros,
+           provider_request_id, input_refs, raw_meta, created_at < now() - make_interval(hours => ${RECONCILE_RENDER_GIVE_UP_HOURS}) as expired
+    from provider_jobs
+    where workspace_id = ${workspaceId} and status = 'dispatched' and task like 'video.%' and provider_request_id is not null
+      and input_refs->>'sceneId' = ${sceneId} and input_refs->>'inputHash' = ${inputHash}
+      and (last_polled_at is null or last_polled_at < now() - make_interval(secs => ${LIVE_POLL_WINDOW_SECONDS}))
+    order by created_at desc limit 1`);
+  if (!j) return false;
+  const p = await providers();
+  const deadline = Date.now() + (opts.timeoutMs ?? 15 * 60_000);
+  let beat = Date.now();
+  for (;;) {
+    const r = await settleOpenRender(j as unknown as OpenRender, p);
+    if (r !== 'pending') return r === 'succeeded';
+    if (Date.now() > deadline) return false;
+    if (opts.heartbeat && Date.now() - beat > 60_000) {
+      beat = Date.now();
+      await opts.heartbeat();
+    }
+    await sleep(opts.pollMs ?? (process.env.NODE_ENV === 'test' ? 20 : 5000));
+  }
+}
+
 /** A worker that polled within this long is still waiting on its render: a callback is left to it. */
 export const LIVE_POLL_WINDOW_SECONDS = 120;
 /** How often the waiting worker marks the job as polled. */
