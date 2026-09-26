@@ -95,11 +95,11 @@ export function sceneClaimIds(lines: (string | null | undefined)[], mapping: rea
   return [...new Set(mapping.filter((m) => own.has(m.line) && m.status === 'claim' && m.claimId).map((m) => m.claimId!))];
 }
 
-/** Generated seconds for one render of a scene (whole seconds, at least the model minimum). */
 /** Input tokens of one render inspection: two reference photos and three sampled frames (qa.ts RENDER_QA_FRAMES). */
 export const RENDER_QA_TOKENS = 8_000;
 /** Input tokens of one still inspection: two reference photos and the frame. */
 export const STILL_QA_TOKENS = 5_000;
+/** Generated seconds for one render of a scene (whole seconds, at least the model minimum). */
 export const genSeconds = (durationMs: number) => Math.max(MIN_GEN_SECONDS, Math.ceil(durationMs / 1000));
 
 type RouteModel = Pick<Route, 'provider' | 'model'>;
