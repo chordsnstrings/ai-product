@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
 import { DEFAULT_VOICE, DomainError, platformAssets } from '@arkiv/shared';
-import { captionCues, composeAd, layoutVoice, probe, scheduleVoice, withTempDir, type ComposedOutput, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { captionCues, composeAd, COMPOSER_VERSION, layoutVoice, probe, scheduleVoice, withTempDir, type ComposedOutput, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { assetBytes, saveAsset, saveCaptions, verifyAssetIntegrity } from './assets';
 import { brandBrainFor } from './brand';
 import type { LineMapping } from './compliance';
@@ -193,6 +193,7 @@ async function saveVersion(
   opts: { changedVariables: string[]; lineage: Record<string, unknown>; after?: (tx: Tx, creativeId: string) => Promise<void> },
 ): Promise<string | null> {
   const ws = ctx.workspaceId;
+  next = { ...next, composer: COMPOSER_VERSION };
   return withTempDir(async (dir) => {
     const outs = await composeFromManifest(ws, next, dir);
     for (const o of outs) checks.push(...(await qaExport(o.file, o.aspect, next.durationMs)));
@@ -203,9 +204,15 @@ async function saveVersion(
       const [cur] = await tx`select final_creative_id from projects where id = ${projectId} and workspace_id = ${ws} for update`;
       if (cur?.final_creative_id !== p.final_creative_id) return null;
       const captions = await saveCaptions(tx, ws, p.sku_id as string, outs[0]!.srt, { projectId, storyboardId: p.storyboard_id, ...opts.lineage });
+      // The version's provenance (§25.7): the parent export's, with this composition's voice, claims and composer.
+      const [parent] = await tx`select a.lineage->'provenance' as pv from creatives c join assets a on a.id = c.final_asset_ids[1] and a.workspace_id = c.workspace_id
+                                where c.id = ${p.final_creative_id as string} and c.workspace_id = ${ws}`;
+      const provenance = parent?.pv
+        ? { ...(parent.pv as object), claimIds: [...new Set(next.scenes.flatMap((m) => m.claimIds ?? []))], voiceClipIds: (next.voiceover?.segments ?? []).map((sg) => sg.clipAssetId), composer: COMPOSER_VERSION }
+        : null;
       const exported: { aspect: string; assetId: string }[] = [];
       for (const o of outs) {
-        const a = await saveAsset(tx, ws, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captions.id, storyboardId: p.storyboard_id, disclosure: next.disclosure, ...opts.lineage } });
+        const a = await saveAsset(tx, ws, { bytes: await readFile(o.file), mime: 'video/mp4', kind: 'final_export', skuId: p.sku_id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captions.id, storyboardId: p.storyboard_id, disclosure: next.disclosure, ...(provenance ? { provenance } : {}), ...opts.lineage } });
         exported.push({ aspect: o.aspect, assetId: a.id });
       }
       if (!(await Promise.all([...exported.map((e) => e.assetId), captions.id].map((id) => verifyAssetIntegrity(tx, id)))).every(Boolean)) throw new Error('recomposition: checksum mismatch');

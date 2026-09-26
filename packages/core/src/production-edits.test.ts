@@ -13,6 +13,7 @@ import { assetBytes } from './assets';
 import type { CompositionManifest } from './composition';
 import { deliveryBundle, recordAssetExport } from './exports';
 import { applyDeliveredTextEdit, composeFromManifest, requestTextEdit } from './recompose';
+import { assertLineageComplete } from './qa';
 import { ctxFor, productPhoto } from './testing';
 import { ingestBytes } from './uploads';
 
@@ -171,6 +172,18 @@ describe('delivered ad: SRT, reproducible composition, text edits (plan 06 Phase
     expect(outs.map((o) => o.aspect)).toEqual(r.manifest.aspects);
     expect(outs.every((o) => o.durationMs === r.manifest.durationMs)).toBe(true);
     expect(outs[0]!.srt).toBe(srt);
+    // §25.7 lineage: each export names its authorization, rates, scene versions, models, claims, voice and composer.
+    const [ex] = await ownerPool()`select id, lineage->'provenance' as pv from assets where kind = 'final_export' and lineage->>'projectId' = ${r.projectId} limit 1`;
+    expect(ex!.pv).toMatchObject({ authorizationId: expect.any(String), sceneVersionIds: r.manifest.scenes.map((s) => s.versionId), composer: expect.stringMatching(/^composer@/) });
+    expect(Object.keys((ex!.pv as { rateTableVersions: object }).rateTableVersions).length).toBeGreaterThan(0);
+    for (const g of (ex!.pv as { generated: { model: string | null; promptVersion: string | null }[] }).generated) expect(g).toMatchObject({ model: expect.any(String), promptVersion: expect.any(String) });
+    const [rep] = await ownerPool()`select qa_report from projects where id = ${r.projectId}`;
+    expect((rep!.qa_report as { checks: { detail: string }[] }).checks.some((c) => /^Lineage complete/.test(c.detail))).toBe(true);
+    await withTenant(r.t.workspaceId, async (tx) => {
+      expect(await assertLineageComplete(tx, ex!.id as string, { spoken: true })).toMatchObject({ pass: true });
+      // An asset with no provenance (here: the SRT) can't be accounted for: a hard failure.
+      expect(await assertLineageComplete(tx, r.captionsAssetId!, { spoken: true })).toMatchObject({ pass: false, hard: true, detail: expect.stringMatching(/provenance/) });
+    });
     // Every scene has its script version 1 from the storyboard.
     const scripts = await ownerPool()`select v.lineage->>'source' as source from scene_versions v join scenes s on s.id = v.scene_id where s.storyboard_id = ${r.storyboardId} and v.kind = 'script'`;
     expect(scripts.length).toBeGreaterThan(0);

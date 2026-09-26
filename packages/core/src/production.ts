@@ -3,7 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { withTenant, type Tx } from '@arkiv/db';
 import { COST_LIMITS, DEFAULT_VOICE, DomainError, platformAssets, platformsFor, type LogicalVoice, type Micros, type Platform, type ProductionMode, type ProjectState } from '@arkiv/shared';
-import { brandAccent, captionCues, composeAd, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
+import { brandAccent, captionCues, composeAd, COMPOSER_VERSION, extractFrames, layoutVoice, probe, scheduleVoice, withTempDir, type Aspect, type Cue, type SceneInput, type VoiceClip } from '@arkiv/media';
 import { ProviderError } from '@arkiv/providers';
 import { assetBytes, saveAsset, saveCaptions, verifyAssetIntegrity } from './assets';
 import { assertCan } from './authz';
@@ -27,7 +27,7 @@ import { projectVisitor, recordFunnel } from './funnel';
 import { FAILURE_COPY, getProject, IN_PRODUCTION, isTerminal, PATH, transition, type FailureCode } from './projects';
 import { GENOME_VERSION_SQL } from './creatives';
 import { setExperimentState } from './experiment-state';
-import { qaClaims, qaClipContract, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
+import { assertLineageComplete, qaClaims, qaClipContract, type ExportProvenance, qaContinuity, qaExperimentIntegrity, qaExport, qaImpliedClaims, qaScene, summarize, type CheckResult } from './qa';
 import { estimate, loadRates, priceLine, type CostLine, type RateTable } from './rates';
 import { fidelityThresholds } from './fidelity';
 import { fitCeiling, planSceneModes, type PlannerFacts, type PlannerScene } from './production-planner';
@@ -1273,6 +1273,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         ...(tokensSpoken ? { tokensSpoken } : {}),
         durationMs: totalMs,
         aspects: ASPECTS,
+        composer: COMPOSER_VERSION,
         genes: { angle: proposal.angle, hookMechanism: proposal.hookMechanism, proofMechanism: proposal.proofMechanism, treatment: proposal.treatment },
         disclosure,
       };
@@ -1281,18 +1282,22 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
       await heartbeat();
       await withTenant(ws, (tx) => advance(tx, ctx, projectId, 'FINAL_QA'));
       const exportAssets: { aspect: Aspect; assetId: string }[] = [];
+      const provenance = await withTenant(ws, (tx) => exportProvenance(tx, ws, auth.authorizationId, manifest));
       // The SRT (the same cues in every format) is its own downloadable asset (plan 06 Phase 3 #6).
       const captionsAsset = await withTenant(ws, (tx) => saveCaptions(tx, ws, sku.id as string, outs[0]!.srt, { projectId, storyboardId: sb.id }));
       for (const o of outs) {
         checks.push(...(await qaExport(o.file, o.aspect, totalMs)));
         const bytes = await readFile(o.file);
         const a = await withTenant(ws, (tx) =>
-          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captionsAsset.id, storyboardId: sb.id, disclosure } }),
+          saveAsset(tx, ws, { bytes, mime: 'video/mp4', kind: 'final_export', skuId: sku.id as string, source: 'composed', lineage: { projectId, aspect: o.aspect, srt: o.srt, captionsAssetId: captionsAsset.id, storyboardId: sb.id, disclosure, provenance } }),
         );
         exportAssets.push({ aspect: o.aspect, assetId: a.id });
       }
       const integrity = await withTenant(ws, async (tx) => Promise.all(exportAssets.map((e) => verifyAssetIntegrity(tx, e.assetId))));
       checks.push({ check: 'asset_integrity', pass: integrity.every(Boolean), hard: !integrity.every(Boolean), detail: integrity.every(Boolean) ? 'Files stored in our storage; checksums verified' : 'Checksum mismatch' });
+      // …and each export can be accounted for: authorization, rates, scene versions, models, claims, voice, composer.
+      const lineageChecks = await withTenant(ws, (tx) => Promise.all(exportAssets.map((e) => assertLineageComplete(tx, e.assetId, { spoken: segments.length > 0 }))));
+      checks.push(lineageChecks.find((c) => !c.pass) ?? lineageChecks[0]!);
       checks.push(await withTenant(ws, (tx) => masterIntegrity(tx, variant, manifest)));
       const report = summarize(checks.filter((c) => !(c.check === 'visual' && /provider/.test(c.detail)) || !c.pass));
       const hardFinal = checks.filter((c) => ['platform', 'audio', 'asset_integrity', 'experiment_integrity'].includes(c.check)).some((c) => !c.pass && c.hard);
@@ -1345,6 +1350,33 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     await withTenant(ws, (tx) => failProduction(tx, ctx, projectId, (e as Error).message, { checks }));
     throw e;
   }
+}
+
+/**
+ * The provenance every final export records (§25.7): the authorization and rate tables it was priced on, the scene
+ * versions composed and the model/prompt version of each generated one, the Claim IDs, the voice clips and composer.
+ */
+export async function exportProvenance(tx: Tx, ws: string, authorizationId: string, manifest: CompositionManifest): Promise<ExportProvenance> {
+  const [a] = await tx`select rate_table_versions from cost_authorizations where id = ${authorizationId} and workspace_id = ${ws}`;
+  const sceneVersionIds = manifest.scenes.map((m) => m.versionId).filter((x): x is string => !!x);
+  // The version's own record, else its provider job's (the model the provider reported, the prompt it was sent).
+  const rows = await tx`select v.id, v.kind, v.technique, v.provider_job_id,
+                               coalesce(v.model, j.model_version_returned, j.model) as model, coalesce(v.prompt_version, j.prompt_version) as prompt_version
+                        from scene_versions v left join provider_jobs j on j.id = v.provider_job_id and j.workspace_id = v.workspace_id
+                        where v.workspace_id = ${ws} and v.id = any(${sceneVersionIds}::uuid[])`;
+  // Generated by a model: a render, a frame the model drew, or an exact product on a generated setting (a plate job).
+  const generated = rows
+    .filter((r) => r.provider_job_id && (r.kind === 'render' || String(r.technique ?? '').startsWith('generated')))
+    .map((r) => ({ versionId: r.id as string, model: (r.model as string | null) ?? null, promptVersion: (r.prompt_version as string | null) ?? null }));
+  return {
+    authorizationId,
+    rateTableVersions: ((a?.rate_table_versions ?? {}) as Record<string, number>),
+    sceneVersionIds,
+    generated,
+    claimIds: [...new Set(manifest.scenes.flatMap((m) => m.claimIds ?? []))],
+    voiceClipIds: (manifest.voiceover?.segments ?? []).map((sg) => sg.clipAssetId),
+    composer: manifest.composer ?? null,
+  };
 }
 
 /** An outage is over once the stage it stopped gets through. */

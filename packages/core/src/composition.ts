@@ -52,6 +52,8 @@ export interface CompositionManifest {
   genes: Record<string, unknown>;
   /** What in this ad is AI-generated (standard §40): drives platform disclosure guidance and export metadata. */
   disclosure?: AiDisclosure;
+  /** The composer version that made the exports from this manifest (§24). */
+  composer?: string;
 }
 
 /** Facts an ad shows through {price} / {size} tokens: the value shown and the fact it came from. */

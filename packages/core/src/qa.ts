@@ -1,6 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
+import type { Tx } from '@arkiv/db';
 import { probe, withTempDir, extractFrames, ASPECT_SIZE, type Aspect } from '@arkiv/media';
 import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
@@ -343,6 +344,48 @@ export async function qaExport(file: string, aspect: Aspect, expectedMs: number)
     },
     { check: 'audio', pass: p.hasAudio, hard: !p.hasAudio, detail: p.hasAudio ? 'Audio track present, loudness normalized' : 'Missing audio track' },
   ];
+}
+
+/** What a final export records about how it was made (standard §25.7 "metadata/lineage is complete"). */
+export interface ExportProvenance {
+  authorizationId: string | null;
+  rateTableVersions: Record<string, number>;
+  /** Scene versions composed, in timeline order. */
+  sceneVersionIds: string[];
+  /** Model and prompt version of every generated scene version (render, generated frame or plate). */
+  generated: { versionId: string; model: string | null; promptVersion: string | null }[];
+  claimIds: string[];
+  voiceClipIds: string[];
+  composer: string | null;
+}
+
+/**
+ * Final asset integrity, lineage half (§25.7; Launch Gate 8): the export's provenance names the authorization and the
+ * rate tables it was priced on, the composed scene versions, the model and prompt version of every generated one,
+ * the Claim IDs, the voice clips (when the ad speaks) and the composer — and each named row exists. A gap is a hard
+ * failure: an export we can't account for is not delivered.
+ */
+export async function assertLineageComplete(tx: Tx, assetId: string, opts: { spoken: boolean }): Promise<CheckResult> {
+  const [a] = await tx`select lineage from assets where id = ${assetId}`;
+  const pv = ((a?.lineage ?? {}) as { provenance?: Partial<ExportProvenance> }).provenance;
+  const missing: string[] = [];
+  if (!pv) missing.push('provenance');
+  else {
+    if (!pv.authorizationId) missing.push('authorization');
+    else if (!(await tx`select 1 from cost_authorizations where id = ${pv.authorizationId}`).length) missing.push('authorization row');
+    if (!pv.rateTableVersions || !Object.keys(pv.rateTableVersions).length) missing.push('rate table versions');
+    if (!pv.sceneVersionIds?.length) missing.push('scene versions');
+    else {
+      const [n] = await tx`select count(*)::int as n from scene_versions where id = any(${pv.sceneVersionIds}::uuid[])`;
+      if (Number(n!.n) !== new Set(pv.sceneVersionIds).size) missing.push('scene version rows');
+    }
+    for (const g of pv.generated ?? []) if (!g.model || !g.promptVersion) missing.push(`model/prompt version of ${g.versionId.slice(0, 8)}`);
+    if (!Array.isArray(pv.claimIds)) missing.push('claim ids');
+    if (opts.spoken && !pv.voiceClipIds?.length) missing.push('voice-over clips');
+    if (!pv.composer) missing.push('composer version');
+  }
+  const pass = missing.length === 0;
+  return { check: 'asset_integrity', pass, hard: !pass, detail: pass ? 'Lineage complete: authorization, rates, scene versions, models, claims, voice, composer' : `Lineage incomplete: ${missing.join(', ')}`, data: { missing } };
 }
 
 /**

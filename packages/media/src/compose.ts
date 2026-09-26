@@ -228,6 +228,13 @@ export interface ComposedOutput {
   srt: string;
 }
 
+/**
+ * Version of the composer (timeline, overlays, captions, end card, audio finish). Recorded in every export's
+ * provenance and composition manifest (§24 reproducible composition); bump it when the output of the same manifest
+ * would change.
+ */
+export const COMPOSER_VERSION = 'composer@2026.09';
+
 /** Deterministic composition from scene versions (§24): same inputs → same timeline. */
 export async function composeAd(spec: ComposeSpec, outDir: string): Promise<ComposedOutput[]> {
   const results: ComposedOutput[] = [];
