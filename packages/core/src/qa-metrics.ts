@@ -231,3 +231,37 @@ export function customerQaSummary(report: QaReport | null | undefined): { label:
   }
   return out;
 }
+
+/** One measured score of a QA check, with the threshold it is held to (plan 05 §13 "per-check scores"). */
+export interface CheckScore {
+  name: string;
+  value: number;
+  /** The limit it was judged against, and which side of it passes. */
+  limit: number | null;
+  better: 'lower' | 'higher';
+  ok: boolean | null;
+}
+
+/**
+ * The scores behind a stored check, for the QA review screen: label-OCR similarity, palette and region colour
+ * distances and the located match for product fidelity; flicker for visual; each against its threshold.
+ */
+export function checkScores(c: Pick<CheckResult, 'check' | 'data'>): CheckScore[] {
+  const d = (c.data ?? {}) as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const th = (d.thresholds ?? {}) as Record<string, unknown>;
+  const det = (d.deterministic ?? {}) as Record<string, unknown>;
+  const out: CheckScore[] = [];
+  const add = (name: string, value: number | null, limit: number | null, better: 'lower' | 'higher') => {
+    if (value == null) return;
+    out.push({ name, value: Math.round(value * 1000) / 1000, limit, better, ok: limit == null ? null : better === 'lower' ? value <= limit : value >= limit });
+  };
+  if (c.check === 'product_fidelity') {
+    add('label similarity', num(d.labelSimilarity), num(th.labelSimilarityMin), 'higher');
+    add('palette distance', num(d.paletteDistance), num(th.paletteDistanceMax), 'lower');
+    add('region colour shift', num(det.regionColorDelta), num(th.regionColorMax), 'lower');
+    add('product match', num(det.matchScore), num(th.matchMin), 'higher');
+  }
+  if (c.check === 'visual') add('flicker', num(d.flicker), num(d.flickerMax), 'lower');
+  return out;
+}

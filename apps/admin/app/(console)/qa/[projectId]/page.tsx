@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
-import { activeBreakGlass, assertBreakGlass, assetUrl, labelDiff, qaVerdictKey, staffCan, type CheckResult, type LineMapping } from '@arkiv/core';
+import { activeBreakGlass, assertBreakGlass, assetUrl, checkScores, labelDiff, qaVerdictKey, staffCan, type CheckResult, type CheckScore, type LineMapping } from '@arkiv/core';
 import { ActForm } from '@/components/act';
 import { Mono, Page, Section, Table } from '@/components/ui';
 import { requireStaff } from '@/lib/staff';
@@ -30,7 +30,35 @@ export default async function QaCase({ params, searchParams }: { params: Promise
       .flatMap((c) => ((c.data as { mapping?: LineMapping[] } | undefined)?.mapping ?? []).map((m) => m.claimId))
       .filter((x): x is string => !!x && /^[0-9a-f-]{36}$/i.test(x));
     const claims = mapped.length ? await tx`select id, preferred_wording, status from claims where workspace_id = ${ws} and id = any(${[...new Set(mapped)]}::uuid[])` : [];
-    return { p, content: { refs, outputs, label: fp?.label_text as string, scenes, claims } };
+    const cutout = fp?.cutout_asset_id ? await assetUrl(tx, fp.cutout_asset_id as string, 900) : null;
+    // Every generated frame and render of each scene with its own inspection (plan 05 §13 "output video/frames next
+    // to the Visual Fingerprint reference views"): the latest three per scene and kind.
+    const versions = p.storyboard_id
+      ? await tx`select s.position, v.id, v.kind, v.version, v.technique, v.status, v.qa, v.asset_id, a.mime
+                 from scene_versions v join scenes s on s.id = v.scene_id and s.workspace_id = v.workspace_id
+                 left join assets a on a.id = v.asset_id and a.workspace_id = v.workspace_id
+                 where v.workspace_id = ${ws} and s.storyboard_id = ${p.storyboard_id} and v.kind in ('frame', 'render')
+                 order by s.position, v.kind, v.version desc`
+      : [];
+    const seen = new Map<string, number>();
+    const shown = versions.filter((v) => {
+      const k = `${v.position}:${v.kind}`;
+      seen.set(k, (seen.get(k) ?? 0) + 1);
+      return seen.get(k)! <= 3;
+    });
+    const sceneVersions = await Promise.all(
+      shown.map(async (v) => ({
+        position: Number(v.position),
+        kind: v.kind as string,
+        version: Number(v.version),
+        technique: (v.technique as string | null) ?? null,
+        status: v.status as string,
+        qa: Array.isArray(v.qa) ? (v.qa as CheckResult[]) : [],
+        video: String(v.mime ?? '').startsWith('video/'),
+        url: v.asset_id ? await assetUrl(tx, v.asset_id as string, 900) : null,
+      })),
+    );
+    return { p, content: { refs, cutout, outputs, label: fp?.label_text as string, scenes, claims, sceneVersions } };
   });
   if (!d0) notFound();
   // Stored QA reports are summarize(CheckResult[]) from the QA Gateway (packages/core qa.ts).
@@ -46,7 +74,11 @@ export default async function QaCase({ params, searchParams }: { params: Promise
       })
       .map((u) => u.trim()),
   );
-  const palette = (c: CheckResult) => (typeof c.data?.paletteDistance === 'number' ? (c.data.paletteDistance as number).toFixed(1) : '—');
+  const scoreText = (x: CheckScore) => `${x.name} ${x.value}${x.limit == null ? '' : ` (${x.better === 'lower' ? '≤' : '≥'} ${x.limit})`}`;
+  const scores = (c: Pick<CheckResult, 'check' | 'data'>) => {
+    const list = checkScores(c);
+    return list.length ? <span className="ak-small">{list.map((x, k) => <span key={k} style={{ display: 'block', ...(x.ok === false ? { color: 'var(--signal-risk)' } : {}) }}>{x.ok === false ? '✗ ' : ''}{scoreText(x)}</span>)}</span> : '—';
+  };
   // Every spoken / overlay line the claims check scanned, with the Claim ID it mapped to (plan 05 §13).
   const mapping = checks.filter((c) => c.check === 'claims').flatMap((c) => ((c.data ?? {}) as { mapping?: LineMapping[] }).mapping ?? []);
   const lines = [...new Map(mapping.map((m) => [`${m.line}\u0000${m.claimId ?? ''}\u0000${m.status}`, m])).values()];
@@ -55,13 +87,29 @@ export default async function QaCase({ params, searchParams }: { params: Promise
   const canGolden = staffCan(s.roles, 'golden.add');
   return (
     <Page title={`QA case ${projectId.slice(0, 8)}`} sub={<><Link href={`/tenants/${ws}?tab=skus`}>Tenant</Link> · {d0.p.state as string}</>}>
-      <Table head={['#', 'Check', 'Result', 'Severity', 'Palette distance', 'Detail']} rows={checks.map((c, i) => [i + 1, <Mono key="c">{c.check}</Mono>, c.pass ? '✓ pass' : '✗ fail', c.hard ? 'hard' : 'soft', palette(c), <span key="d" className="ak-small">{c.detail ?? ''}</span>])} empty="No QA report stored." />
+      <Table head={['#', 'Check', 'Result', 'Severity', 'Scores', 'Detail']} rows={checks.map((c, i) => [i + 1, <Mono key="c">{c.check}</Mono>, c.pass ? '✓ pass' : '✗ fail', c.hard ? 'hard' : 'soft', <span key="s">{scores(c)}</span>, <span key="d" className="ak-small">{c.detail ?? ''}</span>])} empty="No QA report stored." />
       {d0.content ? (
         <>
           <div className="ak-grid-2" style={{ marginTop: 16 }}>
-            <div><p className="ak-label">Reference photos</p><div className="ak-row">{d0.content.refs.map((u) => <img key={u} src={u} alt="reference" style={{ width: 140, border: '1px solid var(--rule)' }} />)}</div><p className="ak-small">Label: <Mono>{d0.content.label ?? '—'}</Mono></p></div>
+            <div><p className="ak-label">Visual Fingerprint reference views</p><div className="ak-row">{d0.content.refs.map((u) => <img key={u} src={u} alt="reference" style={{ width: 140, border: '1px solid var(--rule)' }} />)}{d0.content.cutout ? <img src={d0.content.cutout} alt="product cut-out" style={{ width: 140, border: '1px solid var(--rule)' }} /> : null}</div><p className="ak-small">Label: <Mono>{d0.content.label ?? '—'}</Mono></p></div>
             <div><p className="ak-label">Output</p>{d0.content.outputs[0] ? <video src={d0.content.outputs[0]} controls style={{ width: 240 }} /> : <p className="ak-small ak-muted">No output.</p>}</div>
           </div>
+          <Section title="Scene frames and renders (each with its own inspection)">
+            <Table head={['Scene', 'Output', 'Version', 'Technique', 'Status', 'Checks', 'Scores', 'Label read']} rows={d0.content.sceneVersions.map((v) => {
+              const fid = v.qa.find((c) => c.check === 'product_fidelity');
+              const read = (fid?.data?.labelTextRead as string | null | undefined) ?? null;
+              return [
+                v.position + 1,
+                v.url ? (v.video ? <video key="o" src={v.url} controls muted style={{ width: 120 }} /> : <img key="o" src={v.url} alt={`scene ${v.position + 1} ${v.kind}`} style={{ width: 90, border: '1px solid var(--rule)' }} />) : '—',
+                `${v.kind} v${v.version}`,
+                v.technique ?? '—',
+                v.status,
+                <span key="c" className="ak-small">{v.qa.map((c) => `${c.pass ? '✓' : '✗'} ${c.check}${c.hard && !c.pass ? ' (hard)' : ''}: ${c.detail}`).join(' · ') || 'not inspected'}</span>,
+                <span key="s">{v.qa.map((c, k) => <span key={k}>{scores(c)}</span>)}</span>,
+                read === null ? '—' : <span key="r">{labelDiff(d0.content!.label, read).map((w, k) => <span key={k} style={{ marginRight: 4, ...(w.status === 'missing' ? { textDecoration: 'line-through', color: 'var(--signal-risk)' } : w.status === 'extra' ? { background: 'var(--signal-risk)', color: 'var(--paper)', padding: '0 2px' } : {}) }}>{w.word}</span>)}</span>,
+              ];
+            })} empty="No generated frames or renders for this storyboard." />
+          </Section>
           <Section title="Label OCR diff (reference → read on output)">
             <p className="ak-small">Reference: <Mono>{d0.content.label ?? '—'}</Mono></p>
             <Table head={['Check #', 'Read on output', 'Diff', 'Detail']} rows={ocr.map((o) => [o.n, <Mono key="r">{o.read || '(nothing legible)'}</Mono>,
