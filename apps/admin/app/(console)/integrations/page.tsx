@@ -46,6 +46,9 @@ export default async function Integrations({ searchParams }: { searchParams: Pro
                                  extract(day from now() - r.created_at)::int as waited
                           from shop_transfer_requests r join workspaces f on f.id = r.from_workspace_id join workspaces t on t.id = r.workspace_id
                           where r.status = 'pending' order by r.created_at limit 50`,
+      // Plan 02 §8 item 7: deliveries for a shop no workspace is connected to wait here instead of reaching one.
+      unmatched: await tx`select delivery_id, topic, headers->>'x-shopify-shop-domain' as shop, received_at from webhook_receipts
+                          where provider = 'shopify' and status = 'unmatched' order by received_at desc limit 100`,
     };
   });
   const scopeCell = (p: ConnectorProvider, granted: string[]) => {
@@ -174,6 +177,14 @@ export default async function Integrations({ searchParams }: { searchParams: Pro
             ];
           })}
           empty="No pending store transfers."
+        />
+      </Section>
+      <Section title={`Unmatched Shopify webhooks · ${d0.unmatched.length}`}>
+        <p className="ak-small ak-muted">Verified deliveries for a shop no workspace is connected to. Nothing was changed for any workspace; a shop that keeps sending them was uninstalled without the webhook reaching us, or connected from a workspace that no longer exists.</p>
+        <Table
+          head={['Shop', 'Topic', 'Received', 'Delivery id']}
+          rows={d0.unmatched.map((x) => [<Mono key="s">{(x.shop as string | null) ?? '—'}</Mono>, x.topic as string, dt(x.received_at), <Mono key="d">{String(x.delivery_id).slice(0, 40)}</Mono>])}
+          empty="No unmatched Shopify webhooks."
         />
       </Section>
       {staleTable}

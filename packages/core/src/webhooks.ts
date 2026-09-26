@@ -92,11 +92,16 @@ async function revokeAll(rows: { id: string; workspace_id: string }[], provider:
 
 /** Handlers that live outside core (the email package), passed in by the worker. */
 export interface WebhookDeps {
-  resendEvent: (evt: { type: string; data: { email_id?: string; to?: string[] } }) => Promise<void>;
+  /** One Resend event, with the delivery id (svix-id) it arrived under. */
+  resendEvent: (evt: { type: string; data: { email_id?: string; to?: string[] } }, deliveryId: string) => Promise<void>;
 }
 
-/** Handle one stored delivery. Returns 'ignored' for topics we acknowledge without acting on. */
-async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ignored'> {
+/**
+ * Handle one stored delivery. Returns 'ignored' for topics we acknowledge without acting on, and 'unmatched' for a
+ * Shopify delivery about a shop no workspace is connected to (plan 02 §8 item 7: it waits in the staff queue and
+ * changes no workspace).
+ */
+async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ignored' | 'unmatched'> {
   const body = r.payload ? (JSON.parse(r.payload) as Record<string, unknown>) : {};
   switch (r.provider) {
     case 'resend': {
@@ -105,12 +110,16 @@ async function handle(r: Receipt, deps: WebhookDeps): Promise<'processed' | 'ign
         const opened = await withSystem((tx) => rightsCaseFromEmail(tx, (body.data ?? {}) as InboundEmail));
         return opened ? 'processed' : 'ignored';
       }
-      await deps.resendEvent(body as { type: string; data: { email_id?: string; to?: string[] } });
+      await deps.resendEvent(body as { type: string; data: { email_id?: string; to?: string[] } }, r.delivery_id);
       return 'processed';
     }
     case 'shopify': {
       const shop = r.headers['x-shopify-shop-domain'] ?? '';
       const rows = shop ? await integrationsFor('shopify', { account: [shop] }) : [];
+      // Routing is by the shop the delivery names, and only to the workspaces connected to it: an unknown shop's
+      // uninstall or product change goes to the unmatched queue. shop/redact still erases what we kept for the
+      // shop, and customers/* requests are filed either way (the privacy clock runs regardless).
+      if (!rows.length && (r.topic === 'app/uninstalled' || r.topic.startsWith('products/'))) return 'unmatched';
       if (r.topic === 'app/uninstalled') {
         await revokeAll(rows, 'shopify', r.topic);
         return 'processed';
