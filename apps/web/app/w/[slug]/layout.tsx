@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { cookies } from 'next/headers';
 import type { ReactNode } from 'react';
 import { withTenant } from '@arkiv/db';
-import { freshness, periodUsage } from '@arkiv/core';
+import { freshness, periodUsage, setting } from '@arkiv/core';
 import { Banner } from '@arkiv/ui';
 import { Announcer, ConfirmHost, ThemeScope, Toaster } from '@arkiv/ui/client';
 import { formatDate } from '@arkiv/shared/format';
@@ -19,7 +19,7 @@ export default async function WorkspaceLayout({ children, params }: { children: 
   const user = await requireUser(`/w/${slug}/this-week`);
   const w = await workspacePage(slug);
   const all = await userWorkspaces(user.userId);
-  const { meter, fresh, ws, notices, providers } = await withTenant(w.ctx.workspaceId, async (tx) => {
+  const { meter, fresh, ws, notices, providers, support } = await withTenant(w.ctx.workspaceId, async (tx) => {
     const [sub] = await tx`select current_period_start, current_period_end from subscriptions where status in ('active','trialing','past_due') order by created_at desc limit 1`;
     let meter: string | null = null;
     if (sub) {
@@ -32,7 +32,9 @@ export default async function WorkspaceLayout({ children, params }: { children: 
                              where workspace_id = ${w.ctx.workspaceId} and dismissed_at is null and expires_at > now() order by created_at desc limit 2`;
     // Connected platforms, for incident banners aimed at one connector (plan 05 §22).
     const providers = (await tx`select distinct provider from integrations where status <> 'disconnected'`).map((r) => r.provider as string);
-    return { meter, fresh: await freshness(tx), ws, notices, providers };
+    // Where to write about a hold (plan 02 §2: SUSPENDED — "login shows a notice").
+    const support = ws?.state === 'SUSPENDED' || ws?.state === 'LOCKED' ? await setting(tx, 'support.email') : null;
+    return { meter, fresh: await freshness(tx), ws, notices, providers, support };
   });
   const stale = fresh.filter((f) => f.stale);
   // The viewer's manual light/dark choice (design §2.1); without one the app follows the system setting.
@@ -46,6 +48,18 @@ export default async function WorkspaceLayout({ children, params }: { children: 
       </header>
       <main className="ak-main">
         <StatusBanner viewer={{ workspaceId: w.ctx.workspaceId, planCode: (ws?.plan_code as string | null) ?? null, providers }} />
+        {ws?.state === 'SUSPENDED' ? (
+          <Banner tone="risk">
+            <strong>This workspace is paused while our team reviews it.</strong> Your data is untouched, nothing runs and billing is paused until the review ends.
+            {support ? <> Questions? <a href={`mailto:${support}`}>{support}</a></> : null}
+          </Banner>
+        ) : null}
+        {ws?.state === 'LOCKED' ? (
+          <Banner tone="warn">
+            <strong>This workspace is read-only while a payment dispute is reviewed.</strong> You can still view and export everything; changes and new ads are paused.
+            {support ? <> Questions? <a href={`mailto:${support}`}>{support}</a></> : null}
+          </Banner>
+        ) : null}
         {ws?.state === 'PURGE_SCHEDULED' ? (
           <Banner tone="risk">This workspace is scheduled for deletion on {formatDate(ws.purge_at as string)}. <Link href={`/w/${slug}/settings/data`}>Cancel deletion</Link></Banner>
         ) : null}

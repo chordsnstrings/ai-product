@@ -1,4 +1,5 @@
-import { withTenant } from '@arkiv/db';
+import { globalTx, withTenant } from '@arkiv/db';
+import { billingGateway } from '@arkiv/billing';
 import { env, formatTime, formatUsd, PLANS, type PlanCode, type RiskIndicator } from '@arkiv/shared';
 import { isTemplateName, quietHoursDelay, sendEmail, type TemplateMap, type TemplateName } from '@arkiv/email';
 import { assetUrl, enqueue, Queues, quoteAfterOffer, recoveryEmailKey, recoveryStatus, recoveryUrl, RISK_PLAYBOOKS, setting, subscriptionPrice, type RecoveryTemplate, type TenantContext } from '@arkiv/core';
@@ -11,6 +12,25 @@ async function recipients(workspaceId: string, roles = ['OWNER', 'ADMIN']): Prom
   return withTenant(workspaceId, async (tx) =>
     (await tx`select u.email from memberships m join users u on u.id = m.user_id where m.role in ${tx(roles)} and u.deleted_at is null`).map((r) => r.email as string),
   );
+}
+
+/**
+ * Recipients of a billing email (plan 02 §5 M13): the usual ones, plus the Stripe customer's billing email when
+ * every Owner address hard-bounces — receipts and payment notices must reach someone who can act on them.
+ */
+export async function billingRecipients(workspaceId: string, roles = ['OWNER']): Promise<string[]> {
+  const to = await recipients(workspaceId, roles);
+  const owners = roles.length === 1 && roles[0] === 'OWNER' ? to : await recipients(workspaceId, ['OWNER']);
+  const bounced = owners.length
+    ? new Set((await globalTx((tx) => tx`select lower(email) as email from email_suppressions where lower(email) in ${tx(owners.map((e) => e.toLowerCase()))}
+                                        and reason = 'hard_bounce'`)).map((r) => r.email as string))
+    : new Set<string>();
+  if (owners.some((e) => !bounced.has(e.toLowerCase()))) return to;
+  const [w] = await withTenant(workspaceId, (tx) => tx`select stripe_customer_id from workspaces where id = ${workspaceId}`);
+  const customer = (w?.stripe_customer_id as string | null) ?? null;
+  const fallback = customer ? await billingGateway().customerEmail(customer).catch(() => null) : null;
+  if (!fallback || bounced.has(fallback.toLowerCase()) || to.some((e) => e.toLowerCase() === fallback.toLowerCase())) return to;
+  return [...to, fallback];
 }
 
 export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, unknown>, jobId: string) {
@@ -48,7 +68,7 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
     }
     case 'receipt': {
       const [pu] = await withTenant(ws, (tx) => tx`select pu.amount_micros, pu.kind, pu.project_id, s.name from purchases pu join projects p on p.id = pu.project_id join skus s on s.id = p.sku_id where pu.id = ${data.purchaseId as string}`);
-      if (pu) await send('receipt', { productName: pu.name, amount: formatUsd(Number(pu.amount_micros)), description: pu.kind === 'taste' ? '15-second ad · intro price' : '15-second ad', url: `${app}/produce/${pu.project_id}` });
+      if (pu) await send('receipt', { productName: pu.name, amount: formatUsd(Number(pu.amount_micros)), description: pu.kind === 'taste' ? '15-second ad · intro price' : '15-second ad', url: `${app}/produce/${pu.project_id}` }, await billingRecipients(ws, ['OWNER', 'ADMIN']));
       return;
     }
     case 'refund_issued': {
@@ -64,7 +84,7 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
             note: `We couldn’t produce your ${pu.name as string} ad to our quality standard, so as promised you don’t pay for it.`,
             url: `${base}/settings/billing`,
           },
-          await recipients(ws, ['OWNER']),
+          await billingRecipients(ws),
         );
       }
       return;
@@ -74,7 +94,7 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       const [s] = await withTenant(ws, (tx) => tx`select id, plan_code, created_at, current_period_end from subscriptions order by created_at desc limit 1`);
       // The price this subscriber agreed to (a scheduled plan price version counts from its effective date).
       const price = s ? (await withTenant(ws, (tx) => subscriptionPrice(tx, { id: s.id as string, workspaceId: ws, planCode: s.plan_code as PlanCode, createdAt: s.created_at as string }))).priceMicros : plan.priceMicros;
-      await send('subscription_started', { planName: plan.name, tests: plan.creativeTestsPerMonth, price: formatUsd(price, 0), renewsOn: s ? new Date(s.current_period_end as string).toDateString() : 'in one month', url: `${base}/this-week` }, await recipients(ws, ['OWNER']));
+      await send('subscription_started', { planName: plan.name, tests: plan.creativeTestsPerMonth, price: formatUsd(price, 0), renewsOn: s ? new Date(s.current_period_end as string).toDateString() : 'in one month', url: `${base}/this-week` }, await billingRecipients(ws));
       return;
     }
     // Plan 04 §3: notice of a subscriber's price change, at least 30 days before it applies.
@@ -84,16 +104,16 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       await send(
         'price_change_notice',
         { planName: PLANS[n.plan_code as PlanCode].name, oldPrice: formatUsd(Number(n.old_price_micros), 0), newPrice: formatUsd(Number(n.new_price_micros), 0), effectiveOn: new Date(n.effective_from as string).toDateString(), url: `${base}/settings/billing` },
-        await recipients(ws, ['OWNER']),
+        await billingRecipients(ws),
       );
       return;
     }
     case 'payment_failed':
-      await send('payment_failed', { url: `${base}/settings/billing`, workspaceName: w!.name }, await recipients(ws, ['OWNER']));
+      await send('payment_failed', { url: `${base}/settings/billing`, workspaceName: w!.name }, await billingRecipients(ws));
       return;
     case 'cancellation_confirmed': {
       const [s] = await withTenant(ws, (tx) => tx`select plan_code, current_period_end from subscriptions order by created_at desc limit 1`);
-      await send('cancellation_confirmed', { planName: PLANS[(s?.plan_code as PlanCode) ?? 'GROWTH'].name, endsOn: s ? new Date(s.current_period_end as string).toDateString() : 'today', exportUrl: `${base}/settings/data` }, await recipients(ws, ['OWNER']));
+      await send('cancellation_confirmed', { planName: PLANS[(s?.plan_code as PlanCode) ?? 'GROWTH'].name, endsOn: s ? new Date(s.current_period_end as string).toDateString() : 'today', exportUrl: `${base}/settings/data` }, await billingRecipients(ws));
       return;
     }
     case 'plan_ended_payment_failed': {
@@ -101,7 +121,7 @@ export async function sendQueuedEmail(ctx: TenantContext, data: Record<string, u
       const [st] = await withTenant(ws, (tx) => tx`select cancelled_at from workspaces where id = ${ws}`);
       const days = await withTenant(ws, (tx) => setting(tx, 'retention.cancelled_archive_days'));
       const deletesOn = new Date(new Date((st?.cancelled_at as string) ?? Date.now()).getTime() + days * 86400_000).toDateString();
-      await send('plan_ended_payment_failed', { planName: PLANS[(s?.plan_code as PlanCode) ?? 'GROWTH'].name, deletesOn, reactivateUrl: `${app}/app/plan`, exportUrl: `${base}/settings/data` }, await recipients(ws, ['OWNER']));
+      await send('plan_ended_payment_failed', { planName: PLANS[(s?.plan_code as PlanCode) ?? 'GROWTH'].name, deletesOn, reactivateUrl: `${app}/app/plan`, exportUrl: `${base}/settings/data` }, await billingRecipients(ws));
       return;
     }
     case 'offer_ending': {

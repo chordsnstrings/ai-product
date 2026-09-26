@@ -1018,6 +1018,35 @@ export async function refundProjectPurchase(ctx: TenantContext, purchaseId: stri
  * stop Stripe from billing it (x-promises-09). Only for a workspace actually due (a deletion cancelled at the last
  * minute keeps its plan). System job, so the workspace filter is explicit. Returns the subscriptions ended.
  */
+/**
+ * Bring Stripe collection in line with the workspace's hold (plan 02 §2: SUSPENDED → billing paused; any other
+ * state → billing as normal). Reads the state as committed now, so a late or repeated job converges instead of
+ * undoing a newer change. System role: every row is filtered by this workspace explicitly.
+ */
+export async function syncCollectionHold(workspaceId: string): Promise<{ paused: string[]; resumed: string[] }> {
+  const { state, subs } = await withSystem(async (tx) => {
+    const [w] = await tx`select state from workspaces where id = ${workspaceId}`;
+    const subs = await tx`select id, stripe_subscription_id, collection_paused_at from subscriptions
+                          where workspace_id = ${workspaceId} and status <> 'canceled' and stripe_subscription_id is not null`;
+    return { state: (w?.state as string | undefined) ?? null, subs };
+  });
+  const pause = state === 'SUSPENDED';
+  const out = { paused: [] as string[], resumed: [] as string[] };
+  for (const s of subs) {
+    const id = s.stripe_subscription_id as string;
+    if (pause && !s.collection_paused_at) {
+      await billingGateway().pauseCollection(id);
+      await withSystem((tx) => tx`update subscriptions set collection_paused_at = now() where id = ${s.id} and workspace_id = ${workspaceId}`);
+      out.paused.push(id);
+    } else if (!pause && s.collection_paused_at) {
+      await billingGateway().resumeCollection(id);
+      await withSystem((tx) => tx`update subscriptions set collection_paused_at = null where id = ${s.id} and workspace_id = ${workspaceId}`);
+      out.resumed.push(id);
+    }
+  }
+  return out;
+}
+
 export async function cancelSubscriptionsForPurge(workspaceId: string): Promise<string[]> {
   const subs = await withSystem(async (tx) => {
     const [w] = await tx`select state, purge_at from workspaces where id = ${workspaceId}`;

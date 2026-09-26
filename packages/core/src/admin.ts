@@ -420,6 +420,9 @@ export async function setTenantHold(s: Staff, workspaceId: string, hold: 'SUSPEN
       to = w.state_before_hold as WorkspaceState;
     } else to = hold;
     await transitionWorkspace(tx, staffCtx(s, workspaceId), to, `staff: ${reason}`);
+    // Plan 02 §2: SUSPENDED pauses billing; leaving it resumes. The worker brings Stripe in line with the state
+    // this transaction commits (core can't call the billing gateway; the outbox job runs only if this commits).
+    if (to === 'SUSPENDED' || w.state === 'SUSPENDED') await enqueue(tx, workspaceId, Queues.billingHold, { reason: `tenant.${hold.toLowerCase()}` });
     await audit(tx, s, `tenant.${hold.toLowerCase()}`, { type: 'workspace', id: workspaceId }, { workspaceId, reason, before: { state: w.state }, after: { state: to } });
     return to;
   });

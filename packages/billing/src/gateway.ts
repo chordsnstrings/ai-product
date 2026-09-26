@@ -72,6 +72,14 @@ export interface BillingGateway {
    * proration, no final invoice, and Stripe stops retrying its open invoices.
    */
   cancelNow(subscriptionId: string): Promise<void>;
+  /**
+   * Pause collection while a workspace is suspended (plan 02 §2 "SUSPENDED: billing paused"): invoices created
+   * meanwhile are voided, so nothing is charged. `resumeCollection` restores normal billing.
+   */
+  pauseCollection(subscriptionId: string): Promise<void>;
+  resumeCollection(subscriptionId: string): Promise<void>;
+  /** The billing email on the Stripe customer (plan 02 M13 fallback when the Owner's address bounces), or null. */
+  customerEmail(customerId: string): Promise<string | null>;
   /** The customer a charge belongs to (disputes name only the charge), or null for a guest charge. */
   chargeCustomer(chargeId: string): Promise<string | null>;
   changeSubscriptionPrice(subscriptionId: string, priceId: string, prorate: boolean): Promise<void>;
@@ -127,6 +135,17 @@ class LiveStripe implements BillingGateway {
     const sub = await this.s.subscriptions.retrieve(id);
     if (sub.status === 'canceled') return;
     await this.s.subscriptions.cancel(id, { prorate: false, invoice_now: false }, { idempotencyKey: `cancel-now:${id}` });
+  }
+  async pauseCollection(id: string) {
+    // Setting the same pause again is a no-op, so no idempotency key (a key would replay a stale pause after a resume).
+    await this.s.subscriptions.update(id, { pause_collection: { behavior: 'void' } });
+  }
+  async resumeCollection(id: string) {
+    await this.s.subscriptions.update(id, { pause_collection: '' });
+  }
+  async customerEmail(customerId: string) {
+    const c = await this.s.customers.retrieve(customerId);
+    return 'deleted' in c && c.deleted ? null : ((c as Stripe.Customer).email ?? null);
   }
   async chargeCustomer(chargeId: string) {
     const c = await this.s.charges.retrieve(chargeId);
@@ -213,10 +232,24 @@ export class MockStripe implements BillingGateway {
   subscriptions: StripeSubscriptionRecord[] = [];
   charges: StripeChargeRecord[] = [];
   disputeSubmissions: { disputeId: string; evidence: DisputeEvidence; idempotencyKey: string }[] = [];
-  async createCustomer(_email: string, workspaceId: string) {
+  /** Subscriptions whose collection is paused. */
+  paused = new Set<string>();
+  /** The billing email on each customer (tests may set one). */
+  emails = new Map<string, string>();
+  async createCustomer(email: string, workspaceId: string) {
     const id = `cus_mock_${workspaceId.replace(/-/g, '').slice(0, 14)}`;
     if (!this.customers.some((c) => c.id === id)) this.customers.push({ id, workspaceId, created: Math.floor(Date.now() / 1000) });
+    if (!this.emails.has(id)) this.emails.set(id, email);
     return id;
+  }
+  async pauseCollection(id: string) {
+    this.paused.add(id);
+  }
+  async resumeCollection(id: string) {
+    this.paused.delete(id);
+  }
+  async customerEmail(customerId: string) {
+    return this.emails.get(customerId) ?? null;
   }
   async createCheckout(p: CheckoutParams) {
     const existing = [...this.sessions.values()].find((s) => s.idempotencyKey === p.idempotencyKey);
