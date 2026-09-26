@@ -1,0 +1,67 @@
+name: Nightly (chaos + load)
+
+on:
+  schedule: [{ cron: '0 7 * * *' }]   # 03:00 America/New_York
+  workflow_dispatch:
+    inputs:
+      previews: { description: 'Concurrent previews', default: '200' }
+
+env:
+  NODE_VERSION: '22.12'
+  PNPM_VERSION: '10.33.0'
+  NEXT_TELEMETRY_DISABLED: '1'
+  DATABASE_URL: postgres://dev:dev@localhost:5432/arkiv
+  APP_DATABASE_URL: postgres://app_rw:app_rw@localhost:5432/arkiv
+  ADMIN_DATABASE_URL: postgres://admin_rw:admin_rw@localhost:5432/arkiv
+  PROVIDERS_MODE: mock
+  STORAGE_DRIVER: local
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U dev" --health-interval 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - run: PGPASSWORD=dev psql -h localhost -U dev -d arkiv -c 'create database arkiv_test'
+      - run: pnpm test:chaos
+
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U dev" --health-interval 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:migrate && pnpm --filter @arkiv/web build
+      - name: Start web and worker
+        env: { NODE_ENV: development }
+        run: |
+          nohup pnpm --filter @arkiv/worker start > worker.log 2>&1 &
+          nohup pnpm --filter @arkiv/web dev > web.log 2>&1 &
+          for i in $(seq 1 90); do curl -fs http://localhost:3000/api/health > /dev/null && break; sleep 2; done
+      - run: N=${{ inputs.previews || '200' }} pnpm exec tsx tests/load/previews.ts
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: load-logs, path: '*.log' }

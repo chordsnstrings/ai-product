@@ -1,0 +1,28 @@
+{
+  "name": "@arkiv/admin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start -p ${PORT:-3001}",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "create-staff": "tsx scripts/create-staff.ts"
+  },
+  "dependencies": {
+    "@arkiv/auth": "workspace:*",
+    "@arkiv/billing": "workspace:*",
+    "@arkiv/core": "workspace:*",
+    "@arkiv/db": "workspace:*",
+    "@arkiv/email": "workspace:*",
+    "@arkiv/shared": "workspace:*",
+    "@arkiv/ui": "workspace:*",
+    "@simplewebauthn/browser": "^14.0.0",
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": { "@types/react": "^19.2.0", "@types/react-dom": "^19.2.0" }
+}

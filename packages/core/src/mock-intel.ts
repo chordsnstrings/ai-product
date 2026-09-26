@@ -1,0 +1,250 @@
+import { detectSkincareCategory, excludedProductReason, nonSkincareCategory } from './compliance';
+import type { ConceptSet, Genome, ProductExtraction, Proposal, StoryboardPlan } from './intel-schemas';
+
+/**
+ * Deterministic "model" outputs for PROVIDERS_MODE=mock. They are built from the real product data so dev,
+ * tests and demos produce specific, plausible skincare work — and they double as golden expectations.
+ */
+
+export interface ProductContext {
+  name: string;
+  category: string;
+  sizeText?: string | null;
+  texture?: string | null;
+  ingredients?: string[];
+  approvedClaims: string[];
+  themes: { label: string; signalType: string }[];
+  testedAngles: string[];
+  /** §8 the merchant's creative goal for this project (performance when unset). */
+  goal?: 'performance' | 'ugc_review' | 'explainer' | 'premium';
+  /** Ids of the context-packet items the mock cites as rationale (themes, claims, facts, learnings). */
+  rationaleIds?: { themes: string[]; claims: string[]; facts: string[]; learnings: string[] };
+}
+
+const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
+
+const INGREDIENTS = ['niacinamide', 'hyaluronic acid', 'ceramides', 'squalane', 'peptides', 'vitamin c', 'retinol', 'glycerin', 'panthenol', 'centella', 'bakuchiol', 'azelaic acid'];
+
+export function mockExtraction(input: { name?: string; description?: string; text: string; ingredients?: string; sizeText?: string; labelText?: string | null; photoCount?: number }): ProductExtraction {
+  const all = `${input.name ?? ''} ${input.description ?? ''} ${input.text}`;
+  const notSkin = nonSkincareCategory(all);
+  // Drug/SPF detection reads the product itself (name, description, INCI, label) — never the page's menus.
+  const drug = excludedProductReason(`${input.name ?? ''} ${input.description ?? ''} ${input.ingredients ?? ''} ${input.labelText ?? ''}`);
+  const category = drug ? 'drug_or_sunscreen' : notSkin ? 'not_skincare' : detectSkincareCategory(all);
+  const lower = `${all} ${input.ingredients ?? ''}`.toLowerCase();
+  const keyIngredients = INGREDIENTS.filter((i) => lower.includes(i)).slice(0, 5);
+  const claimSentences = (input.description ?? '')
+    .split(/(?<=[.!])\s+/)
+    .filter((s) => /\b(hydrat|smooth|bright|firm|plump|calm|sooth|absorb|glow|reduce|visibly|clinically|dermatologist|non-comedogenic|fragrance[- ]free|lightweight|acne|wrinkle)/i.test(s))
+    .slice(0, 6)
+    .map((s) => ({ wording: s.trim().replace(/\s+/g, ' ').slice(0, 200), sourceQuote: s.trim().slice(0, 300), canonicalMeaning: s.trim().replace(/\s+/g, ' ').replace(/[.!]+$/, '').toLowerCase().slice(0, 160) }));
+  // Directions only as the page states them ("How to use: …", "Directions: …") — never written by the analyst.
+  const usageDirections = /\b(?:how to use|directions(?: for use)?)\s*[:\-]\s*([^.]{5,380}\.?)/i.exec(all)?.[1]?.trim() ?? null;
+  const format = /\bgel\b/i.test(all) ? 'gel' : /\boil\b/i.test(all) ? 'oil' : /\bcream\b/i.test(all) ? 'cream' : category === 'serum' ? 'serum' : null;
+  const packaging = category === 'serum' || category === 'facial_oil' ? 'dropper_bottle' : category === 'moisturizer' || category === 'mask' ? 'jar' : category === 'cleanser' ? 'pump_bottle' : 'bottle';
+  return {
+    name: (input.name ?? 'Untitled product').slice(0, 160),
+    brand: null,
+    category: category as ProductExtraction['category'],
+    sizeText: input.sizeText ?? null,
+    format,
+    texture: /lightweight|weightless/i.test(all) ? 'lightweight, fast-absorbing' : format === 'cream' ? 'rich cream' : null,
+    keyIngredients,
+    labelText: input.labelText !== undefined ? input.labelText : (input.name ?? null),
+    // Test hook: a page naming "[[liquid:amber]]" reads the product's own colour.
+    liquidColor: /\[\[liquid:([a-z ]{2,20})\]\]/.exec(all)?.[1] ?? null,
+    packaging: { type: packaging, closure: packaging === 'dropper_bottle' ? 'dropper' : packaging === 'pump_bottle' ? 'pump' : 'cap', transparent: false, colors: ['white'] },
+    claimsFound: claimSentences,
+    missingEvidence: [!input.ingredients ? 'Full ingredient list (INCI)' : null, !input.sizeText ? 'Product size' : null].filter(Boolean) as string[],
+    suggestedViews: ['side', 'swatch'],
+    assetQualityConfidence: 0.8,
+    multipleProductsVisible: false,
+    usageDirections,
+    photoViews: Array.from({ length: Math.max(1, Math.min(3, input.photoCount ?? 1)) }, (_, index) => ({ index, view: (['front', 'side', 'back'] as const)[index]! })),
+    labelBox: (input.labelText !== undefined ? input.labelText : (input.name ?? null)) ? { x: 0.3, y: 0.35, w: 0.4, h: 0.3 } : null,
+    closureBox: { x: 0.4, y: 0.04, w: 0.2, h: 0.16 },
+    geometry: packaging === 'jar' ? { silhouette: 'jar', aspectRatio: 0.7 } : packaging === 'pump_bottle' ? { silhouette: 'cylinder', aspectRatio: 3 } : { silhouette: 'cylinder', aspectRatio: 2.5 },
+    // Test hooks: page text markers make the mock analyst flag the first photo for compliance review.
+    imageReview: /\[\[review:before_after\]\]/.test(all) ? [{ index: 0, beforeAfter: true, possibleMinor: false }] : /\[\[review:minor\]\]/.test(all) ? [{ index: 0, beforeAfter: false, possibleMinor: true }] : [],
+  };
+}
+
+function pickThemes(ctx: ProductContext) {
+  const objection = ctx.themes.find((t) => t.signalType === 'objection')?.label;
+  const benefit = ctx.themes.find((t) => t.signalType === 'benefit')?.label;
+  return { objection: objection ?? (ctx.category === 'serum' ? 'feels sticky under makeup' : 'heavy, greasy feel'), benefit: benefit ?? 'skin feels soft and comfortable' };
+}
+
+export function mockConcepts(ctx: ProductContext, batch = 1): ConceptSet {
+  const n = ctx.name;
+  const { objection, benefit } = pickThemes(ctx);
+  const ing = ctx.ingredients?.[0];
+  const approved = ctx.approvedClaims.slice(0, 1);
+  const texture = ctx.texture ?? (ctx.category === 'serum' ? 'lightweight' : 'silky');
+  const base: Proposal[] = [
+    {
+      hypothesis: `Showing the ${texture} texture in the first two seconds beats a talking opening for ${n}.`,
+      customerTension: `Shoppers worry a new ${ctx.category} will ${objection}.`,
+      customerTensionSource: ctx.themes.length ? 'reviews' : 'category_pattern',
+      whyNow: ctx.testedAngles.includes('TEXTURE_SENSORY') ? 'Texture was directional; this isolates the opening.' : 'Texture is untested for this SKU and is the most native skincare format.',
+      primaryVariable: 'hook',
+      angle: 'TEXTURE_SENSORY',
+      hookMechanism: 'DEMONSTRATION',
+      hookOptions: [`Watch this ${texture} ${ctx.category} disappear`, 'No sticky finish. Here is proof.', `The ${ctx.category} that layers under makeup`],
+      bodyStrategy: 'Macro texture drop → spread on hand → absorbs → product hero → routine placement → CTA.',
+      proofMechanism: 'TEXTURE_DEMO',
+      treatment: 'HYBRID',
+      claimWordings: approved,
+      expectedLearning: 'Whether a texture-first opening lifts hold rate versus the brand’s usual opening.',
+      ifTestFails: 'Keep the body, test a problem-first hook instead.',
+      riskProfile: 'lower_risk',
+      estimatedGenerationClass: 'hybrid_short',
+    },
+    {
+      hypothesis: `Answering the “${objection}” objection directly converts better than general benefits for ${n}.`,
+      customerTension: `“Will it ${objection}?” is the most common hesitation.`,
+      customerTensionSource: ctx.themes.length ? 'reviews' : 'category_pattern',
+      whyNow: 'Objection handling is uncovered in this SKU’s creative map.',
+      primaryVariable: 'angle',
+      angle: 'OBJECTION_HANDLING',
+      hookMechanism: 'QUESTION',
+      hookOptions: [`Does it ${objection}? Let’s check.`, 'The question everyone asks about this', 'I tested it under makeup'],
+      bodyStrategy: 'State the worry → show it layered under makeup → close-up finish → product hero → CTA.',
+      proofMechanism: 'APPLICATION_DEMO',
+      treatment: 'POLISHED_UGC',
+      claimWordings: approved,
+      expectedLearning: 'Whether naming the objection lifts click-through against benefit-led openings.',
+      ifTestFails: 'Move the objection to the middle and test a benefit-led hook.',
+      riskProfile: 'adjacent',
+      estimatedGenerationClass: 'generative_short',
+    },
+    {
+      hypothesis: ing
+        ? `A simple ${ing} explainer builds more purchase intent than lifestyle footage for ${n}.`
+        : `Placing ${n} in a 3-step routine sells it better than a single-product focus.`,
+      customerTension: ing ? `Buyers see ${ing} everywhere but don’t know what it does in this formula.` : 'Routines feel complicated; people want to know where it fits.',
+      customerTensionSource: 'category_pattern',
+      whyNow: 'An exploratory direction to widen the tested territory.',
+      primaryVariable: 'angle',
+      angle: ing ? 'INGREDIENT_EDUCATION' : 'ROUTINE',
+      hookMechanism: ing ? 'MYTH' : 'LIST',
+      hookOptions: ing ? [`What ${ing} actually does in your routine`, `${ing[0]!.toUpperCase()}${ing.slice(1)}, explained in 10 seconds`, 'Stop guessing what goes on first'] : ['My 3-step night routine', 'Where this goes in your routine', 'Step two is the one that matters'],
+      bodyStrategy: ing ? 'Ingredient title card → product hero → how to apply → feel → CTA.' : 'Step 1 cleanse → step 2 this product → step 3 moisturize → CTA.',
+      proofMechanism: ing ? 'INGREDIENT_EXPLANATION' : 'APPLICATION_DEMO',
+      treatment: 'MOTION_GRAPHICS',
+      claimWordings: [],
+      expectedLearning: 'Whether education-led creative earns cheaper clicks for this SKU.',
+      ifTestFails: 'Retire the education angle for this SKU and reinvest in texture.',
+      riskProfile: 'exploratory',
+      estimatedGenerationClass: 'remix',
+    },
+  ];
+  // Cite what each idea rests on, as a real Creative Director does: the review themes, approved claims and facts.
+  const r = ctx.rationaleIds;
+  if (r) {
+    base[0]!.rationaleIds = [...r.themes.slice(0, 1), ...r.claims.slice(0, 1), ...r.facts.slice(0, 1), ...r.learnings.slice(0, 1)];
+    base[1]!.rationaleIds = [...r.themes.slice(0, 2), ...r.claims.slice(0, 1)];
+    base[2]!.rationaleIds = r.facts.slice(0, 2);
+  }
+  const offset = (batch - 1) % 3;
+  const concepts = [...base.slice(offset), ...base.slice(0, offset)] as [Proposal, Proposal, Proposal];
+  if (batch > 1) concepts.forEach((c, i) => (c.hookOptions = [c.hookOptions[(i + batch) % 3]!, ...c.hookOptions.filter((_, j) => j !== (i + batch) % 3)]));
+  // §8 goal: the idea that fits the goal leads (and is our pick), shaped to it; performance keeps the default.
+  const goal = ctx.goal ?? 'performance';
+  if (goal !== 'performance') {
+    const fits = (c: Proposal) =>
+      goal === 'ugc_review' ? c.angle === 'OBJECTION_HANDLING' : goal === 'explainer' ? c.angle === 'INGREDIENT_EDUCATION' || c.angle === 'ROUTINE' : c.angle === 'TEXTURE_SENSORY';
+    const i = Math.max(0, concepts.findIndex(fits));
+    const lead = concepts[i]!;
+    if (goal === 'ugc_review') lead.treatment = 'RAW_UGC';
+    if (goal === 'premium') {
+      lead.treatment = 'PREMIUM_STUDIO';
+      lead.estimatedGenerationClass = 'premium';
+    }
+    const ordered = [lead, ...concepts.filter((_, j) => j !== i)] as [Proposal, Proposal, Proposal];
+    const words = { ugc_review: 'a UGC-style review', explainer: 'an explainer', premium: 'a premium look' }[goal];
+    return { concepts: ordered, pickIndex: 0, pickReason: `It fits ${words} best and still tests one clear variable: the ${lead.angle.toLowerCase().replace(/_/g, ' ')} angle.` };
+  }
+  return { concepts, pickIndex: 0, pickReason: `Lowest production risk and it tests the ${concepts[0].angle.toLowerCase().replace(/_/g, ' ')} angle this SKU has not tried yet.` };
+}
+
+export function mockStoryboard(ctx: ProductContext, concept: Proposal): StoryboardPlan {
+  const hook = concept.hookOptions[0]!;
+  const claim = ctx.approvedClaims[0];
+  const vo = [hook + '.', concept.proofMechanism === 'TEXTURE_DEMO' ? 'Two drops. It absorbs fast and leaves no sticky finish.' : `Here is how ${ctx.name} fits your routine.`, claim ? `${claim}.` : 'Skin feels soft and comfortable.', 'Tap to try it.'].join(' ');
+  return {
+    hook,
+    cta: 'Shop now',
+    voiceover: vo.slice(0, 420),
+    scenes: [
+      { purpose: 'hook', durationMs: 3000, visualPlan: `Macro close-up: ${ctx.name} on seamless warm paper, soft side light.`, productBehavior: 'Product upright, label facing camera', spokenLine: hook, overlayText: hook.slice(0, 60), productionMode: 'STRICT_COMPOSITE', showsHumanSkin: false },
+      { purpose: 'demonstration', durationMs: 4000, visualPlan: 'A hand releases a drop onto the back of the other hand; slow spread.', productBehavior: 'Dropper/pump dispensing, product partly visible', spokenLine: 'Two drops. It absorbs fast.', overlayText: 'Absorbs in seconds', productionMode: 'GENERATIVE_INTERACTION', showsHumanSkin: true },
+      { purpose: 'product_reveal', durationMs: 3000, visualPlan: 'Hero shot, product centred, label sharp, gentle push-in.', productBehavior: 'Static hero', spokenLine: claim ?? 'Skin feels soft and comfortable.', overlayText: ctx.sizeText ? `${ctx.name} · ${ctx.sizeText}` : ctx.name, productionMode: 'STRICT_COMPOSITE', showsHumanSkin: false },
+      { purpose: 'routine', durationMs: 3000, visualPlan: 'Flat lay of the routine with the product as step two.', productBehavior: 'Product in routine line-up', spokenLine: 'Morning and night, after cleansing.', overlayText: 'AM + PM, after cleansing', productionMode: 'HYBRID', showsHumanSkin: false },
+      { purpose: 'cta', durationMs: 2000, visualPlan: 'End card with product name and CTA.', productBehavior: null, spokenLine: 'Tap to try it.', overlayText: null, productionMode: 'STRICT_COMPOSITE', showsHumanSkin: false },
+    ],
+  };
+}
+
+export function mockGenome(text: string): Genome {
+  const h = hash(text);
+  const t = text.toLowerCase();
+  const angle = /texture|absorb|feel/.test(t) ? 'TEXTURE_SENSORY' : /routine|step/.test(t) ? 'ROUTINE' : /ingredient|niacinamide|hyaluronic/.test(t) ? 'INGREDIENT_EDUCATION' : /\?/.test(t) ? 'OBJECTION_HANDLING' : /founder|i made/.test(t) ? 'FOUNDER_STORY' : /off|sale|bundle/.test(t) ? 'OFFER' : 'PROBLEM_SOLUTION';
+  return {
+    angle,
+    secondaryAngle: null,
+    hookMechanism: /\?/.test(t) ? 'QUESTION' : /watch|look/.test(t) ? 'DEMONSTRATION' : 'PROBLEM',
+    hookText: text.split(/[.!?]/)[0]?.slice(0, 160) ?? null,
+    proofMechanism: angle === 'TEXTURE_SENSORY' ? 'TEXTURE_DEMO' : angle === 'INGREDIENT_EDUCATION' ? 'INGREDIENT_EXPLANATION' : 'APPLICATION_DEMO',
+    treatment: (['RAW_UGC', 'POLISHED_UGC', 'PRODUCT_ONLY', 'HYBRID'] as const)[h % 4]!,
+    customerProblem: null,
+    productRevealSec: 2,
+    faceRevealSec: null,
+    durationSec: 15,
+    hasCaptions: true,
+    hasVoiceover: true,
+    offer: /\d+% off|bundle|free shipping/.test(t) ? (t.match(/\d+% off|bundle|free shipping/)?.[0] ?? null) : null,
+    desiredOutcome: /hydrat|plump|dewy/.test(t) ? 'skin that feels hydrated' : /glow|bright/.test(t) ? 'a healthy-looking glow' : null,
+    objection: /sticky|greasy|heavy/.test(t) ? 'feels sticky or heavy' : /price|expensive/.test(t) ? 'price' : null,
+    benefit: /absorb|lightweight/.test(t) ? 'absorbs quickly' : null,
+    ingredientProposition: INGREDIENTS.find((i) => t.includes(i)) ?? null,
+    funnelIntent: /shop|buy|off|link/.test(t) ? 'conversion' : 'consideration',
+    emotionalFrame: /finally|love|obsessed/.test(t) ? 'relief' : null,
+    firstFrameSubject: angle === 'TEXTURE_SENSORY' ? 'texture' : /i |my /.test(t) ? 'face' : 'product',
+    firstMotion: angle === 'TEXTURE_SENSORY' ? 'drop falls onto skin' : null,
+    bodySequence: angle === 'TEXTURE_SENSORY' ? ['texture_demo', 'application', 'cta'] : angle === 'ROUTINE' ? ['routine', 'application', 'cta'] : ['problem', 'product_reveal', 'cta'],
+    sceneCount: null,
+    cutsPerMinute: null,
+    humanScreenRatio: null,
+    productScreenRatio: null,
+    voice: /\bi\b|\bmy\b/.test(t) ? 'creator' : 'voiceover_human',
+    music: 'unknown',
+    polish: null,
+    impliedClaimFlags: [],
+    beforeAfter: /before\s*(and|&|\/)\s*after/.test(t),
+    creatorConnection: /#ad\b|#sponsored|paid partnership/.test(t) ? 'paid' : /gifted/.test(t) ? 'gifted' : null,
+  };
+}
+
+export function mockThemes(snippets: string[]) {
+  const buckets: [RegExp, string, 'objection' | 'benefit' | 'question' | 'usage' | 'sentiment'][] = [
+    [/sticky|tacky|greasy|oily/i, 'sticky or greasy feel', 'objection'],
+    [/pill|under makeup|foundation/i, 'pilling under makeup', 'objection'],
+    [/price|expensive|pricey|cost/i, 'price concern', 'objection'],
+    [/sensitive|irritat|sting|burn|red/i, 'sensitivity concern', 'objection'],
+    [/smell|scent|fragrance/i, 'scent', 'sentiment'],
+    [/soft|smooth|glow|hydrat|plump/i, 'feels hydrated and soft', 'benefit'],
+    [/absorb|quick|fast|lightweight/i, 'absorbs quickly', 'benefit'],
+    [/how (do|to)|when|order|routine/i, 'how to use it in a routine', 'question'],
+  ];
+  const themes = buckets
+    .map(([re, label, signalType]) => {
+      const idx = snippets.map((s, i) => (re.test(s) ? i : -1)).filter((i) => i >= 0);
+      const sentiment = signalType === 'objection' ? -0.6 : signalType === 'benefit' ? 0.7 : signalType === 'question' ? 0 : idx.some((i) => /love|great|lovely|nice/i.test(snippets[i]!)) ? 0.4 : -0.2;
+      return { label, signalType, intensity: Math.min(1, idx.length / Math.max(3, snippets.length / 3)), sentiment, snippetIndexes: idx.slice(0, 5), matchIndexes: idx, count: idx.length };
+    })
+    .filter((t) => t.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .map(({ count: _c, ...t }) => t);
+  return { themes };
+}

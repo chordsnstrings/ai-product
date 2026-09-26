@@ -1,0 +1,52 @@
+{
+  "_note": "Sanitized TikTok API for Business v1.3 responses (report/integrated/get BASIC AUCTION_AD, campaign/get, adgroup/get, gmv_max/*, ad/get), written from the API reference.",
+  "report": {
+    "code": 0,
+    "message": "OK",
+    "request_id": "20260920000000",
+    "data": {
+      "list": [
+        {
+          "dimensions": { "ad_id": "1790000000000001", "stat_time_day": "2026-09-20 00:00:00" },
+          "metrics": { "spend": "10.00", "impressions": "5000", "reach": "4200", "frequency": "1.19", "clicks": "40", "video_play_actions": "3000", "video_views_p25": "1500", "video_views_p50": "900", "video_views_p75": "500", "video_views_p100": "300", "average_video_play": "3.1", "complete_payment": "3", "total_complete_payment_rate": "90.00", "campaign_id": "1780000000000001", "adgroup_id": "1770000000000001", "ad_name": "Dew AK-014-A" }
+        }
+      ],
+      "page_info": { "page": 1, "page_size": 200, "total_number": 1, "total_page": 1 }
+    }
+  },
+  "campaigns": {
+    "code": 0,
+    "message": "OK",
+    "data": { "list": [{ "campaign_id": "1780000000000001", "campaign_name": "Dew prospecting", "objective_type": "WEB_CONVERSIONS", "campaign_type": "REGULAR_CAMPAIGN" }], "page_info": { "page": 1, "total_page": 1 } }
+  },
+  "adgroups": {
+    "code": 0,
+    "message": "OK",
+    "data": { "list": [{ "adgroup_id": "1770000000000001", "click_attribution_window": "SEVEN_DAYS", "view_attribution_window": "ONE_DAY" }], "page_info": { "page": 1, "total_page": 1 } }
+  },
+  "gmvMaxCampaigns": {
+    "code": 0,
+    "message": "OK",
+    "data": { "list": [{ "campaign_id": "1780000000000009", "campaign_name": "Dew GMV Max", "gmv_max_promotion_type": "PRODUCT_GMV_MAX" }], "page_info": { "page": 1, "total_page": 1 } }
+  },
+  "gmvMaxStores": {
+    "code": 0,
+    "message": "OK",
+    "data": { "store_list": [{ "store_id": "7490000000000001", "store_name": "Glow Lab Shop", "is_gmv_max_available": true }] }
+  },
+  "gmvMaxReport": {
+    "code": 0,
+    "message": "OK",
+    "data": {
+      "list": [
+        { "dimensions": { "campaign_id": "1780000000000009", "item_id": "7400000000000001", "stat_time_day": "2026-09-20 00:00:00" }, "metrics": { "cost": "25.00", "orders": "6", "gross_revenue": "228.00", "product_impressions": "12000", "product_clicks": "180" } }
+      ],
+      "page_info": { "page": 1, "total_page": 1 }
+    }
+  },
+  "ads": {
+    "code": 0,
+    "message": "OK",
+    "data": { "list": [{ "ad_id": "1790000000000001", "operation_status": "DISABLE", "secondary_status": "AD_STATUS_DELETE" }], "page_info": { "page": 1, "total_page": 1 } }
+  }
+}

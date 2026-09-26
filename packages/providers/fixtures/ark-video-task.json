@@ -1,0 +1,19 @@
+{
+  "_note": "Sanitized ModelArk API v3 video task responses (POST/GET contents/generations/tasks), written from the API reference.",
+  "submitted": { "id": "cgt-20260920-0001" },
+  "running": { "id": "cgt-20260920-0001", "model": "video-model-x", "status": "running", "created_at": 1758326400, "updated_at": 1758326410 },
+  "succeeded": {
+    "id": "cgt-20260920-0001",
+    "model": "video-model-x",
+    "status": "succeeded",
+    "content": { "video_url": "https://ark-output.example/video.mp4?X-Tos-Signature=secret" },
+    "usage": { "completion_tokens": 108900, "total_tokens": 108900 },
+    "seed": 42,
+    "resolution": "720p",
+    "ratio": "9:16",
+    "duration": 5,
+    "created_at": 1758326400,
+    "updated_at": 1758326460
+  },
+  "failed": { "id": "cgt-20260920-0002", "model": "video-model-x", "status": "failed", "error": { "code": "OutputVideoSensitiveContentDetected", "message": "The output video may contain sensitive information." }, "usage": { "duration": 3 } }
+}

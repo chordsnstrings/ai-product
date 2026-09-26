@@ -1,0 +1,189 @@
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { closeAll, ownerPool, withTenant } from '@arkiv/db';
+import { makeSku, makeTenant, truncateAll } from '@arkiv/db/testing';
+import { ingestBytes, Queues, startPreview } from '@arkiv/core';
+import { ctxFor, productPhoto } from '@arkiv/core/testing';
+import { onFinalFailure, runJob } from './handlers';
+import { sweepQueue, sweeps } from './sweeps';
+
+beforeEach(truncateAll);
+afterAll(closeAll);
+
+describe('schedules', () => {
+  it('never share a pg-boss queue with job handlers', () => {
+    // Regression: the "weekly-recommendations" schedule shared its queue with the per-workspace job, so the
+    // schedule's worker sometimes consumed a workspace's job and ran the fan-out instead.
+    const jobQueues = new Set<string>(Object.values(Queues).flatMap((q) => [q, `${q}-dlq`]));
+    for (const key of Object.keys(sweeps)) expect(jobQueues.has(sweepQueue(key)), sweepQueue(key)).toBe(false);
+  });
+});
+
+describe('flag-expiry sweep (plan 05 §20)', () => {
+  it('emails the owner of an expired flag once a day', async () => {
+    await ownerPool()`insert into feature_flags (key, description, owner, kind, expires_at) values ('test.expired', 'x', 'owner@arkiv.test', 'boolean', now() - interval '1 day')`;
+    try {
+      expect(await sweeps['flag-expiry']!.run()).toBe(1);
+      expect(await sweeps['flag-expiry']!.run()).toBe(0);
+      const mails = await ownerPool()`select to_email, template from email_log where template = 'flag_expired'`;
+      expect(mails).toEqual([{ to_email: 'owner@arkiv.test', template: 'flag_expired' }]);
+    } finally {
+      await ownerPool()`delete from feature_flags where key = 'test.expired'`;
+    }
+  });
+});
+
+describe('risk-flags sweep (plan 05 §17)', () => {
+  it('flags each workspace only on its own evidence', async () => {
+    // Regression: the sweep runs as the system role (policies see every tenant) and the indicator queries had
+    // no workspace filter, so one tenant's stockout or QA failures flagged every tenant.
+    const a = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    const b = await makeTenant({ state: 'ACTIVE_PAID', plan: 'GROWTH' });
+    const sku = await makeSku(a.workspaceId);
+    await ownerPool()`update skus set status = 'out_of_stock' where id = ${sku}`;
+    for (let i = 0; i < 3; i++) {
+      await ownerPool()`insert into events (workspace_id, type, actor, payload) values (${a.workspaceId}, 'QA_FAILED', 'system:test', '{}')`;
+    }
+    await ownerPool()`insert into events (workspace_id, type, actor, payload, at) values (${a.workspaceId}, 'SKU_VALIDATED', ${'user:' + a.userId}, '{}', now() - interval '10 days')`;
+    await ownerPool()`insert into events (workspace_id, type, actor, payload) values (${b.workspaceId}, 'SKU_VALIDATED', ${'user:' + b.userId}, '{}')`;
+
+    expect(await sweeps['risk-flags']!.run()).toBe(2);
+    const flags = await ownerPool()`select workspace_id, indicator from risk_flags where resolved_at is null order by indicator`;
+    expect(flags.filter((f) => f.workspace_id === a.workspaceId).map((f) => f.indicator)).toEqual(['idle_7d', 'repeated_qa_rejects', 'stockout']);
+    expect(flags.filter((f) => f.workspace_id === b.workspaceId)).toEqual([]);
+
+    // Resolution is per workspace too: B's (empty) refresh must not resolve A's flags.
+    await sweeps['risk-flags']!.run();
+    expect(await ownerPool()`select 1 from risk_flags where workspace_id = ${a.workspaceId} and resolved_at is null`).toHaveLength(3);
+    await ownerPool()`update skus set status = 'active' where id = ${sku}`;
+    await sweeps['risk-flags']!.run();
+    const open = await ownerPool()`select indicator from risk_flags where workspace_id = ${a.workspaceId} and resolved_at is null order by indicator`;
+    expect(open.map((f) => f.indicator)).toEqual(['idle_7d', 'repeated_qa_rejects']);
+  });
+});
+
+describe('risk-flags sweep resolution (plan 02 §3: system_rw is not tenant-scoped)', () => {
+  it('computes and resolves flags per workspace, never across tenants', async () => {
+    const a = await makeTenant({ state: 'ACTIVE_FREE' });
+    const b = await makeTenant({ state: 'ACTIVE_FREE' });
+    const bSku = await makeSku(b.workspaceId, 'B cream');
+    await ownerPool()`update skus set status = 'out_of_stock' where id = ${bSku}`;
+    // B already has an open flag for that; A has a stale flag that should resolve.
+    await ownerPool()`insert into risk_flags (workspace_id, indicator) values (${b.workspaceId}, 'stockout'), (${a.workspaceId}, 'ad_account_disconnected')`;
+
+    await sweeps['risk-flags']!.run();
+
+    const open = await ownerPool()`select workspace_id, indicator from risk_flags where resolved_at is null order by indicator`;
+    // Before: A inherited B's stockout (unscoped count) and A's refresh resolved B's open flag.
+    expect(open.map((r) => [r.workspace_id === a.workspaceId ? 'A' : 'B', r.indicator])).toEqual([['B', 'stockout']]);
+    const [resolvedA] = await ownerPool()`select resolved_at from risk_flags where workspace_id = ${a.workspaceId} and indicator = 'ad_account_disconnected'`;
+    expect(resolvedA!.resolved_at).not.toBeNull();
+  });
+});
+
+describe('a failed analysis never stays "analyzing" (plan 03 P3)', () => {
+  async function preview() {
+    const t = await makeTenant();
+    const ctx = ctxFor(t.workspaceId, t.userId);
+    const asset = await withTenant(t.workspaceId, async (tx) => ingestBytes(tx, ctx, await productPhoto(), 'product_photo', null));
+    const { skuId, projectId } = await withTenant(t.workspaceId, (tx) => startPreview(tx, ctx, { photoAssetIds: [asset.id] }));
+    const [job] = await ownerPool()`select id, queue, payload from outbox where workspace_id = ${t.workspaceId} and queue like 'analyze-product%'`;
+    return { t, skuId, projectId, job: job! };
+  }
+  const skuStatus = async (id: string) => (await ownerPool()`select status from skus where id = ${id}`)[0]!.status;
+
+  it('a final error ends the analysis at once, and so does its last failed retry', async () => {
+    const a = await preview();
+    await ownerPool()`update platform_settings set value = '1' where key = 'free_preview.cogs_cap_micros'`;
+    let r: unknown;
+    try {
+      r = await runJob(a.job.queue as string, a.job.payload as Record<string, unknown>, a.job.id as string);
+    } finally {
+      await ownerPool()`update platform_settings set value = '200000' where key = 'free_preview.cogs_cap_micros'`;
+    }
+    expect(r).toMatchObject({ failed: 'GATE_BLOCKED' });
+    expect(await skuStatus(a.skuId)).toBe('needs_input');
+
+    const b = await preview();
+    await onFinalFailure(b.job.queue as string, b.job.payload as Record<string, unknown>, b.job.id as string, new Error('provider down'));
+    expect(await skuStatus(b.skuId)).toBe('needs_input');
+    const [p] = await ownerPool()`select state from projects where id = ${b.projectId}`;
+    expect(p!.state).toBe('NEEDS_USER_ACTION');
+  }, 60_000);
+
+  it('the sweep fails an analysis with no progress for 10 minutes, and leaves live or queued ones alone', async () => {
+    const t = await makeTenant();
+    const mk = async (no: number, opts: { stepAgo: string; queued?: boolean }) => {
+      const [s] = await ownerPool()`insert into skus (workspace_id, catalogue_no, name, status, created_at) values (${t.workspaceId}, ${no}, 'Stuck', 'analyzing', now() - interval '30 minutes') returning id`;
+      const [p] = await ownerPool()`insert into projects (workspace_id, sku_id, kind, state, created_by, updated_at) values (${t.workspaceId}, ${s!.id}, 'preview', 'PRODUCT_UPLOADED', 'x', now() - interval '30 minutes') returning id`;
+      await ownerPool()`insert into progress_steps (workspace_id, subject_id, step_key, label, status, started_at, position)
+                        values (${t.workspaceId}, ${s!.id}, 'identify', 'Identifying the product', 'active', now() - ${opts.stepAgo}::interval, 0)`;
+      if (opts.queued) await ownerPool()`insert into outbox (workspace_id, queue, payload) values (${t.workspaceId}, 'analyze-product-free', ${ownerPool().json({ skuId: s!.id, projectId: p!.id, workspaceId: t.workspaceId })})`;
+      return s!.id as string;
+    };
+    const stuck = await mk(1, { stepAgo: '20 minutes' });
+    const live = await mk(2, { stepAgo: '1 minute' });
+    const queued = await mk(3, { stepAgo: '20 minutes', queued: true });
+    expect(await sweeps['sweep-stuck-analysis']!.run()).toBe(1);
+    expect([await skuStatus(stuck), await skuStatus(live), await skuStatus(queued)]).toEqual(['needs_input', 'analyzing', 'analyzing']);
+    expect(await sweeps['sweep-stuck-analysis']!.run()).toBe(0);
+  });
+});
+
+describe('growth and finance sweeps (plan 05 §5–§7)', () => {
+  it('are scheduled, run as the system role, and do nothing when there is nothing to do', async () => {
+    expect(sweeps['landing-gallery-rights']!.cron).toBe('12 * * * *');
+    expect(sweeps['offer-guardrails']!.cron).toBe('*/15 * * * *');
+    expect(sweeps['stripe-reconcile']!.cron).toBe('40 3 * * *');
+    expect(await sweeps['landing-gallery-rights']!.run()).toBe(0);
+    expect(await sweeps['offer-guardrails']!.run()).toBe(0);
+    // Without Stripe configured the nightly reconciliation records a skipped run instead of flagging mock data.
+    expect(await sweeps['stripe-reconcile']!.run()).toBe(0);
+    const runs = await ownerPool()`select status, error from stripe_recon_runs`;
+    expect(runs).toEqual([{ status: 'skipped', error: 'Stripe is not configured (mock gateway)' }]);
+  });
+});
+
+describe('sync-integrations sweep (§28 scheduled reconciliation; integ-27, x-races-16)', () => {
+  it('retries degraded connections once their backoff has passed, leaves permission/schema errors alone, and keeps one pending sync per connection', async () => {
+    const t = await makeTenant();
+    const add = async (account: string, status: string, error: Record<string, unknown> | null) => {
+      const [i] = await ownerPool()`insert into integrations (workspace_id, provider, external_account_id, status, token_enc, error)
+                                    values (${t.workspaceId}, 'meta', ${account}, ${status}, 'v1.x.y.z', ${error ? ownerPool().json(error as never) : null}) returning id`;
+      return i!.id as string;
+    };
+    const active = await add('a', 'active', null);
+    const due = await add('b', 'degraded', { kind: 'network', failures: 5, nextRetryAt: new Date(Date.now() - 60_000).toISOString() });
+    await add('c', 'degraded', { kind: 'network', failures: 5, nextRetryAt: new Date(Date.now() + 3600_000).toISOString() });
+    await add('d', 'degraded', { kind: 'partial_scopes', failures: 1 });
+    await add('e', 'degraded', { kind: 'schema_changed', failures: 1 });
+    await add('f', 'revoked', null);
+    expect(await sweeps['sync-integrations']!.run()).toBe(2);
+    expect(await sweeps['sync-integrations']!.run()).toBe(2); // the pending job is not duplicated
+    const jobs = await ownerPool()`select payload->>'integrationId' as id, singleton_key from outbox where queue = 'sync-integration'`;
+    expect(jobs.map((j) => j.id).sort()).toEqual([active, due].sort());
+    expect(jobs.map((j) => j.singleton_key).sort()).toEqual([`sync:${active}`, `sync:${due}`].sort());
+  });
+
+  it('freshness and token-expiry sweeps are scheduled daily', () => {
+    expect(sweeps['integration-freshness']!.cron).toMatch(/^\d+ \d+ \* \* \*$/);
+    expect(sweeps['integration-token-expiry']!.cron).toMatch(/^\d+ \d+ \* \* \*$/);
+  });
+});
+
+describe('quarterly access review (plan 05 §23)', () => {
+  it('removes roles not re-confirmed 14 days after the review fell due, ends sessions and audits it', async () => {
+    const [lapsed] = await ownerPool()`insert into staff_users (email, name, password_hash, roles, roles_confirmed_at) values ('lapsed@arkiv.test', 'L', 'x', ${['SUPPORT', 'OPS']}, now() - interval '105 days') returning id`;
+    const [due] = await ownerPool()`insert into staff_users (email, name, password_hash, roles, roles_confirmed_at) values ('due@arkiv.test', 'D', 'x', ${['SUPPORT']}, now() - interval '95 days') returning id`;
+    await ownerPool()`insert into staff_sessions (staff_id, token_hash, expires_at) values (${lapsed!.id}, 'h1', now() + interval '1 hour'), (${due!.id}, 'h2', now() + interval '1 hour')`;
+    expect(await sweeps['staff-access-review']!.run()).toBe(1);
+    const rows = await ownerPool()`select u.email, u.roles, u.active, (select count(*) from staff_sessions s where s.staff_id = u.id and s.revoked_at is null)::int as live
+                                   from staff_users u where u.email in ('lapsed@arkiv.test', 'due@arkiv.test') order by u.email`;
+    expect(rows.map((r) => ({ ...r }))).toEqual([
+      { email: 'due@arkiv.test', roles: ['SUPPORT'], active: true, live: 1 }, // still inside the 14-day grace
+      { email: 'lapsed@arkiv.test', roles: [], active: true, live: 0 },
+    ]);
+    const [a] = await ownerPool()`select staff_id, before, after from admin_audit_log where action = 'staff.access_review_removed' and target_id = ${lapsed!.id as string}`;
+    expect(a).toMatchObject({ staff_id: null, before: { roles: ['SUPPORT', 'OPS'] }, after: { roles: [] } });
+    expect(await sweeps['staff-access-review']!.run()).toBe(0);
+  });
+});
