@@ -208,6 +208,9 @@ describe('several products in the photo (plan 03 P2)', () => {
     const [fp] = await ownerPool()`select reference_asset_ids from visual_fingerprints where sku_id = ${skuId} and active`;
     expect((fp!.reference_asset_ids as string[])[0]).toBe(r.assetId);
     expect((await ownerPool()`select count(*)::int as n from concepts where project_id = ${projectId}`)[0]!.n).toBeGreaterThan(0);
+    // Choosing never pays for a second reading: one extraction in all, and the held reading is cleared.
+    expect((await ownerPool()`select count(*)::int as n from provider_jobs where task = 'extract.product_facts' and workspace_id = ${t.workspaceId}`)[0]!.n).toBe(1);
+    expect((await ownerPool()`select analysis ? 'heldExtraction' as held from skus where id = ${skuId}`)[0]!.held).toBe(false);
   }, 60_000);
 });
 

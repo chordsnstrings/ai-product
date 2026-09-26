@@ -148,8 +148,25 @@ describe('Taste production (Launch Gate 1, second half)', () => {
       const [p] = await tx`select state, qa_report, final_creative_id from projects where id = ${projectId}`;
       expect(p!.state).toBe('COMPLETE');
       expect((p!.qa_report as { pass: boolean }).pass).toBe(true);
-      const [cr] = await tx`select final_asset_ids from creatives where id = ${p!.final_creative_id}`;
+      const [cr] = await tx`select final_asset_ids, genome, visual_fingerprint_id from creatives where id = ${p!.final_creative_id}`;
       expect((cr!.final_asset_ids as string[]).length).toBe(3);
+      // §19 genome of the ad as made, and §42 the packaging version it was made with (the storyboard's pin).
+      const [sb] = await tx`select sb.visual_fingerprint_id from storyboards sb join projects p on p.storyboard_id = sb.id where p.id = ${projectId}`;
+      expect(sb!.visual_fingerprint_id).toBeTruthy();
+      expect(cr!.visual_fingerprint_id).toBe(sb!.visual_fingerprint_id);
+      const versions = await tx`select distinct visual_fingerprint_id from scene_versions`;
+      expect(versions.map((v) => v.visual_fingerprint_id)).toEqual([sb!.visual_fingerprint_id]);
+      const g = cr!.genome as Record<string, Record<string, unknown>> & { schemaVersion: number; angle: string };
+      expect(g.schemaVersion).toBe(2);
+      expect(g.angle).toBeTruthy(); // taxonomy genes stay at the top level for coverage and the Creative Map
+      expect(Object.keys(g)).toEqual(expect.arrayContaining(['strategy', 'hook', 'body', 'production', 'compliance', 'lineage']));
+      expect(g.production).toMatchObject({ durationSec: 15, captions: true });
+      expect(Number(g.production!.sceneCount)).toBeGreaterThan(2);
+      expect(Number(g.production!.syntheticRatio)).toBeGreaterThan(0);
+      expect(g.lineage).toMatchObject({ visualFingerprintId: sb!.visual_fingerprint_id, variantRole: 'single' });
+      expect((g.lineage!.promptVersions as Record<string, string>).concepts).toBeTruthy();
+      expect((g.lineage!.models as string[]).length).toBeGreaterThan(0);
+      expect(Array.isArray((g.body as { sequence: unknown[] }).sequence)).toBe(true);
       expect(await available(tx, 'taste')).toBe(0);
       const [consumed] = await tx`select count(*)::int as n from ledger_entries where type = 'CREDIT_CONSUMED'`;
       expect(consumed!.n).toBe(1);
