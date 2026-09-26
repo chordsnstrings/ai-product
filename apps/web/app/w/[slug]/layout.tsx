@@ -12,6 +12,7 @@ import { StatusBanner } from '@/components/status-banner';
 import { requireUser } from '@/lib/session';
 import { userWorkspaces, workspacePage } from '@/lib/tenant';
 import { parseTheme, THEME_COOKIE } from '@/lib/theme';
+import { freshnessChips } from '@/lib/freshness-chip';
 
 /** Workspace chrome (plan 03 Part B): left rail on desktop, bottom tabs on phone, freshness + entitlement meter. */
 export default async function WorkspaceLayout({ children, params }: { children: ReactNode; params: Promise<{ slug: string }> }) {
@@ -45,8 +46,16 @@ export default async function WorkspaceLayout({ children, params }: { children: 
       <header className="ak-topbar ak-topbar--mobile">
         <Link href={`/w/${slug}/this-week`} className="ak-wordmark">Arkiv</Link>
         <span className="ak-small ak-muted">{meter ?? w.name}</span>
+        <Link href={`/w/${slug}/settings/members`} className="ak-small">Settings</Link>
       </header>
       <main className="ak-main">
+        {/* Plan 03 Part B: the page header always shows the workspace and how fresh its data is. */}
+        <div className="ak-row ak-small ak-muted" style={{ gap: 8, flexWrap: 'wrap', marginBottom: 16 }} aria-label="Data freshness">
+          <span>{w.name}</span>
+          {freshnessChips(fresh).map((c) => (
+            <Link key={c.key} href={`/w/${slug}/settings/integrations`} className={`ak-chip${c.stale ? ' ak-chip--warn' : ''}`}>{c.text}</Link>
+          ))}
+        </div>
         <StatusBanner viewer={{ workspaceId: w.ctx.workspaceId, planCode: (ws?.plan_code as string | null) ?? null, providers }} />
         {ws?.state === 'SUSPENDED' ? (
           <Banner tone="risk">

@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withTenant } from '@arkiv/db';
-import { evidenceFloor, experimentView } from '@arkiv/core';
+import { evidenceFloor, experimentView, resultEffects, resultRevisions, variantChanges } from '@arkiv/core';
 import { MeasurementContextCaveat, measurementContextLabel, type MeasurementContext } from '@arkiv/shared';
 import { Banner, SignalChip, VideoThumb } from '@arkiv/ui';
 import { ActionButton } from '@/components/actions';
@@ -23,6 +23,8 @@ const ratio = (n: number | null) => (n == null ? '—' : `${Number(n).toFixed(2)
 const fmt = (metric: string) => (metric === 'cpa' ? money : metric === 'roas' ? ratio : pct);
 const METRIC_LABEL: Record<string, string> = { ctr: 'click-through', hold_rate: 'hold rate', cvr: 'conversion', cpa: 'cost per purchase', roas: 'return on ad spend' };
 const METRIC_ORDER = ['hold_rate', 'ctr', 'cvr', 'cpa', 'roas'];
+/** A creative variable (hook, angle, treatment…) in words. */
+const words = (v: string) => v.replace(/_/g, ' ').toLowerCase();
 
 /** Metrics shown only inside their measurement context — Meta paid and TikTok GMV Max are never merged (§30). */
 export default async function ResultDetail({ params }: { params: Promise<{ slug: string; experimentId: string }> }) {
@@ -47,7 +49,11 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
     const comparisons = await tx`select measurement_context, attribution_window, metric, state, explanation from experiment_comparisons where experiment_id = ${experimentId}`;
     const [vol] = await tx`select coalesce(sum(impressions) / nullif(count(distinct date), 0), 0)::bigint as daily from performance_observations
                            where date > now() - interval '30 days' and superseded_at is null`;
-    return { ...v, conf, revisedAt: revised[0]?.at as string | null, thumbs, deletedVariants: new Set(deleted.map((x) => x.id as string)), comparisons, daily: Number(vol?.daily ?? 0) };
+    // What the result does (standard §13): learnings it supports or contradicts, and the recommendations they shape.
+    const effects = await resultEffects(tx, experimentId);
+    // Late conversions (plan 03 A6): each revision with the replaced and the current numbers.
+    const revisions = await resultRevisions(tx, v.variants.map((x) => x.id as string));
+    return { ...v, conf, effects, revisions, revisedAt: revised[0]?.at as string | null, thumbs, deletedVariants: new Set(deleted.map((x) => x.id as string)), comparisons, daily: Number(vol?.daily ?? 0) };
   });
   if (!d) return denyPage('experiment', experimentId, w);
   // One table per measurement context and attribution window: different windows are different measurements (§30).
@@ -93,6 +99,43 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
         </div>
       ) : null}
       {d.revisedAt ? <Banner>Updated: numbers were revised on {formatDate(d.revisedAt)} as late conversions arrived.</Banner> : null}
+      {d.revisions.length ? (
+        <details className="ak-small" style={{ marginTop: 8 }}>
+          <summary>Revision history</summary>
+          <div className="ak-scroll-x">
+            <table className="ak-table">
+              <thead><tr><th>Revised</th><th>Variant</th><th>Days</th><th>Impressions</th><th>Clicks</th><th>Purchases</th></tr></thead>
+              <tbody>
+                {d.revisions.map((r) => (
+                  <tr key={`${r.variantId}:${r.revisedOn}`}>
+                    <td>{formatDate(r.revisedOn)}</td>
+                    <td className="ak-mono">{label.get(r.variantId) ?? '—'}</td>
+                    <td className="ak-mono">{r.days}</td>
+                    <td className="ak-mono">{r.before.impressions.toLocaleString('en-US')} → {r.after.impressions.toLocaleString('en-US')}</td>
+                    <td className="ak-mono">{r.before.clicks.toLocaleString('en-US')} → {r.after.clicks.toLocaleString('en-US')}</td>
+                    <td className="ak-mono">{r.before.purchases.toLocaleString('en-US')} → {r.after.purchases.toLocaleString('en-US')}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      ) : null}
+      {variantChanges(d.variants).some((v) => v.changed.length || v.heldConstant.length) ? (
+        // Standard §13: what changed between the variants being compared.
+        <section className="ak-section">
+          <h2 className="ak-label">What changed between the variants</h2>
+          {variantChanges(d.variants).map((v) => (
+            <div key={v.variantId} className="ak-index-row">
+              <span className="ak-mono">{v.code} · {v.label}{v.role === 'control' ? ' (control)' : ''}</span>
+              <span className="ak-small">
+                {v.role === 'control' ? 'Your baseline' : v.changed.length ? `Changes ${v.changed.map(words).join(', ')}` : 'Same as the control'}
+                {v.heldConstant.length ? <span className="ak-muted"> · keeps {v.heldConstant.map(words).join(', ')} the same</span> : null}
+              </span>
+            </div>
+          ))}
+        </section>
+      ) : null}
       {d.freshness?.stale ? <Banner tone="warn">{d.freshness.degraded ? 'A connected ad account needs attention' : 'Your ad data hasn’t synced for over a week'} — these numbers may be incomplete.</Banner> : null}
       {groups.length === 0 ? (
         <p className="ak-muted" style={{ marginTop: 24 }}>No performance data yet. Launch the ads with the variant codes in their names, or upload a CSV from Results. A first read needs about {floor.minTrials.toLocaleString('en-US')} {floorUnit} per variant over at least {floor.minDays} days.</p>
@@ -145,6 +188,30 @@ export default async function ResultDetail({ params }: { params: Promise<{ slug:
           </section>
         ))
       )}
+      <section className="ak-section">
+        <h2 className="ak-label">What this changes</h2>
+        {d.effects.learnings.length ? (
+          <>
+            {d.effects.learnings.map((l) => (
+              <div key={l.id} className="ak-index-row">
+                <span>{l.statement}<span className="ak-small ak-muted" style={{ display: 'block' }}>{l.supports ? 'This test supports it' : 'This test contradicts it'} · as of {formatDate(l.revalidatedAt)}</span></span>
+                <SignalChip state={l.state} />
+              </div>
+            ))}
+            {d.effects.recommendations.length ? (
+              <>
+                <p className="ak-small" style={{ marginTop: 12 }}>Recommendations it shapes:</p>
+                <ul className="ak-small" style={{ paddingLeft: 18 }}>
+                  {d.effects.recommendations.map((r) => <li key={r.id}>{r.hypothesis || 'A test idea'} · {r.sku}{r.status === 'accepted' ? ' · approved' : ''}</li>)}
+                </ul>
+              </>
+            ) : null}
+            <p className="ak-small"><Link href={`/w/${slug}/this-week`}>See this week’s recommendations</Link></p>
+          </>
+        ) : (
+          <p className="ak-small ak-muted" style={{ maxWidth: 640 }}>No learning yet. Once a comparison reaches a directional or actionable read, what it found becomes a learning and shapes next week’s recommendations.</p>
+        )}
+      </section>
       <section className="ak-section">
         <h2 className="ak-label">How to read this</h2>
         <p className="ak-small ak-muted" style={{ maxWidth: 640 }}>Estimates shrink small samples toward your product’s average so one lucky day doesn’t look like a winner. “Gathering” means not enough data yet; “Directional” is a lean; “Actionable” means the evidence floor was met and it will shape next week’s recommendations.</p>

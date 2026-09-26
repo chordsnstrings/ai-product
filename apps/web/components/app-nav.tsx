@@ -6,8 +6,9 @@ import { usePathname, useRouter } from 'next/navigation';
 const MAIN = [
   { href: 'this-week', label: 'This Week' },
   { href: 'map', label: 'Creative Map' },
-  { href: 'results', label: 'Results' },
+  { href: 'studio', label: 'Studio' },
   { href: 'products', label: 'Products' },
+  { href: 'results', label: 'Results' },
 ];
 
 export function AppNav({ slug, workspaces, current, meter }: { slug: string; workspaces: { slug: string; name: string }[]; current: string; meter: string | null }) {
@@ -52,7 +53,8 @@ export function AppNav({ slug, workspaces, current, meter }: { slug: string; wor
 
 export function TabBar({ slug }: { slug: string }) {
   const path = usePathname();
-  const items = [...MAIN.map((m) => ({ ...m, label: m.label.replace('Creative ', '') })), { href: 'settings/members', label: 'Settings' }];
+  // Five tabs on the phone (plan 03 Part B); Settings is in the phone header.
+  const items = MAIN.map((m) => ({ ...m, label: m.label.replace('Creative ', '') }));
   return (
     <nav className="ak-tabbar" aria-label="Workspace">
       {items.map((m) => (
