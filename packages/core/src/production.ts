@@ -96,6 +96,10 @@ export function sceneClaimIds(lines: (string | null | undefined)[], mapping: rea
 }
 
 /** Generated seconds for one render of a scene (whole seconds, at least the model minimum). */
+/** Input tokens of one render inspection: two reference photos and three sampled frames (qa.ts RENDER_QA_FRAMES). */
+export const RENDER_QA_TOKENS = 8_000;
+/** Input tokens of one still inspection: two reference photos and the frame. */
+export const STILL_QA_TOKENS = 5_000;
 export const genSeconds = (durationMs: number) => Math.max(MIN_GEN_SECONDS, Math.ceil(durationMs / 1000));
 
 type RouteModel = Pick<Route, 'provider' | 'model'>;
@@ -202,10 +206,12 @@ export function planProduction(
   ];
   const tail = (reserve: number): CostLine[] => {
     const repairs = generative.length ? Math.min(generative.length, Math.floor((reserve + 1e-6) / shortest)) : 0;
-    const inspections = 2 * generative.length + repairs + plates + 1 + (opts.stillChecks ?? 0);
+    // A render is inspected from three sampled frames (RENDER_QA_FRAMES) and two references; a still from one frame.
+    const renderInspections = 2 * generative.length + repairs;
+    const stillInspections = plates + 1 + (opts.stillChecks ?? 0);
     return [
       ...voice(),
-      dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: 5_000 * inspections, outputTokens: 800 * inspections }),
+      dearerLine(routes.qa, rates, { kind: 'llm', inputTokens: RENDER_QA_TOKENS * renderInspections + STILL_QA_TOKENS * stillInspections, outputTokens: 800 * (renderInspections + stillInspections) }),
       ...review(),
       ...(plates && routes.plate ? [dearerLine(routes.plate, rates, { kind: 'image', images: plates })] : []),
       { kind: 'media', outputs: 1 },
@@ -782,6 +788,7 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
     const fingerprint = {
       labelText: (fp?.label_text as string) ?? null,
       closure: (fp?.closure as string) ?? null,
+      packageType: (fp?.package_type as string | null) ?? null,
       dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
       liquidColor: (fp?.liquid_color as string | null) ?? null,
       thresholds: fidelityThresholds(fp?.thresholds),

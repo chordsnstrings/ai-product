@@ -133,6 +133,12 @@ export const FidelityCheck = z.object({
   labelTextRead: z.string().max(400).nullable().optional(),
   /** A person who looks under 18 appears (fidelity@1.2.0; standard §48 "synthetic talent appears under 18"). */
   apparentMinorPresent: z.boolean().optional(),
+  /** Hands and product don't interact plausibly (fidelity@1.3.0; standard §25.2 "object interactions"). */
+  objectInteractionBroken: z.boolean().optional(),
+  /** Motion, liquid or objects that could not happen (fidelity@1.3.0; §25.2 "impossible physics"). */
+  impossiblePhysics: z.boolean().optional(),
+  /** Warped or garbled background, text or props (fidelity@1.3.0; §25.2 "background artifacts"). */
+  backgroundArtifacts: z.boolean().optional(),
 });
 export type FidelityCheck = z.infer<typeof FidelityCheck>;
 

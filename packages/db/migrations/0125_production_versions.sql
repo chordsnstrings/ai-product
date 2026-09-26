@@ -23,3 +23,7 @@ alter table storyboards add column prompt_version text;
 alter table storyboards add column model text;
 alter table scenes add column approved_at timestamptz;
 alter table scenes add column approved_by text;
+
+-- §25.2 visual QA: the fidelity inspector judges a clip from three sampled frames and flags broken hand–product
+-- interaction, impossible physics and background artifacts (fidelity@1.3.0).
+update model_routes set prompt_version = 'fidelity@1.3.0' where task = 'qa.fidelity' and prompt_version = 'fidelity@1.2.0';

@@ -22,7 +22,7 @@ import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, fidelityThresholds } from
 import { planSteps, step } from './progress';
 import { planStoryboardScenes, sceneClaimIds } from './production';
 import { transition } from './projects';
-import { qaClaims, qaScene, type CheckResult, type SceneQaInput } from './qa';
+import { multiUnitPackaging, qaClaims, qaScene, type CheckResult, type SceneQaInput } from './qa';
 import { ensureVariantImage, referenceAssetIds } from './sku-variants';
 import { stockState } from './stock';
 import { toDataUrl } from './vision';
@@ -47,18 +47,21 @@ async function checkFrame(inspect: boolean, input: SceneQaInput): Promise<CheckR
   const cutout = input.fingerprint.cutout;
   if (!cutout) return null;
   const det = await fidelitySignals(input.frameBytes!, cutout, input.fingerprint.thresholds ?? DEFAULT_FIDELITY_THRESHOLDS);
-  const pass = det.failures.length === 0;
-  return [{ check: 'product_fidelity', pass, hard: !pass, detail: pass ? 'Product matches reference (deterministic checks)' : `Product identity mismatch: ${det.failures.map((f) => f.detail).join('; ')}`, data: { deterministic: det, inspector: 'not run' } }];
+  // Packaging sold as several units: a second package in frame is expected.
+  const failures = det.failures.filter((f) => !(f.kind === 'count' && multiUnitPackaging(input.fingerprint.packageType)));
+  const pass = failures.length === 0;
+  return [{ check: 'product_fidelity', pass, hard: !pass, detail: pass ? 'Product matches reference (deterministic checks)' : `Product identity mismatch: ${failures.map((f) => f.detail).join('; ')}`, data: { deterministic: det, inspector: 'not run' } }];
 }
 
 /** What a generated frame is checked against (§16): the active fingerprint, two reference photos and the cut-out. */
 async function frameFidelity(tx: Tx, skuId: string, refAssetIds: readonly string[], cutout: Buffer | null): Promise<Pick<SceneQaInput, 'referenceBytes' | 'fingerprint'>> {
-  const [fp] = await tx`select label_text, closure, dominant_colors, liquid_color, thresholds from visual_fingerprints where sku_id = ${skuId} and active order by version desc limit 1`;
+  const [fp] = await tx`select label_text, closure, package_type, dominant_colors, liquid_color, thresholds from visual_fingerprints where sku_id = ${skuId} and active order by version desc limit 1`;
   return {
     referenceBytes: await Promise.all(refAssetIds.slice(0, 2).map((id) => assetBytes(tx, id))),
     fingerprint: {
       labelText: (fp?.label_text as string | null) ?? null,
       closure: (fp?.closure as string | null) ?? null,
+      packageType: (fp?.package_type as string | null) ?? null,
       dominantColors: ((fp?.dominant_colors as unknown[] | null) ?? []).filter((c): c is string => typeof c === 'string'),
       liquidColor: (fp?.liquid_color as string | null) ?? null,
       thresholds: fidelityThresholds(fp?.thresholds),

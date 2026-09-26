@@ -182,6 +182,34 @@ export async function extractFrames(video: string, count: number, dir: string): 
   return outs;
 }
 
+/** Mean luma of every frame of a video (ffmpeg signalstats YAVG, 0–255), on a small scaled copy. */
+export async function lumaSeries(video: string): Promise<number[]> {
+  const { stdout } = await ffmpeg(['-i', video, '-vf', 'scale=160:-2,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-', '-an', '-f', 'null', '-']);
+  return [...stdout.matchAll(/lavfi\.signalstats\.YAVG=([\d.]+)/g)].map((m) => Number(m[1]));
+}
+
+/**
+ * Flicker from a luma series: brightness that goes one way and straight back on the next frame. For each frame the
+ * smaller of two consecutive, opposite-signed changes counts (a single cut or a steady fade counts nothing); the
+ * score is their mean over the clip, in luma levels.
+ */
+export function flickerScore(series: readonly number[]): number {
+  if (series.length < 3) return 0;
+  let sum = 0;
+  for (let i = 2; i < series.length; i++) {
+    const a = series[i - 1]! - series[i - 2]!;
+    const b = series[i]! - series[i - 1]!;
+    if (a * b < 0) sum += Math.min(Math.abs(a), Math.abs(b));
+  }
+  return sum / (series.length - 2);
+}
+
+/** Temporal statistics of a clip for visual QA (§25.2 flicker): frame count, mean luma and the flicker score. */
+export async function frameDiffStats(video: string): Promise<{ frames: number; meanLuma: number; flicker: number }> {
+  const s = await lumaSeries(video);
+  return { frames: s.length, meanLuma: s.length ? s.reduce((a, b) => a + b, 0) / s.length : 0, flicker: flickerScore(s) };
+}
+
 export interface Cue {
   startMs: number;
   endMs: number;

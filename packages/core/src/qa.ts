@@ -2,7 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import type { Tx } from '@arkiv/db';
-import { probe, withTempDir, extractFrames, ASPECT_SIZE, boxInside, contrastRatio, safeRect, type Aspect, type PlacedText } from '@arkiv/media';
+import { probe, withTempDir, extractFrames, frameDiffStats, ASPECT_SIZE, boxInside, contrastRatio, safeRect, type Aspect, type PlacedText } from '@arkiv/media';
 import { scanCreativeText, scanPasses } from './compliance';
 import type { TenantContext } from './context';
 import { DEFAULT_FIDELITY_THRESHOLDS, fidelitySignals, labelTextSimilarity, type FidelityThresholds } from './fidelity';
@@ -36,43 +36,74 @@ export interface SceneQaInput {
    * The active Visual Fingerprint (§16): OCR label text, closure, dominant colours and its similarity thresholds
    * (`visual_fingerprints.thresholds`), and the product cut-out the deterministic checks locate in the frame.
    */
-  fingerprint: { labelText: string | null; closure: string | null; dominantColors?: string[]; liquidColor?: string | null; thresholds?: FidelityThresholds; cutout?: Buffer | null };
+  fingerprint: { labelText: string | null; closure: string | null; packageType?: string | null; dominantColors?: string[]; liquidColor?: string | null; thresholds?: FidelityThresholds; cutout?: Buffer | null };
   /**
    * Test hook: markers in the visual plan make the mock inspector fail deterministically — [[qa:fidelity]] (first
-   * attempt), [[qa:fidelity_always]], [[qa:color]] (wrong product colour), [[qa:minor]] (a person who looks under 18).
+   * attempt), [[qa:fidelity_always]], [[qa:color]] (wrong product colour), [[qa:minor]] (a person who looks under 18),
+   * and on the first attempt [[qa:physics]], [[qa:interaction]] and [[qa:background]] (§25.2 visual defects).
+   * ([[mock:flicker]] in the render prompt makes the mock video itself flicker.)
    */
   planText: string;
   attempt: number;
 }
 
-/** Product fidelity + visual integrity for one rendered scene. */
+/** Frames sampled from a render for inspection: start, middle and end of the clip (§25.2 temporal defects). */
+export const RENDER_QA_FRAMES = 3;
+/** Flicker score (flickerScore, luma levels) above which a clip's brightness visibly pulses. */
+export const FLICKER_MAX = 2;
+
+/** Packaging sold as several units (a set, duo, kit): more than one package in frame is expected, not a wrong count. */
+export const multiUnitPackaging = (packageType: string | null | undefined) => /\b(set|kit|duo|trio|bundle|multi-?pack|pack of|\d+\s*-?\s*pack|pair)\b/i.test(packageType ?? '');
+
+/** Product fidelity + visual integrity for one rendered scene or still. */
 export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
-  const frame = i.frameBytes ?? (await withTempDir(async (dir) => {
-    const f = path.join(dir, 'v.mp4');
-    await writeFile(f, i.videoBytes!);
-    const [mid] = await extractFrames(f, 1, dir);
-    return sharp(mid!).toBuffer();
-  }));
+  // A render is judged from frames at its start, middle and end plus its frame-to-frame brightness (flicker); a
+  // still is its own single frame.
+  const sampled = i.frameBytes
+    ? { frames: [i.frameBytes], temporal: null }
+    : await withTempDir(async (dir) => {
+        const f = path.join(dir, 'v.mp4');
+        await writeFile(f, i.videoBytes!);
+        const files = await extractFrames(f, RENDER_QA_FRAMES, dir);
+        return { frames: await Promise.all(files.map((x) => sharp(x).toBuffer())), temporal: await frameDiffStats(f) };
+      });
+  const frames = sampled.frames;
   const th = i.fingerprint.thresholds ?? DEFAULT_FIDELITY_THRESHOLDS;
-  // Deterministic signals first (independent of the inspector): shade and package count where the exact product
-  // can be located in the frame.
-  const det = i.fingerprint.cutout ? await fidelitySignals(frame, i.fingerprint.cutout, th) : null;
+  const multiUnit = multiUnitPackaging(i.fingerprint.packageType);
+  // Deterministic signals first (independent of the inspector): shade and package count, in every sampled frame
+  // where the exact product can be located. The worst frame decides.
+  const perFrame = i.fingerprint.cutout ? await Promise.all(frames.map((fr) => fidelitySignals(fr, i.fingerprint.cutout!, th))) : [];
+  const detFailures = perFrame.flatMap((d, n) => d.failures.map((x) => ({ ...x, frame: n + 1 }))).filter((x) => !(multiUnit && x.kind === 'count'));
+  const located = perFrame.filter((d) => d.located);
+  const det = perFrame.length
+    ? {
+        located: located.length > 0,
+        framesLocated: located.length,
+        paletteDistance: located.some((d) => d.paletteDistance != null) ? Math.max(...located.map((d) => d.paletteDistance ?? 0)) : null,
+        regionColorDelta: located.some((d) => d.regionColorDelta != null) ? Math.max(...located.map((d) => d.regionColorDelta ?? 0)) : null,
+        matchScore: Math.max(...perFrame.map((d) => d.matchScore)),
+        failures: detFailures,
+      }
+    : null;
   const failMock = /\[\[qa:fidelity_always\]\]/.test(i.planText) || (/\[\[qa:fidelity\]\]/.test(i.planText) && i.attempt === 1);
   const colorMock = /\[\[qa:colou?r\]\]/.test(i.planText);
   const minorMock = /\[\[qa:minor\]\]/.test(i.planText);
+  const physicsMock = /\[\[qa:physics\]\]/.test(i.planText) && i.attempt === 1;
+  const interactionMock = /\[\[qa:interaction\]\]/.test(i.planText) && i.attempt === 1;
+  const backgroundMock = /\[\[qa:background\]\]/.test(i.planText) && i.attempt === 1;
   const insp = await llmJson({
     ctx: i.ctx,
     token: i.token,
     task: 'qa.fidelity',
     subject: { type: 'scene', id: i.sceneId },
-    inputRefs: { sceneId: i.sceneId, attempt: i.attempt, kind: i.frameBytes ? 'frame' : 'render' },
+    inputRefs: { sceneId: i.sceneId, attempt: i.attempt, kind: i.frameBytes ? 'frame' : 'render', frames: frames.length },
     template: 'fidelity',
     content: [
       ...(await Promise.all(i.referenceBytes.slice(0, 2).map(async (b) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(b, 768) })))),
-      { type: 'image', mediaType: 'image/jpeg', base64: await toJpegBase64(frame, 768) },
+      ...(await Promise.all(frames.map(async (fr) => ({ type: 'image' as const, mediaType: 'image/jpeg' as const, base64: await toJpegBase64(fr, 768) })))),
       {
         type: 'text',
-        text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. Reference product colours: ${i.fingerprint.dominantColors?.length ? i.fingerprint.dominantColors.join(', ') : 'unknown'}. Colour of the product itself: ${i.fingerprint.liquidColor ?? 'unknown'}. The last image is the generated frame. Scene: ${i.sceneText}`,
+        text: `Reference label text: ${i.fingerprint.labelText ?? 'unknown'}. Closure: ${i.fingerprint.closure ?? 'unknown'}. Packaging: ${i.fingerprint.packageType ?? 'unknown'}${multiUnit ? ' (sold as several units: more than one package is expected)' : ''}. Reference product colours: ${i.fingerprint.dominantColors?.length ? i.fingerprint.dominantColors.join(', ') : 'unknown'}. Colour of the product itself: ${i.fingerprint.liquidColor ?? 'unknown'}. ${frames.length > 1 ? `The last ${frames.length} images are frames from the start, middle and end of the generated clip.` : 'The last image is the generated frame.'} Scene: ${i.sceneText}`,
       },
     ],
     schema: FidelityCheck,
@@ -86,7 +117,10 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
       skinAlteredUnnaturally: false,
       impliesMedicalResult: false,
       apparentMinorPresent: minorMock,
-      notes: failMock ? 'Label text differs from reference' : colorMock ? 'Serum colour differs from reference' : 'Matches reference',
+      objectInteractionBroken: interactionMock,
+      impossiblePhysics: physicsMock,
+      backgroundArtifacts: backgroundMock,
+      notes: failMock ? 'Label text differs from reference' : colorMock ? 'Serum colour differs from reference' : physicsMock ? 'The serum drips upward' : 'Matches reference',
       // A failing mock "reads" a drifted label so the review screen's OCR diff has something to show.
       labelTextRead: i.fingerprint.labelText ? (failMock ? i.fingerprint.labelText.split(/\s+/).slice(0, -1).concat('SERUMM').join(' ') : i.fingerprint.labelText) : null,
     }),
@@ -101,14 +135,27 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
   if (i.fingerprint.labelText && !f.labelTextMatches) reasons.push('label text differs');
   if (labelSimilarity != null && labelSimilarity < th.labelSimilarityMin && f.labelTextMatches) reasons.push(`label reads “${f.labelTextRead}”`);
   if (!f.closureMatches) reasons.push('different closure');
-  if (f.productCount > 1) reasons.push(`${f.productCount} products in frame`);
-  for (const d of det?.failures.filter((x) => x.kind === 'count') ?? []) reasons.push(d.detail);
+  if (f.productCount > 1 && !multiUnit) reasons.push(`${f.productCount} products in frame`);
+  for (const d of detFailures.filter((x) => x.kind === 'count')) reasons.push(d.detail);
   const identityFail = reasons.length > 0;
   // §16: a materially wrong shade is a hard failure regardless of the overall visual score — whether the
   // inspector saw it or the located product's colours moved beyond the fingerprint's thresholds.
-  const shade = det?.failures.find((x) => x.kind === 'shade') ?? null;
+  const shade = detFailures.find((x) => x.kind === 'shade') ?? null;
   const colorFail = !f.colorMatches || !!shade;
   const colorDetail = shade?.detail ?? 'Materially wrong shade: the product’s colour differs from the reference';
+  // §25.2 visual quality: people, interactions, physics, background and flicker. A minor, unnatural skin change or
+  // an implied medical result is hard; the rest is a repairable defect (retry, then the exact product).
+  const flicker = sampled.temporal ? Math.round(sampled.temporal.flicker * 100) / 100 : null;
+  const defects = [
+    f.apparentMinorPresent ? 'A person who may appear under 18 is shown' : null,
+    f.skinAlteredUnnaturally ? 'Skin altered unnaturally (possible implied before/after)' : null,
+    f.impliesMedicalResult ? 'Implies a medical result' : null,
+    f.handsOrFacesDeformed ? 'Deformed hands or face' : null,
+    f.objectInteractionBroken ? 'Hands and product don’t interact naturally' : null,
+    f.impossiblePhysics ? 'Physically impossible motion' : null,
+    f.backgroundArtifacts ? 'Background artifacts' : null,
+    flicker != null && flicker > FLICKER_MAX ? `Flicker: brightness pulses between frames (${flicker} > ${FLICKER_MAX})` : null,
+  ].filter((x): x is string => !!x);
   return [
     {
       check: 'product_fidelity',
@@ -117,6 +164,9 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
       detail: identityFail ? `Product identity mismatch: ${reasons.join('; ')}${f.notes ? ` (${f.notes})` : ''}` : colorFail ? colorDetail : 'Product matches reference',
       data: {
         ...f,
+        framesInspected: frames.length,
+        multiUnit,
+        labelReference: i.fingerprint.labelText,
         labelSimilarity: labelSimilarity == null ? null : Math.round(labelSimilarity * 1000) / 1000,
         deterministic: det,
         paletteDistance: det?.paletteDistance ?? null,
@@ -126,9 +176,18 @@ export async function qaScene(i: SceneQaInput): Promise<CheckResult[]> {
     {
       check: 'visual',
       // §48: synthetic talent must present as clearly adult; anyone who may appear under 18 is a hard failure.
-      pass: !f.handsOrFacesDeformed && !f.skinAlteredUnnaturally && !f.impliesMedicalResult && !f.apparentMinorPresent,
+      pass: defects.length === 0,
       hard: f.skinAlteredUnnaturally || f.impliesMedicalResult || !!f.apparentMinorPresent,
-      detail: f.apparentMinorPresent ? 'A person who may appear under 18 is shown' : f.handsOrFacesDeformed ? 'Deformed hands or face' : f.skinAlteredUnnaturally ? 'Skin altered unnaturally (possible implied before/after)' : f.impliesMedicalResult ? 'Implies a medical result' : 'No visual defects found',
+      detail: defects.length ? defects.join('; ') : 'No visual defects found',
+      data: {
+        framesInspected: frames.length,
+        flicker,
+        flickerMax: FLICKER_MAX,
+        handsOrFacesDeformed: f.handsOrFacesDeformed,
+        objectInteractionBroken: !!f.objectInteractionBroken,
+        impossiblePhysics: !!f.impossiblePhysics,
+        backgroundArtifacts: !!f.backgroundArtifacts,
+      },
     },
   ];
 }
