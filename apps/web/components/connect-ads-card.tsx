@@ -41,7 +41,7 @@ export function ConnectAdsCard({ slug, userKey }: { slug: string; userKey: strin
             <li>turn test results into learnings that steer next week’s plan,</li>
             <li>notice when a winning ad starts to wear out and suggest a refresh.</li>
           </ul>
-          <Link className="ak-btn" href={`/w/${slug}/settings/integrations`}>Connect an ad account</Link>
+          <Link className="ak-btn" href={`/w/${slug}/connect?step=meta`}>Connect an ad account</Link>
           <span className="ak-small ak-muted" style={{ marginLeft: 12 }}>No access? Upload a CSV from Results.</span>
         </div>
         <button className="ak-textbtn" onClick={dismiss} aria-label="Dismiss">Not now</button>

@@ -368,6 +368,34 @@ export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind:
   return asset;
 }
 
+/** The rights attestation a merchant gives for footage they upload (standard §40), stored verbatim. */
+export const RIGHTS_ATTESTATION_VERSION = 'rights@2026-09-26';
+export const RIGHTS_ATTESTATION_TEXT =
+  'I own this footage, or have written permission from whoever made it and everyone who appears in it, to use and edit it in ads for this brand.';
+
+/** Kinds of uploaded footage a rights attestation covers (creator / UGC / past-ad media). */
+const ATTESTABLE_KINDS: ReadonlySet<string> = new Set(['creator_footage', 'historical_creative']);
+
+/**
+ * Standard §40: "Uploaded creator/UGC assets require merchant attestation that they have rights to use/process
+ * them; preserve origin metadata where possible." Records who attested on the asset and keeps the exact text,
+ * the person, IP and user agent as an append-only consent record. Only a signed-in person can attest.
+ */
+export async function recordRightsAttestation(tx: Tx, ctx: TenantContext, assetId: string, meta: { ip?: string | null; userAgent?: string | null } = {}) {
+  assertCan(ctx, 'sku.edit');
+  if (ctx.actor.kind !== 'user') throw new DomainError('FORBIDDEN', 'Only a signed-in member can attest rights.');
+  const [a] = await tx`update assets set rights_attested_by = ${ctx.actor.id}, rights_attested_at = now()
+                       where id = ${assetId} and workspace_id = ${ctx.workspaceId} and deleted_at is null and kind in ${tx([...ATTESTABLE_KINDS])}
+                         and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null
+                       returning id, kind`;
+  if (!a) throw new DomainError('NOT_FOUND', 'Footage not found');
+  const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)
+                       values (${ctx.workspaceId}, ${ctx.actor.id}, 'rights_attestation', ${RIGHTS_ATTESTATION_VERSION}, ${RIGHTS_ATTESTATION_TEXT},
+                               ${tx.json({ assetId, kind: a.kind as string })}, ${meta.ip ?? null}, ${meta.userAgent ?? null})
+                       returning id`;
+  return { consentId: c!.id as string };
+}
+
 /** Merchant-supplied media that can end up in an ad (and so in the before/after and minors review). */
 const REVIEWABLE_KINDS: ReadonlySet<AssetKind> = new Set<AssetKind>(['product_photo', 'reference_view', 'creator_footage', 'historical_creative']);
 

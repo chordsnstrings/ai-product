@@ -34,4 +34,6 @@ export const QUEUE_CONFIG: Record<string, { concurrency: number; expireInSeconds
   [Queues.customerThemes]: { concurrency: 1, expireInSeconds: 600, retryLimit: 2 },
   // Staff SKU transfer (plan 05 §2.3): one at a time; copies stored objects, so a generous lease.
   [Queues.transferSku]: { concurrency: 1, expireInSeconds: 900, retryLimit: 2 },
+  // Suspension pauses Stripe collection; lifting it resumes (plan 02 §2). Retried generously: it only converges.
+  [Queues.billingHold]: { concurrency: 1, expireInSeconds: 120, retryLimit: 8 },
 };

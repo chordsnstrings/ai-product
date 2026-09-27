@@ -76,7 +76,7 @@ export default async function Brand({ params, searchParams }: { params: Promise<
           <h2 className="ak-label">Brand brain</h2>
           {canEdit ? (
             <ActionForm slug={slug} action="brand" submit="Save brand" extra={brandId ? { brandId } : {}} fields={[
-              { name: 'name', label: 'Brand name', required: true, defaultValue: (row?.name as string) ?? w.name, max: 80 },
+              { name: 'name', label: 'Brand name', required: true, defaultValue: (row?.name as string) ?? w.name, max: 80, autoComplete: 'organization' },
               { name: 'tone', label: 'Tone of voice', type: 'textarea', defaultValue: brain.tone ?? '', max: 300, placeholder: 'e.g. calm, clinical, never hypey' },
               { name: 'colors', label: 'Brand colours', defaultValue: brain.colors.join(', '), max: 200, placeholder: '#1F2A44, #F4EDE4', hint: 'Hex codes, up to six.' },
               { name: 'headingFont', label: 'Heading font', defaultValue: brain.fonts.heading ?? '', max: 60, placeholder: 'e.g. Canela' },
@@ -132,7 +132,7 @@ export default async function Brand({ params, searchParams }: { params: Promise<
             ))}
           </>
         ) : null}
-        {['OWNER', 'ADMIN'].includes(w.ctx.role) ? <ActionForm slug={slug} action="rename" submit="Rename workspace" fields={[{ name: 'name', label: 'Workspace name', defaultValue: w.name, required: true, max: 80 }]} /> : null}
+        {['OWNER', 'ADMIN'].includes(w.ctx.role) ? <ActionForm slug={slug} action="rename" submit="Rename workspace" fields={[{ name: 'name', label: 'Workspace name', defaultValue: w.name, required: true, max: 80, autoComplete: 'organization' }]} /> : null}
       </div>
     </div>
   );

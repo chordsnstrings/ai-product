@@ -33,6 +33,7 @@ export const Queues = {
   extractGenome: 'extract-genome',
   customerThemes: 'customer-themes',
   transferSku: 'transfer-sku',
+  billingHold: 'billing-hold',
 } as const;
 export type QueueName = (typeof Queues)[keyof typeof Queues];
 
@@ -72,6 +73,8 @@ export const QUEUE_POLICY: Record<QueueName, { idempotent: boolean; spends: bool
   [Queues.extractGenome]: { idempotent: true, spends: true },
   [Queues.customerThemes]: { idempotent: true, spends: true },
   [Queues.transferSku]: { idempotent: true, spends: false },
+  // Pauses or resumes Stripe collection to match the workspace's hold; re-running converges on the same state.
+  [Queues.billingHold]: { idempotent: true, spends: false },
 };
 
 export const queuePolicy = (queue: string) => (QUEUE_POLICY as Record<string, { idempotent: boolean; spends: boolean } | undefined>)[queue] ?? null;

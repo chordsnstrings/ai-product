@@ -1,16 +1,32 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useState, type ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { Banner, Button, Field as FormField, Input, Select, splitConfirm, Textarea } from '@arkiv/ui';
 import { api, confirmSheet, Sheet, toast, useSubmissionKey } from '@arkiv/ui/client';
 import { StepUp } from './profile';
 import { forgetUpload, RESUMABLE_TYPES, resumableUpload } from './resumable-upload';
+import { blockedAlternative, type BlockedAlternative } from '@/lib/claim-alternative';
 
 /** The server wants a recent sign-in first (plan 02 M14 step-up): offer the emailed confirmation link. */
 const needsStepUp = (e: unknown) => !!(e as { details?: { stepUp?: boolean } } | null)?.details?.stepUp;
 
 type Variant = 'primary' | 'secondary' | 'accent' | 'text';
+
+/**
+ * A blocked claim's compliant alternative, under the error (plan 03 A3/A5, §43): the rules' advice, and — when it
+ * quotes an example wording — a button that puts that wording into the field.
+ */
+export function AlternativeHint({ alt, onUse }: { alt: BlockedAlternative; onUse?: (wording: string) => void }) {
+  return (
+    <div className="ak-small" role="note" style={{ display: 'grid', gap: 4 }}>
+      <span><span className="ak-muted">Try instead:</span> {alt.advice}</span>
+      {alt.wording && onUse ? (
+        <span><button type="button" className="ak-textbtn" onClick={() => onUse(alt.wording!)}>Use “{alt.wording}”</button></span>
+      ) : null}
+    </div>
+  );
+}
 
 /**
  * POSTs a workspace action and refreshes server data. Errors are shown inline, never swallowed. A `confirm`
@@ -70,15 +86,30 @@ export interface Field {
   hint?: string;
   /** Checkbox values ticked at first (all of them when omitted). */
   checked?: string[];
+  /** The input's purpose for autofill (WCAG 1.3.5), e.g. 'name' or 'organization'. */
+  autoComplete?: string;
 }
 
 /** Small declarative form → workspace action (JSON, or multipart when a file field is present). Success is a toast. */
 export function ActionForm({ slug, action, fields, submit, extra, onDone, multipart, danger }: { slug: string; action: string; fields: Field[]; submit: string; extra?: Record<string, unknown>; onDone?: (r: unknown) => void; multipart?: boolean; danger?: boolean }) {
   const router = useRouter();
+  const formRef = useRef<HTMLFormElement>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [alt, setAlt] = useState<BlockedAlternative | null>(null);
   const [stepUp, setStepUp] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
+  // A compliant alternative replaces the claim wording the form sends (a form without one only shows the advice).
+  const wordingField = fields.find((f) => f.name === 'wording' && (!f.type || f.type === 'text' || f.type === 'textarea'))?.name;
+  const applyWording = (w: string) => {
+    const el = wordingField ? formRef.current?.elements.namedItem(wordingField) : null;
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      el.value = w;
+      el.focus();
+    }
+    setErr(null);
+    setAlt(null);
+  };
   // One key per submission: a doubled or retried submit of the same form returns the first answer (§39).
   const submission = useSubmissionKey();
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -86,6 +117,7 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
     const fd = new FormData(e.currentTarget);
     setBusy(true);
     setErr(null);
+    setAlt(null);
     try {
       let payload: unknown;
       let sent: File | null = null;
@@ -124,13 +156,16 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
       else router.refresh();
     } catch (x) {
       if (needsStepUp(x)) setStepUp(true);
-      else setErr((x as Error).message);
+      else {
+        setErr((x as Error).message);
+        setAlt(blockedAlternative(x));
+      }
     }
     setProgress(null);
     setBusy(false);
   }
   return (
-    <form className="ak-stack" onSubmit={onSubmit}>
+    <form ref={formRef} className="ak-stack" onSubmit={onSubmit}>
       {fields.map((f) =>
         f.type === 'checkboxes' ? (
           <fieldset key={f.name} className="ak-field" style={{ border: 0, padding: 0, margin: 0 }}>
@@ -145,19 +180,20 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
         ) : (
           <FormField key={f.name} label={f.label} hint={f.hint}>
             {f.type === 'textarea' ? (
-              <Textarea name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} />
+              <Textarea name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} autoComplete={f.autoComplete} />
             ) : f.type === 'select' ? (
-              <Select name={f.name} required={f.required} defaultValue={f.defaultValue}>
+              <Select name={f.name} required={f.required} defaultValue={f.defaultValue} autoComplete={f.autoComplete}>
                 {f.options?.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
               </Select>
             ) : (
-              <Input type={f.type ?? 'text'} name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} accept={f.accept} />
+              <Input type={f.type ?? 'text'} name={f.name} required={f.required} placeholder={f.placeholder} defaultValue={f.defaultValue} maxLength={f.max} accept={f.accept} autoComplete={f.autoComplete} />
             )}
           </FormField>
         ),
       )}
       {stepUp ? <StepUp message="For your security, confirm it’s you first, then try again." /> : null}
       {err ? <Banner tone="risk">{err}</Banner> : null}
+      {err && alt ? <AlternativeHint alt={alt} onUse={wordingField ? applyWording : undefined} /> : null}
       <div><Button type="submit" variant={danger ? 'danger' : 'primary'} disabled={busy}>{busy ? (progress != null && progress < 1 ? `Uploading ${Math.round(progress * 100)}%…` : 'Saving…') : submit}</Button></div>
     </form>
   );

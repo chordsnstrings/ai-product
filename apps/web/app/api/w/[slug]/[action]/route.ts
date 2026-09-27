@@ -55,11 +55,12 @@ import {
   refreshPackaging,
   approveFingerprintViews,
   consumeMediaUpload,
+  recordRightsAttestation,
   uploadedFile,
   weekOf,
 } from '@arkiv/core';
 import { assertRecentLogin } from '@arkiv/auth';
-import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
+import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, recordUpgradeConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
 import { addressBouncing, DIGEST_TEMPLATES, setDigestPreference } from '@arkiv/email';
 import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env } from '@arkiv/shared';
 import { body, clientIp, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
@@ -68,6 +69,12 @@ import { workspaceBySlug } from '@/lib/tenant';
 const uuid = z.string().uuid();
 const PLAN = z.enum(['LAUNCH', 'GROWTH', 'SCALE']);
 const MULTIPART = new Set(['performance-csv', 'evidence', 'import-creative', 'asset-replace', 'brand-logo', 'brand-reference', 'packaging-refresh']);
+/** Validate one form value; a bad value is a 422 with its message (a raw ZodError would surface as a 500). */
+const valid = <T>(schema: z.ZodType<T>, v: unknown): T => {
+  const r = schema.safeParse(v);
+  if (!r.success) throw new DomainError('INVALID', r.error.issues[0]?.message ?? 'Invalid request');
+  return r.data;
+};
 /** A textarea of one item per line (or comma-separated) → a clean list. */
 const lines = (v: string | undefined, max: number, len: number) => [...new Set((v ?? '').split(/\n|,(?![^(]*\))/).map((x) => x.trim()).filter(Boolean).map((x) => x.slice(0, len)))].slice(0, max);
 /** Brand colours as the form writes them (#hex, comma or space separated). */
@@ -124,6 +131,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const type = z.enum(['clinical_study', 'consumer_perception', 'lab_test', 'certificate', 'ingredient_spec', 'other']).parse(form.get('type'));
         // §43: evidence is a document (or a link to one) and says whether it is about this product.
         const applicability = z.enum(EVIDENCE_APPLICABILITY).parse(form.get('applicability'));
+        // §17 evidence_strength, as the supplier rates it (weak evidence never verifies a high-risk claim).
+        const strength = valid(z.enum(['weak', 'moderate', 'strong']).default('moderate'), (form.get('strength') as string | null) || undefined);
         const location = z.string().trim().max(500).optional().parse((form.get('location') as string | null) || undefined) || null;
         const wording = z.string().trim().max(200).optional().parse((form.get('wording') as string | null) || undefined) || null;
         const expiry = z.string().date().optional().parse((form.get('expiry') as string | null) || undefined) ?? null;
@@ -131,9 +140,9 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         if (!hasFile && !/^https?:\/\/\S+$/i.test(location ?? '')) throw new DomainError('INVALID', 'Attach the document, or paste a link to it. A description alone isn’t evidence.');
         assertCan(ctx, 'sku.edit');
         await t((tx) =>
-          once(tx, { claimId, type, applicability, location, wording, expiry, file: fileIdentity(file) }, async () => {
+          once(tx, { claimId, type, applicability, strength, location, wording, expiry, file: fileIdentity(file) }, async () => {
             const assetId = hasFile ? (await ingestBytes(tx, ctx, Buffer.from(await (file as File).arrayBuffer()), 'evidence_doc', null, { filename: (file as File).name })).id : null;
-            await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, expiry, wording });
+            await attachEvidence(tx, ctx, claimId, { type, assetId, location, applicability, strength, expiry, wording });
             return { ok: true };
           }),
         );
@@ -199,10 +208,18 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
         const minorsPresent = form.getAll('minors').includes('yes');
         // §43: a before/after is declared with its provenance/permission attestation and goes to policy review.
         const beforeAfter = beforeAfterAttestation(form.getAll('beforeAfter').map(String));
+        // §40: uploaded creator/UGC footage needs the merchant's attestation of rights, and keeps its origin.
+        const hasFile = file instanceof File && file.size > 0;
+        const rightsAttested = form.getAll('rights').map(String).includes('attested');
+        if (hasFile && !rightsAttested) throw new DomainError('INVALID', 'Confirm you have the rights to use this footage in ads.', { field: 'rights' });
+        const creatorHandle = valid(z.string().trim().max(80).optional(), (form.get('creatorHandle') as string | null) || undefined) ?? null;
+        const sourceUrl = valid(z.string().trim().max(500).regex(/^https?:\/\/\S+$/i, 'Paste the link to the original post (https://…).').optional(), (form.get('sourceUrl') as string | null) || undefined) ?? null;
         const id = await t((tx) =>
-          once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, beforeAfter: !!beforeAfter, file: fileIdentity(file) }, async () => {
+          once(tx, { skuId, copy, platform, adId, secondarySkuIds, minorsPresent, beforeAfter: !!beforeAfter, rightsAttested, creatorHandle, sourceUrl, file: fileIdentity(file) }, async () => {
             // Stored as what it is — a past ad (§19 historical creative) — not as creator footage for new productions.
-            const assetId = file instanceof File && file.size ? (await ingestBytes(tx, ctx, Buffer.from(await file.arrayBuffer()), 'historical_creative', skuId, { filename: file.name, ...(beforeAfter ? { beforeAfter } : {}) })).id : null;
+            const origin = { filename: hasFile ? (file as File).name : null, ...(platform ? { platform } : {}), ...(adId ? { adId } : {}), ...(creatorHandle ? { creatorHandle } : {}), ...(sourceUrl ? { sourceUrl } : {}), ...(beforeAfter ? { beforeAfter } : {}) };
+            const assetId = hasFile ? (await ingestBytes(tx, ctx, Buffer.from(await (file as File).arrayBuffer()), 'historical_creative', skuId, origin)).id : null;
+            if (assetId) await recordRightsAttestation(tx, ctx, assetId, { ip: clientIp(req), userAgent: req.headers.get('user-agent') });
             return importHistoricalCreative(tx, ctx, { skuId, copy, assetId, platform, adId, secondarySkuIds, minorsPresent });
           }),
         );
@@ -310,6 +327,12 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'fact': {
       const i = await body(req, z.object({ skuId: uuid, key: z.string().regex(/^[a-z_]{2,40}$/), value: z.string().trim().min(1).max(2000) }));
       assertCan(ctx, 'sku.edit');
+      // Offer context (plan 03 A4): subscription and bundle availability are yes/no, stored as the store stores them.
+      if (i.key === 'subscription_available' || i.key === 'bundle_eligible') {
+        const yes = valid(z.enum(['yes', 'no'], { error: 'Choose yes or no.' }), i.value.toLowerCase()) === 'yes';
+        await t((tx) => decideFact(tx, ctx, i.skuId, i.key, { json: yes }));
+        return json({ ok: true });
+      }
       const n = i.key.includes('price') ? Number(i.value.replace(/[^0-9.]/g, '')) : null;
       await t((tx) => decideFact(tx, ctx, i.skuId, i.key, n != null && n > 0 ? { number: n } : { text: i.value }));
       return json({ ok: true });
@@ -321,6 +344,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'fact-confirm': {
       const i = await body(req, z.object({ skuId: uuid, factIds: z.array(uuid).min(1).max(50) }));
       return json({ ok: true, confirmed: (await t((tx) => confirmFacts(tx, ctx, i.skuId, i.factIds))).length });
+    }
+    case 'asset-attest': {
+      // §40: attest rights for uploaded footage that has none yet (e.g. imported before attestation existed).
+      const { assetId } = await body(req, z.object({ assetId: uuid }));
+      return json(await t((tx) => recordRightsAttestation(tx, ctx, assetId, { ip: clientIp(req), userAgent: req.headers.get('user-agent') })));
     }
     case 'asset-delete': {
       const i = await body(req, z.object({ assetId: uuid }));
@@ -422,8 +450,16 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'uncancel':
       return json(await t((tx) => setCancellation(tx, ctx, false)));
     case 'change-plan': {
-      const { plan } = await body(req, z.object({ plan: PLAN }));
-      return json(await t((tx) => changePlan(tx, ctx, plan)));
+      // An upgrade raises the recurring charge: the customer ticks consent to the new monthly price first (plan 04 §3).
+      const { plan, agreed } = await body(req, z.object({ plan: PLAN, agreed: z.boolean().optional() }));
+      return json(
+        await t(async (tx) => {
+          const consentId = agreed
+            ? await recordUpgradeConsent(tx, ctx, { userId: w.user?.id ?? null, plan, agreed, ip: clientIp(req), userAgent: req.headers.get('user-agent') })
+            : null;
+          return changePlan(tx, ctx, plan, { consentId });
+        }),
+      );
     }
     case 'portal': {
       assertCan(ctx, 'billing.manage');

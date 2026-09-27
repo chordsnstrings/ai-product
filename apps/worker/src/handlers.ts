@@ -1,6 +1,6 @@
 import { withSystem, withTenant } from '@arkiv/db';
 import { DomainError, type PlanCode } from '@arkiv/shared';
-import { STRIPE_CLAIM_STALE_MINUTES, cancelSubscriptionsForPurge, refundProjectPurchase } from '@arkiv/billing';
+import { STRIPE_CLAIM_STALE_MINUTES, cancelSubscriptionsForPurge, refundProjectPurchase, syncCollectionHold } from '@arkiv/billing';
 import {
   analyzeProduct,
   buildExport,
@@ -168,6 +168,7 @@ export const handlers: Record<string, Handler> = {
   [Queues.extractGenome]: (ctx, d) => extractGenome(ctx, d.creativeId as string),
   [Queues.customerThemes]: (ctx, d, jobId) => exclusive(ctx, Queues.customerThemes, `themes:${d.skuId as string}`, jobId, d, () => clusterThemes(ctx, d.skuId as string)),
   [Queues.transferSku]: (_ctx, d) => transferSku(d.transferId as string),
+  [Queues.billingHold]: (ctx) => syncCollectionHold(ctx.workspaceId),
 };
 
 async function deliverExport(ctx: TenantContext, jobId: string) {

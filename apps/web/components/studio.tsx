@@ -5,7 +5,8 @@ import { useRouter } from 'next/navigation';
 import { Banner, Button, LockButton, VideoThumb } from '@arkiv/ui';
 import { api, LiveLedger, Sheet, usePoll } from '@arkiv/ui/client';
 import type { ProjectView } from '@/lib/views';
-import { ActionButton, ActionForm, SheetButton } from './actions';
+import { ActionButton, ActionForm, AlternativeHint, SheetButton } from './actions';
+import { blockedAlternative, fieldForAlternative, type BlockedAlternative } from '@/lib/claim-alternative';
 import { AiDisclosureSteps, CancelProduction, Liveness, ProductionIssue, productionStopped, QueuedBanner } from './flow';
 
 type V = { id: string; code: string; label: string; role: string; projectId: string | null; projectState: string | null; files: { aspect: string; label: string; url: string }[]; preview?: string | null; caption?: string };
@@ -18,6 +19,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
   const { data: v, refresh } = usePoll<ProjectView>(`/api/projects/${masterProjectId ?? '00000000-0000-0000-0000-000000000000'}`, 2000, !!masterProjectId && live && (pre || producing));
   const [edit, setEdit] = useState<{ id: string; spokenLine: string; overlayText: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [alt, setAlt] = useState<BlockedAlternative | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const done = useCallback(() => { setLive(true); refresh(); }, [refresh]);
   const masterDone = !!v && producing && v.project.state === 'COMPLETE';
@@ -31,6 +33,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
 
   async function call(url: string, body: unknown) {
     setErr(null);
+    setAlt(null);
     try {
       const r = (await api(url, body)) as { applied?: boolean; warning?: string } | undefined;
       // Plan 03 A3: an edit to what a controlled test keeps the same is confirmed first ("This makes it exploratory").
@@ -42,6 +45,7 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
       return true;
     } catch (e) {
       setErr((e as Error).message);
+      setAlt(blockedAlternative(e));
       return false;
     }
   }
@@ -150,7 +154,8 @@ export function StudioClient({ slug, experimentId, state, masterProjectId, varia
           <form className="ak-stack" onSubmit={async (e) => { e.preventDefault(); await saveEdit(); }}>
             <label className="ak-field"><span className="ak-label">Spoken line</span><textarea className="ak-textarea" maxLength={160} value={edit.spokenLine} onChange={(e) => { setWarning(null); setEdit({ ...edit, spokenLine: e.target.value }); }} /></label>
             <label className="ak-field"><span className="ak-label">On-screen text</span><input className="ak-input" maxLength={70} value={edit.overlayText} onChange={(e) => { setWarning(null); setEdit({ ...edit, overlayText: e.target.value }); }} /></label>
-            {err ? <p className="ak-error">{err}</p> : null}
+            {err ? <p className="ak-error" role="alert">{err}</p> : null}
+            {err && alt ? <AlternativeHint alt={alt} onUse={(w) => { setEdit({ ...edit, [fieldForAlternative(edit, alt)]: w }); setErr(null); setAlt(null); }} /> : null}
             {warning ? (
               <Banner tone="warn">
                 {warning}: this test keeps that part the same as your current ad so the result can be explained. After this change, a winner is still real but its cause isn’t isolated.

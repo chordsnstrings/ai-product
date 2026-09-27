@@ -50,10 +50,11 @@ describe('runJob while a workspace is suspended', () => {
     expect(exp).toMatchObject({ delivery: 'held' });
     const log = await ownerPool()`select template from email_log where workspace_id = ${t.workspaceId}`;
     expect(log.map((l) => l.template)).toEqual(['payment_failed']);
-    expect(await ownerPool()`select queue from outbox where workspace_id = ${t.workspaceId}`).toEqual([]);
+    // Only the suspension's own billing pause is queued (it runs during the hold); everything else is parked.
+    expect(await ownerPool()`select queue from outbox where workspace_id = ${t.workspaceId}`).toEqual([{ queue: Queues.billingHold }]);
 
     await setTenantHold(staff, t.workspaceId, 'LIFT', 'cleared');
-    const replay = await ownerPool()`select id, queue, payload from outbox where workspace_id = ${t.workspaceId} order by created_at`;
+    const replay = await ownerPool()`select id, queue, payload from outbox where workspace_id = ${t.workspaceId} and queue <> ${Queues.billingHold} order by created_at`;
     expect(replay.map((r) => `${r.queue}${(r.payload as { template?: string }).template ? ':' + (r.payload as { template: string }).template : ''}`).sort()).toEqual(['compute-results', 'send-email:asset_ready', 'send-email:export_ready']);
     // The released export email mints a fresh signed link from the stored asset.
     const exportMail = replay.find((r) => (r.payload as { template?: string }).template === 'export_ready')!;

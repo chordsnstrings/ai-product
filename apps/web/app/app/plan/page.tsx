@@ -35,7 +35,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ p
         ) : w.state === 'SUSPENDED' || w.state === 'LOCKED' ? (
           <Banner tone="warn">This workspace is on hold, so a plan can’t be started right now. Contact support to resolve the hold first.</Banner>
         ) : (
-          <PlanPicker slug={w.slug as string} plans={plans} initial={initial} canBuy={['OWNER', 'ADMIN'].includes(w.role as string)} />
+          <PlanPicker slug={w.slug as string} plans={plans} initial={initial} canBuy={w.role === 'OWNER'} />
         )}
       </div>
     </ThemeScope>

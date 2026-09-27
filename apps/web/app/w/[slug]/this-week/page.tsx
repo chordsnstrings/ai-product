@@ -7,26 +7,13 @@ import { ActionButton, ActionForm, SheetButton } from '@/components/actions';
 import { ConnectAdsCard } from '@/components/connect-ads-card';
 import { projectRoute } from '@/lib/project-route';
 import { workspacePage } from '@/lib/tenant';
+import { describeChange, WHAT_CHANGED_TYPES } from '@/lib/what-changed';
 import { formatDate } from '@arkiv/shared/format';
 
 export const metadata: Metadata = { title: 'This Week' };
 
 const SLOT: Record<string, string> = { EXPLOIT: 'Exploit · build on what works', EXPAND: 'Expand · adjacent bet', EXPLORE: 'Explore · new territory' };
 const BASIS: Record<string, string> = { performance: 'Based on your results', context_limited: 'Limited performance data', cold_start: 'Based on your product and reviews — not performance yet' };
-const SIGNIFICANT = ['CONFIDENCE_CHANGED', 'LEARNING_CREATED', 'LEARNING_WEAKENED', 'LEARNING_INVALIDATED', 'EXPERIMENT_CONFOUNDED', 'INTEGRATION_DEGRADED', 'INTEGRATION_DISCONNECTED', 'COMPOSITION_COMPLETED', 'CLAIM_BLOCKED', 'CLAIM_APPROVED'];
-const EVENT_TEXT: Record<string, string> = {
-  CONFIDENCE_CHANGED: 'A test’s confidence changed',
-  LEARNING_CREATED: 'New learning recorded',
-  LEARNING_WEAKENED: 'A learning weakened',
-  LEARNING_INVALIDATED: 'A learning no longer holds',
-  EXPERIMENT_CONFOUNDED: 'A test was marked confounded',
-  INTEGRATION_DEGRADED: 'A connection needs attention',
-  INTEGRATION_DISCONNECTED: 'A connection was removed',
-  COMPOSITION_COMPLETED: 'An ad finished rendering',
-  CLAIM_BLOCKED: 'A claim was blocked',
-  CLAIM_APPROVED: 'A claim was approved',
-};
-
 /** §20 CONTROLLED vs EXPLORATORY, in the merchant's words (plan 03 A1 cards show the mode). */
 const MODE_HINT: Record<string, string> = {
   CONTROLLED: 'Changes one thing and keeps the rest the same, so the result says what caused it.',
@@ -77,7 +64,18 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
     const jobs = await tx`select p.id, p.state, p.kind, p.entitlement_unit, s.name, e.id as experiment_id from projects p join skus s on s.id = p.sku_id left join experiments e on e.id = p.experiment_id
                           where p.state in ('STORYBOARD_APPROVED','RENDER_RESERVED','RENDERING','QA_RUNNING','COMPOSING','PLATFORM_VARIANTS','FINAL_QA','CONCEPT_SELECTED','STORYBOARD_READY')
                           order by p.updated_at desc limit 8`;
-    const changes = await tx`select type, subject_type, subject_id, payload, at from events where type in ${tx(SIGNIFICANT)} and at > now() - interval '14 days' order by at desc limit 10`;
+    const changes = await tx`select type, subject_type, subject_id, payload, refs, at from events where type in ${tx([...WHAT_CHANGED_TYPES])} and at > now() - interval '14 days' order by at desc limit 10`;
+    // What each change is about: the test (hypothesis and product), the learning, or the connection.
+    const ids = (type: string) => [...new Set(changes.filter((c) => c.subject_type === type && c.subject_id).map((c) => c.subject_id as string))];
+    const learningRows = ids('learning').length ? await tx`select l.id, l.statement, s.name from learnings l left join skus s on s.id = l.sku_id where l.id = any(${ids('learning')}::uuid[])` : [];
+    const expIds = [...new Set([...ids('experiment'), ...changes.map((c) => (c.refs as { experimentId?: string } | null)?.experimentId).filter((x): x is string => !!x)])];
+    const experimentRows = expIds.length ? await tx`select e.id, e.hypothesis, e.state, s.name from experiments e left join skus s on s.id = e.sku_id where e.id = any(${expIds}::uuid[])` : [];
+    const integrationRows = ids('integration').length ? await tx`select id, provider, display_name from integrations where id = any(${ids('integration')}::uuid[])` : [];
+    const subjects = {
+      experiments: new Map(experimentRows.map((r) => [r.id as string, { hypothesis: String(r.hypothesis ?? ''), sku: (r.name as string | null) ?? null, state: String(r.state) }])),
+      learnings: new Map(learningRows.map((r) => [r.id as string, { statement: String(r.statement), sku: (r.name as string | null) ?? null }])),
+      integrations: new Map(integrationRows.map((r) => [r.id as string, { provider: String(r.provider), name: (r.display_name as string | null) ?? null }])),
+    };
     const dismissedStreak = await tx`select count(*)::int as n from recommendations where status = 'dismissed' and created_at > now() - interval '21 days'`;
     const acceptedRecent = await tx`select count(*)::int as n from recommendations where status = 'accepted' and created_at > now() - interval '21 days'`;
     const [sub] = await tx`select plan_code from subscriptions where status in ('active','trialing','past_due') limit 1`;
@@ -87,7 +85,7 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
     // §45: automatically detected sales spikes wait for the merchant's confirmation before they confound anything.
     const pending = await tx`select c.id, c.kind, c.note, c.starts_at, s.name from confounders c left join skus s on s.id = c.sku_id
                              where c.status = 'pending_confirmation' order by c.starts_at desc limit 5`;
-    return { skus, recs, jobs, changes, rationale, bal: await balances(tx), ignored: dismissedStreak[0]!.n >= 6 && acceptedRecent[0]!.n === 0, sub, adAccounts: ads!.n as number, pending };
+    return { skus, recs, jobs, changes, subjects, rationale, bal: await balances(tx), ignored: dismissedStreak[0]!.n >= 6 && acceptedRecent[0]!.n === 0, sub, adAccounts: ads!.n as number, pending };
   });
   const canCreate = ['OWNER', 'ADMIN', 'MEMBER'].includes(w.ctx.role);
 
@@ -97,13 +95,19 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
         <p className="ak-index">{weekLine()}</p>
         <h1 className="ak-h1">Welcome to your archive</h1>
         <Empty title="Add your first product" body="Paste a product link or add a photo. We’ll catalogue it and draft three test ideas in about a minute." action={<LinkButton href="/start">Add a product</LinkButton>} />
+        <p className="ak-small ak-muted">Selling on Shopify or running Meta or TikTok ads? <Link href={`/w/${slug}/connect`}>Connect your accounts</Link> — products, prices and results come in by themselves.</p>
       </>
     );
   }
   const outOfTests = data.sub && data.bal.creativeTests <= 0;
   return (
     <>
-      {sp.subscribed ? <Banner>Your plan is active. Creative Tests are ready to use.</Banner> : null}
+      {sp.subscribed ? (
+        <Banner>
+          Your plan is active. Creative Tests are ready to use.
+          {data.adAccounts === 0 ? <> <Link href={`/w/${slug}/connect?step=meta`}>Connect your ad accounts</Link> so results flow into your tests.</> : null}
+        </Banner>
+      ) : null}
       <p className="ak-index">{weekLine()}</p>
       <div className="ak-between" style={{ flexWrap: 'wrap', gap: 12 }}>
         <h1 className="ak-h1" style={{ margin: 0 }}>What to test this week</h1>
@@ -181,16 +185,24 @@ export default async function ThisWeek({ params, searchParams }: { params: Promi
             ) : null}
           </div>
         ))}
-        {data.changes.length === 0 && data.pending.length === 0 ? (
-          <p className="ak-muted ak-small">Nothing significant in the last two weeks. We only list changes that should affect what you test.</p>
-        ) : (
-          data.changes.map((c, i) => (
-            <div key={i} className="ak-index-row">
-              <span>{EVENT_TEXT[c.type as string] ?? c.type}{(c.payload as { to?: string }).to ? <> · <SignalChip state={String((c.payload as { to: string }).to)} /></> : null}</span>
-              <span className="ak-index">{formatDate(c.at as string)}</span>
-            </div>
-          ))
-        )}
+        {(() => {
+          const rows = data.changes
+            .map((c) => ({ at: c.at as string, d: describeChange({ type: c.type as string, subjectId: (c.subject_id as string | null) ?? null, refs: c.refs as never, payload: c.payload as never }, data.subjects, slug) }))
+            .filter((r) => r.d);
+          return rows.length === 0 && data.pending.length === 0 ? (
+            <p className="ak-muted ak-small">Nothing significant in the last two weeks. We only list changes that should affect what you test.</p>
+          ) : (
+            rows.map((r, i) => (
+              <div key={i} className="ak-index-row">
+                <span>
+                  {r.d!.href ? <Link href={r.d!.href}>{r.d!.text}</Link> : r.d!.text}
+                  {r.d!.state ? <> · <SignalChip state={r.d!.state} /></> : null}
+                </span>
+                <span className="ak-index">{formatDate(r.at)}</span>
+              </div>
+            ))
+          );
+        })()}
       </section>
     </>
   );

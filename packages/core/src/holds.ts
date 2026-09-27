@@ -17,10 +17,11 @@ export const JOB_HOLD_STATES: ReadonlySet<WorkspaceState> = new Set(['SUSPENDED'
 /** States in which finished work is not delivered. */
 export const DELIVERY_HOLD_STATES: ReadonlySet<WorkspaceState> = new Set(['SUSPENDED']);
 /**
- * Run regardless of holds: the staff-requested export on legal request, and the quality-guarantee refund
- * (money owed back to the customer never waits on a hold, and a purge would otherwise drop it).
+ * Run regardless of holds: the staff-requested export on legal request, the quality-guarantee refund (money owed
+ * back to the customer never waits on a hold, and a purge would otherwise drop it), and pausing billing for the
+ * hold itself (plan 02 §2 "SUSPENDED: billing paused").
  */
-export const HOLD_EXEMPT_QUEUES: ReadonlySet<string> = new Set([Queues.exportWorkspace, Queues.refundPurchase]);
+export const HOLD_EXEMPT_QUEUES: ReadonlySet<string> = new Set([Queues.exportWorkspace, Queues.refundPurchase, Queues.billingHold]);
 /** Emails that deliver finished work. Other transactional mail (billing, security) is still sent. */
 export const DELIVERY_TEMPLATES: ReadonlySet<string> = new Set(['asset_ready', 'export_ready']);
 

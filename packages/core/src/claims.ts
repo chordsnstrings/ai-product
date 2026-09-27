@@ -26,6 +26,8 @@ export interface ClaimRow {
   origin: string;
   sourceText: string | null;
   blockReason: string | null;
+  /** The compliant wording the rules propose instead of a blocked or restricted one (§43). */
+  suggestedAlternative: string | null;
   /** Our compliance team's note on a RESTRICTED claim (kept restricted, or what evidence is needed). */
   complianceNote: string | null;
   /** Other wordings of the same claim found in the sources (page, label, merchant). */
@@ -46,6 +48,7 @@ const toClaim = (r: Record<string, unknown>): ClaimRow => ({
   origin: r.origin as string,
   sourceText: (r.source_text as string) ?? null,
   blockReason: (r.block_reason as string) ?? null,
+  suggestedAlternative: (r.suggested_alternative as string | null) ?? null,
   complianceNote: (r.compliance_note as string) ?? null,
   altWordings: (r.alt_wordings as string[] | null) ?? [],
 });
@@ -105,12 +108,15 @@ export async function proposeClaim(
       return toClaim(r!);
     }
   }
+  // A blocked or restricted wording is kept with the reason and the compliant alternative the rules propose (§43).
+  const held = status === 'BLOCKED' || status === 'RESTRICTED';
   const [r] = await withClaimChange(tx, { kind: 'created', actor: actorString(ctx), reason: input.sourceText ?? null }, () => tx`
     insert into claims (workspace_id, sku_id, canonical_meaning, preferred_wording, claim_category, risk_level, status,
-      origin, source_text, block_reason, mandatory_qualifier)
+      origin, source_text, block_reason, mandatory_qualifier, suggested_alternative)
     values (${ctx.workspaceId}, ${skuId}, ${meaning ?? claimMeaningKey(wording)}, ${wording}, ${cls.category}, ${cls.risk}, ${status},
-      ${input.origin}, ${input.sourceText ?? null}, ${status === 'BLOCKED' || status === 'RESTRICTED' ? cls.matched[0]?.reason ?? null : null},
-      ${cls.status === 'VERIFIED_WITH_QUALIFIER' ? 'with regular use' : null})
+      ${input.origin}, ${input.sourceText ?? null}, ${held ? cls.matched[0]?.reason ?? null : null},
+      ${cls.status === 'VERIFIED_WITH_QUALIFIER' ? 'with regular use' : null},
+      ${held ? cls.matched.find((m) => m.alternative)?.alternative ?? null : null})
     returning *`);
   await emit(tx, ctx, 'CLAIM_CREATED', { type: 'claim', id: r!.id as string }, { status, category: cls.category, rules: cls.matched.map((m) => m.ruleId), wording, canonicalMeaning: r!.canonical_meaning, origin: input.origin }, { skuId });
   if (status === 'BLOCKED') await emit(tx, ctx, 'CLAIM_BLOCKED', { type: 'claim', id: r!.id as string }, { reason: r!.block_reason }, { skuId });
@@ -167,7 +173,7 @@ const normWording = (s: string) => s.toLowerCase().replace(/[“”"'’.!]/g, '
  * Expert endorsements need that wording stated.
  */
 export async function qualifyingEvidence(tx: Tx, claimId: string, wording: string, category: string, only?: string[] | null) {
-  const rows = await tx`select id, evidence_type, source_asset_id, source_location, applicability, expiry_date, substantiated_wording
+  const rows = await tx`select id, evidence_type, source_asset_id, source_location, applicability, evidence_strength, expiry_date, substantiated_wording
                         from claim_evidence where claim_id = ${claimId}`;
   const reasons = new Set<string>();
   const ok = rows.filter((e) => {
@@ -176,6 +182,8 @@ export async function qualifyingEvidence(tx: Tx, claimId: string, wording: strin
     if (!onFile) return reasons.add('attach the document (or a link to it)'), false;
     if (e.expiry_date && new Date(e.expiry_date as string).getTime() < new Date(new Date().toISOString().slice(0, 10)).getTime()) return reasons.add('the evidence has expired'), false;
     if (e.evidence_type === 'ingredient_spec' || e.applicability !== 'product_specific') return reasons.add('the evidence must be about this product, not an ingredient or another formula'), false;
+    // §17 evidence_strength: evidence its supplier rates weak (an anecdote, a small informal test) never verifies.
+    if (e.evidence_strength === 'weak') return reasons.add('weak evidence can’t verify it — attach a study or test report'), false;
     const said = (e.substantiated_wording as string | null)?.trim();
     if (said ? normWording(said) !== normWording(wording) : EXACT_WORDING.has(category)) return reasons.add('the evidence must state this exact wording'), false;
     return true;
@@ -286,7 +294,17 @@ export async function attachEvidence(
            values (${ctx.workspaceId}, ${claimId}, ${e.type}, ${e.assetId ?? null}, ${e.location ?? null}, ${actorString(ctx)},
              ${e.applicability ?? null}, ${e.strength ?? 'moderate'}, ${e.expiry ?? null}, ${e.wording?.trim() || null})`;
   await emit(tx, ctx, 'CLAIM_EVIDENCE_ATTACHED', { type: 'claim', id: claimId }, { type: e.type });
+  // §43 "Ingredient study not matching formulation/dose": whether ingredient-level evidence applies to the product is
+  // a compliance review, never an automatic transfer. A high-risk claim waiting on the merchant goes to our team.
+  if (e.applicability === 'ingredient_level') {
+    const [c] = await tx`select status, preferred_wording from claims where id = ${claimId}`;
+    if (c?.status === 'MERCHANT_REVIEW_REQUIRED' && classifyClaim(c.preferred_wording as string).risk === 'high')
+      await restrictClaim(tx, ctx, claimId, INGREDIENT_EVIDENCE_REASON);
+  }
 }
+
+/** Why ingredient-level evidence sent a claim to our compliance team. */
+export const INGREDIENT_EVIDENCE_REASON = 'The evidence is about an ingredient, not this product. Our compliance team reviews whether it applies to your formula.';
 
 export async function listClaims(tx: Tx, skuId: string): Promise<ClaimRow[]> {
   return (await tx`select * from claims where sku_id = ${skuId} order by created_at`).map(toClaim);

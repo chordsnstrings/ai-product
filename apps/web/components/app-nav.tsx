@@ -6,8 +6,9 @@ import { usePathname, useRouter } from 'next/navigation';
 const MAIN = [
   { href: 'this-week', label: 'This Week' },
   { href: 'map', label: 'Creative Map' },
-  { href: 'results', label: 'Results' },
+  { href: 'studio', label: 'Studio' },
   { href: 'products', label: 'Products' },
+  { href: 'results', label: 'Results' },
 ];
 
 export function AppNav({ slug, workspaces, current, meter }: { slug: string; workspaces: { slug: string; name: string }[]; current: string; meter: string | null }) {
@@ -18,9 +19,22 @@ export function AppNav({ slug, workspaces, current, meter }: { slug: string; wor
     <nav className="ak-nav" aria-label="Workspace">
       <div className="ak-ws-switch">
         {workspaces.length > 1 ? (
-          <select aria-label="Switch workspace" value={slug} onChange={(e) => router.push(`/w/${e.target.value}/this-week`)}>
-            {workspaces.map((w) => <option key={w.slug} value={w.slug}>{w.name}</option>)}
-          </select>
+          // WCAG 3.2.2 On Input: choosing an option never navigates by itself (arrow keys on a closed select change
+          // it); the switch happens on the button or Enter.
+          <form
+            className="ak-row"
+            style={{ gap: 8, flexWrap: 'nowrap' }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const to = new FormData(e.currentTarget).get('workspace');
+              if (typeof to === 'string' && to && to !== slug) router.push(`/w/${to}/this-week`);
+            }}
+          >
+            <select name="workspace" aria-label="Workspace" defaultValue={slug} key={slug}>
+              {workspaces.map((w) => <option key={w.slug} value={w.slug}>{w.name}</option>)}
+            </select>
+            <button type="submit" className="ak-textbtn ak-small">Switch</button>
+          </form>
         ) : (
           <span>{current}</span>
         )}
@@ -39,7 +53,8 @@ export function AppNav({ slug, workspaces, current, meter }: { slug: string; wor
 
 export function TabBar({ slug }: { slug: string }) {
   const path = usePathname();
-  const items = [...MAIN.map((m) => ({ ...m, label: m.label.replace('Creative ', '') })), { href: 'settings/members', label: 'Settings' }];
+  // Five tabs on the phone (plan 03 Part B); Settings is in the phone header.
+  const items = MAIN.map((m) => ({ ...m, label: m.label.replace('Creative ', '') }));
   return (
     <nav className="ak-tabbar" aria-label="Workspace">
       {items.map((m) => (

@@ -9,6 +9,7 @@ import {
   processStripeEvent,
   receiveStripeWebhook,
   recordAutoRenewConsent,
+  recordUpgradeConsent,
   setCancellation,
   startProductionCheckout,
   startSubscriptionCheckout,
@@ -181,8 +182,21 @@ describe('subscriptions (P11, plan 04 §3)', () => {
       const [s] = await tx`select consent_record_id from subscriptions`;
       expect(s!.consent_record_id).toBe(consentId);
     });
-    const up = await withTenant(t.workspaceId, (tx) => changePlan(tx, paid, 'SCALE'));
+    // An upgrade raises the recurring charge: it needs fresh consent to the new price (plan 04 §3).
+    await expect(withTenant(t.workspaceId, (tx) => changePlan(tx, paid, 'SCALE'))).rejects.toMatchObject({ code: 'INVALID', details: { needsConsent: true } });
+    await expect(withTenant(t.workspaceId, (tx) => recordUpgradeConsent(tx, paid, { userId: t.userId, plan: 'SCALE', agreed: false }))).rejects.toMatchObject({ code: 'INVALID' });
+    // A downgrade is not an upgrade; and the first subscription's consent (to Growth) doesn't cover Scale.
+    await expect(withTenant(t.workspaceId, (tx) => recordUpgradeConsent(tx, paid, { userId: t.userId, plan: 'LAUNCH', agreed: true }))).rejects.toMatchObject({ code: 'INVALID' });
+    await expect(withTenant(t.workspaceId, (tx) => changePlan(tx, paid, 'SCALE', { consentId }))).rejects.toMatchObject({ code: 'INVALID', details: { needsConsent: true } });
+    const upConsent = await withTenant(t.workspaceId, (tx) => recordUpgradeConsent(tx, paid, { userId: t.userId, plan: 'SCALE', agreed: true, ip: '1.1.1.1' }));
+    const [snap] = await ownerPool()`select text_snapshot, context from consent_records where id = ${upConsent}`;
+    expect(snap!.text_snapshot).toMatch(/^Scale: \$199\/month plus applicable sales tax\. The prorated difference for the rest of this period is charged today, then \$199 on the \d+(st|nd|rd|th) of each month/);
+    expect(snap!.context).toMatchObject({ plan: 'SCALE', from: 'GROWTH', via: 'upgrade' });
+    const up = await withTenant(t.workspaceId, (tx) => changePlan(tx, paid, 'SCALE', { consentId: upConsent }));
     expect(up.effective).toBe('now');
+    // The subscription now points at the consent to what it is billed.
+    const [afterUp] = await ownerPool()`select consent_record_id from subscriptions`;
+    expect(afterUp!.consent_record_id).toBe(upConsent);
     expect(await withTenant(t.workspaceId, (tx) => available(tx, 'creative_test'))).toBeGreaterThan(7);
     await withTenant(t.workspaceId, (tx) => setCancellation(tx, paid, true, { code: 'paused_ads', detail: 'seasonal' }));
     const [sub] = await ownerPool()`select cancel_at_period_end from subscriptions`;
