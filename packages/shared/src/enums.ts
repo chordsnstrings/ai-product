@@ -340,6 +340,7 @@ export const RiskIndicator = [
   'paid_no_export',
   'repeated_qa_rejects',
   'ignored_recommendations',
+  'falling_acceptance',
   'ad_account_disconnected',
   'stockout',
   'low_utilisation',

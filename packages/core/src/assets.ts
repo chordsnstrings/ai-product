@@ -25,7 +25,9 @@ export type AssetKind =
   | 'brand_reference'
   | 'historical_creative'
   | 'thumbnail'
-  | 'captions';
+  | 'captions'
+  // A workspace export ZIP (plan 02 §7): never included in a later export.
+  | 'export_archive';
 
 const EXT: Record<string, string> = {
   'image/png': 'png',
