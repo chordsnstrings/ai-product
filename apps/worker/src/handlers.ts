@@ -131,9 +131,23 @@ export const handlers: Record<string, Handler> = {
     const skus = d.skuId
       ? await withTenant(ctx.workspaceId, (tx) => tx`select id from skus where id = ${d.skuId as string} and status = 'active'`)
       : await withTenant(ctx.workspaceId, (tx) => tx`select id from skus where status = 'active' order by catalogue_no limit ${WEEKLY_RECOMMENDATION_SKUS}`);
+    // The Monday run closes cycles older than the two This Week shows: an unanswered recommendation expires (it
+    // counted as an ignored cycle for the churn indicators already, and never lingers as "open").
+    if (d.scheduled) await withTenant(ctx.workspaceId, (tx) => tx`update recommendations set status = 'expired' where status = 'open' and week_of < ${weekOf(new Date(Date.now() - 7 * 86400_000))}`);
     let n = 0;
-    for (const s of skus) n += await generateRecommendations(ctx, s.id as string, week).catch((e) => (e instanceof DomainError ? 0 : Promise.reject(e)));
-    if (n) await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week }, { singletonKey: `brief:${ctx.workspaceId}:${week}` }));
+    let blockedReason: string | null = null;
+    for (const s of skus) {
+      n += await generateRecommendations(ctx, s.id as string, week).catch((e) => {
+        if (!(e instanceof DomainError)) return Promise.reject(e);
+        blockedReason ??= e.code;
+        return 0;
+      });
+    }
+    // Standard §11 Monday brief: sent once per workspace per week (the email is keyed on the week). The Monday run
+    // always sends it — with nothing new, it says why; an on-demand refresh sends it only when it produced something.
+    if (n || d.scheduled) {
+      await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'weekly_brief', week, blockedReason }, { singletonKey: `brief:${ctx.workspaceId}:${week}` }));
+    }
     return n;
   },
   [Queues.exportWorkspace]: async (ctx, d, jobId) => {

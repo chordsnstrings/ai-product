@@ -61,7 +61,8 @@ export async function assembleDisputeEvidence(tx: Tx, workspaceId: string, dispu
   const consents = await tx`select created_at, kind, text_version, text_snapshot, host(ip) as ip, user_agent from consent_records
                             where workspace_id = ${workspaceId} order by created_at desc limit 10`;
   const receipts = await tx`select created_at, template, status from email_log where workspace_id = ${workspaceId}
-                            and template in ('receipt', 'subscription_started', 'asset_ready') order by created_at limit 20`;
+                            and template in ('receipt', 'invoice_receipt', 'subscription_started', 'asset_ready')
+                            and status not in ('queued', 'failed', 'suppressed', 'capped', 'paused') order by created_at limit 20`;
   // The IP the buyer used around the purchase: their consent (subscriptions), else their session at that time.
   const [session] = buyer
     ? await tx`select host(ip) as ip from sessions where user_id = ${buyer.id} and ip is not null

@@ -60,8 +60,8 @@ import {
 } from '@arkiv/core';
 import { assertRecentLogin } from '@arkiv/auth';
 import { billingGateway, CANCEL_REASONS, changePlan, recordAutoRenewConsent, setCancellation, startSubscriptionCheckout } from '@arkiv/billing';
-import { sendEmail } from '@arkiv/email';
-import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env, formatDate, PLANS, type PlanCode } from '@arkiv/shared';
+import { addressBouncing, DIGEST_TEMPLATES, setDigestPreference } from '@arkiv/email';
+import { CSV_PLATFORMS, CSV_SOURCES, DomainError, env } from '@arkiv/shared';
 import { body, clientIp, fileIdentity, idempotencyKeyOf, json, route, withIdempotency } from '@/lib/http';
 import { workspaceBySlug } from '@/lib/tenant';
 
@@ -359,9 +359,11 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     /* ── Members ── */
     case 'invite': {
       const i = await body(req, z.object({ email: z.string().email(), role: z.enum(['ADMIN', 'MEMBER', 'VIEWER']) }));
-      const r = await t((tx) => inviteMember(tx, ctx, i.email, i.role));
-      await sendEmail('invite', i.email.toLowerCase(), { url: `${env().APP_URL}/invite/${r.token}`, workspaceName: w.name, inviterName: w.user?.name ?? w.user?.email ?? 'A teammate', role: i.role }, { idempotencyKey: `invite:${r.inviteId}` });
-      return json({ ok: true });
+      // The email is queued with the invite (retried by the worker). An address known to bounce is named now, so the
+      // inviter can correct it instead of waiting for someone who never gets the link.
+      await t((tx) => inviteMember(tx, ctx, i.email, i.role));
+      const bouncing = await addressBouncing(i.email);
+      return json({ ok: true, warning: bouncing ? 'We can’t deliver email to this address: earlier mail to it bounced. Check the spelling, or send them the invite link another way.' : null });
     }
     case 'invite-revoke': {
       const { id } = await body(req, z.object({ id: uuid }));
@@ -386,6 +388,15 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
       await t((tx) => transferOwnership(tx, ctx, userId));
       return json({ ok: true });
     }
+    /* ── Weekly digests on or off, per member and workspace (plan 03 A10 "Weekly") ── */
+    case 'digest-pref': {
+      const i = await body(req, z.object({ kind: z.enum(DIGEST_TEMPLATES), enabled: z.boolean() }));
+      if (!w.user) throw new DomainError('UNAUTHENTICATED', 'Please log in.');
+      // Any member (even a Viewer, even on a held workspace) chooses their own weekly emails.
+      assertCan(ctx, 'workspace.view');
+      await setDigestPreference({ workspaceId: ctx.workspaceId, userId: w.user.id, kind: i.kind }, i.enabled);
+      return json({ ok: true });
+    }
     /* ── In-app notices from Arkiv (plan 05 §17 playbooks) ── */
     case 'notice-dismiss': {
       const { id } = await body(req, z.object({ id: uuid }));
@@ -405,14 +416,8 @@ export const POST = route(async (req, { params }: { params: Promise<{ slug: stri
     case 'cancel': {
       // The reason code and the free text are kept apart, so the console can count cancellations by code.
       const i = await body(req, z.object({ reason: z.enum(CANCEL_REASONS).nullish(), detail: z.string().max(500).nullish() }));
-      const r = await t((tx) => setCancellation(tx, ctx, true, { code: i.reason ?? null, detail: i.detail ?? null }));
-      if (w.user) {
-        const plan = PLANS[(ctx.planCode as PlanCode) ?? 'LAUNCH'];
-        // A past-due plan ends today (immediate cancel); otherwise access runs to the end of the paid period.
-        const endsOn = r.immediate ? 'today' : formatDate(r.endsAt);
-        await sendEmail('cancellation_confirmed', w.user.email, { planName: plan?.name ?? 'Your plan', endsOn, exportUrl: `${env().APP_URL}/w/${slug}/settings/data` }, { idempotencyKey: `cancel:${ctx.workspaceId}:${r.immediate ? 'now' : r.endsAt}` });
-      }
-      return json(r);
+      // setCancellation queues the confirmation email in the same transaction (one per cancellation, retried).
+      return json(await t((tx) => setCancellation(tx, ctx, true, { code: i.reason ?? null, detail: i.detail ?? null })));
     }
     case 'uncancel':
       return json(await t((tx) => setCancellation(tx, ctx, false)));

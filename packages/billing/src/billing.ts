@@ -227,13 +227,25 @@ export async function setCancellation(tx: Tx, ctx: TenantContext, cancel: boolea
     await billingStateChange(tx, ctx, 'CANCELLED', ['ACTIVE_PAID', 'PAST_DUE'], 'cancelled while past due');
     await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, { immediate: true, ...why });
     await emit(tx, ctx, 'SUBSCRIPTION_ENDED', { type: 'subscription', id: s.id as string }, { plan: s.plan_code as string, stripeSubscriptionId: s.stripe_subscription_id as string, reason: 'cancelled_past_due' });
+    await queueCancellationEmail(tx, ctx, s.plan_code as string, null);
     return { endsAt: new Date().toISOString(), immediate: true };
   }
   await billingGateway().setCancelAtPeriodEnd(s.stripe_subscription_id as string, cancel);
   // What Stripe holds as of now: a subscription event created before this change is older and never undoes it.
   await tx`update subscriptions set cancel_at_period_end = ${cancel}, stripe_event_at = greatest(stripe_event_at, now()) where id = ${s.id} and workspace_id = ${ctx.workspaceId}`;
   await emit(tx, ctx, 'SUBSCRIPTION_CHANGED', { type: 'subscription', id: s.id as string }, cancel ? { cancelAtPeriodEnd: true, ...why } : { cancelAtPeriodEnd: false });
+  if (cancel) await queueCancellationEmail(tx, ctx, s.plan_code as string, s.current_period_end as string);
   return { endsAt: s.current_period_end as string, immediate: false };
+}
+
+/**
+ * Plan 03 A10 cancellation confirmation, queued with the cancellation itself (retried by the worker, never lost to
+ * a provider error after the cancel committed). One email per cancellation: cancelling again after "keep my plan"
+ * confirms again. `endsAt` null = ended today (a past-due plan cancelled at once).
+ */
+async function queueCancellationEmail(tx: Tx, ctx: TenantContext, planCode: string, endsAt: string | null) {
+  const cancelId = randomUUID();
+  await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'cancellation_confirmed', cancelId, plan: planCode, endsAt: endsAt ? new Date(endsAt).toISOString() : null }, { singletonKey: `cancel:${cancelId}` });
 }
 
 /**
@@ -592,12 +604,15 @@ async function applyStripeEvent(tx: Tx, workspaceId: string, event: Stripe.Event
       const [other] = await tx`select 1 from subscriptions where workspace_id = ${workspaceId} and id <> ${ended.id} and status in ('active','trialing','past_due')`;
       if (!other) await tx`update workspaces set plan_code = null where id = ${workspaceId}`;
       if (!other) await billingStateChange(tx, ctx, 'CANCELLED', ['ACTIVE_PAID', 'PAST_DUE'], 'subscription ended');
-      // A cancel the customer asked for was confirmed when they asked (the cancel flow's email); a plan that ended
-      // because payment failed gets its own notice; one ended in Stripe by staff gets the cancellation email.
+      // A cancel the customer asked for was confirmed when they asked (the cancel flow's email) and now gets "your
+      // plan has ended"; a plan that ended because payment failed gets its own notice; one ended in Stripe by staff
+      // gets the cancellation email. Each keyed on the subscription, so a redelivered webhook sends once.
       if (before?.status === 'past_due' || endReason === 'payment_failed') {
         await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'plan_ended_payment_failed', subscriptionId: sub.id }, { singletonKey: `ended-unpaid:${sub.id}` });
-      } else if (!before?.cancel_at_period_end) {
-        await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'cancellation_confirmed', subscriptionId: sub.id }, { singletonKey: `cancelled:${sub.id}` });
+      } else if (before?.cancel_at_period_end) {
+        await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'plan_ended', subscriptionId: sub.id }, { singletonKey: `ended:${sub.id}` });
+      } else {
+        await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'cancellation_confirmed', subscriptionId: sub.id, plan: ended.plan_code, endsAt: null }, { singletonKey: `cancelled:${sub.id}` });
       }
       return 'processed';
     }
@@ -855,6 +870,18 @@ async function onInvoicePaid(tx: Tx, ctx: TenantContext, inv: Stripe.Invoice, at
   const [s] = await tx`select * from subscriptions where stripe_subscription_id = ${subId} and workspace_id = ${ctx.workspaceId} for update`;
   if (!s) throw new DomainError('NOT_FOUND', 'subscription row not committed yet');
   const reason = (inv as unknown as { billing_reason?: string | null }).billing_reason ?? null;
+  // Plan 03 A10 receipt for every subscription charge (first invoice, renewal, prorated upgrade, a late payment of
+  // an ended plan's last invoice). Keyed on the invoice, so a redelivered event sends one receipt.
+  const paid = inv as unknown as { amount_paid?: number | null; number?: string | null; tax?: number | null; status_transitions?: { paid_at?: number | null } | null };
+  if ((paid.amount_paid ?? 0) > 0) {
+    await enqueue(
+      tx,
+      ctx.workspaceId,
+      Queues.sendEmail,
+      { template: 'invoice_receipt', invoiceId: inv.id, number: paid.number ?? null, taxCents: paid.tax ?? null, paidAt: paid.status_transitions?.paid_at ? new Date(paid.status_transitions.paid_at * 1000).toISOString() : at.toISOString() },
+      { singletonKey: `invoice-receipt:${inv.id}` },
+    );
+  }
   if (s.status === 'canceled') {
     // The plan already ended (dunning over, or cancelled) and its last open invoice was paid later through the
     // hosted invoice link: the debt is settled (mirrored above), but Stripe never renews a canceled subscription,

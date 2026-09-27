@@ -112,11 +112,13 @@ export function ActionForm({ slug, action, fields, submit, extra, onDone, multip
         }
         payload = o;
       }
-      const r = await api<{ next?: string }>(`/api/w/${slug}/${action}`, payload, 'POST', { idempotencyKey: submission.key() });
+      const r = await api<{ next?: string; warning?: string | null }>(`/api/w/${slug}/${action}`, payload, 'POST', { idempotencyKey: submission.key() });
       submission.next();
       if (sent) forgetUpload(slug, sent);
       (e.target as HTMLFormElement).reset();
-      toast('Saved');
+      // Done, but with something the person should know (e.g. an invite to an address that bounces).
+      if (r?.warning) setErr(r.warning);
+      else toast('Saved');
       onDone?.(r);
       if (r?.next) router.push(r.next);
       else router.refresh();

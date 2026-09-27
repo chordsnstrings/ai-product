@@ -324,7 +324,7 @@ describe('danger zone and jobs actions', () => {
     expect(await ownerPool()`select 1 from admin_audit_log where action = 'tenant.invite_resend' and workspace_id = ${t.workspaceId}`).toHaveLength(1);
 
     // A stored transactional email is resent with the same content; a double click (same requestId) sends once.
-    await sendEmail('receipt', t.email, { productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: 'http://localhost/x' }, { idempotencyKey: 'orig-receipt', workspaceId: t.workspaceId });
+    await sendEmail('receipt', t.email, { workspaceName: 'Dew Co', productName: 'Dew Serum', amount: '$19.00', description: 'One 15-second ad', url: 'http://localhost/x' }, { idempotencyKey: 'orig-receipt', workspaceId: t.workspaceId });
     const [log] = await ownerPool()`select id from email_log where idempotency_key = 'orig-receipt'`;
     devOutbox.length = 0;
     const requestId = newId();
@@ -350,7 +350,7 @@ describe('danger zone and jobs actions', () => {
     await expect(act(o, 'tenant.integration_status', { workspaceId: t.workspaceId, integrationId: i!.id, status: 'active', reason: 'try again' })).rejects.toThrow(/only the customer/);
   });
 
-  it('break-glass and claim review emails land on the access log and the SKU claims page', async () => {
+  it('break-glass and claim review emails are queued with the decision; the audit reason is never sent', async () => {
     const t = await makeTenant();
     const sku = await makeSku(t.workspaceId);
     const [cl] = await ownerPool()`insert into claims (workspace_id, sku_id, canonical_meaning, preferred_wording, claim_category, risk_level, status, origin)
@@ -358,12 +358,12 @@ describe('danger zone and jobs actions', () => {
     const sup = await staff(['SUPPORT']);
     devOutbox.length = 0;
     await act(sup, 'tenant.breakglass', { workspaceId: t.workspaceId, reasonKind: 'ticket', ticket: '812', reason: 'Customer reports the wrong cap colour in the storyboard' });
-    const bg = devOutbox.find((m) => m.template === 'staff_break_glass');
-    expect((bg!.data as { url: string }).url).toMatch(new RegExp(`/w/${t.slug}/settings/access-log$`));
+    // Queued in the break-glass transaction (the worker sends it with the access-log link; apps/worker tests).
+    const queued = async (template: string) => (await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and payload->>'template' = ${template}`).map((r) => r.payload as Record<string, unknown>);
+    expect(await queued('staff_break_glass')).toEqual([expect.objectContaining({ staffName: sup.name, reason: 'Support ticket #812: Customer reports the wrong cap colour in the storyboard', breakGlassId: expect.any(String) })]);
     const comp = await staff(['COMPLIANCE']);
     await act(comp, 'claim.decide', { workspaceId: t.workspaceId, claimId: cl!.id, decision: 'block', reason: 'Needs a clinical study' });
-    const cr = devOutbox.find((m) => m.template === 'claim_review_result');
-    expect((cr!.data as { url: string }).url).toMatch(new RegExp(`/w/${t.slug}/products/${sku}/claims$`));
+    expect(await queued('claim_review_result')).toEqual([expect.objectContaining({ claimId: cl!.id, outcome: 'blocked', note: null })]);
   });
 
   it('unblocking a claim (four-eyes) emits CLAIM_UNBLOCKED, not a restriction', async () => {
@@ -727,7 +727,8 @@ describe('compliance queues (plan 05 §14)', () => {
     expect(String(r.message)).toMatch(/Evidence requested/);
     expect(devOutbox.find((m) => m.template === 'claim_evidence_request')).toMatchObject({ to: t.email, data: { claim: 'Clinically proven to reduce redness', note: 'Send the clinical study summary.' } });
     await act(comp, 'claim.decide', { workspaceId: t.workspaceId, claimId: c!.id, decision: 'keep_restricted', reason: 'Study used a different formula.' });
-    expect(devOutbox.find((m) => m.template === 'claim_review_result')).toMatchObject({ data: { outcome: 'Kept restricted: Study used a different formula.' } });
+    const [q] = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and payload->>'template' = 'claim_review_result'`;
+    expect(q!.payload).toMatchObject({ outcome: 'kept_restricted', note: 'Study used a different formula.' });
     const [after] = await ownerPool()`select status, compliance_note from claims where id = ${c!.id}`;
     expect(after).toEqual({ status: 'RESTRICTED', compliance_note: 'Study used a different formula.' });
     const other = await makeTenant();

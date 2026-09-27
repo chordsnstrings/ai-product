@@ -3,6 +3,7 @@ import { DomainError, type ProjectState } from '@arkiv/shared';
 import type { TenantContext } from './context';
 import { emit } from './events';
 import { syncExperimentWithProject } from './experiment-state';
+import { enqueue, Queues } from './outbox';
 
 /**
  * Why a project stopped, as a code (plan 03 P9, standard §8). The customer sees copy mapped from the code
@@ -95,6 +96,9 @@ export const NEXT: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
   CANCELLED: [],
 };
 
+/** Stops that clear themselves (a partner outage, paused renders): the customer has nothing to do. */
+const QUIET_CODES: ReadonlySet<FailureCode> = new Set(['provider_outage', 'renders_paused']);
+
 const TERMINAL: ReadonlySet<ProjectState> = new Set(['COMPLETE', 'REFUNDED', 'CANCELLED']);
 
 export function canTransition(from: ProjectState, to: ProjectState): boolean {
@@ -139,10 +143,10 @@ export async function transition(
   if (!canTransition(from, to)) throw new DomainError('CONFLICT', `Project cannot move from ${from} to ${to}`);
   const patch = opts.patch ?? {};
   const failing = to === 'PROVIDER_FAILED' || to === 'BLOCKED_COMPLIANCE' || to === 'NEEDS_USER_ACTION';
-  await tx`update projects set state = ${to}, state_version = state_version + 1,
+  const [v] = await tx`update projects set state = ${to}, state_version = state_version + 1,
              failure_reason = ${failing ? (opts.reason ?? null) : null},
              failure_code = ${failing ? (opts.code ?? null) : null}
-           where id = ${projectId}`;
+           where id = ${projectId} returning state_version, workspace_id`;
   for (const [k, v] of Object.entries(patch)) {
     await tx`update projects set ${tx({ [k]: v } as never)} where id = ${projectId}`;
   }
@@ -150,6 +154,18 @@ export async function transition(
   await emit(tx, ctx, 'PROJECT_STATE_CHANGED', { type: 'project', id: projectId }, { from, to, reason: opts.reason ?? null, detail: opts.detail ?? null });
   // A creative test's experiment follows its master production (failed → retryable, cancelled → archived).
   await syncExperimentWithProject(tx, ctx, projectId, to);
+  // Plan 03 A10 "QA needs you": the customer was told they can close the tab (P9), so a production that stops on
+  // them — a line to change, a payment or photo needed, or an attempt that failed and can be retried — is emailed,
+  // once per stop. An outage pause resumes by itself and sends nothing.
+  if (failing && !QUIET_CODES.has(opts.code as FailureCode)) {
+    await enqueue(
+      tx,
+      v!.workspace_id as string,
+      Queues.sendEmail,
+      { template: 'qa_needs_you', projectId, state: to, stateVersion: Number(v!.state_version), actorUserId: ctx.actor.kind === 'user' ? ctx.actor.id : null },
+      { singletonKey: `qa:${projectId}:${to}:${v!.state_version as number}` },
+    );
+  }
   return { changed: true, from };
 }
 

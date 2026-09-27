@@ -88,7 +88,7 @@ describe('integration emails (plan 03 A10, plan 05 §16, plan 02 §3 layer 8)', 
     await sendQueuedEmail(ctx, { template: 'integration_expiring', provider: 'Meta', expiresAt: '2026-10-01T12:00:00Z' }, 'job-e');
     const exp = devOutbox.filter((x) => x.template === 'integration_expiring');
     expect(exp.map((x) => x.to).sort()).toEqual(['admin@brand.com', t.email].sort());
-    expect(exp[0]!.subject).toBe('Reconnect Meta before October 1');
+    expect(exp[0]!.subject).toBe('Reconnect Meta before 1 Oct 2026');
 
     const other = await makeTenant({ email: 'jordan@elsewhere.example' });
     const [r] = await ownerPool()`insert into shop_transfer_requests (workspace_id, from_workspace_id, shop_domain, requested_by, requester_email)
