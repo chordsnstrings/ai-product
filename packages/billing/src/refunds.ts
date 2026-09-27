@@ -158,12 +158,12 @@ export async function refundPayment(r: RefundRequest, who: { requester: Staff; a
   });
   // The customer hears about it from us, with the note staff wrote (transactional, idempotent per recipient).
   const owners = await withAdmin((tx) => tx`select u.email from memberships m join users u on u.id = m.user_id where m.workspace_id = ${ws} and m.role = 'OWNER' and u.deleted_at is null`);
-  const [w] = await withAdmin((tx) => tx`select slug from workspaces where id = ${ws}`);
+  const [w] = await withAdmin((tx) => tx`select slug, name from workspaces where id = ${ws}`);
   for (const o of owners) {
     await sendEmail(
       'refund_issued',
       o.email as string,
-      { amount: formatUsd(Number(row.amount_micros)), description: String((row as { description?: string }).description ?? 'Your payment'), note: r.customerNote?.trim() || null, url: `${env().APP_URL}/w/${w?.slug as string}/settings/billing` },
+      { workspaceName: (w?.name as string) ?? 'your workspace', amount: formatUsd(Number(row.amount_micros)), description: String((row as { description?: string }).description ?? 'Your payment'), note: r.customerNote?.trim() || null, url: `${env().APP_URL}/w/${w?.slug as string}/settings/billing` },
       { idempotencyKey: `refund-mail:${row.id}:${o.email}`, workspaceId: ws },
     ).catch(() => {});
   }

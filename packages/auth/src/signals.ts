@@ -1,7 +1,7 @@
 import { recordAbuseSignalSafe } from '@arkiv/core';
 import { globalTx } from '@arkiv/db';
 import { sendEmail } from '@arkiv/email';
-import { disposableEmailDomain, env, type SignInMethod } from '@arkiv/shared';
+import { disposableEmailDomain, env, formatDateTime, type SignInMethod } from '@arkiv/shared';
 import type { LoginMeta } from './login-attempts';
 
 /**
@@ -47,7 +47,7 @@ export async function notifyIfNewDevice(userId: string, sessionId: string, meta:
       await sendEmail(
         'security_alert',
         u.email as string,
-        { event: `New sign-in on ${device}${where ? ` near ${where}` : ''}`, when: new Date().toUTCString(), url: `${env().APP_URL}/app` },
+        { event: `New sign-in on ${device}${where ? ` near ${where}` : ''}`, when: formatDateTime(new Date()), url: `${env().APP_URL}/app` },
         { idempotencyKey: `newlogin:${sessionId}` },
         tx,
       );
@@ -79,7 +79,7 @@ export async function securityNotice(userId: string, event: string, key: string)
     await globalTx(async (tx) => {
       const [u] = await tx`select email from users where id = ${userId} and deleted_at is null`;
       if (!u) return;
-      await sendEmail('security_alert', u.email as string, { event, when: new Date().toUTCString(), url: `${env().APP_URL}/app` }, { idempotencyKey: `security:${key}` }, tx);
+      await sendEmail('security_alert', u.email as string, { event, when: formatDateTime(new Date()), url: `${env().APP_URL}/app` }, { idempotencyKey: `security:${key}` }, tx);
     });
   } catch (e) {
     console.warn('[auth] could not send a security notice', (e as Error).message);

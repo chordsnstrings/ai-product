@@ -99,17 +99,21 @@ describe('cancelling (plan 03 A9, plan 05 §17)', () => {
       expect((await periodUsage(tx, periodKey)).remaining).toBe(0);
     });
     await withTenant(t.workspaceId, (tx) => scheduleDeletion(tx, ctx('CANCELLED')));
-    // Stripe's own deletion webhook arrives later: no second churn event, no email.
+    // Stripe's own deletion webhook arrives later: no second churn event, no second email (the cancel queued one).
     await send('customer.subscription.deleted', { id: subId, customer, metadata: { workspace_id: t.workspaceId } });
     expect(await count(ownerPool()`select count(*)::int as n from events where workspace_id = ${t.workspaceId} and type = 'SUBSCRIPTION_ENDED'`)).toBe(1);
-    expect(await count(ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and payload->>'template' in ('cancellation_confirmed','plan_ended_payment_failed')`)).toBe(0);
+    const mails = await ownerPool()`select payload from outbox where workspace_id = ${t.workspaceId} and payload->>'template' in ('cancellation_confirmed','plan_ended','plan_ended_payment_failed')`;
+    expect(mails.map((m) => m.payload)).toEqual([expect.objectContaining({ template: 'cancellation_confirmed', plan: 'GROWTH', endsAt: null })]);
   }, 30_000);
 
   it('a cancel the customer asked for is not confirmed a second time when the period ends; the period’s tests expire', async () => {
     const { t, ctx, subId, customer, periodKey } = await subscribed('LAUNCH');
     await withTenant(t.workspaceId, (tx) => setCancellation(tx, ctx(), true, null));
+    // Confirmed once, when asked (queued with the cancellation); the period's end sends "your plan has ended".
+    expect(await count(ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and queue = 'send-email' and payload->>'template' = 'cancellation_confirmed'`)).toBe(1);
     await send('customer.subscription.deleted', { id: subId, customer, metadata: { workspace_id: t.workspaceId } });
-    expect(await count(ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and queue = 'send-email' and payload->>'template' = 'cancellation_confirmed'`)).toBe(0);
+    expect(await count(ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and queue = 'send-email' and payload->>'template' = 'cancellation_confirmed'`)).toBe(1);
+    expect(await count(ownerPool()`select count(*)::int as n from outbox where workspace_id = ${t.workspaceId} and queue = 'send-email' and payload->>'template' = 'plan_ended'`)).toBe(1);
     const [w] = await ownerPool()`select state from workspaces where id = ${t.workspaceId}`;
     expect(w!.state).toBe('CANCELLED');
     const [x] = await ownerPool()`select amount from ledger_entries where workspace_id = ${t.workspaceId} and type = 'CREDIT_EXPIRED' and period_key = ${periodKey}`;

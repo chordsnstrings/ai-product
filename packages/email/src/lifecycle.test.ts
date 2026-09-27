@@ -6,7 +6,7 @@ import { dmarcFor, sendingDomains } from './domains';
 import { templateSamples } from './samples';
 import { handleResendEvent, MARKETING_COMPLAINT_THRESHOLD, renderEmail, sendEmail } from './send';
 import { quietHoursDelay, SEQUENCES } from './sequences';
-import { MARKETING_TEMPLATES, type TemplateName } from './templates';
+import { isDigest, MARKETING_TEMPLATES, PROMOTIONAL_TEMPLATES, type TemplateName } from './templates';
 
 beforeEach(truncateAll);
 afterEach(async () => {
@@ -14,7 +14,7 @@ afterEach(async () => {
 });
 afterAll(closeAll);
 
-const sample = { productName: 'Dew Serum', url: 'http://localhost/storyboard/1', standalonePrice: '$49' };
+const sample = { workspaceName: 'Dew Co', productName: 'Dew Serum', url: 'http://localhost/storyboard/1', standalonePrice: '$49' };
 
 describe('complaint-rate guard (plan 05 §18)', () => {
   it('pauses marketing sends above 0.1% complaints over 30 days, audited, and leaves transactional mail alone', async () => {
@@ -33,7 +33,7 @@ describe('complaint-rate guard (plan 05 §18)', () => {
     expect(await ownerPool()`select action from admin_audit_log where action = 'system.email.marketing_paused'`).toHaveLength(1);
 
     expect((await sendEmail('storyboard_saved', 'fresh@example.com', sample, { idempotencyKey: newId() })).status).toBe('paused');
-    expect((await sendEmail('receipt', 'fresh@example.com', { productName: 'Dew Serum', amount: '$19.00', description: 'ad', url: 'http://localhost/x' }, { idempotencyKey: newId() })).status).toBe('logged');
+    expect((await sendEmail('receipt', 'fresh@example.com', { workspaceName: 'Dew Co', productName: 'Dew Serum', amount: '$19.00', description: 'ad', url: 'http://localhost/x' }, { idempotencyKey: newId() })).status).toBe('logged');
     // Staff resumed (the setting is cleared to null): marketing flows again.
     await ownerPool()`update platform_settings set value = 'null'::jsonb where key = 'email.marketing_paused'`;
     expect((await sendEmail('storyboard_saved', 'fresh@example.com', sample, { idempotencyKey: newId() })).status).toBe('logged');
@@ -107,7 +107,7 @@ describe('template previews (plan 05 §18)', () => {
       const r = await renderEmail(t, samples[t] as never, { unsubscribeUrl: 'http://localhost/api/unsubscribe?t=x' });
       expect(r.subject.length, t).toBeGreaterThan(3);
       expect(r.html, t).toContain('<html');
-      expect(r.html.includes('api/unsubscribe'), t).toBe(MARKETING_TEMPLATES.has(t));
+      expect(r.html.includes('api/unsubscribe'), t).toBe(PROMOTIONAL_TEMPLATES.has(t) || isDigest(t));
     }
   });
 });

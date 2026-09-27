@@ -1361,7 +1361,8 @@ async function runProduction(ctx: TenantContext, projectId: string, runId: strin
         if (p.kind === 'taste' || p.kind === 'standalone') {
           await recordFunnel('TASTE_DELIVERED', { workspaceId: ws, visitorId: await projectVisitor(tx, ws, projectId), props: { kind: p.kind } }, tx);
         }
-        await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId });
+        // A one-off ad is ready now; a Creative Test once its hook variants are (variants.ts emails then).
+        if (!p.experiment_id) await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId }, { singletonKey: `asset:${projectId}` });
         if (p.experiment_id) await enqueue(tx, ws, Queues.hookVariants, { projectId });
         // A one-off ad whose offer promised an alternate opening hook (§7 bonus entitlements) gets it the same way.
         else if (await bonusHookDue(tx, projectId)) await enqueue(tx, ws, Queues.hookVariants, { projectId, bonus: true }, { singletonKey: `bonus-hook:${projectId}` });

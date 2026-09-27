@@ -31,8 +31,10 @@ export function recoveryUrl(appUrl: string, projectId: string, template: Recover
 export async function recoveryStatus(tx: Tx, workspaceId: string, projectId: string): Promise<{ eligible: boolean; sent: number; reason?: string }> {
   const [p] = await tx`select state, kind from projects where id = ${projectId} and workspace_id = ${workspaceId}`;
   if (!p) return { eligible: false, sent: 0, reason: 'project not found' };
+  // Only recovery emails that went out count toward the cap (a suppressed or capped attempt is logged too).
   const [n] = await tx`select count(distinct template)::int as n from email_log
-                       where workspace_id = ${workspaceId} and idempotency_key like ${`recovery:${projectId}:%`}`;
+                       where workspace_id = ${workspaceId} and idempotency_key like ${`recovery:${projectId}:%`}
+                         and status not in ('queued', 'failed', 'suppressed', 'capped', 'paused')`;
   const sent = n!.n as number;
   if (sent >= RECOVERY_EMAIL_CAP) return { eligible: false, sent, reason: 'cap reached' };
   if (p.state !== 'STORYBOARD_READY' || p.kind !== 'preview') return { eligible: false, sent, reason: 'no longer abandoned' };

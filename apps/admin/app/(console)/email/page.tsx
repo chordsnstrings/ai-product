@@ -23,10 +23,13 @@ export default async function Email() {
   const d0 = await withAdmin(async (tx) => {
     await auditView(tx, s, 'email', { includeTest: prefs.includeTest });
     return {
-      stats: await tx`select stream, count(*)::int as sent, count(*) filter (where status = 'bounced')::int as bounced, count(*) filter (where status = 'complained')::int as complained,
-                             count(*) filter (where status in ('delivered','opened','clicked'))::int as delivered from email_log where created_at > now() - interval '30 days' ${notTest(tx, prefs)} group by stream`,
+      stats: await tx`select stream, count(*) filter (where status not in ('suppressed','capped','paused','failed','queued'))::int as sent, count(*) filter (where status = 'bounced')::int as bounced, count(*) filter (where status = 'complained')::int as complained,
+                             count(*) filter (where status in ('delivered','opened','clicked'))::int as delivered,
+                             count(*) filter (where status in ('suppressed','capped','paused'))::int as held
+                      from email_log where created_at > now() - interval '30 days' ${notTest(tx, prefs)} group by stream`,
       byTemplate: await tx`select template, count(*)::int as n, max(created_at) as last from email_log where created_at > now() - interval '30 days' ${notTest(tx, prefs)} group by 1 order by 2 desc`,
       suppressions: await tx`select * from email_suppressions order by created_at desc limit 200`,
+      held: await tx`select to_email, template, status, workspace_id, created_at from email_log where status in ('suppressed','capped','paused') ${notTest(tx, prefs)} order by created_at desc limit 30`,
       failed: await tx`select to_email, template, events, created_at from email_log where status = 'failed' ${notTest(tx, prefs)} order by created_at desc limit 20`,
       paused: ((await tx`select value from platform_settings where key = 'email.marketing_paused'`)[0]?.value ?? null) as { at?: string; rate?: number; complaints?: number; sent?: number } | null,
       ownerBounces: await tx`select id, name, owner_email_bouncing_at from workspaces where owner_email_bouncing_at is not null ${notTest(tx, prefs, 'id')} order by owner_email_bouncing_at desc limit 50`,
@@ -48,9 +51,9 @@ export default async function Email() {
           {staffCan(s.roles, 'email.manage') ? <ActButton small action="email.marketing_resume" payload={{}} reason="What was fixed (list cleaned, content changed)?">Resume marketing</ActButton> : null}
         </div>
       ) : null}
-      <Table head={['Stream (30d)', 'Sent', 'Delivered', 'Bounced', 'Complaints', 'Complaint rate']} rows={d0.stats.map((r) => {
-        const high = Number(r.complained) / Number(r.sent) > 0.001;
-        return [r.stream as string, r.sent as number, r.delivered as number, r.bounced as number, r.complained as number, <span key="c" style={{ color: high ? 'var(--risk)' : undefined }}>{pct(Number(r.complained) / Number(r.sent), 2)}{high ? ' ⚠ above 0.1%' : ''}</span>];
+      <Table head={['Stream (30d)', 'Sent', 'Delivered', 'Bounced', 'Complaints', 'Complaint rate', 'Not sent']} rows={d0.stats.map((r) => {
+        const high = Number(r.sent) > 0 && Number(r.complained) / Number(r.sent) > 0.001;
+        return [r.stream as string, r.sent as number, r.delivered as number, r.bounced as number, r.complained as number, <span key="c" style={{ color: high ? 'var(--risk)' : undefined }}>{Number(r.sent) ? pct(Number(r.complained) / Number(r.sent), 2) : '—'}{high ? ' ⚠ above 0.1%' : ''}</span>, r.held as number];
       })} empty="Nothing sent in 30 days." />
       <Section title="Sending domains (Resend)">
         {domainError ? <p className="ak-small ak-error">Couldn’t reach Resend: {domainError}</p> : null}
@@ -73,7 +76,11 @@ export default async function Email() {
         <p className="ak-small ak-muted">The workspace shows the owner a banner until mail to the address is delivered again.</p>
       </Section>
       <Section title="Suppressions">
-        <Table head={['Email', 'Reason', 'Stream', 'Since', '']} rows={d0.suppressions.map((x) => [pii.email(x.email), x.reason as string, x.stream as string, dt(x.created_at), staffCan(s.roles, 'email.manage') ? <ActButton key="u" small action="email.unsuppress" payload={{ emailKey: emailKey(x.email as string) }} reason>Unsuppress</ActButton> : null])} />
+        <p className="ak-small ak-muted">One row per fact: a hard bounce stops all mail but sign-in and security; a complaint stops the stream it came from (a transactional complaint never stops receipts, billing or security notices); an unsubscribe stops marketing and recovery email and can only be undone by the recipient.</p>
+        <Table head={['Email', 'Reason', 'Stream', 'Since', '']} rows={d0.suppressions.map((x) => [pii.email(x.email), x.reason as string, x.stream as string, dt(x.created_at), staffCan(s.roles, 'email.manage') && x.reason !== 'unsubscribed' ? <ActButton key="u" small action="email.unsuppress" payload={{ emailKey: emailKey(x.email as string) }} reason>Clear bounce/complaint</ActButton> : null])} />
+      </Section>
+      <Section title="Sends that didn’t go out">
+        <Table head={['When', 'To', 'Template', 'Why']} rows={d0.held.map((f) => [dt(f.created_at), pii.email(f.to_email), f.template as string, f.status === 'suppressed' ? 'address suppressed' : f.status === 'capped' ? 'marketing frequency cap' : 'marketing paused'])} empty="None." />
       </Section>
       <Section title="Failed sends"><Table head={['When', 'To', 'Template', 'Error']} rows={d0.failed.map((f) => [dt(f.created_at), pii.email(f.to_email), f.template as string, JSON.stringify(f.events).slice(0, 120)])} /></Section>
     </Page>

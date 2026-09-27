@@ -170,6 +170,11 @@ export async function startBreakGlass(
                           values (${workspaceId}, ${s.staffId}, ${s.name}, ${input.reasonKind}, ${reason}, ${ref}, ${!!input.write},
                                   now() + make_interval(mins => ${BREAK_GLASS_MINUTES})) returning id, expires_at`;
     await audit(tx, s, input.write ? 'breakglass.start_write' : 'breakglass.start', { type: 'workspace', id: workspaceId }, { workspaceId, reason, after: { reasonKind: input.reasonKind, reference: ref, write: !!input.write } });
+    // Plan 05 §0.3: the customer is told, through the retrying email queue in this transaction (never lost to a
+    // provider error), with a link to the workspace's own access log. The reason shown is the customer-facing one:
+    // why and the reference, never the internal write justification.
+    const shown = `${BREAK_GLASS_REASON_LABEL[input.reasonKind]}${ref ? ` #${ref}` : ''}: ${input.reason.trim()}`;
+    await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'staff_break_glass', breakGlassId: bg!.id, staffName: s.name, reason: shown }, { singletonKey: `bg:${bg!.id as string}` });
     return { id: bg!.id as string, expiresAt: bg!.expires_at as string };
   });
 }
@@ -369,6 +374,19 @@ registerExecutor('staff.roles', async (p, { approver }) =>
   }),
 );
 
+/** The outcome a claim review email reports (plan 03 A5/A10). */
+export type ClaimReviewOutcome = 'approved' | 'blocked' | 'kept_restricted' | 'returned';
+
+/**
+ * Queue the claim review email with the decision, in the decision's transaction (retried by the worker). Each
+ * decision is its own email: a claim re-reviewed later (evidence expired, unblocked) is told again. `note` is
+ * customer-facing copy; the staff audit reason is never sent.
+ */
+export async function queueClaimReviewEmail(tx: Tx, workspaceId: string, claimId: string, outcome: ClaimReviewOutcome, note: string | null = null) {
+  const reviewId = newId();
+  await enqueue(tx, workspaceId, Queues.sendEmail, { template: 'claim_review_result', claimId, outcome, note: note?.trim() || null, reviewId }, { singletonKey: `claimrev:${claimId}:${reviewId}` });
+}
+
 registerExecutor('claim.unblock', async (p, { approver }) =>
   withAdmin(async (tx) => {
     const ws = p.workspaceId as string;
@@ -379,6 +397,7 @@ registerExecutor('claim.unblock', async (p, { approver }) =>
     if (!c) throw new DomainError('CONFLICT', 'Claim is not blocked');
     await emit(tx, staffCtx(approver, ws), 'CLAIM_UNBLOCKED', { type: 'claim', id: p.claimId as string }, { from: 'BLOCKED', to: 'MERCHANT_REVIEW_REQUIRED', reason: String(p.reason ?? '') });
     await audit(tx, approver, 'claim.unblocked', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string, before: { status: 'BLOCKED' }, after: { status: 'MERCHANT_REVIEW_REQUIRED' } });
+    await queueClaimReviewEmail(tx, ws, p.claimId as string, 'returned');
     return { claimId: p.claimId };
   }),
 );
@@ -402,6 +421,7 @@ registerExecutor('claim.approve_override', async (p, { requester, approver }) =>
       overrideReason: `${String(p.reason ?? '')} (requested by ${requester.email}, approved by ${approver.email})`,
     });
     await audit(tx, approver, 'claim.approved_without_evidence', { type: 'claim', id: p.claimId as string }, { workspaceId: ws, reason: p.reason as string, after: { status: claim.status } });
+    await queueClaimReviewEmail(tx, ws, p.claimId as string, 'approved');
     return { claimId: p.claimId, status: claim.status };
   }),
 );
@@ -785,6 +805,7 @@ export const RISK_WEIGHTS: Record<RiskIndicator, number> = {
   idle_7d: 15,
   low_utilisation: 15,
   ignored_recommendations: 10,
+  falling_acceptance: 10,
   high_utilisation_friction: 10,
   no_performance_linked_test: 10,
   stockout: 5,

@@ -188,10 +188,16 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
   const { p, manifest } = data;
   // A one-off ad: its offer's bonus alternate hook, if it has one due (standard §7/§8).
   if (!p.experiment_id) return manifest?.scenes.length ? runBonusHook(ctx, projectId, holder, { projectId, skuId: p.sku_id as string, manifest, hookText: data.hookText, names: data.names, allowed: data.allowed }) : 0;
-  if (!data.hookVariants.length) return 0;
+  if (!data.hookVariants.length) {
+    await notifyTestReady(ctx, projectId);
+    return 0;
+  }
   if (!manifest?.scenes.length) {
     // Without the master's composition nothing can be held constant: no variant rather than a confounded one.
-    await withTenant(ws, (tx) => settleExperiment(tx, ctx, p.experiment_id as string, 'hook variants unavailable: master has no composition record'));
+    await withTenant(ws, async (tx) => {
+      await settleExperiment(tx, ctx, p.experiment_id as string, 'hook variants unavailable: master has no composition record');
+      await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId }, { singletonKey: `asset:${projectId}` });
+    });
     return 0;
   }
   const src: HookSource = { projectId, skuId: p.sku_id as string, manifest, hookText: data.hookText, names: data.names, allowed: data.allowed };
@@ -249,8 +255,16 @@ async function runHookVariants(ctx: TenantContext, projectId: string, holder: st
     });
     if (ok) made++;
   }
-  await withTenant(ws, (tx) => settleExperiment(tx, ctx, p.experiment_id as string, 'variants ready'));
+  await withTenant(ws, async (tx) => {
+    await settleExperiment(tx, ctx, p.experiment_id as string, 'variants ready');
+    // The Creative Test is ready once its variants are (plan 03 A10 "asset ready"): the email links to the Studio.
+    await enqueue(tx, ws, Queues.sendEmail, { template: 'asset_ready', projectId }, { singletonKey: `asset:${projectId}` });
+  });
   return made;
+}
+
+async function notifyTestReady(ctx: TenantContext, projectId: string) {
+  await withTenant(ctx.workspaceId, (tx) => enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'asset_ready', projectId }, { singletonKey: `asset:${projectId}` }));
 }
 
 /** Store a built hook version's exports (one final_export asset per aspect). */

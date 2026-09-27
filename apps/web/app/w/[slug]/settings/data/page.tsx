@@ -28,7 +28,7 @@ export default async function Data({ params }: { params: Promise<{ slug: string 
       </section>
       <section className="ak-panel">
         <h2 className="ak-label">Retention</h2>
-        <p className="ak-small">After a plan ends, your archive is kept for {archiveDays} days. Anonymous previews are deleted after {PROVISIONAL.TTL_DAYS} days. Deleting a workspace removes all files and records after a {graceDays}-day grace period; payment and consent records are kept as the law requires, without your content.</p>
+        <p className="ak-small">After a plan ends, your archive is kept for {archiveDays} days. Anonymous previews are deleted after {PROVISIONAL.TTL_DAYS} days. Deleting a workspace removes all files and records after a {graceDays}-day grace period. We keep what the law or your own protection requires, without your content and with names, emails and IP addresses removed: payment, subscription, invoice, refund and dispute records, usage and consent records, the activity and email logs, and any privacy, rights or abuse case about the workspace. We email the owner 14 days and 1 day before deletion.</p>
       </section>
       <section className="ak-panel">
         <h2 className="ak-label">Delete workspace</h2>

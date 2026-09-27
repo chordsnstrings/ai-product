@@ -1,11 +1,14 @@
 import type { Metadata } from 'next';
 import { cookies } from 'next/headers';
 import { formatDate, formatDateTime } from '@arkiv/shared/format';
-import { globalTx } from '@arkiv/db';
+import { globalTx, withTenant } from '@arkiv/db';
+import { DIGEST_LABELS, DIGEST_TEMPLATES } from '@arkiv/email';
 import { hasPassword, listSessions, providerEnabled } from '@arkiv/auth';
 import { MIN_PASSWORD_LENGTH } from '@arkiv/shared';
 import { Banner } from '@arkiv/ui';
 import { requireUser } from '@/lib/session';
+import { workspaceBySlug } from '@/lib/tenant';
+import { ActionButton } from '@/components/actions';
 import { LogoutButton } from '@/components/logout-button';
 import { DeleteAccount, MeButton, NameForm, PasskeyRegister, PasswordSettings, StepUp } from '@/components/profile';
 import { ThemeToggle } from '@/components/theme-toggle';
@@ -28,6 +31,9 @@ export default async function Profile({ params, searchParams }: { params: Promis
   const identities = await globalTx((tx) => tx`select provider, email from user_identities where user_id = ${u.userId}`);
   const theme = parseTheme((await cookies()).get(THEME_COOKIE)?.value) ?? 'system';
   const withPassword = await hasPassword(u.userId);
+  const ws = await workspaceBySlug(slug);
+  const prefs = await withTenant(ws.ctx.workspaceId, (tx) => tx`select kind, enabled from notification_prefs where workspace_id = ${ws.ctx.workspaceId} and user_id = ${u.userId}`);
+  const off = new Set(prefs.filter((p) => !p.enabled).map((p) => p.kind as string));
   return (
     <div className="ak-stack" style={{ ['--stack' as string]: '32px', maxWidth: 720 }}>
       {sp.error ? <Banner tone="risk">{sp.error.slice(0, 200)}</Banner> : null}
@@ -43,6 +49,16 @@ export default async function Profile({ params, searchParams }: { params: Promis
         <h2 className="ak-label">Appearance</h2>
         <p className="ak-small ak-muted">The app follows your device’s light or dark setting unless you choose one here. It applies on this browser.</p>
         <ThemeToggle current={theme} compact />
+      </section>
+      <section className="ak-panel">
+        <h2 className="ak-label">Weekly emails</h2>
+        <p className="ak-small ak-muted">For this workspace. Receipts, billing, sign-in and security email always arrive.</p>
+        {DIGEST_TEMPLATES.map((k) => (
+          <div key={k} className="ak-index-row">
+            <span>{DIGEST_LABELS[k]}<span className="ak-small ak-muted" style={{ display: 'block' }}>{off.has(k) ? 'off' : 'on'}</span></span>
+            <ActionButton slug={slug} action="digest-pref" body={{ kind: k, enabled: off.has(k) }} size="sm" success={off.has(k) ? 'Turned on' : 'Turned off'}>{off.has(k) ? 'Turn on' : 'Turn off'}</ActionButton>
+          </div>
+        ))}
       </section>
       <section className="ak-panel">
         <h2 className="ak-label">Sign-in methods</h2>

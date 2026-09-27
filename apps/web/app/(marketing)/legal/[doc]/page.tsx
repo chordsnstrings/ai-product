@@ -28,7 +28,7 @@ const DOCS: Record<string, { title: string; body: string[]; recipients?: boolean
     body: [
       'Draft — pending legal review. We process your product data, uploads, ad performance and account details only to provide the service to your brand.',
       'We never use one customer’s data to serve another customer.',
-      'You can export or delete your workspace at any time. Deleted data is purged after a 7-day grace period; backups expire within 14 days. Financial records are retained as required by law.',
+      'You can export or delete your workspace at any time. Deleted data is purged after a 7-day grace period; backups expire within 14 days. After a purge we keep, with names, email addresses and IP addresses removed: payment, subscription, invoice, refund and dispute records, usage and consent records, activity and email logs, and any privacy, rights or abuse case concerning the workspace (legal and financial retention).',
       'The companies that process data for us, what they receive and where, are listed below and on the subprocessors page.',
     ],
     recipients: true,

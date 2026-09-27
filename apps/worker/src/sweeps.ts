@@ -15,6 +15,7 @@ import {
   createSkuReview,
   detectSalesAnomalies,
   duePurges,
+  duePurgeNotices,
   dueSkuReviews,
   evaluateCanaries,
   evaluateCircuits,
@@ -119,7 +120,8 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
         const conceptH = sequence('new_concept').delayHours;
         // Fragments over the project alias `p` (fresh per query).
         const underCap = () => tx`(select count(distinct l.template) from email_log l where l.workspace_id = p.workspace_id
-                                     and l.idempotency_key like 'recovery:' || p.id::text || ':%') < ${RECOVERY_EMAIL_CAP}`;
+                                     and l.idempotency_key like 'recovery:' || p.id::text || ':%'
+                                     and l.status not in ('queued', 'failed', 'suppressed', 'capped', 'paused')) < ${RECOVERY_EMAIL_CAP}`;
         const notPurchased = () => tx`not exists (select 1 from purchases pu where pu.workspace_id = p.workspace_id and pu.status = 'paid')`;
         const due = await tx`select o.id, o.workspace_id from offers o join projects p on p.id = o.project_id and p.workspace_id = o.workspace_id
                              where o.type = 'TASTE' and o.status = 'active'
@@ -217,6 +219,16 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
   },
   'sweep-provisional': { cron: '*/15 * * * *', run: () => withSystem((tx) => sweepProvisional(tx)) },
   'sweep-retention': { cron: '0 * * * *', run: () => withSystem((tx) => sweepRetention(tx)) },
+  // Plan 02 §2 PURGE_SCHEDULED "email at T-14d and T-1d": one email per notice (the singleton key is the notice).
+  'purge-reminders': {
+    cron: '25 * * * *',
+    run: () =>
+      withSystem(async (tx) => {
+        const due = await duePurgeNotices(tx);
+        for (const n of due) await enqueueFor(tx, n.workspaceId, 'send-email', { template: 'purge_scheduled', stage: n.stage, purgeOn: n.purgeOn, at: n.at }, `purge-notice:${n.workspaceId}:${n.at}`);
+        return due.length;
+      }),
+  },
   'due-purges': {
     cron: '*/10 * * * *',
     run: () =>
@@ -299,7 +311,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
       withSystem(async (tx) => {
         const week = weekOf();
         const ws = await tx`select id from workspaces where state = 'ACTIVE_PAID' and plan_code is not null`;
-        for (const w of ws) await enqueueFor(tx, w.id as string, 'weekly-recommendations', { week }, `recs:${w.id}:${week}`);
+        for (const w of ws) await enqueueFor(tx, w.id as string, 'weekly-recommendations', { week, scheduled: true }, `recs:${w.id}:${week}`);
         return ws.length;
       }),
   },
@@ -308,7 +320,7 @@ export const sweeps: Record<string, { cron: string; run: () => Promise<unknown> 
     run: () =>
       withSystem(async (tx) => {
         const ws = await tx`select id from workspaces where state = 'ACTIVE_PAID' and plan_code is not null`;
-        for (const w of ws) await enqueueFor(tx, w.id as string, 'send-email', { template: 'friday_summary' }, `friday:${w.id}:${weekOf()}`);
+        for (const w of ws) await enqueueFor(tx, w.id as string, 'send-email', { template: 'friday_summary', week: weekOf() }, `friday:${w.id}:${weekOf()}`);
         return ws.length;
       }),
   },

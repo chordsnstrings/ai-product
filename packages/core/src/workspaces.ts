@@ -15,6 +15,7 @@ import {
   type Role,
   type WorkspaceState,
 } from '@arkiv/shared';
+import { decryptToken, encryptToken } from '@arkiv/integrations';
 import { noteProvisionalCreated, type ClientFingerprint } from './abuse';
 import { assertCan } from './authz';
 import type { TenantContext } from './context';
@@ -173,7 +174,7 @@ export async function claimProvisional(workspaceId: string, userId: string, bran
     await tx`update brands set name = ${name} where workspace_id = ${workspaceId}`;
     await tx`insert into memberships (workspace_id, user_id, role) values (${workspaceId}, ${userId}, 'OWNER')`;
     const ctx = { workspaceId, actor: { kind: 'user' as const, id: userId } };
-    await emit(tx, ctx, 'WORKSPACE_STATE_CHANGED', { type: 'workspace', id: workspaceId }, { from: 'PROVISIONAL', to: 'ACTIVE_FREE' });
+    await emit(tx, ctx, 'WORKSPACE_STATE_CHANGED', { type: 'workspace', id: workspaceId }, { from: 'PROVISIONAL', to: 'ACTIVE_FREE', reason: 'claimed on signup' });
     await emit(tx, ctx, 'MEMBER_ADDED', { type: 'user', id: userId }, { role: 'OWNER' });
     return workspaceId;
   });
@@ -217,6 +218,11 @@ export async function moveProvisionalSkus(fromWorkspaceId: string, toWorkspaceId
     throw e;
   }
   await rehomeObjects(toWorkspaceId, fromWorkspaceId);
+  // Plan 02 §2: the emptied preview's move to PURGE_SCHEDULED (done inside move_provisional_skus) is recorded like
+  // every other lifecycle transition, with its actor and reason.
+  await withTenant(fromWorkspaceId, (tx) =>
+    emit(tx, { workspaceId: fromWorkspaceId, actor: { kind: 'user', id: userId } }, 'WORKSPACE_STATE_CHANGED', { type: 'workspace', id: fromWorkspaceId }, { from: 'PROVISIONAL', to: 'PURGE_SCHEDULED', reason: 'moved to existing workspace' }),
+  );
   return moved;
 }
 
@@ -251,6 +257,9 @@ export async function listMembers(tx: Tx) {
   return tx`select m.user_id, m.role, m.created_at, u.email, u.name from memberships m join users u on u.id = m.user_id order by m.created_at`;
 }
 
+/** An invite link queued for the email worker is sealed (AES-GCM, the integration token key); the worker opens it. */
+export const openInviteToken = (sealed: string) => decryptToken(sealed);
+
 export async function inviteMember(tx: Tx, ctx: TenantContext, email: string, role: Exclude<Role, 'OWNER'>) {
   assertCan(ctx, 'member.invite');
   const normalized = email.trim().toLowerCase();
@@ -272,6 +281,10 @@ export async function inviteMember(tx: Tx, ctx: TenantContext, email: string, ro
     insert into invites (workspace_id, email, role, token_hash, invited_by, expires_at)
     values (${ctx.workspaceId}, ${normalized}, ${role}, ${sha256(token)}, ${ctx.actor.kind === 'user' ? ctx.actor.id : null},
             now() + interval '7 days') returning id`;
+  // The invite email goes through the retrying email queue in this transaction (plan 06 Phase 0 #6). The link is a
+  // credential, so the outbox holds it encrypted, never in the clear; the worker checks the invite is still live.
+  const [me] = ctx.actor.kind === 'user' ? await tx`select coalesce(name, email::text) as n from users where id = ${ctx.actor.id}` : [];
+  await enqueue(tx, ctx.workspaceId, Queues.sendEmail, { template: 'invite', inviteId: inv!.id, tokenEnc: encryptToken(token), inviterName: (me?.n as string) ?? null }, { singletonKey: `invite:${inv!.id as string}` });
   return { inviteId: inv!.id as string, token };
 }
 

@@ -73,6 +73,7 @@ export default async function Claims() {
               { name: 'platforms', label: 'Platforms (TIKTOK, META = Reels + Feed, YOUTUBE, ORGANIC)', defaultValue: ((c.allowed_platforms as string[]) ?? []).join(',') || 'TIKTOK,META' },
               { name: 'markets', label: 'Markets (blank = brand market)', defaultValue: ((c.allowed_markets as string[]) ?? []).join(',') },
               { name: 'evidenceIds', label: 'Evidence ids relied on (blank = every product-specific file on record)' },
+              { name: 'note', label: 'Note to the brand (optional; emailed — the reason below stays internal)' },
               { name: 'reason', label: 'Reason / what evidence we need (approving without evidence goes to a second compliance reviewer)', required: true },
             ]} />,
           ];

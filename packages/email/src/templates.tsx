@@ -19,18 +19,22 @@ interface LayoutProps {
   footer?: ReactNode;
   /** Support address (platform setting, plan 05 §20); omitted when unset. */
   support?: string | null;
-  /** Marketing stream only: the visible unsubscribe link (plan 04 L20, plan 05 §18). */
+  /** Promotional or digest emails only: the visible opt-out link (plan 04 L20, plan 05 §18). */
   unsubscribe?: string | null;
+  /** What the opt-out link stops: product emails (marketing unsubscribe) or one weekly digest. */
+  unsubscribeKind?: 'marketing' | 'digest';
+  /** The workspace the email is about (plan 02 M11 "notifications and emails always name the workspace"). */
+  workspace?: string | null;
 }
 
-function Layout({ preview, label, children, footer, support, unsubscribe }: LayoutProps) {
+function Layout({ preview, label, children, footer, support, unsubscribe, unsubscribeKind, workspace }: LayoutProps) {
   return (
     <Html lang="en">
       <Head />
       <Preview>{preview}</Preview>
       <Body style={{ background: C.paper, margin: 0, padding: '32px 0', fontFamily: sans, color: C.ink }}>
         <Container style={{ maxWidth: 520, margin: '0 auto', background: C.raised, border: `1px solid ${C.rule}`, padding: '32px 28px' }}>
-          <Text style={{ fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.stone, margin: 0 }}>{label}</Text>
+          <Text style={{ fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.stone, margin: 0 }}>{workspace ? `${workspace} · ${label}` : label}</Text>
           <Hr style={{ borderColor: C.ink, borderWidth: 1, margin: '10px 0 22px' }} />
           {children}
           <Hr style={{ borderColor: C.rule, margin: '28px 0 12px' }} />
@@ -40,7 +44,11 @@ function Layout({ preview, label, children, footer, support, unsubscribe }: Layo
           </Text>
           {unsubscribe ? (
             <Text style={{ fontSize: 12, color: C.stone, lineHeight: '18px', margin: '8px 0 0' }}>
-              Don’t want these emails? <a href={unsubscribe} style={{ color: C.stone }}>Unsubscribe</a>.
+              {unsubscribeKind === 'digest' ? (
+                <>Don’t want this weekly email? <a href={unsubscribe} style={{ color: C.stone }}>Turn it off</a>. Receipts and account notices still arrive.</>
+              ) : (
+                <>Don’t want these emails? <a href={unsubscribe} style={{ color: C.stone }}>Unsubscribe</a>.</>
+              )}
             </Text>
           ) : null}
         </Container>
@@ -70,60 +78,113 @@ const Cta = ({ href, children, accent }: { href: string; children: ReactNode; ac
 export interface TemplateMap {
   magic_link: { url: string; purpose: 'login' | 'claim' | 'resume' | 'step_up'; productName?: string | null };
   invite: { url: string; workspaceName: string; inviterName: string; role: string };
-  receipt: { productName: string; amount: string; description: string; url: string };
-  asset_ready: { productName: string; url: string; catalogueNo: string };
-  offer_ending: { productName: string; url: string; endsAt: string; price: string; regular: string };
-  storyboard_saved: { productName: string; url: string; standalonePrice: string };
-  new_concept: { productName: string; url: string; hook: string };
+  // A one-time purchase (Taste or standalone ad): when it was paid and the reference to quote to support.
+  receipt: { workspaceName: string; productName: string; amount: string; description: string; url: string; paidAt?: string | null; reference?: string | null };
+  // A subscription invoice paid (first charge, renewal, prorated upgrade) — plan 03 A10 receipt.
+  invoice_receipt: { workspaceName: string; planName: string; amount: string; tax: string | null; paidAt: string; periodStart: string; periodEnd: string; invoiceNumber: string; hostedInvoiceUrl: string | null; url: string };
+  // `variants`: a Creative Test's hook variants are ready in the Studio (subscribers), not the Taste delivery page.
+  asset_ready: { workspaceName: string; productName: string; url: string; catalogueNo: string; variants?: boolean };
+  // Plan 03 A10 "QA needs you": a paid production stopped and waits on the customer (or failed and can be retried).
+  qa_needs_you: { workspaceName: string; productName: string; headline: string; reason: string; cta: string; url: string };
+  offer_ending: { workspaceName: string; productName: string; url: string; endsAt: string; price: string; regular: string };
+  storyboard_saved: { workspaceName: string; productName: string; url: string; standalonePrice: string };
+  new_concept: { workspaceName: string; productName: string; url: string; hook: string };
   export_ready: { url: string; workspaceName: string };
-  refund_issued: { amount: string; description: string; note: string | null; url: string };
+  refund_issued: { workspaceName: string; amount: string; description: string; note: string | null; url: string };
   flag_expired: { flagKey: string; owner: string; expiredOn: string; url: string };
   integration_disconnected: { provider: string; url: string; workspaceName: string };
   // A connection whose access token expires soon (Meta long-lived tokens), and a request to move a Shopify store here.
   integration_expiring: { provider: string; url: string; workspaceName: string; expiresOn: string };
   shop_transfer_request: { shop: string; requester: string; url: string; workspaceName: string };
-  claim_review_result: { claim: string; outcome: string; url: string };
+  // Plan 03 A5/A10: the decision on a claim sent for review, with the scope it may be used in and any wording change.
+  claim_review_result: {
+    workspaceName: string;
+    productName: string;
+    claim: string;
+    outcome: 'approved' | 'blocked' | 'kept_restricted' | 'returned';
+    originalWording?: string | null;
+    platforms?: string[];
+    markets?: string[];
+    qualifier?: string | null;
+    note?: string | null;
+    url: string;
+  };
   // Plan 05 §14 compliance queues: more evidence for a restricted claim; a SKU confirmed out of V1 scope; guidance
   // after repeated blocked claims; the outcome of a before/after or possible-minor media review.
-  claim_evidence_request: { claim: string; productName: string; note: string; url: string };
-  sku_out_of_scope: { productName: string; reason: string; url: string };
+  claim_evidence_request: { workspaceName: string; claim: string; productName: string; note: string; url: string };
+  sku_out_of_scope: { workspaceName: string; productName: string; reason: string; url: string };
   claims_guidance: { workspaceName: string; blocked: number; examples: string[]; url: string };
-  media_review_result: { productName: string; outcome: 'approved' | 'rejected'; note: string; url: string };
-  cancellation_confirmed: { planName: string; endsOn: string; exportUrl: string };
+  media_review_result: { workspaceName: string; productName: string; outcome: 'approved' | 'rejected'; note: string; url: string };
+  cancellation_confirmed: { workspaceName: string; planName: string; endsOn: string; exportUrl: string };
   // A plan Stripe ended because its payment kept failing (dunning over): not "you cancelled".
-  plan_ended_payment_failed: { planName: string; deletesOn: string; reactivateUrl: string; exportUrl: string };
-  subscription_started: { planName: string; tests: number; price: string; renewsOn: string; url: string };
-  price_change_notice: { planName: string; oldPrice: string; newPrice: string; effectiveOn: string; url: string };
+  plan_ended_payment_failed: { workspaceName: string; planName: string; deletesOn: string; reactivateUrl: string; exportUrl: string };
+  // A plan the customer cancelled reached the end of its paid period.
+  plan_ended: { workspaceName: string; planName: string; deletesOn: string; reactivateUrl: string; exportUrl: string };
+  subscription_started: { workspaceName: string; planName: string; tests: number; price: string; renewsOn: string; url: string };
+  price_change_notice: { workspaceName: string; planName: string; oldPrice: string; newPrice: string; effectiveOn: string; url: string };
   payment_failed: { url: string; workspaceName: string };
-  security_alert: { event: string; when: string; url: string };
-  weekly_brief: { workspaceName: string; week: string; recommendations: { hypothesis: string; slot: string }[]; url: string };
-  friday_summary: { workspaceName: string; lines: string[]; url: string };
+  // Account-level (a sign-in, a password) unless it's about one workspace (an ownership change), which it then names.
+  security_alert: { event: string; when: string; url: string; workspaceName?: string | null };
+  // Monday brief (standard §11). No open recommendations: `empty` says why and what to do instead.
+  weekly_brief: { workspaceName: string; week: string; recommendations: { hypothesis: string; slot: string }[]; url: string; empty?: { reason: string; cta: string; url: string } | null };
+  // Friday summary (standard §11): what was learned, what is still uncertain, what is fatiguing, what comes next.
+  friday_summary: { workspaceName: string; learned: string[]; uncertain: string[]; fatiguing: string[]; nextLikely: string | null; url: string };
   signal_update: { workspaceName: string; changes: { test: string; from: string; to: string }[]; url: string };
-  day30_review: { productName: string; tested: number; actionable: number; url: string };
+  day30_review: { workspaceName: string; productName: string; tested: number; actionable: number; url: string };
   // Standard §48: creator usage rights on footage ended — not used for new ads; history and results are kept.
-  rights_expired: { productName: string; files: number; expiredOn: string; url: string };
+  rights_expired: { workspaceName: string; productName: string; files: number; expiredOn: string; url: string };
   // Plan 03 P9 edge: a production running past 20 minutes (still working on it; nothing extra to pay).
-  production_delayed: { productName: string; minutes: number; url: string };
-  staff_break_glass: { staffName: string; reason: string; when: string; url: string };
+  production_delayed: { workspaceName: string; productName: string; minutes: number; url: string };
+  staff_break_glass: { workspaceName: string; staffName: string; reason: string; when: string; url: string };
   // Plan 05 §23: a single-use link to join the staff console (password + authenticator set by the invitee).
   staff_invite: { name: string; inviterName: string; url: string; expiresIn: string };
   // Plan 05 §21: staff deleted a person's review text from the workspace on a privacy request (tenant notice).
   review_text_erased: { workspaceName: string; deleted: number; reference: string; url: string };
   ownership_transfer_confirm: { workspaceName: string; newOwner: string; reason: string; url: string; expiresIn: string };
-  intervention: { label: string; headline: string; body: string; cta: string; url: string };
+  // Plan 02 §2 PURGE_SCHEDULED: "email at T-14d and T-1d". `stage` picks the wording: the archive of a cancelled
+  // plan is about to be scheduled for deletion, deletion was scheduled, or it happens tomorrow.
+  purge_scheduled: { workspaceName: string; stage: 'retention_ending' | 'scheduled' | 'final'; purgeOn: string; cancelUrl: string; exportUrl: string };
+  intervention: { workspaceName: string; label: string; headline: string; body: string; cta: string; url: string };
 }
 
 export type TemplateName = keyof TemplateMap;
 
 type Built = { subject: string; element: ReactNode; stream: 'transactional' | 'marketing' };
 
-/** Templates on the marketing stream (List-Unsubscribe header, visible unsubscribe link, frequency cap). */
+/** Templates on the marketing stream (news. subdomain, frequency cap, quiet hours). */
 export const MARKETING_TEMPLATES: ReadonlySet<TemplateName> = new Set(['storyboard_saved', 'new_concept']);
+
+/**
+ * Promotional emails: every recovery email (plan 04 L20 "one-click unsubscribe"), including the intro-price
+ * reminder that goes out on the transactional stream at an exact time (quiet hours would make it late). They honour
+ * a marketing unsubscribe and carry the List-Unsubscribe header and a visible unsubscribe link.
+ */
+export const PROMOTIONAL_TEMPLATES: ReadonlySet<TemplateName> = new Set([...MARKETING_TEMPLATES, 'offer_ending']);
+
+/** Weekly digests (plan 03 A10 lists "Weekly" apart from transactional): each can be turned off per member and workspace. */
+export const DIGEST_TEMPLATES = ['weekly_brief', 'signal_update', 'friday_summary', 'day30_review'] as const satisfies readonly TemplateName[];
+export type DigestKind = (typeof DIGEST_TEMPLATES)[number];
+export const isDigest = (t: string): t is DigestKind => (DIGEST_TEMPLATES as readonly string[]).includes(t);
+export const DIGEST_LABELS: Record<DigestKind, string> = {
+  weekly_brief: 'The Monday brief',
+  signal_update: 'Midweek signal updates',
+  friday_summary: 'The Friday summary',
+  day30_review: 'SKU Creative Reviews',
+};
+
+/**
+ * Notices the customer must get whatever they complained about (plan 05 §18 "never for transactional (receipts,
+ * security)"): money, access, security and deletion. A complaint on the transactional stream stops the others.
+ */
+export const REQUIRED_TEMPLATES: ReadonlySet<TemplateName> = new Set([
+  'magic_link', 'security_alert', 'receipt', 'invoice_receipt', 'refund_issued', 'cancellation_confirmed', 'plan_ended', 'plan_ended_payment_failed',
+  'price_change_notice', 'payment_failed', 'staff_break_glass', 'purge_scheduled', 'ownership_transfer_confirm', 'review_text_erased', 'export_ready',
+]);
 
 export interface BuildOptions {
   /** Footer support address (platform setting `support.email`). */
   supportEmail?: string | null;
-  /** The recipient's signed unsubscribe link; shown on marketing-stream emails only. */
+  /** The recipient's signed opt-out link; shown on promotional emails (unsubscribe) and digests (turn off). */
   unsubscribeUrl?: string | null;
 }
 
@@ -135,8 +196,12 @@ export function build<T extends TemplateName>(name: T, d: TemplateMap[T], opts: 
 }
 
 function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts: BuildOptions): Built {
-  const L = (p: Omit<LayoutProps, 'support' | 'unsubscribe'>) => <Layout {...p} support={opts.supportEmail ?? null} unsubscribe={MARKETING_TEMPLATES.has(name) ? (opts.unsubscribeUrl ?? null) : null} />;
   const x = d as never as Record<string, unknown> & TemplateMap[TemplateName];
+  const optOut = PROMOTIONAL_TEMPLATES.has(name) || isDigest(name);
+  const workspace = typeof x.workspaceName === 'string' && x.workspaceName ? x.workspaceName : null;
+  const L = (p: Omit<LayoutProps, 'support' | 'unsubscribe' | 'unsubscribeKind' | 'workspace'>) => (
+    <Layout {...p} support={opts.supportEmail ?? null} unsubscribe={optOut ? (opts.unsubscribeUrl ?? null) : null} unsubscribeKind={isDigest(name) ? 'digest' : 'marketing'} workspace={workspace} />
+  );
   switch (name) {
     case 'magic_link': {
       const m = d as TemplateMap['magic_link'];
@@ -177,8 +242,41 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
         element: (
           <L preview={`${m.amount} · ${m.description}`} label="Receipt">
             <H>Thank you</H>
-            <Meta rows={[['Item', m.description], ['Product', m.productName], ['Total', m.amount], ['Billing', 'One-time · no subscription']]} />
+            <Meta
+              rows={[
+                ['Item', m.description],
+                ['Product', m.productName],
+                ['Total', m.amount],
+                ...(m.paidAt ? [['Paid', m.paidAt] as [string, string]] : []),
+                ...(m.reference ? [['Reference', m.reference] as [string, string]] : []),
+                ['Billing', 'One-time · no subscription'],
+              ]}
+            />
             <Cta href={m.url}>Follow production</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'invoice_receipt': {
+      const m = d as TemplateMap['invoice_receipt'];
+      return {
+        subject: `Receipt · ${m.planName} · ${m.amount}`,
+        stream: 'transactional',
+        element: (
+          <L preview={`${m.amount} paid on ${m.paidAt} for ${m.planName}.`} label="Receipt">
+            <H>Payment received</H>
+            <Meta
+              rows={[
+                ['Plan', m.planName],
+                ['Period', `${m.periodStart} – ${m.periodEnd}`],
+                ['Total', m.amount],
+                ...(m.tax ? [['Of which tax', m.tax] as [string, string]] : []),
+                ['Paid', m.paidAt],
+                ['Invoice', m.invoiceNumber],
+              ]}
+            />
+            <P>Your plan renews automatically. You can cancel online anytime in Settings → Billing.</P>
+            <Cta href={m.hostedInvoiceUrl ?? m.url}>{m.hostedInvoiceUrl ? 'View invoice' : 'View billing'}</Cta>
           </L>
         ),
       };
@@ -191,8 +289,26 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
         element: (
           <L preview="Product accuracy and claims checked. Exports for TikTok, Reels and Feed." label={`Archived · ${m.catalogueNo}`}>
             <H>Your ad is ready</H>
-            <P>We checked product accuracy and every claim before it reached you. Exports are sized for TikTok, Reels and Feed.</P>
-            <Cta href={m.url} accent>Watch your ad</Cta>
+            <P>
+              We checked product accuracy and every claim before it reached you. Exports are sized for TikTok, Reels and Feed.
+              {m.variants ? ' Its hook variants are ready too: download them and keep each variant code in the ad name so results flow back.' : ''}
+            </P>
+            <Cta href={m.url} accent>{m.variants ? 'Download your variants' : 'Watch your ad'}</Cta>
+          </L>
+        ),
+      };
+    }
+    case 'qa_needs_you': {
+      const m = d as TemplateMap['qa_needs_you'];
+      return {
+        subject: `${m.productName}: ${m.headline}`,
+        stream: 'transactional',
+        element: (
+          <L preview={m.reason} label="Production · your action needed">
+            <H>{m.headline}</H>
+            <Meta rows={[['Product', m.productName]]} />
+            <P>{m.reason}</P>
+            <Cta href={m.url} accent>{m.cta}</Cta>
           </L>
         ),
       };
@@ -287,7 +403,30 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
     }
     case 'claim_review_result': {
       const m = d as TemplateMap['claim_review_result'];
-      return { subject: `Claim review: ${m.outcome}`, stream: 'transactional', element: (<L preview={m.claim} label="Claims Vault"><H>{m.outcome}</H><Meta rows={[['Claim', m.claim], ['Outcome', m.outcome]]} /><Cta href={m.url}>Open Claims Vault</Cta></L>) };
+      const outcome = { approved: 'Approved for use', blocked: 'Not approved for ads', kept_restricted: 'Kept restricted', returned: 'Back with you for review' }[m.outcome];
+      const changed = !!m.originalWording && m.originalWording.trim() !== m.claim.trim();
+      const rows: [string, string][] = [['Product', m.productName], ['Claim', m.claim]];
+      if (changed) rows.push(['You wrote', m.originalWording!]);
+      rows.push(['Outcome', outcome]);
+      if (m.outcome === 'approved') {
+        if (m.platforms?.length) rows.push(['Platforms', m.platforms.join(', ')]);
+        if (m.markets?.length) rows.push(['Markets', m.markets.join(', ')]);
+        if (m.qualifier) rows.push(['Qualifier', m.qualifier]);
+      }
+      return {
+        subject: `${m.productName} · claim review: ${outcome.toLowerCase()}`,
+        stream: 'transactional',
+        element: (
+          <L preview={`${outcome}: ${m.claim}`} label="Claims Vault">
+            <H>{outcome}</H>
+            <Meta rows={rows} />
+            {changed ? <P>We changed the wording so it can be used in ads. Ads use the wording above.</P> : null}
+            {m.note ? <P>{m.note}</P> : null}
+            {m.outcome === 'returned' ? <P>The evidence behind this claim needs another look. Until it’s approved again, ads use neutral wording.</P> : null}
+            <Cta href={m.url}>See the claim</Cta>
+          </L>
+        ),
+      };
     }
     case 'claim_evidence_request': {
       const m = d as TemplateMap['claim_evidence_request'];
@@ -359,6 +498,34 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
       const m = d as TemplateMap['plan_ended_payment_failed'];
       return { subject: 'Your plan ended: the payment didn’t go through', stream: 'transactional', element: (<L preview={`Your archive is kept until ${m.deletesOn}.`} label="Billing"><H>Your plan has ended</H><P>We couldn’t take the payment for {m.planName} after several tries, so the plan has ended and nothing more will be charged.</P><Meta rows={[['Plan', m.planName], ['Your archive', `Kept until ${m.deletesOn}, then deleted`]]} /><P>Choose a plan again anytime to pick up where you left off, or export everything first.</P><Cta href={m.reactivateUrl}>Reactivate</Cta><P><a href={m.exportUrl}>Export your data</a></P></L>) };
     }
+    case 'plan_ended': {
+      const m = d as TemplateMap['plan_ended'];
+      return { subject: `Your ${m.planName} plan has ended`, stream: 'transactional', element: (<L preview={`Your archive is kept until ${m.deletesOn}.`} label="Billing"><H>Your plan has ended</H><P>The paid period of {m.planName} is over and nothing more will be charged. New production is off; your archive, ads and learnings are kept.</P><Meta rows={[['Plan', m.planName], ['Your archive', `Kept until ${m.deletesOn}, then deleted`]]} /><P>Choose a plan again anytime to pick up where you left off, or export everything first.</P><Cta href={m.reactivateUrl}>Choose a plan</Cta><P><a href={m.exportUrl}>Export your data</a></P></L>) };
+    }
+    case 'purge_scheduled': {
+      const m = d as TemplateMap['purge_scheduled'];
+      const head = m.stage === 'final' ? `${m.workspaceName} will be deleted tomorrow` : m.stage === 'retention_ending' ? `${m.workspaceName} is kept until ${m.purgeOn}` : `${m.workspaceName} is scheduled for deletion`;
+      const body =
+        m.stage === 'retention_ending'
+          ? `Your plan ended a while ago. We keep a cancelled workspace’s archive for a limited time; on ${m.purgeOn} its files and records are scheduled for deletion. Choose a plan to keep it, or export everything first.`
+          : m.stage === 'final'
+            ? `On ${m.purgeOn} every file and record in ${m.workspaceName} is deleted for good. This can’t be undone afterwards. Export first, or cancel the deletion now.`
+            : `Every file and record in ${m.workspaceName} will be deleted on ${m.purgeOn}. Until then you can cancel the deletion and nothing is lost.`;
+      return {
+        subject: head,
+        stream: 'transactional',
+        element: (
+          <L preview={`Deletion on ${m.purgeOn}. Export or cancel before then.`} label="Workspace deletion">
+            <H>{head}</H>
+            <P>{body}</P>
+            <Meta rows={[['Workspace', m.workspaceName], ['Deletion on', m.purgeOn]]} />
+            <Cta href={m.cancelUrl} accent>{m.stage === 'retention_ending' ? 'Keep my workspace' : 'Cancel the deletion'}</Cta>
+            <P>{' '}</P>
+            <P><a href={m.exportUrl}>Export your data</a></P>
+          </L>
+        ),
+      };
+    }
     case 'subscription_started': {
       const m = d as TemplateMap['subscription_started'];
       return { subject: `Welcome to ${m.planName}`, stream: 'transactional', element: (<L preview={`${m.tests} Creative Tests a month.`} label="Billing"><H>{m.planName} is active</H><Meta rows={[['Creative Tests', `${m.tests} per month`], ['Price', `${m.price} per month`], ['Renews', m.renewsOn], ['Cancel', 'Online anytime in Settings → Billing']]} /><Cta href={m.url}>See this week’s tests</Cta></L>) };
@@ -381,8 +548,9 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
         subject: `${m.workspaceName} · What to test this week`,
         stream: 'transactional',
         element: (
-          <L preview={m.recommendations[0]?.hypothesis ?? 'Your weekly tests'} label={`Week of ${m.week}`}>
-            <H>What to test this week</H>
+          <L preview={m.recommendations[0]?.hypothesis ?? m.empty?.reason ?? 'Your weekly tests'} label={`Week of ${m.week}`}>
+            <H>{m.recommendations.length ? 'What to test this week' : 'No new tests this week'}</H>
+            {!m.recommendations.length && m.empty ? <P>{m.empty.reason}</P> : null}
             {m.recommendations.map((r, i) => (
               <Text key={i} style={{ fontSize: 15, lineHeight: '22px', borderBottom: `1px solid ${C.rule}`, padding: '8px 0', margin: 0 }}>
                 <span style={{ fontFamily: mono, fontSize: 11, color: C.stone }}>{String(i + 1).padStart(2, '0')} · {r.slot}</span>
@@ -391,14 +559,37 @@ function buildTemplate<T extends TemplateName>(name: T, d: TemplateMap[T], opts:
               </Text>
             ))}
             <P>{' '}</P>
-            <Cta href={m.url}>Review and approve</Cta>
+            {m.recommendations.length || !m.empty ? <Cta href={m.url}>Review and approve</Cta> : <Cta href={m.empty.url}>{m.empty.cta}</Cta>}
           </L>
         ),
       };
     }
     case 'friday_summary': {
       const m = d as TemplateMap['friday_summary'];
-      return { subject: `${m.workspaceName} · This week’s learning`, stream: 'transactional', element: (<L preview={m.lines[0] ?? 'Weekly summary'} label="Friday summary"><H>What we learned</H>{m.lines.map((l, i) => <P key={i}>{l}</P>)}<Cta href={m.url}>Open results</Cta></L>) };
+      const section = (title: string, lines: string[]) =>
+        lines.length ? (
+          <Section style={{ margin: '0 0 12px' }}>
+            <Text style={{ fontFamily: mono, fontSize: 11, letterSpacing: '0.06em', textTransform: 'uppercase', color: C.stone, margin: '0 0 4px' }}>{title}</Text>
+            {lines.map((l, i) => (
+              <Text key={i} style={{ fontSize: 15, lineHeight: '22px', color: C.ink2, margin: 0, padding: '4px 0', borderBottom: `1px solid ${C.rule}` }}>{l}</Text>
+            ))}
+          </Section>
+        ) : null;
+      const first = m.learned[0] ?? m.uncertain[0] ?? m.nextLikely ?? 'Weekly summary';
+      return {
+        subject: `${m.workspaceName} · This week’s learning`,
+        stream: 'transactional',
+        element: (
+          <L preview={first} label="Friday summary">
+            <H>Your week in tests</H>
+            {section('What we learned', m.learned)}
+            {section('Still uncertain', m.uncertain)}
+            {section('Fatiguing', m.fatiguing)}
+            {m.nextLikely ? section('Likely next', [m.nextLikely]) : null}
+            <Cta href={m.url}>Open results</Cta>
+          </L>
+        ),
+      };
     }
     case 'signal_update': {
       const m = d as TemplateMap['signal_update'];

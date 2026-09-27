@@ -4,6 +4,7 @@ import { withAdmin } from '@arkiv/db';
 import { assertFreshReauth, deprovisionStaff, inviteStaff, resendStaffInvite, STAFF_INVITE_HOURS, removeStaffPasskey, requestMagicLink, revokeAllSessions, staffNetworkAllowed } from '@arkiv/auth';
 import {
   deleteUser,
+  queueClaimReviewEmail,
   actOnBehalf,
   addTenantNote,
   approveClaim,
@@ -221,6 +222,11 @@ async function workspaceSlug(workspaceId: string) {
   if (!w) throw new DomainError('NOT_FOUND', 'Workspace not found');
   return w.slug as string;
 }
+/** Emails always name the workspace (plan 02 M11). */
+async function workspaceName(workspaceId: string) {
+  const [w] = await withAdmin((tx) => tx`select name from workspaces where id = ${workspaceId}`);
+  return (w?.name as string | undefined) ?? 'your workspace';
+}
 
 /** Force the challenge and/or tighten rate limits for a normalised abuse key, until a time (plan 05 §15). */
 async function setAbuseOverride(s: StaffUser, rawKey: string, set: { forceChallenge?: boolean; rateLimitFactor?: number }, days: number, why: string) {
@@ -252,11 +258,8 @@ export const ACTIONS = {
     schema: z.object({ workspaceId: uuid, reasonKind: z.enum(BREAK_GLASS_REASON_KINDS), reason: z.string().min(8), ticket: z.string().max(40).optional(), write: z.boolean().optional(), writeReason: z.string().optional() }),
     run: async (s, i) => {
       if (i.write) assertFreshReauth(s);
+      // The owner's notice is queued by startBreakGlass in the same transaction (retried by the worker).
       const r = await startBreakGlass(s, i.workspaceId, i);
-      const url = appUrl(await workspaceSlug(i.workspaceId), '/settings/access-log');
-      for (const to of await ownerEmails(i.workspaceId)) {
-        await sendEmail('staff_break_glass', to, { staffName: s.name, reason: `${BREAK_GLASS_REASON_LABEL[i.reasonKind]}${i.ticket ? ` #${i.ticket}` : ''}: ${i.reason}`, when: new Date().toUTCString(), url }, { idempotencyKey: `bg:${r.id}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
-      }
       return { ...r, message: `Access until ${new Date(r.expiresAt).toISOString().slice(11, 16)} UTC; the customer can see this in their access log.` };
     },
   }),
@@ -876,17 +879,27 @@ export const ACTIONS = {
       markets: z.string().optional(),
       /** Comma-separated claim_evidence ids the approval rests on (default: every qualifying file). */
       evidenceIds: z.string().optional(),
+      /** What the brand is told (optional). The audit reason stays internal. */
+      note: z.string().trim().max(500).optional(),
       reason,
     }),
     run: async (s, i) => {
       if (i.decision === 'unblock') return requestOrExecute(s, 'claim.unblock', { workspaceId: i.workspaceId, claimId: i.claimId }, i.reason);
       if (i.decision === 'keep_restricted' || i.decision === 'request_evidence') {
         // §14: the claim stays restricted either way; "request more evidence" emails the brand what we need.
-        const r = await withAdmin((tx) => (i.decision === 'keep_restricted' ? keepClaimRestricted : requestClaimEvidence)(tx, s, i.workspaceId, i.claimId, i.reason));
-        const url = appUrl(await workspaceSlug(i.workspaceId), `/products/${r.skuId}/claims`);
-        for (const to of await ownerEmails(i.workspaceId)) {
-          if (i.decision === 'request_evidence') await sendEmail('claim_evidence_request', to, { claim: r.claim, productName: r.productName, note: i.reason, url }, { idempotencyKey: `claimev:${i.claimId}:${newId()}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
-          else await sendEmail('claim_review_result', to, { claim: r.claim, outcome: `Kept restricted: ${i.reason}`, url }, { idempotencyKey: `claimrev:${i.claimId}:keep:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+        const r = await withAdmin(async (tx) => {
+          const out = await (i.decision === 'keep_restricted' ? keepClaimRestricted : requestClaimEvidence)(tx, s, i.workspaceId, i.claimId, i.reason);
+          // Kept restricted: the brand sees why in its Claims Vault, so the email carries it too (or the customer note).
+          if (i.decision === 'keep_restricted') await queueClaimReviewEmail(tx, i.workspaceId, i.claimId, 'kept_restricted', i.note ?? i.reason);
+          return out;
+        });
+        if (i.decision === 'request_evidence') {
+          const url = appUrl(await workspaceSlug(i.workspaceId), `/products/${r.skuId}/claims`);
+          const workspace = await workspaceName(i.workspaceId);
+          const requestId = newId();
+          for (const to of await ownerEmails(i.workspaceId)) {
+            await sendEmail('claim_evidence_request', to, { workspaceName: workspace, claim: r.claim, productName: r.productName, note: i.note ?? i.reason, url }, { idempotencyKey: `claimev:${i.claimId}:${requestId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+          }
         }
         return { message: i.decision === 'request_evidence' ? 'Evidence requested; the brand has been emailed. The claim stays restricted meanwhile.' : 'Kept restricted; the brand sees the reason in its Claims Vault.' };
       }
@@ -908,10 +921,8 @@ export const ACTIONS = {
           await approveClaim(tx, ctx, i.claimId, { markets, platforms: i.platforms.split(',').map((p) => p.trim()).filter(Boolean), qualifier: i.qualifier ?? null, wording: i.wording, evidenceIds: evidenceIds.length ? evidenceIds : null });
         }
         await audit(tx, s, `claim.${i.decision}`, { type: 'claim', id: i.claimId }, { workspaceId: i.workspaceId, reason: i.reason, after: { wording: i.wording, qualifier: i.qualifier, evidenceIds } });
-        const [c] = await tx`select c.preferred_wording, c.sku_id, w.slug from claims c join workspaces w on w.id = c.workspace_id where c.id = ${i.claimId} and c.workspace_id = ${i.workspaceId}`;
-        // "Open Claims Vault" lands on this SKU's claims page.
-        const url = c ? appUrl(c.slug as string, `/products/${c.sku_id as string}/claims`) : `${env().APP_URL}/app`;
-        for (const to of await ownerEmails(i.workspaceId)) await sendEmail('claim_review_result', to, { claim: c?.preferred_wording as string, outcome: i.decision === 'block' ? `Blocked: ${i.reason}` : 'Approved for use', url }, { idempotencyKey: `claimrev:${i.claimId}:${i.decision}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+        // The brand is emailed through the worker (product, scope, any wording change; never the audit reason).
+        await queueClaimReviewEmail(tx, i.workspaceId, i.claimId, i.decision === 'block' ? 'blocked' : 'approved', i.note ?? null);
       });
     },
   }),
@@ -939,7 +950,8 @@ export const ACTIONS = {
     run: async (s, i) => {
       const r = await withAdmin((tx) => confirmSkuExclusion(tx, s, i.workspaceId, i.skuId, i.reason));
       const url = appUrl(await workspaceSlug(i.workspaceId), '/products');
-      for (const to of await ownerEmails(i.workspaceId)) await sendEmail('sku_out_of_scope', to, { productName: r.productName, reason: r.reason, url }, { idempotencyKey: `out-of-scope:${i.skuId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      const workspace = await workspaceName(i.workspaceId);
+      for (const to of await ownerEmails(i.workspaceId)) await sendEmail('sku_out_of_scope', to, { workspaceName: workspace, productName: r.productName, reason: r.reason, url }, { idempotencyKey: `out-of-scope:${i.skuId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
       return { message: 'Exclusion confirmed; the owner was told the product is outside V1 scope.' };
     },
   }),
@@ -954,7 +966,8 @@ export const ACTIONS = {
       });
       const url = appUrl(await workspaceSlug(i.workspaceId), r.skuId ? `/products/${r.skuId}` : '/products');
       const note = i.verdict === 'approved' ? 'Our team checked it and it can be used in your ads.' : 'Our team checked it: it shows a before/after comparison or a person who may be under 18, which we can’t use in ads. Your other photos are unaffected.';
-      for (const to of await ownerEmails(i.workspaceId)) await sendEmail('media_review_result', to, { productName: r.productName, outcome: i.verdict, note, url }, { idempotencyKey: `media-review:${i.assetId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
+      const workspace = await workspaceName(i.workspaceId);
+      for (const to of await ownerEmails(i.workspaceId)) await sendEmail('media_review_result', to, { workspaceName: workspace, productName: r.productName, outcome: i.verdict, note, url }, { idempotencyKey: `media-review:${i.assetId}:${to}`, workspaceId: i.workspaceId }).catch(() => {});
       return { message: i.verdict === 'approved' ? 'Approved: the media can be used.' : 'Rejected: it is never used in production.' };
     },
   }),
@@ -1188,13 +1201,18 @@ export const ACTIONS = {
     schema: z.object({ email: z.string().email().optional(), emailKey: z.string().regex(/^[0-9a-f]{64}$/).optional(), reason }).refine((x) => !!x.email !== !!x.emailKey, 'Give the address or its key'),
     run: (s, i) =>
       withAdmin(async (tx) => {
-        const [before] = await tx`delete from email_suppressions
-                                  where ${i.email ? tx`email = ${i.email.toLowerCase()}` : tx`encode(sha256(convert_to(lower(email::text), 'UTF8')), 'hex') = ${i.emailKey!}`}
-                                  returning email, reason, stream, created_at`;
-        if (!before) throw new DomainError('NOT_FOUND', 'That address isn’t suppressed.');
+        const match = i.email ? tx`email = ${i.email.toLowerCase()}` : tx`encode(sha256(convert_to(lower(email::text), 'UTF8')), 'hex') = ${i.emailKey!}`;
+        // Bounces and complaints are cleared; a marketing unsubscribe is the recipient's own choice and stays
+        // (plan 05 §18 "unsubscribe honoured"): only they can resubscribe.
+        const removed = await tx`delete from email_suppressions where ${match} and reason <> 'unsubscribed' returning email, reason, stream, created_at`;
+        if (!removed.length) {
+          const [unsub] = await tx`select 1 from email_suppressions where ${match} and reason = 'unsubscribed'`;
+          throw new DomainError(unsub ? 'CONFLICT' : 'NOT_FOUND', unsub ? 'This address unsubscribed from marketing email; only the recipient can resubscribe. Transactional email already reaches it.' : 'That address isn’t suppressed.');
+        }
         // A deliverable address again: any Owner bounce banner for it is lifted (plan 05 §18).
-        await tx`select email_owner_bounce(${before.email as string}, false)`;
-        await audit(tx, s, 'email.unsuppress', { type: 'email', id: before.email as string }, { reason: i.reason, before });
+        await tx`select email_owner_bounce(${removed[0]!.email as string}, false)`;
+        const before = removed.length === 1 ? removed[0] : { email: removed[0]!.email, entries: removed.map((r) => ({ reason: r.reason, stream: r.stream, created_at: r.created_at })) };
+        await audit(tx, s, 'email.unsuppress', { type: 'email', id: removed[0]!.email as string }, { reason: i.reason, before });
       }),
   }),
   /* §2.2 Emails "Resend" (§0.2 SUPPORT "resend emails"): the same template and data to the same address, under a
