@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { withAdmin } from '@arkiv/db';
-import { isTemplateName, MARKETING_TEMPLATES, renderEmail, templateSamples, unsubscribeLink, type TemplateName } from '@arkiv/email';
+import { isDigest, isTemplateName, PROMOTIONAL_TEMPLATES, renderEmail, templateSamples, unsubscribeLink, type TemplateName } from '@arkiv/email';
 import { env } from '@arkiv/shared';
 import { ActButton } from '@/components/act';
 import { Mono, Page, Section } from '@/components/ui';
@@ -20,9 +20,10 @@ export default async function EmailPreview({ params }: { params: Promise<{ templ
   const t = template as TemplateName;
   const [support] = await withAdmin((tx) => tx`select value from platform_settings where key = 'support.email'`);
   const sample = templateSamples(env().APP_URL)[t];
-  const marketing = MARKETING_TEMPLATES.has(t);
-  // Marketing email carries the recipient's unsubscribe link; the preview shows the staff member's own.
-  const r = await renderEmail(t, sample as never, { supportEmail: typeof support?.value === 'string' ? support.value : null, unsubscribeUrl: marketing ? unsubscribeLink(s.email) : null });
+  // Promotional email carries the recipient's unsubscribe link and a digest its "turn it off" link; the preview
+  // shows a sample link (the staff member's own unsubscribe).
+  const optOut = PROMOTIONAL_TEMPLATES.has(t) || isDigest(t);
+  const r = await renderEmail(t, sample as never, { supportEmail: typeof support?.value === 'string' ? support.value : null, unsubscribeUrl: optOut ? unsubscribeLink(s.email) : null });
   return (
     <Page
       title={r.subject}
