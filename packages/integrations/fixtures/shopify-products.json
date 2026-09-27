@@ -1,0 +1,37 @@
+{
+  "_note": "Sanitized Admin GraphQL `products` response shape (API 2026-07), written from the API reference; replace with a recorded response when one is captured.",
+  "data": {
+    "shop": { "currencyCode": "EUR", "ianaTimezone": "Europe/Berlin" },
+    "products": {
+      "pageInfo": { "hasNextPage": true, "endCursor": "eyJsYXN0X2lkIjo5OX0=" },
+      "nodes": [
+        {
+          "id": "gid://shopify/Product/99",
+          "title": "Dew Serum",
+          "handle": "dew-serum",
+          "productType": "Serum",
+          "onlineStoreUrl": "https://glow.example/products/dew-serum",
+          "description": "A lightweight hydrating serum with 2% niacinamide.",
+          "status": "ACTIVE",
+          "vendor": "Glow Lab",
+          "updatedAt": "2026-09-20T10:00:00Z",
+          "options": [{ "name": "Size", "values": ["30 ml", "50 ml"] }],
+          "metafields": {
+            "nodes": [
+              { "namespace": "custom", "key": "ingredients", "type": "multi_line_text_field", "value": "Aqua, Glycerin, Niacinamide, Sodium Hyaluronate" },
+              { "namespace": "custom", "key": "volume", "type": "volume", "value": "{\"value\":30,\"unit\":\"MILLILITERS\"}" },
+              { "namespace": "reviews", "key": "rating", "type": "rating", "value": "{\"value\":\"4.6\",\"scale_min\":\"1.0\",\"scale_max\":\"5.0\"}" }
+            ]
+          },
+          "media": { "nodes": [{ "image": { "url": "https://cdn.shopify.example/dew-front.jpg" } }, { "image": { "url": "https://cdn.shopify.example/dew-back.jpg" } }, {}] },
+          "variants": {
+            "nodes": [
+              { "id": "gid://shopify/ProductVariant/991", "title": "30 ml", "price": "38.00", "compareAtPrice": null, "sku": "DEW-30", "barcode": "4006381333931", "availableForSale": true, "selectedOptions": [{ "name": "Size", "value": "30 ml" }], "image": { "url": "https://cdn.shopify.example/dew-30.jpg" } },
+              { "id": "gid://shopify/ProductVariant/992", "title": "50 ml", "price": "52.00", "compareAtPrice": "58.00", "sku": "DEW-50", "barcode": null, "availableForSale": false, "selectedOptions": [{ "name": "Size", "value": "50 ml" }], "image": null }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

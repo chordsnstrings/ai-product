@@ -1,0 +1,44 @@
+{
+  "name": "arkiv",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "db:migrate": "pnpm --filter @arkiv/db migrate",
+    "db:migrate:dry": "pnpm --filter @arkiv/db migrate:dry",
+    "db:reset": "pnpm --filter @arkiv/db reset",
+    "db:seed": "pnpm --filter @arkiv/db seed",
+    "dev:web": "pnpm --filter @arkiv/web dev",
+    "dev:admin": "pnpm --filter @arkiv/admin dev",
+    "dev:worker": "pnpm --filter @arkiv/worker dev",
+    "e2e": "playwright test",
+    "smoke": "tsx tests/smoke/funnel.ts",
+    "smoke:admin": "tsx tests/smoke/admin.ts",
+    "test:chaos": "vitest run tests/chaos",
+    "test:contract": "tsx tests/contract/run.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@playwright/test": "1.63.0",
+    "@types/node": "^22.10.0",
+    "eslint": "^10.11.0",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^5.0.1",
+    "@arkiv/core": "workspace:*",
+    "@arkiv/db": "workspace:*",
+    "@arkiv/auth": "workspace:*",
+    "@arkiv/billing": "workspace:*",
+    "@arkiv/shared": "workspace:*"
+  }
+}

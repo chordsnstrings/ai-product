@@ -1,0 +1,438 @@
+/// <reference path="./heic-decode.d.ts" />
+import { fileTypeFromBuffer } from 'file-type';
+import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { probeUntrusted, withTempDir, type UntrustedProbe } from '@arkiv/media';
+import { malwareScan } from './malware-scan';
+import sharp from 'sharp';
+import type { Tx } from '@arkiv/db';
+import { DomainError, newId } from '@arkiv/shared';
+import { saveAsset, type AssetKind } from './assets';
+import { assertCan } from './authz';
+import type { TenantContext } from './context';
+import { actorString } from './context';
+import { allowKey } from './allowlist';
+import { hit } from './rate-limit';
+import { quarantineKey, storage } from './storage';
+import { holdForReview, uploadReviewFlags } from './vision';
+
+/**
+ * Upload pipeline (plan 02 §3 layer 4; standard §48 malicious uploads):
+ *   presigned PUT → quarantine prefix → validate magic bytes / size / pixels → re-encode (strips EXIF/GPS)
+ *   → tenant prefix. Nothing in quarantine is ever served.
+ */
+
+export const UPLOAD_LIMITS = {
+  image: { maxBytes: 25 * 1024 * 1024, maxPixels: 40_000_000, maxEdge: 4096 },
+  video: { maxBytes: 300 * 1024 * 1024, maxDurationMs: 180_000, maxEdge: 4096, maxStreams: 4 },
+  pdf: { maxBytes: 20 * 1024 * 1024, maxPages: 300 },
+} as const;
+
+const ALLOWED: Record<string, 'image' | 'video' | 'pdf'> = {
+  'image/jpeg': 'image',
+  'image/png': 'image',
+  'image/webp': 'image',
+  'image/heic': 'image',
+  'image/heif': 'image',
+  'image/avif': 'image',
+  'video/mp4': 'video',
+  'video/quicktime': 'video',
+  'application/pdf': 'pdf',
+};
+
+/** A quarantined upload row (checked type and size, rate-limited); the bytes arrive by presigned PUT. */
+async function openUpload(tx: Tx, ctx: TenantContext, kind: AssetKind | typeof FORM_FILE, declaredMime: string, bytes: number) {
+  assertCan(ctx, 'sku.edit');
+  // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
+  // still spends the budget, and the counter row is not locked across decoding and storage I/O.
+  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, undefined, { subject: [allowKey.ws(ctx.workspaceId)] });
+  const family = ALLOWED[declaredMime];
+  if (!family) throw new DomainError('INVALID', 'That file type isn’t supported. Use JPG, PNG, WebP, MP4 or PDF.');
+  if (bytes > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.', { maxBytes: UPLOAD_LIMITS[family].maxBytes });
+  const id = newId();
+  const key = quarantineKey(ctx.workspaceId, id);
+  await tx`insert into uploads (id, workspace_id, kind, status, quarantine_key, declared_mime, bytes, created_by)
+           values (${id}, ${ctx.workspaceId}, ${kind}, 'pending', ${key}, ${declaredMime}, ${bytes}, ${actorString(ctx)})`;
+  return { id, key };
+}
+
+export async function createUpload(tx: Tx, ctx: TenantContext, kind: AssetKind, declaredMime: string, bytes: number) {
+  const { id, key } = await openUpload(tx, ctx, kind, declaredMime, bytes);
+  return { uploadId: id, putUrl: await storage().signedPutUrl(key, declaredMime), key };
+}
+
+// ───────────── Resumable uploads for workspace forms (plan 06 Phase 0 D7, Phase 1 D3) ─────────────
+
+/**
+ * The upload kind of a file a workspace form attaches (evidence, footage, a past ad, a packaging photo, a logo): the
+ * form's own action decides what asset it becomes once it has the validated bytes.
+ */
+export const FORM_FILE = 'form_file';
+/** Part size of a resumable upload (S3 multipart needs 5 MB or more for every part but the last). */
+export const UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+/** A started upload not completed and used within this long is removed from quarantine. */
+export const UPLOAD_TTL_HOURS = 24;
+
+export interface UploadParts {
+  uploadId: string;
+  partSize: number;
+  partCount: number;
+  /** Parts already stored (1-based), so a resumed upload sends only the rest. */
+  received: number[];
+  /** Presigned PUT URLs for the parts still missing (a single-part upload is PUT with its declared Content-Type). */
+  parts: { partNumber: number; url: string }[];
+}
+
+async function partsOf(u: { id: string; quarantine_key: string; multipart_id: string | null; part_size: number; part_count: number; declared_mime: string }): Promise<UploadParts> {
+  const received = u.multipart_id
+    ? (await storage().listParts(u.quarantine_key, u.multipart_id)).map((p) => p.partNumber)
+    : (await storage().exists(u.quarantine_key)) ? [1] : [];
+  const missing = Array.from({ length: u.part_count }, (_, i) => i + 1).filter((n) => !received.includes(n));
+  const parts = await Promise.all(
+    missing.map(async (partNumber) => ({ partNumber, url: u.multipart_id ? await storage().signedPartUrl(u.quarantine_key, u.multipart_id, partNumber) : await storage().signedPutUrl(u.quarantine_key, u.declared_mime, 3600) })),
+  );
+  return { uploadId: u.id, partSize: u.part_size, partCount: u.part_count, received, parts };
+}
+
+/**
+ * Start a resumable upload straight into quarantine (the bytes never pass through our servers or the 26 MB
+ * request cap). A file larger than one part goes up as a multipart upload, one presigned URL per part; a dropped
+ * connection resumes from the parts already stored (mediaUploadStatus).
+ */
+export async function startMediaUpload(tx: Tx, ctx: TenantContext, input: { mime: string; bytes: number; filename?: string | null }): Promise<UploadParts> {
+  const { id, key } = await openUpload(tx, ctx, FORM_FILE, input.mime, input.bytes);
+  const partCount = Math.max(1, Math.ceil(input.bytes / UPLOAD_PART_SIZE));
+  const multipartId = partCount > 1 ? await storage().startMultipart(key, input.mime) : null;
+  await tx`update uploads set multipart_id = ${multipartId}, part_size = ${UPLOAD_PART_SIZE}, part_count = ${partCount}, filename = ${input.filename?.slice(0, 200) ?? null}
+           where id = ${id} and workspace_id = ${ctx.workspaceId}`;
+  return partsOf({ id, quarantine_key: key, multipart_id: multipartId, part_size: UPLOAD_PART_SIZE, part_count: partCount, declared_mime: input.mime });
+}
+
+async function formUpload(tx: Tx, ctx: TenantContext, uploadId: string, lock = false) {
+  assertCan(ctx, 'sku.edit');
+  const [u] = lock
+    ? await tx`select * from uploads where id = ${uploadId} and workspace_id = ${ctx.workspaceId} and kind = ${FORM_FILE} for update`
+    : await tx`select * from uploads where id = ${uploadId} and workspace_id = ${ctx.workspaceId} and kind = ${FORM_FILE}`;
+  if (!u) throw new DomainError('NOT_FOUND', 'Upload not found. Please add the file again.');
+  return u as unknown as { id: string; status: string; quarantine_key: string; multipart_id: string | null; part_size: number; part_count: number; bytes: string | number; declared_mime: string; filename: string | null; reject_reason: string | null };
+}
+
+/** Where a started upload stands: the parts stored so far and fresh URLs for the rest (resume after a drop). */
+export async function mediaUploadStatus(tx: Tx, ctx: TenantContext, uploadId: string): Promise<UploadParts & { status: string }> {
+  const u = await formUpload(tx, ctx, uploadId);
+  if (u.status !== 'pending') return { uploadId, partSize: u.part_size, partCount: u.part_count, received: [], parts: [], status: u.status };
+  return { ...(await partsOf(u)), status: u.status };
+}
+
+/**
+ * Every part arrived: assemble them in quarantine. The stored size must be what was declared (a truncated or
+ * padded upload is refused and can be resumed). Completing twice is a no-op.
+ */
+export async function completeMediaUpload(tx: Tx, ctx: TenantContext, uploadId: string): Promise<{ uploadId: string; missing?: number[] }> {
+  const u = await formUpload(tx, ctx, uploadId, true);
+  if (u.status === 'quarantined') return { uploadId };
+  if (u.status !== 'pending') throw new DomainError('CONFLICT', u.reject_reason ?? 'This upload can’t be used any more. Please add the file again.');
+  if (u.multipart_id) {
+    const parts = await storage().listParts(u.quarantine_key, u.multipart_id);
+    const missing = Array.from({ length: u.part_count }, (_, i) => i + 1).filter((n) => !parts.some((p) => p.partNumber === n));
+    if (missing.length) return { uploadId, missing };
+    const size = parts.reduce((a, p) => a + p.size, 0);
+    if (size !== Number(u.bytes)) throw new DomainError('INVALID', 'The upload arrived incomplete. Please add the file again.', { expected: Number(u.bytes), got: size });
+    await storage().completeMultipart(u.quarantine_key, u.multipart_id);
+  } else if (!(await storage().exists(u.quarantine_key))) {
+    return { uploadId, missing: [1] };
+  }
+  await tx`update uploads set status = 'quarantined' where id = ${uploadId} and workspace_id = ${ctx.workspaceId}`;
+  return { uploadId };
+}
+
+/**
+ * The bytes of a completed form upload, for the form's action to validate and ingest like a posted file. The
+ * upload stays in quarantine until `consumeMediaUpload` (after the action succeeded), so a failed action can be
+ * retried without uploading again.
+ */
+export async function uploadedFile(tx: Tx, ctx: TenantContext, uploadId: string): Promise<{ bytes: Buffer; filename: string | null; mime: string }> {
+  const u = await formUpload(tx, ctx, uploadId);
+  if (u.status !== 'quarantined') throw new DomainError('CONFLICT', u.status === 'pending' ? 'The upload hasn’t finished yet.' : 'This upload was already used. Please add the file again.');
+  let bytes: Buffer;
+  try {
+    bytes = await storage().get(u.quarantine_key);
+  } catch {
+    throw new DomainError('CONFLICT', 'The upload expired. Please add the file again.');
+  }
+  return { bytes, filename: u.filename, mime: u.declared_mime };
+}
+
+/** The form's action used the upload: it leaves quarantine (the validated copy lives on as the asset). */
+export async function consumeMediaUpload(tx: Tx, ctx: TenantContext, uploadId: string) {
+  const [u] = await tx`update uploads set status = 'accepted' where id = ${uploadId} and workspace_id = ${ctx.workspaceId} and kind = ${FORM_FILE} and status = 'quarantined' returning quarantine_key`;
+  if (u) await storage().delete(u.quarantine_key as string).catch(() => {});
+}
+
+/**
+ * Uploads started more than UPLOAD_TTL_HOURS ago and never used (abandoned, or the browser gave up) leave
+ * quarantine: stored parts are aborted, the object is deleted, and the row is kept as rejected. System job: each
+ * row is written in its own workspace.
+ */
+export async function sweepStaleUploads(tx: Tx, limit = 200): Promise<number> {
+  const rows = await tx`select id, workspace_id, quarantine_key, multipart_id from uploads
+                        where status in ('pending', 'quarantined') and created_at < now() - make_interval(hours => ${UPLOAD_TTL_HOURS})
+                        order by created_at limit ${limit}`;
+  for (const r of rows) {
+    if (r.multipart_id) await storage().abortMultipart(r.quarantine_key as string, r.multipart_id as string).catch(() => {});
+    await storage().delete(r.quarantine_key as string).catch(() => {});
+    await tx`update uploads set status = 'rejected', reject_reason = 'expired before it was used' where id = ${r.id} and workspace_id = ${r.workspace_id}`;
+  }
+  return rows.length;
+}
+
+export interface ValidatedMedia {
+  bytes: Buffer;
+  mime: 'image/png' | 'image/jpeg' | 'image/webp' | 'video/mp4' | 'video/quicktime' | 'application/pdf';
+}
+
+const TOO_SMALL = 'That image is too small to use. Please upload at least 800px.';
+const TOO_LARGE = 'That image is too large to process.';
+/** Final fallback only: the photo is HEIC but neither decoder could read it. */
+const HEIC_UNREADABLE = 'We couldn’t read that iPhone photo. Choose “Most Compatible” in Camera settings, or upload a screenshot.';
+
+/** The prebuilt sharp/libvips decodes AVIF but not HEVC-coded HEIF (iPhone HEIC). */
+function sharpDecodesHeic(): boolean {
+  const heif = (sharp.format as unknown as Record<string, { input?: { fileSuffix?: string[] } } | undefined>).heif;
+  return (heif?.input?.fileSuffix ?? []).includes('.heic');
+}
+
+/**
+ * iPhone HEIC → display-oriented RGB pixels via libheif compiled to WASM (no native dependency), so the photo
+ * is converted server-side like any other upload (plan 03 P2). The pixel limit is checked from the container
+ * header before any pixel is decoded (decompression bombs), and again on the decoded raster. libheif applies
+ * the container's rotation/mirror itself; the pixels carry no metadata, so the re-encode has no EXIF/GPS.
+ * Returns null when this decoder can't read the file (e.g. AV1-coded HEIF, which sharp decodes).
+ */
+async function decodeHeic(raw: Buffer): Promise<ReturnType<typeof sharp> | null> {
+  const { default: heic } = await import('heic-decode');
+  let frames: Awaited<ReturnType<typeof heic.all>>;
+  try {
+    frames = await heic.all({ buffer: raw });
+  } catch {
+    return null;
+  }
+  try {
+    const primary = frames[0];
+    if (!primary) return null;
+    if (primary.width * primary.height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
+    const decoded = await primary.decode().catch(() => null);
+    if (!decoded) return null;
+    const { width, height, data } = decoded;
+    if (width * height > UPLOAD_LIMITS.image.maxPixels) throw new DomainError('INVALID', TOO_LARGE);
+    if (data.byteLength !== width * height * 4) return null;
+    return sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), { raw: { width, height, channels: 4 } }).removeAlpha();
+  } finally {
+    frames.dispose();
+  }
+}
+
+/** Validate untrusted bytes. Throws INVALID with a customer-safe reason. */
+export async function validateMedia(raw: Buffer): Promise<ValidatedMedia> {
+  const ft = await fileTypeFromBuffer(raw);
+  const family = ft ? ALLOWED[ft.mime] : undefined;
+  if (!ft || !family) throw new DomainError('INVALID', 'We couldn’t read that file. Try a JPG or PNG.');
+  if (raw.length > UPLOAD_LIMITS[family].maxBytes) throw new DomainError('INVALID', 'That file is too large.');
+  if (family === 'image') {
+    const heif = ft.mime === 'image/heic' || ft.mime === 'image/heif';
+    const unreadable = heif ? HEIC_UNREADABLE : 'That image looks damaged or too large to process.';
+    // Our sharp build reads HEIC headers but can't decode HEVC pixels, so HEIC goes to the WASM decoder first.
+    let img = heif && !sharpDecodesHeic() ? await decodeHeic(raw) : null;
+    let hasAlpha = false;
+    if (img) {
+      const meta = await img.metadata();
+      if ((meta.width ?? 0) < 200 || (meta.height ?? 0) < 200) throw new DomainError('INVALID', TOO_SMALL);
+    } else {
+      try {
+        // limitInputPixels rejects decompression bombs before decoding the full raster.
+        const s = sharp(raw, { limitInputPixels: UPLOAD_LIMITS.image.maxPixels, failOn: 'error' });
+        const meta = await s.metadata();
+        if (!meta.width || !meta.height) throw new Error('no dimensions');
+        if (meta.width < 200 || meta.height < 200) throw new DomainError('INVALID', TOO_SMALL);
+        hasAlpha = !!meta.hasAlpha;
+        img = s.rotate(); // apply EXIF orientation before the metadata is dropped
+      } catch (e) {
+        if (e instanceof DomainError) throw e;
+        throw new DomainError('INVALID', unreadable);
+      }
+    }
+    // Re-encode: strips EXIF/GPS metadata. Pixels are only decoded here, so a codec failure surfaces here too.
+    const out = img.resize({ width: UPLOAD_LIMITS.image.maxEdge, height: UPLOAD_LIMITS.image.maxEdge, fit: 'inside', withoutEnlargement: true });
+    try {
+      return hasAlpha
+        ? { bytes: await out.png().toBuffer(), mime: 'image/png' }
+        : { bytes: await out.jpeg({ quality: 90, mozjpeg: true }).toBuffer(), mime: 'image/jpeg' };
+    } catch {
+      throw new DomainError('INVALID', unreadable);
+    }
+  }
+  if (family === 'video') {
+    await validateVideo(raw);
+    await malwareScan(raw);
+    // Stored as what it is: a QuickTime file is never relabelled as MP4.
+    return { bytes: raw, mime: ft.mime === 'video/quicktime' ? 'video/quicktime' : 'video/mp4' };
+  }
+  validatePdf(raw);
+  await malwareScan(raw);
+  return { bytes: raw, mime: 'application/pdf' };
+}
+
+const VIDEO_CODECS = new Set(['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg4', 'prores']);
+const VIDEO_UNREADABLE = 'We couldn’t read that video. Export it again as an MP4 (H.264) and try once more.';
+
+/**
+ * Standard §48 "Malicious or malformed upload": the container is parsed by ffprobe in a child process under kernel
+ * resource limits (never in the app process), and must hold one playable video track within the duration, dimension
+ * and stream-count caps.
+ */
+async function validateVideo(raw: Buffer): Promise<void> {
+  const L = UPLOAD_LIMITS.video;
+  let p: UntrustedProbe;
+  try {
+    p = await withTempDir(async (dir) => {
+      const f = path.join(dir, 'upload');
+      await writeFile(f, raw);
+      return probeUntrusted(f);
+    });
+  } catch {
+    throw new DomainError('INVALID', VIDEO_UNREADABLE);
+  }
+  const videos = p.streams.filter((s) => s.type === 'video');
+  if (videos.length !== 1 || !p.width || !p.height || !p.videoCodec || !VIDEO_CODECS.has(p.videoCodec)) throw new DomainError('INVALID', VIDEO_UNREADABLE);
+  if (p.streams.length > L.maxStreams) throw new DomainError('INVALID', 'That video has more tracks than we accept. Export a single video with one audio track.');
+  if (p.width > L.maxEdge || p.height > L.maxEdge) throw new DomainError('INVALID', `That video is larger than ${L.maxEdge} pixels on a side. Export it at 1080p or 4K.`);
+  if (!(p.durationMs > 0)) throw new DomainError('INVALID', VIDEO_UNREADABLE);
+  if (p.durationMs > L.maxDurationMs) throw new DomainError('INVALID', `Videos can be up to ${Math.round(L.maxDurationMs / 60_000)} minutes long.`);
+}
+
+/**
+ * PDF evidence documents: a real PDF (header and end-of-file marker), a page count within the cap, and no active
+ * content (JavaScript, launch or embedded-file actions) — evidence is read by people, never executed.
+ */
+export function validatePdf(raw: Buffer): void {
+  const head = raw.subarray(0, 1024).toString('latin1');
+  const tail = raw.subarray(Math.max(0, raw.length - 2048)).toString('latin1');
+  if (!/^%PDF-\d\.\d/.test(head) || !tail.includes('%%EOF')) throw new DomainError('INVALID', 'That PDF looks damaged. Export it again and upload the new file.');
+  const text = raw.toString('latin1');
+  if (/\/(JavaScript|JS|Launch|EmbeddedFile|OpenAction\s*<<[^>]*\/S\s*\/JavaScript)\b/.test(text)) throw new DomainError('INVALID', 'That PDF contains scripts or embedded files. Print it to a plain PDF and upload that.');
+  const pages = (text.match(/\/Type\s*\/Page(?!s)\b/g) ?? []).length;
+  if (pages > UPLOAD_LIMITS.pdf.maxPages) throw new DomainError('INVALID', `PDFs can have up to ${UPLOAD_LIMITS.pdf.maxPages} pages. Upload the relevant pages.`);
+}
+
+/** Worker step: move a quarantined upload into the tenant prefix as an asset. */
+export async function processUpload(tx: Tx, ctx: TenantContext, uploadId: string, skuId: string | null, origin: Record<string, unknown> = {}) {
+  const [u] = await tx`select * from uploads where id = ${uploadId} for update`;
+  if (!u) throw new DomainError('NOT_FOUND', 'Upload not found');
+  if (u.status === 'accepted') return { assetId: u.asset_id as string, replayed: true };
+  if (u.status === 'rejected') throw new DomainError('INVALID', u.reject_reason as string);
+  let raw: Buffer;
+  try {
+    raw = await storage().get(u.quarantine_key as string);
+  } catch {
+    throw new DomainError('INVALID', 'The upload didn’t finish. Please try again.');
+  }
+  try {
+    const v = await validateMedia(raw);
+    const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind: u.kind as AssetKind, skuId, source: 'upload', origin: { ...origin, uploadId, declaredMime: u.declared_mime } });
+    // Same review as a direct upload: media named as a before/after or showing children waits for compliance.
+    if (REVIEWABLE_KINDS.has(u.kind as AssetKind)) await holdForReview(tx, [{ assetId: asset.id, flags: uploadReviewFlags(origin) }]);
+    await tx`update uploads set status = 'accepted', asset_id = ${asset.id} where id = ${uploadId}`;
+    await storage().delete(u.quarantine_key as string);
+    return { assetId: asset.id, replayed: false };
+  } catch (e) {
+    const reason = e instanceof DomainError ? e.message : 'We couldn’t process that file.';
+    await tx`update uploads set status = 'rejected', reject_reason = ${reason} where id = ${uploadId}`;
+    await storage().delete(u.quarantine_key as string);
+    throw e;
+  }
+}
+
+/** Direct server-side upload path (small files posted to our API rather than presigned PUT). */
+export async function ingestBytes(tx: Tx, ctx: TenantContext, raw: Buffer, kind: AssetKind, skuId: string | null, origin: Record<string, unknown> = {}) {
+  // Provisional visitors carry an OWNER context on their own PROVISIONAL workspace, so they pass; Viewers and
+  // held workspaces do not.
+  assertCan(ctx, 'sku.edit');
+  // Counted in its own short transaction, committed before validation: a rejected (malformed, malicious) upload
+  // still spends the budget, and the counter row is not locked across decoding and storage I/O.
+  await hit(`upload:ws:${ctx.workspaceId}`, 100, 3600, undefined, { subject: [allowKey.ws(ctx.workspaceId)] });
+  const v = await validateMedia(raw);
+  const asset = await saveAsset(tx, ctx.workspaceId, { bytes: v.bytes, mime: v.mime, kind, skuId, source: 'upload', origin });
+  // Merchant media named or declared as a before/after, or showing children, waits for compliance review (plan 05
+  // §14, standard §43). A declared before/after carries the merchant's provenance/permission attestation.
+  if (REVIEWABLE_KINDS.has(kind)) await holdForReview(tx, [{ assetId: asset.id, flags: uploadReviewFlags(origin) }]);
+  return asset;
+}
+
+/** The rights attestation a merchant gives for footage they upload (standard §40), stored verbatim. */
+export const RIGHTS_ATTESTATION_VERSION = 'rights@2026-09-26';
+export const RIGHTS_ATTESTATION_TEXT =
+  'I own this footage, or have written permission from whoever made it and everyone who appears in it, to use and edit it in ads for this brand.';
+
+/** Kinds of uploaded footage a rights attestation covers (creator / UGC / past-ad media). */
+const ATTESTABLE_KINDS: ReadonlySet<string> = new Set(['creator_footage', 'historical_creative']);
+
+/**
+ * Standard §40: "Uploaded creator/UGC assets require merchant attestation that they have rights to use/process
+ * them; preserve origin metadata where possible." Records who attested on the asset and keeps the exact text,
+ * the person, IP and user agent as an append-only consent record. Only a signed-in person can attest.
+ */
+export async function recordRightsAttestation(tx: Tx, ctx: TenantContext, assetId: string, meta: { ip?: string | null; userAgent?: string | null } = {}) {
+  assertCan(ctx, 'sku.edit');
+  if (ctx.actor.kind !== 'user') throw new DomainError('FORBIDDEN', 'Only a signed-in member can attest rights.');
+  const [a] = await tx`update assets set rights_attested_by = ${ctx.actor.id}, rights_attested_at = now()
+                       where id = ${assetId} and workspace_id = ${ctx.workspaceId} and deleted_at is null and kind in ${tx([...ATTESTABLE_KINDS])}
+                         and (rights_expires_at is null or rights_expires_at > now()) and rights_frozen_at is null
+                       returning id, kind`;
+  if (!a) throw new DomainError('NOT_FOUND', 'Footage not found');
+  const [c] = await tx`insert into consent_records (workspace_id, user_id, kind, text_version, text_snapshot, context, ip, user_agent)
+                       values (${ctx.workspaceId}, ${ctx.actor.id}, 'rights_attestation', ${RIGHTS_ATTESTATION_VERSION}, ${RIGHTS_ATTESTATION_TEXT},
+                               ${tx.json({ assetId, kind: a.kind as string })}, ${meta.ip ?? null}, ${meta.userAgent ?? null})
+                       returning id`;
+  return { consentId: c!.id as string };
+}
+
+/** Merchant-supplied media that can end up in an ad (and so in the before/after and minors review). */
+const REVIEWABLE_KINDS: ReadonlySet<AssetKind> = new Set<AssetKind>(['product_photo', 'reference_view', 'creator_footage', 'historical_creative']);
+
+/** Photos a visitor can add to one preview (the upload module's own limit). */
+export const MAX_PREVIEW_PHOTOS = 6;
+const PHOTO_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'image/avif']);
+
+/**
+ * Plan 03 P2 "starts uploading the moment a file is chosen (presigned PUT to quarantine)": one quarantined upload
+ * per chosen product photo, each with its own short-lived PUT URL. Browsers that report HEIC with no type send
+ * image/heic; the bytes are checked on completion regardless of what is declared.
+ */
+export async function startPhotoUploads(tx: Tx, ctx: TenantContext, files: { mime: string; bytes: number }[]) {
+  if (!files.length || files.length > MAX_PREVIEW_PHOTOS) throw new DomainError('INVALID', `Add 1 to ${MAX_PREVIEW_PHOTOS} photos.`);
+  const out: { uploadId: string; putUrl: string }[] = [];
+  for (const f of files) {
+    const mime = f.mime || 'image/heic';
+    if (!PHOTO_MIMES.has(mime)) throw new DomainError('INVALID', 'Choose a photo (JPG, PNG, WebP or HEIC).');
+    const u = await createUpload(tx, ctx, 'product_photo', mime, f.bytes);
+    out.push({ uploadId: u.uploadId, putUrl: u.putUrl });
+  }
+  return out;
+}
+
+/**
+ * The browser finished its PUT: validate the quarantined bytes and turn them into an (unattached) product photo.
+ * A rejected file is recorded as rejected and reported back — the transaction still commits, so the reason and the
+ * quarantine clean-up stick. Completing twice returns the same asset.
+ */
+export async function completePhotoUpload(tx: Tx, ctx: TenantContext, uploadId: string, filename?: string | null): Promise<{ assetId: string } | { error: string }> {
+  assertCan(ctx, 'sku.edit');
+  const [u] = await tx`select kind, status from uploads where id = ${uploadId}`;
+  if (!u || u.kind !== 'product_photo') throw new DomainError('NOT_FOUND', 'Upload not found. Please add the photo again.');
+  try {
+    return { assetId: (await processUpload(tx, ctx, uploadId, null, filename ? { filename: filename.slice(0, 200) } : {})).assetId };
+  } catch (e) {
+    if (e instanceof DomainError && e.code === 'INVALID') return { error: e.message };
+    throw e;
+  }
+}

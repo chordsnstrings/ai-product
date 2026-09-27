@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22.12'
+  PNPM_VERSION: '10.33.0'
+  NEXT_TELEMETRY_DISABLED: '1'
+  # Runtime + test databases (roles/passwords are created by `pnpm db:migrate` in non-production).
+  DATABASE_URL: postgres://dev:dev@localhost:5432/arkiv
+  APP_DATABASE_URL: postgres://app_rw:app_rw@localhost:5432/arkiv
+  ADMIN_DATABASE_URL: postgres://admin_rw:admin_rw@localhost:5432/arkiv
+  PROVIDERS_MODE: mock
+  STORAGE_DRIVER: local
+
+jobs:
+  # The integration suite runs its files one at a time against one database, so it is split across parallel shards
+  # (each with its own Postgres) to keep every job well inside its time limit as the suite grows.
+  tests:
+    name: Unit + integration tests (${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev -d arkiv" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - name: Create test database
+        run: PGPASSWORD=dev psql -h localhost -U dev -d arkiv -c 'create database arkiv_test'
+      - run: pnpm test --shard=${{ matrix.shard }}/3
+
+  checks:
+    name: Typecheck, unit + integration tests
+    runs-on: ubuntu-latest
+    needs: [tests]
+    if: ${{ always() }}
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev -d arkiv" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - name: Every test shard passed
+        run: test "${{ needs.tests.result }}" = success
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r --parallel typecheck
+      - name: Create test database
+        run: PGPASSWORD=dev psql -h localhost -U dev -d arkiv -c 'create database arkiv_test'
+      - name: Every table is registered and tenant tables are RLS-forced
+        run: pnpm vitest run packages/db/src/rls.test.ts
+
+  migrations:
+    # Plan 06 Phase 0 D2 "migration dry-run": the base branch's schema (with seed data) is built first, then this
+    # change's pending migrations are applied to it in one transaction and rolled back, with lock-heavy DDL listed.
+    name: Migration dry run
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev -d arkiv" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - name: Base schema (merge base) with seed data
+        run: |
+          git worktree add ../base "$(git merge-base HEAD origin/${{ github.base_ref }})"
+          # A base without migrations (e.g. a docs-only first commit) has no schema to build: every migration in this
+          # change is then pending and is dry-run against the empty database.
+          if [ ! -d ../base/packages/db/migrations ]; then echo "Base has no migrations; dry-running all of them."; exit 0; fi
+          cd ../base && pnpm install --frozen-lockfile && pnpm db:migrate && pnpm db:seed
+      - run: pnpm install --frozen-lockfile
+      - name: Apply this change's migrations to it, then roll back
+        run: pnpm db:migrate:dry
+
+  build:
+    name: Build web + admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @arkiv/web build
+      - run: pnpm --filter @arkiv/admin build
+      - name: Font budget — at most 2 preloaded font files per route (design §5)
+        run: pnpm exec tsx scripts/check-fonts.ts apps/web apps/admin
+      - name: Bundle budget — first-load JS of the marketing and funnel routes (plan 06 Phase 0 D2)
+        run: pnpm exec tsx scripts/bundle-budget.ts apps/web
+
+  e2e:
+    name: E2E (browser + HTTP smoke)
+    runs-on: ubuntu-latest
+    needs: [checks]
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dev, POSTGRES_PASSWORD: dev, POSTGRES_DB: arkiv }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dev -d arkiv" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      EMAIL_DEV_FILE: ${{ github.workspace }}/.storage/e2e-mail.jsonl
+      STORAGE_LOCAL_DIR: ${{ github.workspace }}/.storage/files
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: '${{ env.PNPM_VERSION }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: pnpm }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: mkdir -p .storage && pnpm db:migrate
+      - name: Start worker, web and admin
+        run: |
+          nohup pnpm --filter @arkiv/worker start > worker.log 2>&1 &
+          nohup pnpm --filter @arkiv/web dev > web.log 2>&1 &
+          nohup pnpm --filter @arkiv/admin dev > admin.log 2>&1 &
+          for u in http://localhost:3000/api/health http://localhost:3001/login; do
+            for i in $(seq 1 90); do curl -fs "$u" > /dev/null && break; sleep 2; done
+          done
+      - name: Browser e2e (reuses the running servers)
+        run: pnpm e2e
+      - name: HTTP smoke — funnel + retention loop
+        run: pnpm smoke
+        env: { BASE: 'http://localhost:3000' }
+      - name: HTTP smoke — admin console
+        run: pnpm smoke:admin
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            playwright-report
+            test-results
+            worker.log
+            web.log
+            admin.log
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: { target: [web, admin, worker] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}

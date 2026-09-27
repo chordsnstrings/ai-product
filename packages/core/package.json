@@ -1,0 +1,31 @@
+{
+  "name": "@arkiv/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@arkiv/db": "workspace:*",
+    "@arkiv/integrations": "workspace:*",
+    "@arkiv/media": "workspace:*",
+    "@arkiv/providers": "workspace:*",
+    "@arkiv/shared": "workspace:*",
+    "@aws-sdk/client-s3": "^3.1138.0",
+    "@aws-sdk/s3-request-presigner": "^3.1138.0",
+    "fflate": "^0.8.2",
+    "file-type": "^22.1.1",
+    "heic-decode": "^2.1.0",
+    "sharp": "^0.35.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "fast-check": "^4.10.2"
+  }
+}

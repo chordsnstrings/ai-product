@@ -1,0 +1,20 @@
+{
+  "name": "@arkiv/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@arkiv/billing": "workspace:*",
+    "@arkiv/core": "workspace:*",
+    "@arkiv/db": "workspace:*",
+    "@arkiv/email": "workspace:*",
+    "@arkiv/shared": "workspace:*",
+    "pg-boss": "^12.33.6",
+    "tsx": "^4.23.15"
+  }
+}

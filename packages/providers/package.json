@@ -1,0 +1,15 @@
+{
+  "name": "@arkiv/providers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "@arkiv/shared": "workspace:*",
+    "@arkiv/media": "workspace:*",
+    "sharp": "^0.35.4",
+    "zod": "^4.6.5"
+  }
+}

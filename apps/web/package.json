@@ -1,0 +1,30 @@
+{
+  "name": "@arkiv/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p ${PORT:-3000}",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@arkiv/auth": "workspace:*",
+    "@arkiv/billing": "workspace:*",
+    "@arkiv/core": "workspace:*",
+    "@arkiv/db": "workspace:*",
+    "@arkiv/email": "workspace:*",
+    "@arkiv/integrations": "workspace:*",
+    "@arkiv/shared": "workspace:*",
+    "@arkiv/ui": "workspace:*",
+    "@simplewebauthn/browser": "^14.0.0",
+    "@stripe/react-stripe-js": "^6.11.0",
+    "@stripe/stripe-js": "^9.17.0",
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": { "@types/react": "^19.2.0", "@types/react-dom": "^19.2.0" }
+}
